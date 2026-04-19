@@ -1,18 +1,19 @@
-//! End-to-end test: mint → register → send → receive → claim → forward.
+//! End-to-end test: tag registration → mint → send → receive → claim → forward.
 //!
 //! Requires the `test-mint` feature on vess-foundry (enabled by default
 //! in vess-tests/Cargo.toml) so minting completes in seconds rather than
 //! minutes.
 //!
 //! Uses VessNode instances to simulate a live artery network: one
-//! artery-like node (with OwnershipRegistry + proof verification) and
-//! three client nodes for Alice, Bob, and Charlie.
+//! artery-like node (with OwnershipRegistry + TagDht + proof verification)
+//! and three client nodes for Alice, Bob, and Charlie.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use vess_artery::OwnershipRegistry;
 use vess_artery::ownership_registry::OwnershipRecord;
+use vess_artery::TagDht;
 use vess_foundry::spend_auth;
 use vess_foundry::Denomination;
 use vess_kloak::billfold::{BillFold, SpendCredential};
@@ -22,12 +23,15 @@ use vess_kloak::payment::{
 };
 use vess_protocol::{
     OwnershipClaim, OwnershipGenesis, PulseMessage, RegistryQuery, RegistryQueryResponse,
+    TagRegister, TagLookup, TagLookupResponse, TagLookupResult,
 };
-use vess_stealth::generate_master_keys;
+use vess_stealth::{generate_master_keys, MasterStealthAddress};
+use vess_tag::TagRecord;
 use vess_vascular::VessNode;
 
 /// A lightweight test participant: stealth keys + spend credentials + billfold.
 struct Participant {
+    name: String,
     secret: vess_stealth::StealthSecretKey,
     address: vess_stealth::MasterStealthAddress,
     billfold: BillFold,
@@ -35,14 +39,42 @@ struct Participant {
 }
 
 impl Participant {
-    fn new() -> Self {
+    fn new(name: &str) -> Self {
         let (secret, address) = generate_master_keys();
         Self {
+            name: name.to_string(),
             secret,
             address,
             billfold: BillFold::new(),
             credentials: HashMap::new(),
         }
+    }
+
+    /// Build a TagRegister message using test-friendly PoW parameters.
+    fn tag_register_msg(&self) -> PulseMessage {
+        let tag_hash = *blake3::hash(self.name.as_bytes()).as_bytes();
+        let (pow_nonce, pow_hash) = vess_tag::compute_tag_pow_test(
+            &tag_hash,
+            &self.address.scan_ek,
+            &self.address.spend_ek,
+        )
+        .expect("compute test PoW");
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        PulseMessage::TagRegister(TagRegister {
+            tag_hash,
+            scan_ek: self.address.scan_ek.to_vec(),
+            spend_ek: self.address.spend_ek.to_vec(),
+            pow_nonce,
+            pow_hash,
+            timestamp: now,
+            registrant_vk: Vec::new(),
+            signature: Vec::new(),
+        })
     }
 }
 
@@ -55,29 +87,54 @@ async fn three_node_mint_send_claim() {
 
     let node_id_bytes: [u8; 32] = *blake3::hash(artery_node.id().as_bytes()).as_bytes();
     let registry = Arc::new(Mutex::new(OwnershipRegistry::new(node_id_bytes)));
+    let tag_dht = Arc::new(Mutex::new(TagDht::new(node_id_bytes, 3)));
 
     // Spawn the artery handler — mirrors the real node_runner logic for
     // OwnershipGenesis, OwnershipClaim, and RegistryQuery messages.
     let reg = registry.clone();
+    let tags = tag_dht.clone();
     let artery_handle = tokio::spawn({
         let artery_node = artery_node.clone();
         async move {
             artery_node.listen_messages_with_response(move |_peer, msg| {
-                let mut state = reg.lock().unwrap();
                 match msg {
                     PulseMessage::OwnershipGenesis(og) => {
+                        let mut state = reg.lock().unwrap();
                         handle_ownership_genesis(&mut state, og);
                         None
                     }
                     PulseMessage::OwnershipClaim(oc) => {
+                        let mut state = reg.lock().unwrap();
                         handle_ownership_claim(&mut state, oc);
                         None
                     }
                     PulseMessage::RegistryQuery(rq) => {
+                        let state = reg.lock().unwrap();
                         let active = rq.mint_ids.iter()
                             .map(|mid| state.is_active(mid))
                             .collect();
                         Some(PulseMessage::RegistryQueryResponse(RegistryQueryResponse { active }))
+                    }
+                    PulseMessage::TagRegister(tr) => {
+                        handle_tag_register(&tags, tr);
+                        None
+                    }
+                    PulseMessage::TagLookup(tl) => {
+                        let dht = tags.lock().unwrap();
+                        let result = dht.lookup_by_hash(&tl.tag_hash).map(|record| TagLookupResult {
+                            scan_ek: record.master_address.scan_ek.clone(),
+                            spend_ek: record.master_address.spend_ek.clone(),
+                            registered_at: record.registered_at,
+                            pow_nonce: record.pow_nonce,
+                            pow_hash: record.pow_hash.clone(),
+                            registrant_vk: record.registrant_vk.clone(),
+                            signature: record.signature.clone(),
+                        });
+                        Some(PulseMessage::TagLookupResponse(TagLookupResponse {
+                            tag_hash: tl.tag_hash,
+                            nonce: tl.nonce,
+                            result,
+                        }))
                     }
                     _ => None,
                 }
@@ -86,11 +143,30 @@ async fn three_node_mint_send_claim() {
     });
 
     // ── 2. Create three participants: Alice, Bob, Charlie ───────────
-    let mut alice = Participant::new();
-    let mut bob = Participant::new();
-    let mut charlie = Participant::new();
+    let mut alice = Participant::new("alice");
+    let mut bob = Participant::new("bob");
+    let mut charlie = Participant::new("charlie");
 
-    // ── 3. Alice mints a D1 bill ────────────────────────────────────
+    // ── 3. Spin up client nodes and register tags ───────────────────
+    let client_a = VessNode::spawn().await.unwrap();
+    client_a.wait_online().await;
+    let client_b = VessNode::spawn().await.unwrap();
+    client_b.wait_online().await;
+    let client_c = VessNode::spawn().await.unwrap();
+    client_c.wait_online().await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    client_a.send_message(artery_addr.clone(), &alice.tag_register_msg()).await
+        .expect("register tag: alice");
+    client_b.send_message(artery_addr.clone(), &bob.tag_register_msg()).await
+        .expect("register tag: bob");
+    client_c.send_message(artery_addr.clone(), &charlie.tag_register_msg()).await
+        .expect("register tag: charlie");
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    println!("Tags registered: +alice, +bob, +charlie");
+
+    // ── 4. Alice mints a D1 bill ────────────────────────────────────
     //    With test-mint: ~1 MiB scratchpad, 1024 iterations, 4-bit difficulty.
     let (alice_spend_vk, alice_spend_sk) = spend_auth::generate_spend_keypair();
     let alice_vk_hash = spend_auth::vk_hash(&alice_spend_vk);
@@ -122,7 +198,7 @@ async fn three_node_mint_send_claim() {
     });
     assert_eq!(alice.billfold.balance(), 1);
 
-    // ── 4. Alice broadcasts OwnershipGenesis to the artery ──────────
+    // ── 5. Alice broadcasts OwnershipGenesis to the artery ──────────
     let genesis_msg = PulseMessage::OwnershipGenesis(OwnershipGenesis {
         mint_id: bill.mint_id,
         chain_tip: bill.chain_tip,
@@ -134,10 +210,6 @@ async fn three_node_mint_send_claim() {
         hops_remaining: 3,
         chain_depth: 0,
     });
-
-    let client_a = VessNode::spawn().await.unwrap();
-    client_a.wait_online().await;
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     client_a
         .send_message(artery_addr.clone(), &genesis_msg)
@@ -165,11 +237,31 @@ async fn three_node_mint_send_claim() {
     }
     println!("OwnershipGenesis verified on artery.");
 
-    // ── 5. Alice sends payment to Bob ───────────────────────────────
+    // ── 6. Look up Bob's tag to resolve his stealth address ─────────
+    let bob_lookup = PulseMessage::TagLookup(TagLookup {
+        tag_hash: *blake3::hash(b"bob").as_bytes(),
+        nonce: [0u8; 16],
+    });
+    let bob_resp = client_a
+        .send_message_with_response(artery_addr.clone(), &bob_lookup)
+        .await
+        .expect("tag lookup: bob");
+    let bob_address = match bob_resp {
+        Some(PulseMessage::TagLookupResponse(tlr)) => {
+            let res = tlr.result.expect("bob tag should be registered");
+            MasterStealthAddress {
+                scan_ek: res.scan_ek,
+                spend_ek: res.spend_ek,
+            }
+        }
+        other => panic!("expected TagLookupResponse, got: {other:?}"),
+    };
+
+    // ── 7. Alice sends payment to Bob ───────────────────────────────
     let (payment_msg, _payment_id, send_indices) = prepare_payment_with_transfer(
         &alice.billfold,
         1,
-        &bob.address,
+        &bob_address,
         &alice.credentials,
     )
     .expect("prepare payment Alice → Bob");
@@ -184,7 +276,7 @@ async fn three_node_mint_send_claim() {
     }
     assert_eq!(alice.billfold.balance(), 0);
 
-    // ── 6. Bob receives and decrypts the payment ────────────────────
+    // ── 8. Bob receives and decrypts the payment ────────────────────
     let stealth_payload = match &payment_msg {
         PulseMessage::Payment(p) => &p.stealth_payload,
         _ => panic!("expected Payment message"),
@@ -201,7 +293,7 @@ async fn three_node_mint_send_claim() {
     assert_eq!(transfer_payload.bills.len(), 1);
     assert_eq!(transfer_payload.bills[0].mint_id, mint_id);
 
-    // ── 7. Bob claims the transfer ──────────────────────────────────
+    // ── 9. Bob claims the transfer ──────────────────────────────────
     let claim_result = claim_transfer_bills(transfer_payload, stealth_id)
         .expect("claim transfer bills");
 
@@ -224,11 +316,7 @@ async fn three_node_mint_send_claim() {
     }
     assert_eq!(bob.billfold.balance(), 1);
 
-    // ── 8. Bob broadcasts OwnershipClaim to the artery ──────────────
-    let client_b = VessNode::spawn().await.unwrap();
-    client_b.wait_online().await;
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
+    // ── 10. Bob broadcasts OwnershipClaim to the artery ─────────────
     for claim_msg in &claim_result.ownership_claims {
         client_b
             .send_message(artery_addr.clone(), claim_msg)
@@ -252,11 +340,31 @@ async fn three_node_mint_send_claim() {
     }
     println!("OwnershipClaim (Alice → Bob) verified on artery.");
 
-    // ── 9. Bob sends payment to Charlie ─────────────────────────────
+    // ── 11. Look up Charlie's tag to resolve his stealth address ────
+    let charlie_lookup = PulseMessage::TagLookup(TagLookup {
+        tag_hash: *blake3::hash(b"charlie").as_bytes(),
+        nonce: [1u8; 16],
+    });
+    let charlie_resp = client_b
+        .send_message_with_response(artery_addr.clone(), &charlie_lookup)
+        .await
+        .expect("tag lookup: charlie");
+    let charlie_address = match charlie_resp {
+        Some(PulseMessage::TagLookupResponse(tlr)) => {
+            let res = tlr.result.expect("charlie tag should be registered");
+            MasterStealthAddress {
+                scan_ek: res.scan_ek,
+                spend_ek: res.spend_ek,
+            }
+        }
+        other => panic!("expected TagLookupResponse, got: {other:?}"),
+    };
+
+    // ── 12. Bob sends payment to Charlie ────────────────────────────
     let (payment_msg_2, _pid2, send_indices_2) = prepare_payment_with_transfer(
         &bob.billfold,
         1,
-        &charlie.address,
+        &charlie_address,
         &bob.credentials,
     )
     .expect("prepare payment Bob → Charlie");
@@ -270,7 +378,7 @@ async fn three_node_mint_send_claim() {
     }
     assert_eq!(bob.billfold.balance(), 0);
 
-    // ── 10. Charlie receives, decrypts, and claims ──────────────────
+    // ── 13. Charlie receives, decrypts, and claims ─────────────────
     let stealth_payload_2 = match &payment_msg_2 {
         PulseMessage::Payment(p) => &p.stealth_payload,
         _ => panic!("expected Payment message"),
@@ -302,11 +410,7 @@ async fn three_node_mint_send_claim() {
     }
     assert_eq!(charlie.billfold.balance(), 1);
 
-    // ── 11. Charlie broadcasts OwnershipClaim ───────────────────────
-    let client_c = VessNode::spawn().await.unwrap();
-    client_c.wait_online().await;
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
+    // ── 14. Charlie broadcasts OwnershipClaim ──────────────────────
     for claim_msg in &claim_result_2.ownership_claims {
         client_c
             .send_message(artery_addr.clone(), claim_msg)
@@ -316,7 +420,7 @@ async fn three_node_mint_send_claim() {
 
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-    // ── 12. Verify final state ──────────────────────────────────────
+    // ── 15. Verify final state ──────────────────────────────────────
     let resp = client_c
         .send_message_with_response(artery_addr.clone(), &query)
         .await
@@ -342,7 +446,7 @@ async fn three_node_mint_send_claim() {
     }
 
     println!("OwnershipClaim (Bob → Charlie) verified on artery.");
-    println!("Full pipeline: mint → genesis → send → claim → send → claim ✓");
+    println!("Full pipeline: tags → mint → genesis → lookup → send → claim → lookup → send → claim ✓");
 
     // ── Cleanup ─────────────────────────────────────────────────────
     client_a.shutdown().await;
@@ -355,6 +459,39 @@ async fn three_node_mint_send_claim() {
 // ── Artery handler helpers ──────────────────────────────────────────
 // Simplified versions of the real node_runner handlers, exercising the
 // same proof-verification and ownership-chain logic.
+
+fn handle_tag_register(dht: &Arc<Mutex<TagDht>>, tr: TagRegister) {
+    let tag_hash = tr.tag_hash;
+    let addr = MasterStealthAddress {
+        scan_ek: tr.scan_ek.clone(),
+        spend_ek: tr.spend_ek.clone(),
+    };
+
+    let ok = vess_tag::verify_tag_pow_test(
+        &tag_hash,
+        &tr.scan_ek,
+        &tr.spend_ek,
+        &tr.pow_nonce,
+        &tr.pow_hash,
+    )
+    .expect("tag PoW verification error");
+    assert!(ok, "tag PoW verification failed for hash {:?}", tag_hash);
+
+    let record = TagRecord {
+        tag_hash,
+        master_address: addr,
+        pow_nonce: tr.pow_nonce,
+        pow_hash: tr.pow_hash,
+        registered_at: tr.timestamp,
+        registrant_vk: tr.registrant_vk,
+        signature: tr.signature,
+        hardened_at: None,
+    };
+
+    let mut dht = dht.lock().unwrap();
+    let stored = dht.store(record);
+    assert!(stored, "tag store should succeed for hash {:?}", tag_hash);
+}
 
 fn handle_ownership_genesis(registry: &mut OwnershipRegistry, og: OwnershipGenesis) {
     if registry.is_active(&og.mint_id) {

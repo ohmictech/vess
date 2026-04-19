@@ -156,8 +156,7 @@ pub fn prepare_payment(
         .map(|&i| &billfold.bills()[i])
         .collect();
 
-    let mint_ids: Vec<[u8; 32]> = bill_data.iter().map(|b| b.mint_id).collect();
-    let denomination_values: Vec<u64> = bill_data.iter().map(|b| b.denomination.value()).collect();
+    let bill_count = bill_data.len() as u8;
 
     // Serialize bill data for the stealth payload.
     let plaintext = serde_json::to_vec(&bill_data)
@@ -174,8 +173,9 @@ pub fn prepare_payment(
         view_tag: stealth.view_tag,
         stealth_id: stealth.stealth_id,
         created_at: now_unix(),
-        mint_ids,
-        denomination_values,
+        mint_ids: Vec::new(),
+        denomination_values: Vec::new(),
+        bill_count,
     });
 
     Ok((msg, payment_id, selection.send_indices))
@@ -203,8 +203,7 @@ pub fn prepare_payment_with_transfer(
         .map(|&i| &billfold.bills()[i])
         .collect();
 
-    let mint_ids: Vec<[u8; 32]> = bill_data.iter().map(|b| b.mint_id).collect();
-    let denomination_values: Vec<u64> = bill_data.iter().map(|b| b.denomination.value()).collect();
+    let bill_count = bill_data.len() as u8;
 
     // Build transfer auth: sign transfer_message per bill.
     // Use two-phase stealth API so the stealth_id used for signing
@@ -254,8 +253,9 @@ pub fn prepare_payment_with_transfer(
         view_tag: stealth.view_tag,
         stealth_id: stealth.stealth_id,
         created_at: timestamp,
-        mint_ids,
-        denomination_values,
+        mint_ids: Vec::new(),
+        denomination_values: Vec::new(),
+        bill_count,
     });
 
     Ok((msg, payment_id, selection.send_indices))
@@ -270,8 +270,7 @@ pub fn prepare_payment_from_bills(
     recipient: &MasterStealthAddress,
     credentials: &HashMap<[u8; 32], crate::billfold::SpendCredential>,
 ) -> Result<(PulseMessage, [u8; 32])> {
-    let mint_ids: Vec<[u8; 32]> = bills.iter().map(|b| b.mint_id).collect();
-    let denomination_values: Vec<u64> = bills.iter().map(|b| b.denomination.value()).collect();
+    let bill_count = bills.len() as u8;
 
     let stealth_ctx = vess_stealth::generate_stealth_context(recipient)?;
     let recipient_stealth_id = stealth_ctx.stealth_id;
@@ -316,8 +315,9 @@ pub fn prepare_payment_from_bills(
         view_tag: stealth.view_tag,
         stealth_id: stealth.stealth_id,
         created_at: timestamp,
-        mint_ids,
-        denomination_values,
+        mint_ids: Vec::new(),
+        denomination_values: Vec::new(),
+        bill_count,
     });
 
     Ok((msg, payment_id))

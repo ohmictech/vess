@@ -3,7 +3,7 @@
 //! The minter:
 //! 1. Selects a denomination.
 //! 2. Derives a challenge seed from randomness + denomination.
-//! 3. Builds the 256 MiB scratchpad.
+//! 3. Builds the 1 GiB scratchpad.
 //! 4. Runs the VM for `base_iterations × denomination_multiplier` steps.
 //! 5. Checks the final digest against the difficulty target.
 //! 6. On success, generates a STARK proof of the execution trace and emits
@@ -86,7 +86,7 @@ pub enum MintOutcome {
 /// meets the difficulty target, or `MintOutcome::Miss` otherwise.
 ///
 /// Two-phase execution: first runs the VM without recording a trace
-/// (`execute_digest_only`, ~256 MiB scratchpad only). If the digest
+/// (`execute_digest_only`, ~1 GiB scratchpad only). If the digest
 /// meets difficulty, re-executes with full trace recording (~72 MiB
 /// for D1) and generates the STARK proof. This avoids the trace
 /// allocation on the >99.99% of attempts that miss.

@@ -201,6 +201,41 @@ impl VessNode {
         Ok(Some(resp_msg))
     }
 
+    /// Send multiple [`PulseMessage`]s to the same peer over a single QUIC
+    /// connection, multiplexing on separate bistreams.
+    ///
+    /// Opens one connection and reuses it for all messages, avoiding
+    /// per-message handshake overhead.  Errors on individual messages are
+    /// logged but do not abort the batch.
+    pub async fn send_messages_to_peer(
+        &self,
+        target: impl Into<EndpointAddr>,
+        msgs: &[PulseMessage],
+    ) -> Result<()> {
+        if msgs.is_empty() {
+            return Ok(());
+        }
+        let conn = self
+            .endpoint
+            .connect(target, VESS_ALPN)
+            .await
+            .context("connect to peer for batch send")?;
+
+        for msg in msgs {
+            let bytes = match msg.to_bytes() {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!(error = %e, "failed to serialize batch message, skipping");
+                    continue;
+                }
+            };
+            if let Err(e) = write_pulse(&conn, &bytes).await {
+                warn!(error = %e, "batch send: message failed, continuing");
+            }
+        }
+        Ok(())
+    }
+
     /// Listen for incoming [`PulseMessage`]s (fire-and-forget).
     ///
     /// Deserializes each raw pulse into a typed message before invoking

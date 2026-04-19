@@ -7,3 +7,6 @@ license-file = "../LICENSE"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["alloc"] }
+
+[dev-dependencies]
+blake3 = "1"

@@ -21,6 +21,9 @@ use vess_protocol::PulseMessage;
 use vess_stealth::generate_master_keys;
 use vess_tag::{VessTag, validate_registration, TagRegistration};
 
+// blake3 used for computing tag hashes in tests.
+use blake3;
+
 fn now_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -203,7 +206,7 @@ fn tag_registration_and_dht() {
     let (_secret, address) = generate_master_keys();
 
     let reg = TagRegistration {
-        tag: tag.clone(),
+        tag_hash: *blake3::hash(tag.as_str().as_bytes()).as_bytes(),
         master_address: address.clone(),
         pow_nonce: [0x42; 32],
         pow_hash: vec![0xAA; 32],
@@ -215,8 +218,9 @@ fn tag_registration_and_dht() {
     let node_id: [u8; 32] = rand::random();
     let mut dht = TagDht::new(node_id, 3);
 
+    let tag_hash = *blake3::hash(tag.as_str().as_bytes()).as_bytes();
     let record = vess_tag::TagRecord {
-        tag,
+        tag_hash,
         master_address: address,
         pow_nonce: [0x42; 32],
         pow_hash: vec![0xAA; 32],
@@ -231,7 +235,7 @@ fn tag_registration_and_dht() {
 
     // Second store fails (first-broadcast-wins).
     let record2 = vess_tag::TagRecord {
-        tag: VessTag::new("+alice").unwrap(),
+        tag_hash: *blake3::hash(b"alice").as_bytes(),
         master_address: generate_master_keys().1,
         pow_nonce: [0x43; 32],
         pow_hash: vec![0xBB; 32],
@@ -322,6 +326,7 @@ fn protocol_message_serialization() {
             created_at: 1000,
             mint_ids: vec![],
             denomination_values: vec![],
+            bill_count: 0,
         }),
     ];
 
@@ -338,8 +343,9 @@ fn protocol_message_serialization() {
 fn tag_register_round_trip() {
     use vess_protocol::TagRegister;
 
+    let alice_hash = *blake3::hash(b"alice").as_bytes();
     let msg = PulseMessage::TagRegister(TagRegister {
-        tag: "alice".into(),
+        tag_hash: alice_hash,
         scan_ek: vec![0xAA; 1184],
         spend_ek: vec![0xBB; 1952],
         pow_nonce: [0x42; 32],
@@ -353,7 +359,7 @@ fn tag_register_round_trip() {
     let decoded = PulseMessage::from_bytes(&bytes).unwrap();
     match decoded {
         PulseMessage::TagRegister(tr) => {
-            assert_eq!(tr.tag, "alice");
+            assert_eq!(tr.tag_hash, alice_hash);
             assert_eq!(tr.pow_hash.len(), 32);
             assert_eq!(tr.pow_nonce, [0x42; 32]);
         }
@@ -365,8 +371,9 @@ fn tag_register_round_trip() {
 fn tag_lookup_round_trip() {
     use vess_protocol::{TagLookup, TagLookupResponse, TagLookupResult};
 
+    let bob_hash = *blake3::hash(b"bob").as_bytes();
     let lookup = PulseMessage::TagLookup(TagLookup {
-        tag: "bob".into(),
+        tag_hash: bob_hash,
         nonce: [0x42; 16],
     });
 
@@ -374,15 +381,14 @@ fn tag_lookup_round_trip() {
     let decoded = PulseMessage::from_bytes(&bytes).unwrap();
     match decoded {
         PulseMessage::TagLookup(tl) => {
-            assert_eq!(tl.tag, "bob");
+            assert_eq!(tl.tag_hash, bob_hash);
             assert_eq!(tl.nonce, [0x42; 16]);
         }
         _ => panic!("expected TagLookup"),
     }
 
-    // Response with result.
     let response = PulseMessage::TagLookupResponse(TagLookupResponse {
-        tag: "bob".into(),
+        tag_hash: bob_hash,
         nonce: [0x42; 16],
         result: Some(TagLookupResult {
             scan_ek: vec![0xAA; 1184],
@@ -399,7 +405,7 @@ fn tag_lookup_round_trip() {
     let decoded = PulseMessage::from_bytes(&bytes).unwrap();
     match decoded {
         PulseMessage::TagLookupResponse(tlr) => {
-            assert_eq!(tlr.tag, "bob");
+            assert_eq!(tlr.tag_hash, bob_hash);
             let r = tlr.result.unwrap();
             assert_eq!(r.scan_ek.len(), 1184);
             assert_eq!(r.registered_at, 1234567890);
@@ -407,9 +413,8 @@ fn tag_lookup_round_trip() {
         _ => panic!("expected TagLookupResponse"),
     }
 
-    // Response without result (not found).
     let not_found = PulseMessage::TagLookupResponse(TagLookupResponse {
-        tag: "unknown".into(),
+        tag_hash: *blake3::hash(b"unknown").as_bytes(),
         nonce: [0x00; 16],
         result: None,
     });
@@ -541,7 +546,7 @@ fn tag_resolver_quorum_flow() {
 
     let (_secret, address) = generate_master_keys();
     let response = TagLookupResponse {
-        tag: "carol".into(),
+        tag_hash: *blake3::hash(b"carol").as_bytes(),
         nonce: [0x00; 16],
         result: Some(TagLookupResult {
             scan_ek: address.scan_ek.clone(),
@@ -595,7 +600,7 @@ fn tag_resolver_conflict_detection() {
         let mut node_id = [0u8; 32];
         node_id[0] = i;
         let resp = TagLookupResponse {
-            tag: "disputed".into(),
+            tag_hash: *blake3::hash(b"disputed").as_bytes(),
             nonce: [0x00; 16],
             result: Some(TagLookupResult {
                 scan_ek: addr1.scan_ek.clone(),
@@ -615,7 +620,7 @@ fn tag_resolver_conflict_detection() {
         let mut node_id = [0u8; 32];
         node_id[0] = i;
         let resp = TagLookupResponse {
-            tag: "disputed".into(),
+            tag_hash: *blake3::hash(b"disputed").as_bytes(),
             nonce: [0x00; 16],
             result: Some(TagLookupResult {
                 scan_ek: addr2.scan_ek.clone(),
@@ -717,17 +722,19 @@ fn artery_snapshot_save_load() {
 #[test]
 fn tag_pow_compute_and_verify() {
     let tag = VessTag::new("alice").unwrap();
+    let tag_hash = *blake3::hash(tag.as_str().as_bytes()).as_bytes();
     let (_secret, address) = generate_master_keys();
 
-    let (nonce, hash) = vess_tag::compute_tag_pow_test(&tag, &address.scan_ek, &address.spend_ek).unwrap();
+    let (nonce, hash) = vess_tag::compute_tag_pow_test(&tag_hash, &address.scan_ek, &address.spend_ek).unwrap();
     assert_eq!(hash.len(), 32);
 
-    let ok = vess_tag::verify_tag_pow_test(&tag, &address.scan_ek, &address.spend_ek, &nonce, &hash).unwrap();
+    let ok = vess_tag::verify_tag_pow_test(&tag_hash, &address.scan_ek, &address.spend_ek, &nonce, &hash).unwrap();
     assert!(ok);
 
     // Different tag → fails.
     let tag2 = VessTag::new("bob").unwrap();
-    let bad = vess_tag::verify_tag_pow_test(&tag2, &address.scan_ek, &address.spend_ek, &nonce, &hash).unwrap();
+    let tag2_hash = *blake3::hash(tag2.as_str().as_bytes()).as_bytes();
+    let bad = vess_tag::verify_tag_pow_test(&tag2_hash, &address.scan_ek, &address.spend_ek, &nonce, &hash).unwrap();
     assert!(!bad);
 }
 
@@ -741,7 +748,7 @@ fn tag_hardening_and_pruning() {
     // Register two tags.
     let (_s1, addr1) = generate_master_keys();
     let rec1 = vess_tag::TagRecord {
-        tag: VessTag::new("alice").unwrap(),
+        tag_hash: *blake3::hash(b"alice").as_bytes(),
         master_address: addr1,
         pow_nonce: [0x01; 32],
         pow_hash: vec![0xAA; 32],
@@ -754,7 +761,7 @@ fn tag_hardening_and_pruning() {
 
     let (_s2, addr2) = generate_master_keys();
     let rec2 = vess_tag::TagRecord {
-        tag: VessTag::new("bob").unwrap(),
+        tag_hash: *blake3::hash(b"bob").as_bytes(),
         master_address: addr2,
         pow_nonce: [0x02; 32],
         pow_hash: vec![0xBB; 32],

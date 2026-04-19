@@ -7,12 +7,12 @@
 
 use blake3::Hasher;
 
-/// Scratchpad size: 256 MiB expressed in 64-byte cache lines.
+/// Scratchpad size: 1 GiB expressed in 64-byte cache lines.
 ///
 /// Under the `test-mint` feature this is reduced to 1 MiB so that
 /// minting completes in seconds rather than hours.
 #[cfg(not(feature = "test-mint"))]
-pub const SCRATCHPAD_LINES: usize = 256 * 1024 * 1024 / 64; // 4_194_304 lines
+pub const SCRATCHPAD_LINES: usize = 1024 * 1024 * 1024 / 64; // 16_777_216 lines
 
 #[cfg(feature = "test-mint")]
 pub const SCRATCHPAD_LINES: usize = 1 * 1024 * 1024 / 64; // 16_384 lines (1 MiB)
@@ -52,7 +52,7 @@ pub struct VmTrace {
     pub digest: [u8; 32],
 }
 
-/// Build the 256 MiB scratchpad from a 32-byte seed.
+/// Build the 1 GiB scratchpad from a 32-byte seed.
 ///
 /// Each line is derived from the previous line via Blake3, creating a
 /// sequential-write / random-read memory pattern similar to RandomX's dataset

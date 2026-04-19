@@ -18,7 +18,7 @@ use tracing::{info, warn};
 
 use vess_kloak::billfold::SpendCredential;
 use vess_kloak::payment::{prepare_payment_with_transfer, prepare_payment_from_bills};
-use vess_kloak::selection::{select_bills, decompose_amount};
+use vess_kloak::selection::{select_bills_filtered, decompose_amount};
 use vess_foundry::reforge::{reforge, ReforgeRequest};
 use vess_foundry::spend_auth::generate_spend_keypair;
 use vess_protocol::{PulseMessage, TagStore, ManifestStore};
@@ -28,6 +28,18 @@ use vess_tag::{VessTag, TagRecord};
 use crate::node_runner::ArteryState;
 use crate::node_runner::WalletState;
 use crate::persistence::hex_key;
+
+/// Channel senders for gossip queues (shared with drain loops via mpsc).
+#[derive(Clone)]
+pub(crate) struct QueueSenders {
+    pub manifest_tx: tokio::sync::mpsc::UnboundedSender<ManifestStore>,
+    pub tag_store_tx: tokio::sync::mpsc::UnboundedSender<TagStore>,
+    pub tag_confirm_tx: tokio::sync::mpsc::UnboundedSender<vess_protocol::TagConfirm>,
+    pub og_tx: tokio::sync::mpsc::UnboundedSender<vess_protocol::OwnershipGenesis>,
+    pub oc_tx: tokio::sync::mpsc::UnboundedSender<vess_protocol::OwnershipClaim>,
+    pub ra_tx: tokio::sync::mpsc::UnboundedSender<vess_protocol::ReforgeAttestation>,
+    pub pay_tx: tokio::sync::mpsc::UnboundedSender<vess_protocol::Payment>,
+}
 
 /// Hex-encode an arbitrary byte slice.
 fn to_hex(bytes: &[u8]) -> String {
@@ -171,6 +183,7 @@ impl RpcResponse {
 pub(crate) async fn run_rpc_server(
     port: u16,
     state: Arc<Mutex<ArteryState>>,
+    senders: QueueSenders,
 ) -> Result<()> {
     let addr = format!("127.0.0.1:{port}");
     let listener = TcpListener::bind(&addr).await?;
@@ -187,12 +200,13 @@ pub(crate) async fn run_rpc_server(
         info!(%peer_addr, "RPC client connected");
 
         let st = state.clone();
+        let snd = senders.clone();
         tokio::spawn(async move {
             let (reader, mut writer) = stream.into_split();
             let mut lines = BufReader::new(reader).lines();
 
             while let Ok(Some(line)) = lines.next_line().await {
-                let resp = handle_request(&line, &st);
+                let resp = handle_request(&line, &st, &snd);
                 let mut buf = match serde_json::to_vec(&resp) {
                     Ok(b) => b,
                     Err(e) => {
@@ -210,7 +224,7 @@ pub(crate) async fn run_rpc_server(
     }
 }
 
-fn handle_request(line: &str, state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
+fn handle_request(line: &str, state: &Arc<Mutex<ArteryState>>, senders: &QueueSenders) -> RpcResponse {
     let req: RpcRequest = match serde_json::from_str(line) {
         Ok(r) => r,
         Err(e) => return RpcResponse::err(format!("invalid request: {e}")),
@@ -220,18 +234,18 @@ fn handle_request(line: &str, state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
         RpcRequest::Balance => handle_balance(state),
         RpcRequest::NodeInfo => handle_node_info(state),
         RpcRequest::TagLookup { tag } => handle_tag_lookup(state, &tag),
-        RpcRequest::Send { amount, recipient } => handle_send(state, amount, &recipient),
-        RpcRequest::WalletUnlock { password } => handle_wallet_unlock(state, &password),
+        RpcRequest::Send { amount, recipient } => handle_send(state, amount, &recipient, senders),
+        RpcRequest::WalletUnlock { password } => handle_wallet_unlock(state, &password, &senders.oc_tx),
         RpcRequest::WalletSetPassword { current_password, new_password } => handle_wallet_set_password(state, &current_password, &new_password),
         RpcRequest::WalletLock => handle_wallet_lock(state),
         RpcRequest::TagRegister { tag, scan_ek_hex, spend_ek_hex, pow_nonce_hex, pow_hash_hex, timestamp, registrant_vk_hex, signature_hex } =>
-            handle_tag_register(state, &tag, &scan_ek_hex, &spend_ek_hex, &pow_nonce_hex, &pow_hash_hex, timestamp, &registrant_vk_hex, &signature_hex),
+            handle_tag_register(state, &tag, &scan_ek_hex, &spend_ek_hex, &pow_nonce_hex, &pow_hash_hex, timestamp, &registrant_vk_hex, &signature_hex, &senders.tag_store_tx),
         RpcRequest::TagConfirm { tag, mint_id_hex, registrant_vk_hex, signature_hex } =>
-            handle_tag_confirm(state, &tag, &mint_id_hex, &registrant_vk_hex, &signature_hex),
+            handle_tag_confirm(state, &tag, &mint_id_hex, &registrant_vk_hex, &signature_hex, &senders.tag_confirm_tx),
         RpcRequest::OwnershipGenesis { mint_id_hex, chain_tip_hex, owner_vk_hash_hex, owner_vk_hex, denomination_value, proof_hex, digest_hex } =>
-            handle_ownership_genesis(state, &mint_id_hex, &chain_tip_hex, &owner_vk_hash_hex, &owner_vk_hex, denomination_value, &proof_hex, &digest_hex),
+            handle_ownership_genesis(state, &mint_id_hex, &chain_tip_hex, &owner_vk_hash_hex, &owner_vk_hex, denomination_value, &proof_hex, &digest_hex, &senders.og_tx),
         RpcRequest::ManifestStore { dht_key_hex, encrypted_manifest_hex } =>
-            handle_manifest_store(state, &dht_key_hex, &encrypted_manifest_hex),
+            handle_manifest_store(state, &dht_key_hex, &encrypted_manifest_hex, &senders.manifest_tx),
     }
 }
 
@@ -269,7 +283,7 @@ fn handle_tag_lookup(state: &Arc<Mutex<ArteryState>>, tag: &str) -> RpcResponse 
     match s.tag_dht.lookup(tag_str) {
         Some(record) => RpcResponse::ok(RpcData::TagLookup {
             found: true,
-            tag: record.tag.as_str().to_owned(),
+            tag: tag_str.to_owned(),
             scan_ek: Some(to_hex(&record.master_address.scan_ek)),
             spend_ek: Some(to_hex(&record.master_address.spend_ek)),
             hardened: Some(record.hardened_at.is_some()),
@@ -288,6 +302,7 @@ fn handle_send(
     state: &Arc<Mutex<ArteryState>>,
     amount: u64,
     recipient_tag: &str,
+    senders: &QueueSenders,
 ) -> RpcResponse {
     let tag_str = recipient_tag.strip_prefix('+').unwrap_or(recipient_tag);
 
@@ -328,13 +343,14 @@ fn handle_send(
         ));
     }
 
-    // ── Bill selection ──────────────────────────────────────────────
-    let selection = match select_bills(ws.billfold.bills(), amount) {
+    // ── Bill selection (excludes reserved / in-flight bills) ────────
+    let reserved: Vec<[u8; 32]> = ws.billfold.reserved_set().iter().copied().collect();
+    let selection = match select_bills_filtered(ws.billfold.bills(), amount, &reserved) {
         Ok(sel) => sel,
         Err(e) => return RpcResponse::err(format!("bill selection failed: {e}")),
     };
 
-    let (msg, payment_id, _mint_ids_to_remove) = if selection.change > 0 {
+    let (msg, payment_id, sent_mints) = if selection.change > 0 {
         // === CHANGE PATH: reforge ===
         let input_bills: Vec<vess_foundry::VessBill> = selection
             .send_indices
@@ -363,8 +379,8 @@ fn handle_send(
         let send_count = send_denoms.len();
         let send_bills: Vec<vess_foundry::VessBill> =
             result.outputs[..send_count].iter().map(|(b, _)| b.clone()).collect();
-        let change_bills: Vec<vess_foundry::VessBill> =
-            result.outputs[send_count..].iter().map(|(b, _)| b.clone()).collect();
+        let change_bills: Vec<(vess_foundry::VessBill, Vec<u8>)> =
+            result.outputs[send_count..].to_vec();
 
         let mut reforged_creds: HashMap<[u8; 32], SpendCredential> = HashMap::new();
         for (bill, _) in &result.outputs {
@@ -384,18 +400,109 @@ fn handle_send(
             Err(e) => return RpcResponse::err(format!("prepare payment failed: {e}")),
         };
 
-        // Deposit change back, remove originals
         let ws_mut = s.wallet.as_mut().unwrap();
-        for bill in &change_bills {
+
+        // Withdraw consumed originals and deposit change bills.
+        for mid in &result.consumed_mint_ids {
+            ws_mut.billfold.withdraw(mid);
+        }
+        for (bill, _) in &change_bills {
             if let Some(cred) = reforged_creds.get(&bill.mint_id) {
                 ws_mut.billfold.deposit_with_credentials(bill.clone(), cred.clone());
             }
         }
+
+        // Reserve sent bills so they can't be accidentally re-spent.
+        // They stay in a pending state until the recipient claims them
+        // (at which point the OwnershipClaim handler removes them) or
+        // until the limbo TTL expires (periodic release task).
+        let sent_mints: Vec<[u8; 32]> = send_bills.iter().map(|b| b.mint_id).collect();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        ws_mut.billfold.reserve(&sent_mints, now);
+
+        // ── Broadcast reforge to the network ────────────────────────
+        // ReforgeAttestation: tell artery nodes to delete consumed mint_ids.
+        let mut sorted_consumed = result.consumed_mint_ids.clone();
+        sorted_consumed.sort();
+        let reforge_id = {
+            let mut h = blake3::Hasher::new();
+            h.update(b"vess-reforge-id-v0");
+            for mid in &sorted_consumed {
+                h.update(mid);
+            }
+            *h.finalize().as_bytes()
+        };
+
+        // Sign each consumed mint_id to prove ownership.
+        let mut consume_sigs = Vec::new();
+        let mut owner_vk_for_ra = Vec::new();
         for mid in &result.consumed_mint_ids {
-            ws_mut.billfold.withdraw(mid);
+            if let Some(cred) = cred_map.get(mid) {
+                let digest = {
+                    let mut h = blake3::Hasher::new();
+                    h.update(b"vess-reforge-consume-v0");
+                    h.update(mid);
+                    h.update(&reforge_id);
+                    *h.finalize().as_bytes()
+                };
+                if let Ok(sig) = vess_foundry::spend_auth::sign_spend(&cred.spend_sk, &digest) {
+                    consume_sigs.push(sig);
+                    if owner_vk_for_ra.is_empty() {
+                        owner_vk_for_ra = cred.spend_vk.clone();
+                    }
+                }
+            }
+        }
+        if consume_sigs.len() == result.consumed_mint_ids.len() {
+            let _ = senders.ra_tx.send(vess_protocol::ReforgeAttestation {
+                consumed_mint_ids: result.consumed_mint_ids,
+                owner_vk: owner_vk_for_ra,
+                consume_sigs,
+                reforge_id,
+                hops_remaining: 6,
+            });
         }
 
-        let sent_mints: Vec<[u8; 32]> = send_bills.iter().map(|b| b.mint_id).collect();
+        // OwnershipGenesis for each change bill (registers them in the DHT).
+        for (bill, proof_bytes) in &change_bills {
+            if let Some(cred) = reforged_creds.get(&bill.mint_id) {
+                let owner_vk_hash = vess_foundry::spend_auth::vk_hash(&cred.spend_vk);
+                let _ = senders.og_tx.send(vess_protocol::OwnershipGenesis {
+                    mint_id: bill.mint_id,
+                    chain_tip: bill.chain_tip,
+                    owner_vk_hash,
+                    owner_vk: cred.spend_vk.clone(),
+                    denomination_value: bill.denomination.value(),
+                    proof: proof_bytes.clone(),
+                    digest: bill.digest,
+                    hops_remaining: 6,
+                    chain_depth: 0,
+                });
+            }
+        }
+
+        // OwnershipGenesis for each SENT bill (so the recipient can claim it).
+        for (i, bill) in send_bills.iter().enumerate() {
+            if let Some(cred) = reforged_creds.get(&bill.mint_id) {
+                let proof_bytes = result.outputs[i].1.clone();
+                let owner_vk_hash = vess_foundry::spend_auth::vk_hash(&cred.spend_vk);
+                let _ = senders.og_tx.send(vess_protocol::OwnershipGenesis {
+                    mint_id: bill.mint_id,
+                    chain_tip: bill.chain_tip,
+                    owner_vk_hash,
+                    owner_vk: cred.spend_vk.clone(),
+                    denomination_value: bill.denomination.value(),
+                    proof: proof_bytes,
+                    digest: bill.digest,
+                    hops_remaining: 6,
+                    chain_depth: 0,
+                });
+            }
+        }
+
         (msg, pid, sent_mints)
     } else {
         // === EXACT MATCH PATH ===
@@ -414,18 +521,30 @@ fn handle_send(
             .iter()
             .map(|&i| ws_mut.billfold.bills()[i].mint_id)
             .collect();
-        for mid in &mint_ids {
-            ws_mut.billfold.withdraw(mid);
-        }
+
+        // Reserve instead of withdraw — bills stay in the billfold
+        // but are excluded from future selection until confirmed.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        ws_mut.billfold.reserve(&mint_ids, now);
+
         (msg, pid, mint_ids)
     };
 
     // ── Queue payment for relay ─────────────────────────────────────
     if let PulseMessage::Payment(ref payment) = msg {
-        s.payment_relay_queue.push(payment.clone());
+        let _ = senders.pay_tx.send(payment.clone());
     }
 
-    let remaining = s.wallet.as_ref().map(|w| w.billfold.balance()).unwrap_or(0);
+    // Persist wallet immediately so bill withdrawals/reservations survive a crash.
+    s.flush_wallet();
+
+    // Report available balance (excludes reserved in-flight bills).
+    let remaining = s.wallet.as_ref()
+        .map(|w| w.billfold.available_balance())
+        .unwrap_or(0);
 
     RpcResponse::ok(RpcData::Send {
         payment_id: hex_key(&payment_id),
@@ -437,6 +556,7 @@ fn handle_send(
 fn handle_wallet_unlock(
     state: &Arc<Mutex<ArteryState>>,
     password: &str,
+    oc_tx: &tokio::sync::mpsc::UnboundedSender<vess_protocol::OwnershipClaim>,
 ) -> RpcResponse {
     use vess_kloak::payment::receive_and_claim;
     use vess_kloak::billfold::SpendCredential;
@@ -519,9 +639,11 @@ fn handle_wallet_unlock(
                 Err(_) => {}
             }
         }
-        s.ownership_claim_queue.extend(pending_claims);
+        for claim in pending_claims { let _ = oc_tx.send(claim); }
         if received > 0 {
             tracing::info!(amount = received, bills = bill_count, "swept limbo into wallet after unlock");
+            // Persist swept bills immediately.
+            s.flush_wallet();
         }
     }
 
@@ -601,6 +723,7 @@ fn handle_tag_register(
     timestamp: u64,
     registrant_vk_hex: &str,
     signature_hex: &str,
+    tag_store_tx: &tokio::sync::mpsc::UnboundedSender<TagStore>,
 ) -> RpcResponse {
     let tag = match VessTag::new(tag) {
         Ok(t) => t,
@@ -631,8 +754,9 @@ fn handle_tag_register(
         Err(e) => return RpcResponse::err(format!("invalid signature_hex: {e}")),
     };
 
+    let tag_hash = *blake3::hash(tag.as_str().as_bytes()).as_bytes();
     let record = TagRecord {
-        tag: tag.clone(),
+        tag_hash,
         master_address: vess_stealth::MasterStealthAddress {
             scan_ek: scan_ek.clone(),
             spend_ek: spend_ek.clone(),
@@ -656,8 +780,8 @@ fn handle_tag_register(
     s.tag_dht.store(record);
 
     // Queue TagStore for gossip to other artery nodes.
-    s.tag_store_queue.push(TagStore {
-        tag: tag.as_str().to_owned(),
+    let _ = tag_store_tx.send(TagStore {
+        tag_hash,
         scan_ek,
         spend_ek,
         pow_nonce,
@@ -677,6 +801,7 @@ fn handle_tag_confirm(
     mint_id_hex: &str,
     registrant_vk_hex: &str,
     signature_hex: &str,
+    tag_confirm_tx: &tokio::sync::mpsc::UnboundedSender<vess_protocol::TagConfirm>,
 ) -> RpcResponse {
     let tag_str = tag_str.strip_prefix('+').unwrap_or(tag_str);
     let mint_id: [u8; 32] = match decode_hex_fixed(mint_id_hex) {
@@ -711,8 +836,9 @@ fn handle_tag_confirm(
     s.tag_dht.harden(tag_str, &mint_id, now);
 
     // Queue TagConfirm for gossip.
-    s.tag_confirm_queue.push(vess_protocol::TagConfirm {
-        tag: tag_str.to_owned(),
+    let tag_hash = *blake3::hash(tag_str.as_bytes()).as_bytes();
+    let _ = tag_confirm_tx.send(vess_protocol::TagConfirm {
+        tag_hash,
         mint_id,
         registrant_vk,
         signature,
@@ -723,7 +849,7 @@ fn handle_tag_confirm(
 }
 
 fn handle_ownership_genesis(
-    state: &Arc<Mutex<ArteryState>>,
+    _state: &Arc<Mutex<ArteryState>>,
     mint_id_hex: &str,
     chain_tip_hex: &str,
     owner_vk_hash_hex: &str,
@@ -731,6 +857,7 @@ fn handle_ownership_genesis(
     denomination_value: u64,
     proof_hex: &str,
     digest_hex: &str,
+    og_tx: &tokio::sync::mpsc::UnboundedSender<vess_protocol::OwnershipGenesis>,
 ) -> RpcResponse {
     let mint_id: [u8; 32] = match decode_hex_fixed(mint_id_hex) {
         Ok(v) => v,
@@ -757,9 +884,7 @@ fn handle_ownership_genesis(
         Err(e) => return RpcResponse::err(format!("invalid digest_hex: {e}")),
     };
 
-    let mut s = state.lock().unwrap();
-
-    s.ownership_genesis_queue.push(vess_protocol::OwnershipGenesis {
+    let _ = og_tx.send(vess_protocol::OwnershipGenesis {
         mint_id,
         chain_tip,
         owner_vk_hash,
@@ -778,6 +903,7 @@ fn handle_manifest_store(
     state: &Arc<Mutex<ArteryState>>,
     dht_key_hex: &str,
     encrypted_manifest_hex: &str,
+    manifest_tx: &tokio::sync::mpsc::UnboundedSender<ManifestStore>,
 ) -> RpcResponse {
     let dht_key: [u8; 32] = match decode_hex_fixed(dht_key_hex) {
         Ok(v) => v,
@@ -794,7 +920,7 @@ fn handle_manifest_store(
     s.manifest_store.insert(dht_key, encrypted_manifest.clone());
 
     // Queue for gossip.
-    s.manifest_store_queue.push(ManifestStore {
+    let _ = manifest_tx.send(ManifestStore {
         dht_key,
         encrypted_manifest,
         hops_remaining: 6,

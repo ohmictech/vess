@@ -169,7 +169,7 @@ mod tests {
 
     fn make_response(scan_ek: &[u8], spend_ek: &[u8], tag: &str) -> TagLookupResponse {
         TagLookupResponse {
-            tag: tag.to_string(),
+            tag_hash: *blake3::hash(tag.as_bytes()).as_bytes(),
             nonce: [0u8; 16],
             result: Some(TagLookupResult {
                 scan_ek: scan_ek.to_vec(),
@@ -185,7 +185,7 @@ mod tests {
 
     fn not_found_response(tag: &str) -> TagLookupResponse {
         TagLookupResponse {
-            tag: tag.to_string(),
+            tag_hash: *blake3::hash(tag.as_bytes()).as_bytes(),
             nonce: [0u8; 16],
             result: None,
         }

@@ -86,31 +86,10 @@ enum Command {
         status: bool,
     },
 
-    /// Register a VessTag by burning bills.
+    /// Register a VessTag (computes PoW and auto-hardens if bills are available).
     RegisterTag {
         /// Tag to register (e.g. "alice" or "+alice").
         tag: String,
-    },
-
-    /// Look up a VessTag's stealth address.
-    LookupTag {
-        /// Tag to look up (e.g. "+alice" or "alice").
-        tag: String,
-    },
-
-    /// Confirm (harden) a VessTag with proof of payment.
-    ConfirmTag {
-        /// Tag to confirm (e.g. "+alice" or "alice").
-        tag: String,
-        /// A mint_id (hex) from the registry proving real economic activity.
-        #[arg(long)]
-        mint_id: String,
-    },
-
-    /// Back up the wallet to a file.
-    Backup {
-        /// Destination path for the backup file.
-        path: PathBuf,
     },
 
     /// Send a raw Pulse to a remote node (low-level).
@@ -195,9 +174,6 @@ async fn main() -> Result<()> {
         }
         Command::Mint { finalize, status } => cmd_mint(&cli, *finalize, *status).await,
         Command::RegisterTag { tag } => cmd_register_tag(&cli, tag).await,
-        Command::LookupTag { tag } => cmd_lookup_tag(&cli, tag).await,
-        Command::ConfirmTag { tag, mint_id } => cmd_confirm_tag(&cli, tag, mint_id).await,
-        Command::Backup { path } => cmd_backup(&cli, path).await,
         Command::Pulse { node_id, message } => cmd_pulse(&cli, node_id, message).await,
         Command::Listen => cmd_listen(&cli).await,
         Command::Node { k_neighbors, max_hops, state_dir, bootstrap, seed, no_seed, wallet, wallet_password, rpc_port } => {
@@ -328,7 +304,7 @@ async fn cmd_init(cli: &Cli, tag_str: &str) -> Result<()> {
     println!("Checking if tag {} is available…", tag.display());
 
     let lookup = PulseMessage::TagLookup(TagLookup {
-        tag: tag.as_str().to_owned(),
+        tag_hash: *blake3::hash(tag.as_str().as_bytes()).as_bytes(),
         nonce: rand::random(),
     });
 
@@ -361,8 +337,9 @@ async fn cmd_init(cli: &Cli, tag_str: &str) -> Result<()> {
     {
         println!("Computing Argon2id proof-of-work (~10 seconds, 2 GiB RAM)…");
 
+        let tag_hash = *blake3::hash(tag.as_str().as_bytes()).as_bytes();
         let (pow_nonce, pow_hash) = vess_tag::compute_tag_pow(
-            &tag,
+            &tag_hash,
             &wallet.master_address.scan_ek,
             &wallet.master_address.spend_ek,
         )?;
@@ -373,7 +350,7 @@ async fn cmd_init(cli: &Cli, tag_str: &str) -> Result<()> {
         wallet.tag_registrant_sk = registrant_sk.clone();
 
         let tmp_record = vess_tag::TagRecord {
-            tag: tag.clone(),
+            tag_hash,
             master_address: vess_stealth::MasterStealthAddress {
                 scan_ek: wallet.master_address.scan_ek.clone(),
                 spend_ek: wallet.master_address.spend_ek.clone(),
@@ -389,7 +366,7 @@ async fn cmd_init(cli: &Cli, tag_str: &str) -> Result<()> {
         let signature = vess_foundry::spend_auth::sign_spend(&registrant_sk, &digest)?;
 
         let msg = PulseMessage::TagRegister(TagRegister {
-            tag: tag.as_str().to_owned(),
+            tag_hash,
             scan_ek: wallet.master_address.scan_ek.clone(),
             spend_ek: wallet.master_address.spend_ek.clone(),
             pow_nonce,
@@ -890,9 +867,11 @@ async fn cmd_register_tag(cli: &Cli, tag_str: &str) -> Result<()> {
     println!("Registering tag {}", tag.display());
     println!("Computing Argon2id proof-of-work (this takes ~10 seconds and 2 GiB RAM)…");
 
+    let tag_hash = *blake3::hash(tag.as_str().as_bytes()).as_bytes();
+
     // Compute proof-of-work.
     let (pow_nonce, pow_hash) = vess_tag::compute_tag_pow(
-        &tag,
+        &tag_hash,
         &wallet.master_address.scan_ek,
         &wallet.master_address.spend_ek,
     )?;
@@ -907,7 +886,7 @@ async fn cmd_register_tag(cli: &Cli, tag_str: &str) -> Result<()> {
 
     // Construct a temporary TagRecord to compute the digest for signing.
     let tmp_record = vess_tag::TagRecord {
-        tag: tag.clone(),
+        tag_hash,
         master_address: vess_stealth::MasterStealthAddress {
             scan_ek: wallet.master_address.scan_ek.clone(),
             spend_ek: wallet.master_address.spend_ek.clone(),
@@ -940,107 +919,56 @@ async fn cmd_register_tag(cli: &Cli, tag_str: &str) -> Result<()> {
         anyhow::bail!("{}", resp["error"].as_str().unwrap_or("tag registration failed"));
     }
 
-    if cli.json {
-        println!("{}", json!({
-            "ok": true,
-            "tag": tag.display(),
-        }));
-    } else {
+    if !cli.json {
         println!("Tag {} registration sent.", tag.display());
     }
-    Ok(())
-}
 
-async fn cmd_lookup_tag(cli: &Cli, tag_str: &str) -> Result<()> {
-    let port = rpc_port(cli);
-    let resp = rpc_call(port, &json!({
-        "method": "tag_lookup",
-        "tag": tag_str,
-    })).await?;
-    if resp["ok"] == true {
-        if cli.json {
-            println!("{resp}");
-        } else if resp["found"] == true {
-            println!("Tag:      +{}", resp["tag"].as_str().unwrap_or("?"));
-            println!("Scan EK:  {}", resp["scan_ek"].as_str().unwrap_or("?"));
-            println!("Spend EK: {}", resp["spend_ek"].as_str().unwrap_or("?"));
-            println!("Hardened: {}", resp["hardened"]);
+    // ── Auto-harden with first available bill ────────────────────
+    let hardened = if let Some(bill) = wallet.billfold.bills().first() {
+        let mint_id = bill.mint_id;
+        let confirm_digest = {
+            let mut h = blake3::Hasher::new();
+            h.update(b"vess-tag-confirm-v1");
+            h.update(tag.as_str().as_bytes());
+            h.update(&mint_id);
+            *h.finalize().as_bytes()
+        };
+        let confirm_sig = vess_foundry::spend_auth::sign_spend(&registrant_sk, &confirm_digest)?;
+
+        let confirm_resp = rpc_call(port, &json!({
+            "method": "tag_confirm",
+            "tag": tag.as_str(),
+            "mint_id_hex": hex(&mint_id),
+            "registrant_vk_hex": hex(&registrant_vk),
+            "signature_hex": hex(&confirm_sig),
+        })).await?;
+
+        if confirm_resp["ok"] == true {
+            if !cli.json {
+                println!("Tag {} auto-hardened with bill proof.", tag.display());
+            }
+            true
         } else {
-            println!("Tag +{} not found.", tag_str);
+            if !cli.json {
+                println!("Tag registered but hardening failed: {}", confirm_resp["error"].as_str().unwrap_or("unknown"));
+                println!("You can harden later once you have bills in your wallet.");
+            }
+            false
         }
     } else {
-        anyhow::bail!("{}", resp["error"].as_str().unwrap_or("unknown error"));
-    }
-    Ok(())
-}
-
-async fn cmd_confirm_tag(cli: &Cli, tag_str: &str, mint_id_hex: &str) -> Result<()> {
-    let path = wallet_path(cli)?;
-    let wallet = WalletFile::load(&path)?;
-
-    let tag = VessTag::new(tag_str)?;
-
-    if wallet.tag_registrant_vk.is_empty() || wallet.tag_registrant_sk.is_empty() {
-        anyhow::bail!("no tag registrant keypair found in wallet — register a tag first");
-    }
-
-    // Parse mint_id from hex.
-    let mint_id_bytes = hex::decode(mint_id_hex)
-        .map_err(|e| anyhow::anyhow!("invalid mint_id hex: {e}"))?;
-    if mint_id_bytes.len() != 32 {
-        anyhow::bail!("mint_id must be 32 bytes (64 hex chars), got {}", mint_id_bytes.len());
-    }
-    let mut mint_id = [0u8; 32];
-    mint_id.copy_from_slice(&mint_id_bytes);
-
-    println!("Confirming tag {} with payment proof…", tag.display());
-
-    // Sign the confirmation with the stored registrant keypair.
-    let confirm_digest = {
-        let mut h = blake3::Hasher::new();
-        h.update(b"vess-tag-confirm-v1");
-        h.update(tag.as_str().as_bytes());
-        h.update(&mint_id);
-        *h.finalize().as_bytes()
+        if !cli.json {
+            println!("No bills in wallet — tag registered but not hardened.");
+            println!("The tag will be auto-hardened when you receive or mint bills.");
+        }
+        false
     };
-    let signature = vess_foundry::spend_auth::sign_spend(&wallet.tag_registrant_sk, &confirm_digest)?;
-
-    // Send confirmation via RPC to local artery node.
-    let port = rpc_port(cli);
-    let resp = rpc_call(port, &json!({
-        "method": "tag_confirm",
-        "tag": tag.as_str(),
-        "mint_id_hex": mint_id_hex,
-        "registrant_vk_hex": hex(&wallet.tag_registrant_vk),
-        "signature_hex": hex(&signature),
-    })).await?;
-
-    if resp["ok"] != true {
-        anyhow::bail!("{}", resp["error"].as_str().unwrap_or("tag confirmation failed"));
-    }
 
     if cli.json {
         println!("{}", json!({
             "ok": true,
             "tag": tag.display(),
-            "mint_id": mint_id_hex,
+            "hardened": hardened,
         }));
-    } else {
-        println!("Tag {} confirmation sent.", tag.display());
-        println!("The tag will be hardened once the artery node verifies the proof.");
-    }
-    Ok(())
-}
-
-async fn cmd_backup(cli: &Cli, backup_path: &std::path::Path) -> Result<()> {
-    let path = wallet_path(cli)?;
-    let wallet = WalletFile::load(&path)?;
-
-    wallet.backup(backup_path)?;
-    if cli.json {
-        println!("{}", json!({ "ok": true, "backup_path": backup_path.display().to_string() }));
-    } else {
-        println!("Wallet backed up to {}", backup_path.display());
     }
     Ok(())
 }

@@ -17,7 +17,7 @@ use crate::{
     ReputationTable, dht_replication_factor,
 };
 use crate::ownership_registry::OwnershipRecord;
-use crate::gossip::{GossipConfig, k_nearest, random_fan_out, RANDOM_FAN_OUT, OWNERSHIP_FAN_OUT};
+use crate::gossip::{GossipConfig, k_nearest, random_fan_out, dynamic_fan_out, RANDOM_FAN_OUT, OWNERSHIP_FAN_OUT};
 use crate::handshake::{compute_handshake_hmac, compute_handshake_pow, verify_handshake_pow};
 use crate::persistence::{ArterySnapshot, NodeStorage, hex_key, unhex_key};
 use crate::kademlia::{RoutingTable, RoutingPeer};
@@ -44,6 +44,20 @@ const MAX_MESSAGE_AGE_SECS: u64 = 300; // 5 minutes
 
 /// Maximum clock skew tolerance into the future (seconds).
 const MAX_FUTURE_SKEW_SECS: u64 = 30;
+
+/// Maximum number of mint_ids allowed in a single RegistryQuery or
+/// OwnershipFetch request. Prevents memory-exhaustion DoS.
+const MAX_QUERY_MINT_IDS: usize = 256;
+
+/// Maximum number of items in a LimboHold bill_ids array.
+const MAX_LIMBO_HOLD_IDS: usize = 256;
+
+/// Maximum encrypted manifest size in bytes (1 MiB).
+const MAX_MANIFEST_SIZE: usize = 1_048_576;
+
+/// Maximum number of stealth_payloads returned in a single
+/// MailboxSweep response to prevent memory exhaustion.
+const MAX_SWEEP_PAYLOADS: usize = 500;
 
 /// Number of duplicate messages from a single peer within a window
 /// before the peer is banished for duplicate flooding.
@@ -236,17 +250,11 @@ pub(crate) struct ArteryState {
     pub(crate) peer_registry: PeerRegistry,
     pub(crate) handshake_queue: Vec<[u8; 32]>,
     pub(crate) limbo_buffer: LimboBuffer,
-    pub(crate) manifest_store_queue: Vec<vess_protocol::ManifestStore>,
-    pub(crate) tag_store_queue: Vec<TagStore>,
-    pub(crate) tag_confirm_queue: Vec<TagConfirm>,
-    pub(crate) ownership_genesis_queue: Vec<OwnershipGenesis>,
-    pub(crate) ownership_claim_queue: Vec<OwnershipClaim>,
-    pub(crate) reforge_attestation_queue: Vec<ReforgeAttestation>,
-    /// Payments to forward to K-nearest nodes by stealth_id (multi-relay).
-    pub(crate) payment_relay_queue: Vec<vess_protocol::Payment>,
     pub(crate) reputation: ReputationTable,
     pub(crate) rate_limiter: crate::gossip::PeerRateLimiter,
     pub(crate) mailbox_collect_limiter: crate::gossip::PeerRateLimiter,
+    /// Rate limiter for TagLookup to prevent tag enumeration.
+    pub(crate) tag_lookup_limiter: crate::gossip::PeerRateLimiter,
     /// Rate limiter for RegistryQuery / OwnershipFetch to prevent
     /// bulk mint_id enumeration (surveillance attack).
     pub(crate) registry_query_limiter: crate::gossip::PeerRateLimiter,
@@ -271,6 +279,19 @@ pub(crate) struct ArteryState {
 }
 
 impl ArteryState {
+    /// Persist the in-memory wallet billfold to disk immediately.
+    /// No-op if no wallet is loaded.
+    pub(crate) fn flush_wallet(&self) {
+        if let Some(ref ws) = self.wallet {
+            if let Ok(mut wf) = vess_kloak::WalletFile::load(&ws.wallet_path) {
+                wf.billfold = ws.billfold.clone();
+                if let Err(e) = wf.save(&ws.wallet_path) {
+                    tracing::warn!(error = %e, "failed to flush wallet to disk");
+                }
+            }
+        }
+    }
+
     fn snapshot(&self) -> ArterySnapshot {
         let tags: BTreeMap<String, vess_tag::TagRecord> = self
             .tag_dht
@@ -343,6 +364,65 @@ impl ArteryState {
             .into_iter()
             .filter_map(|(k, v)| unhex_key(&k).ok().map(|key| (key, v)))
             .collect();
+    }
+}
+
+// ── Gossip drain helpers ────────────────────────────────────────────
+
+/// Compute target peer indices for a given DHT key using K-nearest
+/// selection, reputation-weighted ranking, and random fan-out.
+fn compute_gossip_targets(
+    key: &[u8; 32],
+    peer_hashes: &[[u8; 32]],
+    age_factors: &[f64],
+    k: usize,
+    rep: &ReputationTable,
+    fan: usize,
+    total_peers: usize,
+) -> Vec<usize> {
+    let nearest = k_nearest(key, peer_hashes, k);
+    let candidate_hashes: Vec<[u8; 32]> = nearest.iter().map(|&i| peer_hashes[i]).collect();
+    let candidate_ages: Vec<f64> = nearest.iter().map(|&i| age_factors[i]).collect();
+    let ranked = rep.select_best_with_age(&candidate_hashes, k, &candidate_ages);
+    let mut indices: Vec<usize> = ranked.iter().map(|&ri| nearest[ri]).collect();
+    let extra = random_fan_out(total_peers, &indices, fan);
+    for ei in extra {
+        if !indices.contains(&ei) {
+            indices.push(ei);
+        }
+    }
+    indices
+}
+
+/// Batch-send grouped messages to peers over single QUIC connections.
+/// Sends to all target peers concurrently via tokio::spawn.
+async fn batch_forward_to_peers(
+    node: &VessNode,
+    routable_peers: &[Vec<u8>],
+    per_peer: HashMap<usize, Vec<PulseMessage>>,
+) {
+    let mut tasks = Vec::with_capacity(per_peer.len());
+    for (idx, msgs) in per_peer {
+        if idx >= routable_peers.len() || msgs.is_empty() {
+            continue;
+        }
+        let arr: [u8; 32] = match routable_peers[idx].as_slice().try_into() {
+            Ok(a) => a,
+            Err(_) => continue,
+        };
+        let target = match iroh::EndpointId::from_bytes(&arr) {
+            Ok(id) => id,
+            Err(_) => continue,
+        };
+        let peer_node = node.clone();
+        tasks.push(tokio::spawn(async move {
+            if let Err(e) = peer_node.send_messages_to_peer(target, &msgs).await {
+                warn!("batch forward to peer failed: {e}");
+            }
+        }));
+    }
+    for task in tasks {
+        let _ = task.await;
     }
 }
 
@@ -421,17 +501,12 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
         peer_registry: PeerRegistry::new(std::time::Duration::from_secs(30)),
         handshake_queue: Vec::new(),
         limbo_buffer: LimboBuffer::new(),
-        manifest_store_queue: Vec::new(),
-        tag_store_queue: Vec::new(),
-        tag_confirm_queue: Vec::new(),
-        ownership_genesis_queue: Vec::new(),
-        ownership_claim_queue: Vec::new(),
-        reforge_attestation_queue: Vec::new(),
-        payment_relay_queue: Vec::new(),
         reputation: ReputationTable::new(),
         rate_limiter: crate::gossip::PeerRateLimiter::with_defaults(),
         // MailboxCollect: 10 requests per 60-second window per peer.
         mailbox_collect_limiter: crate::gossip::PeerRateLimiter::new(10, 60),
+        // TagLookup: 30 requests per 60-second window per peer.
+        tag_lookup_limiter: crate::gossip::PeerRateLimiter::new(30, 60),
         // RegistryQuery / OwnershipFetch: 20 requests per 60-second window.
         registry_query_limiter: crate::gossip::PeerRateLimiter::new(20, 60),
         duplicate_tracker: DuplicateTracker::new(),
@@ -446,6 +521,18 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
     }));
 
     let banishment = Arc::new(BanishmentManager::new());
+
+    // ── Gossip drain channels ───────────────────────────────────────
+    // Unbounded mpsc channels decouple queue producers (handler) from
+    // consumers (drain loops) so drain loops never contend on the main
+    // state mutex for queue access.
+    let (manifest_tx, mut manifest_rx) = tokio::sync::mpsc::unbounded_channel::<vess_protocol::ManifestStore>();
+    let (tag_store_tx, mut tag_store_rx) = tokio::sync::mpsc::unbounded_channel::<TagStore>();
+    let (tag_confirm_tx, mut tag_confirm_rx) = tokio::sync::mpsc::unbounded_channel::<TagConfirm>();
+    let (og_tx, mut og_rx) = tokio::sync::mpsc::unbounded_channel::<OwnershipGenesis>();
+    let (oc_tx, mut oc_rx) = tokio::sync::mpsc::unbounded_channel::<OwnershipClaim>();
+    let (ra_tx, mut ra_rx) = tokio::sync::mpsc::unbounded_channel::<ReforgeAttestation>();
+    let (pay_tx, mut pay_rx) = tokio::sync::mpsc::unbounded_channel::<vess_protocol::Payment>();
 
     // Restore persisted state.
     {
@@ -505,7 +592,9 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                         Err(e) => warn!(error = %e, "limbo sweep trial-decrypt error"),
                     }
                 }
-                s.ownership_claim_queue.extend(pending_claims);
+                for claim in pending_claims {
+                    let _ = oc_tx.send(claim);
+                }
                 if received > 0 {
                     info!(amount = received, bills = bill_count, "swept existing limbo into wallet");
                 }
@@ -526,8 +615,17 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
     if let Some(port) = config.rpc_port {
         println!("RPC:     127.0.0.1:{}", port);
         let rpc_state = state.clone();
+        let rpc_senders = crate::rpc::QueueSenders {
+            manifest_tx: manifest_tx.clone(),
+            tag_store_tx: tag_store_tx.clone(),
+            tag_confirm_tx: tag_confirm_tx.clone(),
+            og_tx: og_tx.clone(),
+            oc_tx: oc_tx.clone(),
+            ra_tx: ra_tx.clone(),
+            pay_tx: pay_tx.clone(),
+        };
         tokio::spawn(async move {
-            if let Err(e) = crate::rpc::run_rpc_server(port, rpc_state).await {
+            if let Err(e) = crate::rpc::run_rpc_server(port, rpc_state, rpc_senders).await {
                 warn!(error = %e, "RPC server exited with error");
             }
         });
@@ -555,6 +653,13 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 }
                 if evicted > 0 {
                     info!(count = evicted, "evicted expired limbo buffer entries");
+                }
+                // Release bill reservations older than the limbo TTL (3600 s).
+                if let Some(ref mut ws) = s.wallet {
+                    let released = ws.billfold.release_expired(3600, now);
+                    if !released.is_empty() {
+                        info!(count = released.len(), "released expired bill reservations");
+                    }
                 }
                 // Prune unhardened tags past the 30-day TTL.
                 let now = std::time::SystemTime::now()
@@ -600,16 +705,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
             // Flush embedded wallet billfold to disk.
             {
                 let s = flush_state.lock().unwrap();
-                if let Some(ref ws) = s.wallet {
-                    if let Ok(mut wf) = vess_kloak::WalletFile::load(&ws.wallet_path) {
-                        wf.billfold = ws.billfold.clone();
-                        if let Err(e) = wf.save(&ws.wallet_path) {
-                            warn!(error = %e, "failed to flush wallet to disk");
-                        } else {
-                            info!("wallet flushed to disk");
-                        }
-                    }
-                }
+                s.flush_wallet();
             }
         }
     });
@@ -753,61 +849,34 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
     let manifest_drain_state = state.clone();
     let manifest_drain_node = node.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_millis(200));
-        loop {
-            interval.tick().await;
+        while let Some(first) = manifest_rx.recv().await {
+            let mut manifests = vec![first];
+            while let Ok(item) = manifest_rx.try_recv() { manifests.push(item); }
 
-            let (manifests, targets) = {
-                let mut s = manifest_drain_state.lock().unwrap();
-                let queue: Vec<vess_protocol::ManifestStore> = s.manifest_store_queue.drain(..).collect();
-                if queue.is_empty() {
-                    continue;
-                }
+            let (peer_hashes, routable_peers, age_factors, k, net_size, rep) = {
+                let s = manifest_drain_state.lock().unwrap();
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs();
-                let (peer_hashes, routable_peers, age_factors) = s.routing_table.routable_peer_vecs(
+                let (ph, rp, af) = s.routing_table.routable_peer_vecs(
                     |id| s.peer_registry.state(id) == PeerState::Verified, now,
                 );
-                let k = s.gossip_config.k_neighbors;
-                let rep = s.reputation.clone();
-                (queue, (peer_hashes, routable_peers, age_factors, k, rep))
+                (ph, rp, af, s.gossip_config.k_neighbors, s.estimated_network_size, s.reputation.clone())
             };
+            if routable_peers.is_empty() { continue; }
 
-            let (peer_hashes, routable_peers, age_factors, k, rep) = targets;
-            if routable_peers.is_empty() {
-                continue;
-            }
-
+            let fan = dynamic_fan_out(net_size, RANDOM_FAN_OUT, RANDOM_FAN_OUT * 3);
+            let mut per_peer: HashMap<usize, Vec<PulseMessage>> = HashMap::new();
             for ms in &manifests {
-                let nearest = k_nearest(&ms.dht_key, &peer_hashes, k);
-                let candidate_hashes: Vec<[u8; 32]> = nearest.iter().map(|&i| peer_hashes[i]).collect();
-                let candidate_ages: Vec<f64> = nearest.iter().map(|&i| age_factors[i]).collect();
-                let ranked = rep.select_best_with_age(&candidate_hashes, k, &candidate_ages);
-                let mut indices: Vec<usize> = ranked.iter().map(|&ri| nearest[ri]).collect();
-                let extra = random_fan_out(routable_peers.len(), &indices, RANDOM_FAN_OUT);
-                for ei in extra {
-                    if !indices.contains(&ei) {
-                        indices.push(ei);
-                    }
-                }
+                let indices = compute_gossip_targets(
+                    &ms.dht_key, &peer_hashes, &age_factors, k, &rep, fan, routable_peers.len(),
+                );
                 for idx in indices {
-                    let peer_id_bytes = &routable_peers[idx];
-                    let arr: [u8; 32] = match peer_id_bytes.as_slice().try_into() {
-                        Ok(a) => a,
-                        Err(_) => continue,
-                    };
-                    let target = match iroh::EndpointId::from_bytes(&arr) {
-                        Ok(id) => id,
-                        Err(_) => continue,
-                    };
-                    let msg = PulseMessage::ManifestStore(ms.clone());
-                    if let Err(e) = manifest_drain_node.send_message(target, &msg).await {
-                        warn!("manifest store forward failed: {e}");
-                    }
+                    per_peer.entry(idx).or_default().push(PulseMessage::ManifestStore(ms.clone()));
                 }
             }
+            batch_forward_to_peers(&manifest_drain_node, &routable_peers, per_peer).await;
             info!(count = manifests.len(), "manifest store batch forwarded");
         }
     });
@@ -816,62 +885,35 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
     let tag_drain_state = state.clone();
     let tag_drain_node = node.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_millis(200));
-        loop {
-            interval.tick().await;
+        while let Some(first) = tag_store_rx.recv().await {
+            let mut tags = vec![first];
+            while let Ok(item) = tag_store_rx.try_recv() { tags.push(item); }
 
-            let (tags, targets) = {
-                let mut s = tag_drain_state.lock().unwrap();
-                let queue: Vec<TagStore> = s.tag_store_queue.drain(..).collect();
-                if queue.is_empty() {
-                    continue;
-                }
+            let (peer_hashes, routable_peers, age_factors, k, net_size, rep) = {
+                let s = tag_drain_state.lock().unwrap();
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs();
-                let (peer_hashes, routable_peers, age_factors) = s.routing_table.routable_peer_vecs(
+                let (ph, rp, af) = s.routing_table.routable_peer_vecs(
                     |id| s.peer_registry.state(id) == PeerState::Verified, now,
                 );
-                let k = s.gossip_config.k_neighbors;
-                let rep = s.reputation.clone();
-                (queue, (peer_hashes, routable_peers, age_factors, k, rep))
+                (ph, rp, af, s.gossip_config.k_neighbors, s.estimated_network_size, s.reputation.clone())
             };
+            if routable_peers.is_empty() { continue; }
 
-            let (peer_hashes, routable_peers, age_factors, k, rep) = targets;
-            if routable_peers.is_empty() {
-                continue;
-            }
-
+            let fan = dynamic_fan_out(net_size, RANDOM_FAN_OUT, RANDOM_FAN_OUT * 3);
+            let mut per_peer: HashMap<usize, Vec<PulseMessage>> = HashMap::new();
             for ts in &tags {
-                let dht_key = *blake3::hash(ts.tag.as_bytes()).as_bytes();
-                let nearest = k_nearest(&dht_key, &peer_hashes, k);
-                let candidate_hashes: Vec<[u8; 32]> = nearest.iter().map(|&i| peer_hashes[i]).collect();
-                let candidate_ages: Vec<f64> = nearest.iter().map(|&i| age_factors[i]).collect();
-                let ranked = rep.select_best_with_age(&candidate_hashes, k, &candidate_ages);
-                let mut indices: Vec<usize> = ranked.iter().map(|&ri| nearest[ri]).collect();
-                let extra = random_fan_out(routable_peers.len(), &indices, RANDOM_FAN_OUT);
-                for ei in extra {
-                    if !indices.contains(&ei) {
-                        indices.push(ei);
-                    }
-                }
+                let dht_key = ts.tag_hash;
+                let indices = compute_gossip_targets(
+                    &dht_key, &peer_hashes, &age_factors, k, &rep, fan, routable_peers.len(),
+                );
                 for idx in indices {
-                    let peer_id_bytes = &routable_peers[idx];
-                    let arr: [u8; 32] = match peer_id_bytes.as_slice().try_into() {
-                        Ok(a) => a,
-                        Err(_) => continue,
-                    };
-                    let target = match iroh::EndpointId::from_bytes(&arr) {
-                        Ok(id) => id,
-                        Err(_) => continue,
-                    };
-                    let msg = PulseMessage::TagStore(ts.clone());
-                    if let Err(e) = tag_drain_node.send_message(target, &msg).await {
-                        warn!("tag store forward failed: {e}");
-                    }
+                    per_peer.entry(idx).or_default().push(PulseMessage::TagStore(ts.clone()));
                 }
             }
+            batch_forward_to_peers(&tag_drain_node, &routable_peers, per_peer).await;
             info!(count = tags.len(), "tag store batch forwarded");
         }
     });
@@ -880,62 +922,35 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
     let confirm_drain_state = state.clone();
     let confirm_drain_node = node.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_millis(200));
-        loop {
-            interval.tick().await;
+        while let Some(first) = tag_confirm_rx.recv().await {
+            let mut confirms = vec![first];
+            while let Ok(item) = tag_confirm_rx.try_recv() { confirms.push(item); }
 
-            let (confirms, targets) = {
-                let mut s = confirm_drain_state.lock().unwrap();
-                let queue: Vec<TagConfirm> = s.tag_confirm_queue.drain(..).collect();
-                if queue.is_empty() {
-                    continue;
-                }
+            let (peer_hashes, routable_peers, age_factors, k, net_size, rep) = {
+                let s = confirm_drain_state.lock().unwrap();
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs();
-                let (peer_hashes, routable_peers, age_factors) = s.routing_table.routable_peer_vecs(
+                let (ph, rp, af) = s.routing_table.routable_peer_vecs(
                     |id| s.peer_registry.state(id) == PeerState::Verified, now,
                 );
-                let k = s.gossip_config.k_neighbors;
-                let rep = s.reputation.clone();
-                (queue, (peer_hashes, routable_peers, age_factors, k, rep))
+                (ph, rp, af, s.gossip_config.k_neighbors, s.estimated_network_size, s.reputation.clone())
             };
+            if routable_peers.is_empty() { continue; }
 
-            let (peer_hashes, routable_peers, age_factors, k, rep) = targets;
-            if routable_peers.is_empty() {
-                continue;
-            }
-
+            let fan = dynamic_fan_out(net_size, RANDOM_FAN_OUT, RANDOM_FAN_OUT * 3);
+            let mut per_peer: HashMap<usize, Vec<PulseMessage>> = HashMap::new();
             for tc in &confirms {
-                let dht_key = *blake3::hash(tc.tag.as_bytes()).as_bytes();
-                let nearest = k_nearest(&dht_key, &peer_hashes, k);
-                let candidate_hashes: Vec<[u8; 32]> = nearest.iter().map(|&i| peer_hashes[i]).collect();
-                let candidate_ages: Vec<f64> = nearest.iter().map(|&i| age_factors[i]).collect();
-                let ranked = rep.select_best_with_age(&candidate_hashes, k, &candidate_ages);
-                let mut indices: Vec<usize> = ranked.iter().map(|&ri| nearest[ri]).collect();
-                let extra = random_fan_out(routable_peers.len(), &indices, RANDOM_FAN_OUT);
-                for ei in extra {
-                    if !indices.contains(&ei) {
-                        indices.push(ei);
-                    }
-                }
+                let dht_key = tc.tag_hash;
+                let indices = compute_gossip_targets(
+                    &dht_key, &peer_hashes, &age_factors, k, &rep, fan, routable_peers.len(),
+                );
                 for idx in indices {
-                    let peer_id_bytes = &routable_peers[idx];
-                    let arr: [u8; 32] = match peer_id_bytes.as_slice().try_into() {
-                        Ok(a) => a,
-                        Err(_) => continue,
-                    };
-                    let target = match iroh::EndpointId::from_bytes(&arr) {
-                        Ok(id) => id,
-                        Err(_) => continue,
-                    };
-                    let msg = PulseMessage::TagConfirm(tc.clone());
-                    if let Err(e) = confirm_drain_node.send_message(target, &msg).await {
-                        warn!("tag confirm forward failed: {e}");
-                    }
+                    per_peer.entry(idx).or_default().push(PulseMessage::TagConfirm(tc.clone()));
                 }
             }
+            batch_forward_to_peers(&confirm_drain_node, &routable_peers, per_peer).await;
             info!(count = confirms.len(), "tag confirm batch forwarded");
         }
     });
@@ -944,61 +959,34 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
     let og_drain_state = state.clone();
     let og_drain_node = node.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_millis(200));
-        loop {
-            interval.tick().await;
+        while let Some(first) = og_rx.recv().await {
+            let mut items = vec![first];
+            while let Ok(item) = og_rx.try_recv() { items.push(item); }
 
-            let (items, targets) = {
-                let mut s = og_drain_state.lock().unwrap();
-                let queue: Vec<OwnershipGenesis> = s.ownership_genesis_queue.drain(..).collect();
-                if queue.is_empty() {
-                    continue;
-                }
+            let (peer_hashes, routable_peers, age_factors, k, net_size, rep) = {
+                let s = og_drain_state.lock().unwrap();
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs();
-                let (peer_hashes, routable_peers, age_factors) = s.routing_table.routable_peer_vecs(
+                let (ph, rp, af) = s.routing_table.routable_peer_vecs(
                     |id| s.peer_registry.state(id) == PeerState::Verified, now,
                 );
-                let k = s.gossip_config.k_neighbors;
-                let rep = s.reputation.clone();
-                (queue, (peer_hashes, routable_peers, age_factors, k, rep))
+                (ph, rp, af, s.gossip_config.k_neighbors, s.estimated_network_size, s.reputation.clone())
             };
+            if routable_peers.is_empty() { continue; }
 
-            let (peer_hashes, routable_peers, age_factors, k, rep) = targets;
-            if routable_peers.is_empty() {
-                continue;
-            }
-
+            let fan = dynamic_fan_out(net_size, OWNERSHIP_FAN_OUT, OWNERSHIP_FAN_OUT * 3);
+            let mut per_peer: HashMap<usize, Vec<PulseMessage>> = HashMap::new();
             for og in &items {
-                let nearest = k_nearest(&og.mint_id, &peer_hashes, k);
-                let candidate_hashes: Vec<[u8; 32]> = nearest.iter().map(|&i| peer_hashes[i]).collect();
-                let candidate_ages: Vec<f64> = nearest.iter().map(|&i| age_factors[i]).collect();
-                let ranked = rep.select_best_with_age(&candidate_hashes, k, &candidate_ages);
-                let mut indices: Vec<usize> = ranked.iter().map(|&ri| nearest[ri]).collect();
-                let extra = random_fan_out(routable_peers.len(), &indices, OWNERSHIP_FAN_OUT);
-                for ei in extra {
-                    if !indices.contains(&ei) {
-                        indices.push(ei);
-                    }
-                }
+                let indices = compute_gossip_targets(
+                    &og.mint_id, &peer_hashes, &age_factors, k, &rep, fan, routable_peers.len(),
+                );
                 for idx in indices {
-                    let peer_id_bytes = &routable_peers[idx];
-                    let arr: [u8; 32] = match peer_id_bytes.as_slice().try_into() {
-                        Ok(a) => a,
-                        Err(_) => continue,
-                    };
-                    let target = match iroh::EndpointId::from_bytes(&arr) {
-                        Ok(id) => id,
-                        Err(_) => continue,
-                    };
-                    let msg = PulseMessage::OwnershipGenesis(og.clone());
-                    if let Err(e) = og_drain_node.send_message(target, &msg).await {
-                        warn!("ownership genesis forward failed: {e}");
-                    }
+                    per_peer.entry(idx).or_default().push(PulseMessage::OwnershipGenesis(og.clone()));
                 }
             }
+            batch_forward_to_peers(&og_drain_node, &routable_peers, per_peer).await;
             info!(count = items.len(), "ownership genesis batch forwarded");
         }
     });
@@ -1007,61 +995,34 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
     let oc_drain_state = state.clone();
     let oc_drain_node = node.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_millis(200));
-        loop {
-            interval.tick().await;
+        while let Some(first) = oc_rx.recv().await {
+            let mut items = vec![first];
+            while let Ok(item) = oc_rx.try_recv() { items.push(item); }
 
-            let (items, targets) = {
-                let mut s = oc_drain_state.lock().unwrap();
-                let queue: Vec<OwnershipClaim> = s.ownership_claim_queue.drain(..).collect();
-                if queue.is_empty() {
-                    continue;
-                }
+            let (peer_hashes, routable_peers, age_factors, k, net_size, rep) = {
+                let s = oc_drain_state.lock().unwrap();
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs();
-                let (peer_hashes, routable_peers, age_factors) = s.routing_table.routable_peer_vecs(
+                let (ph, rp, af) = s.routing_table.routable_peer_vecs(
                     |id| s.peer_registry.state(id) == PeerState::Verified, now,
                 );
-                let k = s.gossip_config.k_neighbors;
-                let rep = s.reputation.clone();
-                (queue, (peer_hashes, routable_peers, age_factors, k, rep))
+                (ph, rp, af, s.gossip_config.k_neighbors, s.estimated_network_size, s.reputation.clone())
             };
+            if routable_peers.is_empty() { continue; }
 
-            let (peer_hashes, routable_peers, age_factors, k, rep) = targets;
-            if routable_peers.is_empty() {
-                continue;
-            }
-
+            let fan = dynamic_fan_out(net_size, OWNERSHIP_FAN_OUT, OWNERSHIP_FAN_OUT * 3);
+            let mut per_peer: HashMap<usize, Vec<PulseMessage>> = HashMap::new();
             for oc in &items {
-                let nearest = k_nearest(&oc.mint_id, &peer_hashes, k);
-                let candidate_hashes: Vec<[u8; 32]> = nearest.iter().map(|&i| peer_hashes[i]).collect();
-                let candidate_ages: Vec<f64> = nearest.iter().map(|&i| age_factors[i]).collect();
-                let ranked = rep.select_best_with_age(&candidate_hashes, k, &candidate_ages);
-                let mut indices: Vec<usize> = ranked.iter().map(|&ri| nearest[ri]).collect();
-                let extra = random_fan_out(routable_peers.len(), &indices, OWNERSHIP_FAN_OUT);
-                for ei in extra {
-                    if !indices.contains(&ei) {
-                        indices.push(ei);
-                    }
-                }
+                let indices = compute_gossip_targets(
+                    &oc.mint_id, &peer_hashes, &age_factors, k, &rep, fan, routable_peers.len(),
+                );
                 for idx in indices {
-                    let peer_id_bytes = &routable_peers[idx];
-                    let arr: [u8; 32] = match peer_id_bytes.as_slice().try_into() {
-                        Ok(a) => a,
-                        Err(_) => continue,
-                    };
-                    let target = match iroh::EndpointId::from_bytes(&arr) {
-                        Ok(id) => id,
-                        Err(_) => continue,
-                    };
-                    let msg = PulseMessage::OwnershipClaim(oc.clone());
-                    if let Err(e) = oc_drain_node.send_message(target, &msg).await {
-                        warn!("ownership claim forward failed: {e}");
-                    }
+                    per_peer.entry(idx).or_default().push(PulseMessage::OwnershipClaim(oc.clone()));
                 }
             }
+            batch_forward_to_peers(&oc_drain_node, &routable_peers, per_peer).await;
             info!(count = items.len(), "ownership claim batch forwarded");
         }
     });
@@ -1070,64 +1031,36 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
     let ra_drain_state = state.clone();
     let ra_drain_node = node.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_millis(200));
-        loop {
-            interval.tick().await;
+        while let Some(first) = ra_rx.recv().await {
+            let mut items = vec![first];
+            while let Ok(item) = ra_rx.try_recv() { items.push(item); }
 
-            let (items, targets) = {
-                let mut s = ra_drain_state.lock().unwrap();
-                let queue: Vec<ReforgeAttestation> = s.reforge_attestation_queue.drain(..).collect();
-                if queue.is_empty() {
-                    continue;
-                }
+            let (peer_hashes, routable_peers, age_factors, k, net_size, rep) = {
+                let s = ra_drain_state.lock().unwrap();
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs();
-                let (peer_hashes, routable_peers, age_factors) = s.routing_table.routable_peer_vecs(
+                let (ph, rp, af) = s.routing_table.routable_peer_vecs(
                     |id| s.peer_registry.state(id) == PeerState::Verified, now,
                 );
-                let k = s.gossip_config.k_neighbors;
-                let rep = s.reputation.clone();
-                (queue, (peer_hashes, routable_peers, age_factors, k, rep))
+                (ph, rp, af, s.gossip_config.k_neighbors, s.estimated_network_size, s.reputation.clone())
             };
+            if routable_peers.is_empty() { continue; }
 
-            let (peer_hashes, routable_peers, age_factors, k, rep) = targets;
-            if routable_peers.is_empty() {
-                continue;
-            }
-
+            let fan = dynamic_fan_out(net_size, RANDOM_FAN_OUT, RANDOM_FAN_OUT * 3);
+            let mut per_peer: HashMap<usize, Vec<PulseMessage>> = HashMap::new();
             for ra in &items {
-                // Forward to K-nearest peers for each consumed mint_id.
                 for cid in &ra.consumed_mint_ids {
-                    let nearest = k_nearest(cid, &peer_hashes, k);
-                    let candidate_hashes: Vec<[u8; 32]> = nearest.iter().map(|&i| peer_hashes[i]).collect();
-                    let candidate_ages: Vec<f64> = nearest.iter().map(|&i| age_factors[i]).collect();
-                    let ranked = rep.select_best_with_age(&candidate_hashes, k, &candidate_ages);
-                    let mut indices: Vec<usize> = ranked.iter().map(|&ri| nearest[ri]).collect();
-                    let extra = random_fan_out(routable_peers.len(), &indices, RANDOM_FAN_OUT);
-                    for ei in extra {
-                        if !indices.contains(&ei) {
-                            indices.push(ei);
-                        }
-                    }
+                    let indices = compute_gossip_targets(
+                        cid, &peer_hashes, &age_factors, k, &rep, fan, routable_peers.len(),
+                    );
                     for idx in indices {
-                        let peer_id_bytes = &routable_peers[idx];
-                        let arr: [u8; 32] = match peer_id_bytes.as_slice().try_into() {
-                            Ok(a) => a,
-                            Err(_) => continue,
-                        };
-                        let target = match iroh::EndpointId::from_bytes(&arr) {
-                            Ok(id) => id,
-                            Err(_) => continue,
-                        };
-                        let msg = PulseMessage::ReforgeAttestation(ra.clone());
-                        if let Err(e) = ra_drain_node.send_message(target, &msg).await {
-                            warn!("reforge attestation forward failed: {e}");
-                        }
+                        per_peer.entry(idx).or_default().push(PulseMessage::ReforgeAttestation(ra.clone()));
                     }
                 }
             }
+            batch_forward_to_peers(&ra_drain_node, &routable_peers, per_peer).await;
             info!(count = items.len(), "reforge attestation batch forwarded");
         }
     });
@@ -1139,63 +1072,34 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
     let pay_drain_state = state.clone();
     let pay_drain_node = node.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_millis(200));
-        loop {
-            interval.tick().await;
+        while let Some(first) = pay_rx.recv().await {
+            let mut items = vec![first];
+            while let Ok(item) = pay_rx.try_recv() { items.push(item); }
 
-            let (items, targets) = {
-                let mut s = pay_drain_state.lock().unwrap();
-                let queue: Vec<vess_protocol::Payment> = s.payment_relay_queue.drain(..).collect();
-                if queue.is_empty() {
-                    continue;
-                }
+            let (peer_hashes, routable_peers, age_factors, k, net_size, rep) = {
+                let s = pay_drain_state.lock().unwrap();
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs();
-                let (peer_hashes, routable_peers, age_factors) = s.routing_table.routable_peer_vecs(
+                let (ph, rp, af) = s.routing_table.routable_peer_vecs(
                     |id| s.peer_registry.state(id) == PeerState::Verified, now,
                 );
-                let k = s.gossip_config.k_neighbors;
-                let rep = s.reputation.clone();
-                (queue, (peer_hashes, routable_peers, age_factors, k, rep))
+                (ph, rp, af, s.gossip_config.k_neighbors, s.estimated_network_size, s.reputation.clone())
             };
+            if routable_peers.is_empty() { continue; }
 
-            let (peer_hashes, routable_peers, age_factors, k, rep) = targets;
-            if routable_peers.is_empty() {
-                continue;
-            }
-
+            let fan = dynamic_fan_out(net_size, RANDOM_FAN_OUT, RANDOM_FAN_OUT * 3);
+            let mut per_peer: HashMap<usize, Vec<PulseMessage>> = HashMap::new();
             for p in &items {
-                // Route by stealth_id so the payment reaches nodes
-                // near the recipient's DHT neighbourhood.
-                let nearest = k_nearest(&p.stealth_id, &peer_hashes, k);
-                let candidate_hashes: Vec<[u8; 32]> = nearest.iter().map(|&i| peer_hashes[i]).collect();
-                let candidate_ages: Vec<f64> = nearest.iter().map(|&i| age_factors[i]).collect();
-                let ranked = rep.select_best_with_age(&candidate_hashes, k, &candidate_ages);
-                let mut indices: Vec<usize> = ranked.iter().map(|&ri| nearest[ri]).collect();
-                let extra = random_fan_out(routable_peers.len(), &indices, RANDOM_FAN_OUT);
-                for ei in extra {
-                    if !indices.contains(&ei) {
-                        indices.push(ei);
-                    }
-                }
+                let indices = compute_gossip_targets(
+                    &p.stealth_id, &peer_hashes, &age_factors, k, &rep, fan, routable_peers.len(),
+                );
                 for idx in indices {
-                    let peer_id_bytes = &routable_peers[idx];
-                    let arr: [u8; 32] = match peer_id_bytes.as_slice().try_into() {
-                        Ok(a) => a,
-                        Err(_) => continue,
-                    };
-                    let target = match iroh::EndpointId::from_bytes(&arr) {
-                        Ok(id) => id,
-                        Err(_) => continue,
-                    };
-                    let msg = PulseMessage::Payment(p.clone());
-                    if let Err(e) = pay_drain_node.send_message(target, &msg).await {
-                        warn!("payment relay forward failed: {e}");
-                    }
+                    per_peer.entry(idx).or_default().push(PulseMessage::Payment(p.clone()));
                 }
             }
+            batch_forward_to_peers(&pay_drain_node, &routable_peers, per_peer).await;
             info!(count = items.len(), "payment relay batch forwarded");
         }
     });
@@ -1412,7 +1316,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
     let limbo_node = node.clone();
     let limbo_state = state.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
         loop {
             interval.tick().await;
 
@@ -1482,6 +1386,13 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
 
     let st = state.clone();
     let ban_ref = banishment.clone();
+    let h_manifest_tx = manifest_tx.clone();
+    let h_tag_store_tx = tag_store_tx.clone();
+    let h_tag_confirm_tx = tag_confirm_tx.clone();
+    let h_og_tx = og_tx.clone();
+    let h_oc_tx = oc_tx.clone();
+    let h_ra_tx = ra_tx.clone();
+    let h_pay_tx = pay_tx.clone();
     node.listen_messages_with_response(move |peer, msg| {
         let peer_hash: [u8; 32] = *blake3::hash(peer.as_bytes()).as_bytes();
         if ban_ref.is_banished(&peer_hash) {
@@ -1538,13 +1449,21 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 }
                 // Verify the Argon2id PoW. A missing or invalid PoW means the
                 // peer either didn't invest resources or is running old software.
-                if let Some(nonce) = stored_nonce {
-                    if hr.pow_hash.is_empty()
-                        || !verify_handshake_pow(peer.as_bytes(), &nonce, &hr.pow_hash)
-                    {
-                        warn!(%peer, "handshake PoW verification failed — banishing");
-                        state.peer_registry.mark_banished(peer_id);
-                        ban_ref.banish(peer_id);
+                match stored_nonce {
+                    Some(nonce) => {
+                        if hr.pow_hash.is_empty()
+                            || !verify_handshake_pow(peer.as_bytes(), &nonce, &hr.pow_hash)
+                        {
+                            warn!(%peer, "handshake PoW verification failed — banishing");
+                            state.peer_registry.mark_banished(peer_id);
+                            ban_ref.banish(peer_id);
+                        }
+                    }
+                    None => {
+                        // No challenge nonce on record — peer responded to a
+                        // challenge we never sent. Reject but don't banish
+                        // (could be a race with a restart).
+                        warn!(%peer, "handshake response without stored nonce — ignoring");
                     }
                 }
                 return None;
@@ -1638,11 +1557,15 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     }));
                 }
 
-                // Collect ALL stealth_payloads across every stealth_id in limbo.
+                // Collect stealth_payloads across every stealth_id in limbo,
+                // capped to prevent memory-exhaustion from a bloated limbo.
                 let mut payloads = Vec::new();
-                for sid in state.limbo_buffer.stealth_ids_with_payments() {
+                'sweep: for sid in state.limbo_buffer.stealth_ids_with_payments() {
                     for entry in state.limbo_buffer.peek(&sid) {
                         payloads.push(entry.payment.stealth_payload.clone());
+                        if payloads.len() >= MAX_SWEEP_PAYLOADS {
+                            break 'sweep;
+                        }
                     }
                 }
                 info!(%peer, count = payloads.len(), "mailbox sweep");
@@ -1653,24 +1576,18 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
             }
 
             PulseMessage::TagRegister(tr) => {
-                info!(%peer, tag = %tr.tag, "tag registration");
+                info!(%peer, "tag registration for hash {:?}", &tr.tag_hash[..4]);
 
                 if !timestamp_is_valid(tr.timestamp) {
                     warn!("tag registration rejected: timestamp out of range");
                     return None;
                 }
 
-                let tag = match vess_tag::VessTag::new(&tr.tag) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        warn!("invalid tag: {e}");
-                        return None;
-                    }
-                };
+                let tag_hash = tr.tag_hash;
 
                 // Fast duplicate checks BEFORE expensive PoW verification.
                 // 1. Tag already registered?
-                if state.tag_dht.lookup(tag.as_str()).is_some() {
+                if state.tag_dht.lookup_by_hash(&tag_hash).is_some() {
                     warn!("tag registration rejected: tag already registered");
                     return None;
                 }
@@ -1687,7 +1604,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
 
                 // Validate PoW format.
                 let reg = vess_tag::TagRegistration {
-                    tag: tag.clone(),
+                    tag_hash,
                     master_address: addr.clone(),
                     pow_nonce: tr.pow_nonce,
                     pow_hash: tr.pow_hash.clone(),
@@ -1701,7 +1618,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
 
                 // Build the TagRecord.
                 let record = vess_tag::TagRecord {
-                    tag,
+                    tag_hash,
                     master_address: addr,
                     pow_nonce: tr.pow_nonce,
                     pow_hash: tr.pow_hash.clone(),
@@ -1711,30 +1628,31 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     hardened_at: None, // starts unhardened
                 };
 
-                // Verify the registrant's signature (cheap — do before PoW).
-                if !record.registrant_vk.is_empty() {
-                    match vess_tag::verify_record_signature(&record) {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            warn!("tag registration: invalid signature — banishing peer");
-                            state.peer_registry.mark_banished(peer_id);
-                            ban_ref.banish(peer_id);
-                            return None;
-                        }
-                        Err(e) => {
-                            warn!("tag registration: signature check error: {e} — banishing peer");
-                            state.peer_registry.mark_banished(peer_id);
-                            ban_ref.banish(peer_id);
-                            return None;
-                        }
+                // All tags MUST carry a valid registrant signature.
+                if record.registrant_vk.is_empty() || record.signature.is_empty() {
+                    warn!("tag registration: missing signature — rejecting");
+                    return None;
+                }
+                match vess_tag::verify_record_signature(&record) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        warn!("tag registration: invalid signature — banishing peer");
+                        state.peer_registry.mark_banished(peer_id);
+                        ban_ref.banish(peer_id);
+                        return None;
+                    }
+                    Err(e) => {
+                        warn!("tag registration: signature check error: {e} — banishing peer");
+                        state.peer_registry.mark_banished(peer_id);
+                        ban_ref.banish(peer_id);
+                        return None;
                     }
                 }
 
-                // Verify Argon2id proof-of-work (expensive: ~10 s, 2 GiB RAM).
-                // In test builds, use the fast test variant.
+                // Verify Argon2id proof-of-work.
                 #[cfg(any(test, feature = "test-pow"))]
                 let pow_ok = vess_tag::verify_tag_pow_test(
-                    &record.tag,
+                    &tag_hash,
                     &record.master_address.scan_ek,
                     &record.master_address.spend_ek,
                     &record.pow_nonce,
@@ -1742,7 +1660,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 );
                 #[cfg(not(any(test, feature = "test-pow")))]
                 let pow_ok = vess_tag::verify_tag_pow(
-                    &record.tag,
+                    &tag_hash,
                     &record.master_address.scan_ek,
                     &record.master_address.spend_ek,
                     &record.pow_nonce,
@@ -1767,8 +1685,8 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 if state.tag_dht.store(record) {
                     info!("tag stored in DHT — queueing replication");
                     let max_hops = state.gossip_config.max_hops;
-                    state.tag_store_queue.push(TagStore {
-                        tag: tr.tag,
+                    let _ = h_tag_store_tx.send(TagStore {
+                        tag_hash,
                         scan_ek: tr.scan_ek,
                         spend_ek: tr.spend_ek,
                         pow_nonce: tr.pow_nonce,
@@ -1785,8 +1703,17 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
             }
 
             PulseMessage::TagLookup(tl) => {
-                info!(%peer, tag = %tl.tag, "tag lookup");
-                let result = state.tag_dht.lookup(&tl.tag);
+                // Rate-limit TagLookup to prevent tag enumeration.
+                if !state.tag_lookup_limiter.allow(&peer_id) {
+                    warn!(%peer, "tag lookup rate-limited");
+                    return Some(PulseMessage::TagLookupResponse(TagLookupResponse {
+                        tag_hash: tl.tag_hash,
+                        nonce: tl.nonce,
+                        result: None,
+                    }));
+                }
+                info!(%peer, "tag lookup");
+                let result = state.tag_dht.lookup_by_hash(&tl.tag_hash);
                 let lookup_result = result.map(|record| TagLookupResult {
                     scan_ek: record.master_address.scan_ek.clone(),
                     spend_ek: record.master_address.spend_ek.clone(),
@@ -1797,7 +1724,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     signature: record.signature.clone(),
                 });
                 Some(PulseMessage::TagLookupResponse(TagLookupResponse {
-                    tag: tl.tag,
+                    tag_hash: tl.tag_hash,
                     nonce: tl.nonce,
                     result: lookup_result,
                 }))
@@ -1818,36 +1745,37 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     return None;
                 }
 
-                // Check ownership registry — all mint_ids must be active.
-                for mint_id in &p.mint_ids {
-                    if !state.registry.is_active(mint_id) {
-                        warn!("payment rejected: mint_id not active in registry");
+                // Backwards-compatible metadata validation: if the sender
+                // populated cleartext mint_ids/denomination_values (legacy),
+                // validate them.  Modern senders leave these empty for
+                // privacy — relay nodes use payment_id for dedup instead.
+                if !p.mint_ids.is_empty() {
+                    // Check ownership registry — all mint_ids must be active.
+                    for mint_id in &p.mint_ids {
+                        if !state.registry.is_active(mint_id) {
+                            warn!("payment rejected: mint_id not active in registry");
+                            return None;
+                        }
+                    }
+
+                    // Validate denomination_values array length matches mint_ids.
+                    if p.denomination_values.len() != p.mint_ids.len()
+                    {
+                        warn!("payment rejected: array length mismatch (mints={}, denoms={}) — banishing peer",
+                            p.mint_ids.len(), p.denomination_values.len());
+                        state.peer_registry.mark_banished(peer_id);
+                        ban_ref.banish(peer_id);
                         return None;
                     }
-                }
 
-                // Validate denomination_values array length matches mint_ids.
-                if p.denomination_values.len() != p.mint_ids.len()
-                {
-                    warn!("payment rejected: array length mismatch (mints={}, denoms={}) — banishing peer",
-                        p.mint_ids.len(), p.denomination_values.len());
-                    state.peer_registry.mark_banished(peer_id);
-                    ban_ref.banish(peer_id);
-                    return None;
-                }
-
-                // Registry-only model: STARK proofs are verified once at
-                // OwnershipGenesis. Relay nodes trust the registry — if a
-                // mint_id is active, the proof was already verified.
-
-                // Reject payments whose mint_ids overlap with existing limbo
-                // entries. A bill that is already in-flight (held in limbo)
-                // cannot be spent again until the first payment clears.
-                // This prevents double-spend races at the relay layer.
-                for mid in &p.mint_ids {
-                    if state.limbo_mint_ids.contains(mid) {
-                        warn!("payment rejected: mint_id already in limbo");
-                        return None;
+                    // Reject payments whose mint_ids overlap with existing limbo
+                    // entries. A bill that is already in-flight (held in limbo)
+                    // cannot be spent again until the first payment clears.
+                    for mid in &p.mint_ids {
+                        if state.limbo_mint_ids.contains(mid) {
+                            warn!("payment rejected: mint_id already in limbo");
+                            return None;
+                        }
                     }
                 }
 
@@ -1859,24 +1787,28 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis() as u64;
-                state.limbo_payment_ids.insert(p.payment_id);
-                for mid in &p.mint_ids {
-                    state.limbo_mint_ids.insert(*mid);
-                    state.limbo_entry_times.insert(*mid, now_ms);
-                }
 
                 let mint_ids = p.mint_ids.clone();
                 let stealth_id = p.stealth_id;
                 let relay_copy = p.clone();
+                let payment_id = p.payment_id;
 
-                if !state.limbo_buffer.hold(stealth_id, p, mint_ids, now, peer_id) {
+                if !state.limbo_buffer.hold(stealth_id, p, mint_ids.clone(), now, peer_id) {
                     warn!(%peer, "payment rejected: limbo buffer at capacity or peer quota exceeded");
                     return None;
                 }
 
+                // Track AFTER successful hold so rejected payments don't
+                // leave stale entries that block legitimate payments.
+                state.limbo_payment_ids.insert(payment_id);
+                for mid in &mint_ids {
+                    state.limbo_mint_ids.insert(*mid);
+                    state.limbo_entry_times.insert(*mid, now_ms);
+                }
+
                 // Forward to K-nearest by stealth_id so multiple relay
                 // nodes hold the payment (prevents single-node censorship).
-                state.payment_relay_queue.push(relay_copy);
+                let _ = h_pay_tx.send(relay_copy);
 
                 // ── Auto-receive: trial-decrypt if wallet is loaded ─────
                 // Clone the payload out first to avoid overlapping borrows.
@@ -1907,7 +1839,9 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                                 }
                             }
                             info!(amount = total, "auto-received payment into wallet");
-                            state.ownership_claim_queue.extend(pending_oc);
+                            for oc in pending_oc { let _ = h_oc_tx.send(oc); }
+                            // Persist wallet immediately after receiving bills.
+                            state.flush_wallet();
                         }
                         Ok(None) => {} // Not for us — normal relay.
                         Err(e) => {
@@ -1937,6 +1871,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 let closest = state.routing_table.closest_peers(&fn_req.target, crate::kademlia::K_BUCKET_SIZE);
                 let peers: Vec<Vec<u8>> = closest.into_iter()
                     .filter(|p| !p.id_bytes.is_empty())
+                    .take(crate::kademlia::K_BUCKET_SIZE)
                     .map(|p| p.id_bytes)
                     .collect();
                 Some(PulseMessage::FindNodeResponse(FindNodeResponse { peers }))
@@ -1945,6 +1880,12 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
             PulseMessage::RegistryQuery(rq) => {
                 if !state.registry_query_limiter.allow(&peer_id) {
                     warn!(%peer, "registry query rate limited");
+                    return None;
+                }
+                if rq.mint_ids.len() > MAX_QUERY_MINT_IDS {
+                    warn!(%peer, count = rq.mint_ids.len(), "registry query exceeds max — banishing");
+                    state.peer_registry.mark_banished(peer_id);
+                    ban_ref.banish(peer_id);
                     return None;
                 }
                 info!(%peer, count = rq.mint_ids.len(), "registry query");
@@ -1957,6 +1898,10 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
             PulseMessage::RegistryQueryResponse(_) => None,
 
             PulseMessage::LimboHold(lh) => {
+                if lh.bill_ids.len() > MAX_LIMBO_HOLD_IDS {
+                    warn!(%peer, count = lh.bill_ids.len(), "limbo hold exceeds max — ignoring");
+                    return None;
+                }
                 info!(%peer, count = lh.bill_ids.len(), "limbo hold received");
                 for mid in &lh.bill_ids {
                     state.limbo_mint_ids.insert(*mid);
@@ -1992,7 +1937,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     }
                 }
 
-                if p.denomination_values.len() != p.mint_ids.len()
+                if !p.mint_ids.is_empty() && p.denomination_values.len() != p.mint_ids.len()
                 {
                     warn!("limbo deliver rejected: array length mismatch — banishing peer");
                     state.peer_registry.mark_banished(peer_id);
@@ -2005,15 +1950,22 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
 
                 let mint_ids = p.mint_ids.clone();
                 let stealth_id = p.stealth_id;
+                let payment_id = p.payment_id;
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs();
-                state.limbo_payment_ids.insert(p.payment_id);
+
+                if !state.limbo_buffer.hold(stealth_id, ld.payment, mint_ids.clone(), now, peer_id) {
+                    warn!(%peer, "limbo deliver rejected: buffer at capacity");
+                    return None;
+                }
+
+                // Track AFTER successful hold.
+                state.limbo_payment_ids.insert(payment_id);
                 for mid in &mint_ids {
                     state.limbo_mint_ids.insert(*mid);
                 }
-                state.limbo_buffer.hold(stealth_id, ld.payment, mint_ids, now, peer_id);
 
                 // Auto-receive trial-decrypt for LimboDeliver too.
                 let maybe_payload = state.limbo_buffer.peek(&stealth_id)
@@ -2043,7 +1995,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                                 }
                             }
                             info!(amount = total, "auto-received limbo-deliver payment");
-                            state.ownership_claim_queue.extend(pending_oc);
+                            for oc in pending_oc { let _ = h_oc_tx.send(oc); }
                         }
                         Ok(None) => {}
                         Err(e) => {
@@ -2058,6 +2010,11 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
 
 
             PulseMessage::ManifestStore(ms) => {
+                // Reject oversized manifests to prevent bandwidth/storage DoS.
+                if ms.encrypted_manifest.len() > MAX_MANIFEST_SIZE {
+                    warn!(%peer, size = ms.encrypted_manifest.len(), "manifest exceeds max size — rejecting");
+                    return None;
+                }
                 // Store encrypted manifest if we're among the K-closest.
                 let peer_ids: Vec<[u8; 32]> = state.routing_table.routable_peers(|_| true)
                     .iter().map(|p| p.id_hash).collect();
@@ -2069,7 +2026,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 if ms.hops_remaining > 0 {
                     let mut fwd = ms.clone();
                     fwd.hops_remaining -= 1;
-                    state.manifest_store_queue.push(fwd);
+                    let _ = h_manifest_tx.send(fwd);
                 }
                 None
             }
@@ -2098,6 +2055,12 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     warn!(%peer, "ownership fetch rate limited");
                     return None;
                 }
+                if of.mint_ids.len() > MAX_QUERY_MINT_IDS {
+                    warn!(%peer, count = of.mint_ids.len(), "ownership fetch exceeds max — banishing");
+                    state.peer_registry.mark_banished(peer_id);
+                    ban_ref.banish(peer_id);
+                    return None;
+                }
                 let records: Vec<FetchedRecord> = of.mint_ids.iter().map(|mint_id| {
                     if let Some(rec) = state.registry.get(mint_id) {
                         FetchedRecord {
@@ -2124,14 +2087,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
 
 
             PulseMessage::TagStore(ts) => {
-                let tag = match vess_tag::VessTag::new(&ts.tag) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        warn!("TagStore: invalid tag: {e}");
-                        return None;
-                    }
-                };
-                let dht_key = *blake3::hash(ts.tag.as_bytes()).as_bytes();
+                let dht_key = ts.tag_hash;
                 let peer_ids: Vec<[u8; 32]> = state.routing_table.routable_peers(|_| true)
                     .iter().map(|p| p.id_hash).collect();
 
@@ -2141,12 +2097,12 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     spend_ek: ts.spend_ek.clone(),
                 };
                 let addr_fp = vess_tag::address_fingerprint(&addr);
-                if state.tag_dht.lookup(tag.as_str()).is_some() {
+                if state.tag_dht.lookup_by_hash(&dht_key).is_some() {
                     // Tag already stored — skip.
                     if ts.hops_remaining > 0 {
                         let mut fwd = ts.clone();
                         fwd.hops_remaining -= 1;
-                        state.tag_store_queue.push(fwd);
+                        let _ = h_tag_store_tx.send(fwd);
                     }
                     return None;
                 }
@@ -2157,7 +2113,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
 
                 if state.tag_dht.should_store(&dht_key, &peer_ids) {
                     let record = vess_tag::TagRecord {
-                        tag,
+                        tag_hash: dht_key,
                         master_address: addr,
                         pow_nonce: ts.pow_nonce,
                         pow_hash: ts.pow_hash.clone(),
@@ -2166,16 +2122,20 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                         signature: ts.signature.clone(),
                         hardened_at: None, // starts unhardened from gossip
                     };
-                    // Verify signature before storing replicated record.
-                    if !record.registrant_vk.is_empty() {
-                        match vess_tag::verify_record_signature(&record) {
-                            Ok(true) => {}
-                            _ => {
-                                warn!("TagStore: invalid signature on replicated tag — banishing peer");
-                                state.peer_registry.mark_banished(peer_id);
-                                ban_ref.banish(peer_id);
-                                return None;
-                            }
+                    // All replicated tags MUST carry a valid registrant signature.
+                    if record.registrant_vk.is_empty() || record.signature.is_empty() {
+                        warn!("TagStore: unsigned tag — rejecting and banishing");
+                        state.peer_registry.mark_banished(peer_id);
+                        ban_ref.banish(peer_id);
+                        return None;
+                    }
+                    match vess_tag::verify_record_signature(&record) {
+                        Ok(true) => {}
+                        _ => {
+                            warn!("TagStore: invalid signature on replicated tag — banishing peer");
+                            state.peer_registry.mark_banished(peer_id);
+                            ban_ref.banish(peer_id);
+                            return None;
                         }
                     }
                     if state.tag_dht.store(record) {
@@ -2185,32 +2145,25 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 if ts.hops_remaining > 0 {
                     let mut fwd = ts.clone();
                     fwd.hops_remaining -= 1;
-                    state.tag_store_queue.push(fwd);
+                    let _ = h_tag_store_tx.send(fwd);
                 }
                 None
             }
 
             PulseMessage::TagConfirm(tc) => {
-                info!(%peer, tag = %tc.tag, "tag confirm (harden)");
+                info!(%peer, "tag confirm (harden) for hash {:?}", &tc.tag_hash[..4]);
 
-                // 1. Validate tag.
-                let tag = match vess_tag::VessTag::new(&tc.tag) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        warn!("TagConfirm: invalid tag: {e}");
-                        return None;
-                    }
-                };
+                let tag_hash = tc.tag_hash;
 
                 // 2. The tag must exist and be unhardened.
-                let record = match state.tag_dht.lookup(tag.as_str()) {
+                let record = match state.tag_dht.lookup_by_hash(&tag_hash) {
                     Some(r) => r.clone(),
                     None => {
                         // We don't have this tag — relay if hops remain.
                         if tc.hops_remaining > 0 {
                             let mut fwd = tc.clone();
                             fwd.hops_remaining -= 1;
-                            state.tag_confirm_queue.push(fwd);
+                            let _ = h_tag_confirm_tx.send(fwd);
                         }
                         return None;
                     }
@@ -2221,7 +2174,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     if tc.hops_remaining > 0 {
                         let mut fwd = tc.clone();
                         fwd.hops_remaining -= 1;
-                        state.tag_confirm_queue.push(fwd);
+                        let _ = h_tag_confirm_tx.send(fwd);
                     }
                     return None;
                 }
@@ -2242,7 +2195,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 let confirm_digest = {
                     let mut h = blake3::Hasher::new();
                     h.update(b"vess-tag-confirm-v1");
-                    h.update(tag.as_str().as_bytes());
+                    h.update(&tag_hash);
                     h.update(&tc.mint_id);
                     *h.finalize().as_bytes()
                 };
@@ -2266,7 +2219,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     }
                 }
 
-                // 4. Check that the mint_id is active in the registry (real economic activity).
+                // 4. Check that the mint_id is active in the registry.
                 if !state.registry.is_active(&tc.mint_id) {
                     warn!("TagConfirm: mint_id not active in registry");
                     return None;
@@ -2277,8 +2230,8 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs();
-                if state.tag_dht.harden(tag.as_str(), &tc.mint_id, now) {
-                    info!(tag = %tag, "tag hardened successfully");
+                if state.tag_dht.harden_by_hash(&tag_hash, &tc.mint_id, now) {
+                    info!("tag hardened successfully for hash {:?}", &tag_hash[..4]);
                 } else {
                     warn!("TagConfirm: harden failed (bill_id reuse or already hardened)");
                 }
@@ -2287,7 +2240,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 if tc.hops_remaining > 0 {
                     let mut fwd = tc.clone();
                     fwd.hops_remaining -= 1;
-                    state.tag_confirm_queue.push(fwd);
+                    let _ = h_tag_confirm_tx.send(fwd);
                 }
                 None
             }
@@ -2300,7 +2253,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     if og.hops_remaining > 0 {
                         let mut fwd = og.clone();
                         fwd.hops_remaining -= 1;
-                        state.ownership_genesis_queue.push(fwd);
+                        let _ = h_og_tx.send(fwd);
                     }
                     return None;
                 }
@@ -2446,7 +2399,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 if og.hops_remaining > 0 {
                     let mut fwd = og.clone();
                     fwd.hops_remaining -= 1;
-                    state.ownership_genesis_queue.push(fwd);
+                    let _ = h_og_tx.send(fwd);
                 }
                 None
             }
@@ -2604,6 +2557,16 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                             }
                             // Clear limbo state for this mint_id.
                             state.limbo_mint_ids.remove(&oc.mint_id);
+
+                            // If this mint_id is in our billfold and reserved,
+                            // the recipient has claimed it — permanently remove it.
+                            if let Some(ref mut ws) = state.wallet {
+                                if ws.billfold.is_reserved(&oc.mint_id) {
+                                    ws.billfold.withdraw(&oc.mint_id);
+                                    ws.billfold.release(&[oc.mint_id]);
+                                    info!("bill permanently withdrawn after claim: {:?}", &oc.mint_id[..4]);
+                                }
+                            }
                         } else if oc.chain_depth == rec.chain_depth {
                             // Same depth — check if this is a competing claim
                             // for the same transfer slot.
@@ -2657,7 +2620,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 if oc.hops_remaining > 0 {
                     let mut fwd = oc.clone();
                     fwd.hops_remaining -= 1;
-                    state.ownership_claim_queue.push(fwd);
+                    let _ = h_oc_tx.send(fwd);
                 }
                 None
             }
@@ -2749,7 +2712,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 if ra.hops_remaining > 0 {
                     let mut fwd = ra.clone();
                     fwd.hops_remaining -= 1;
-                    state.reforge_attestation_queue.push(fwd);
+                    let _ = h_ra_tx.send(fwd);
                 }
                 None
             }

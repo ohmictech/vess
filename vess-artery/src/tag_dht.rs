@@ -97,6 +97,11 @@ impl TagDht {
         self.records.get(&key)
     }
 
+    /// Look up a tag by its pre-computed hash (DHT key).
+    pub fn lookup_by_hash(&self, tag_hash: &[u8; 32]) -> Option<&TagRecord> {
+        self.records.get(tag_hash)
+    }
+
     /// Look up a tag by address fingerprint (reverse lookup).
     pub fn lookup_by_address(&self, addr_fp: &[u8; 32]) -> Option<&TagRecord> {
         let tag_key = self.addr_to_tag.get(addr_fp)?;
@@ -162,11 +167,16 @@ impl TagDht {
     /// Returns `false` if the tag doesn't exist, is already hardened,
     /// or the bill_id was already used to harden another tag.
     pub fn harden(&mut self, tag_str: &str, bill_id: &[u8; 32], now: u64) -> bool {
+        let key = *blake3::hash(tag_str.as_bytes()).as_bytes();
+        self.harden_by_hash(&key, bill_id, now)
+    }
+
+    /// Harden a tag by hash (pre-computed DHT key).
+    pub fn harden_by_hash(&mut self, tag_hash: &[u8; 32], bill_id: &[u8; 32], now: u64) -> bool {
         if self.hardening_proofs.contains(bill_id) {
             return false; // bill_id already used
         }
-        let key = *blake3::hash(tag_str.as_bytes()).as_bytes();
-        if let Some(record) = self.records.get_mut(&key) {
+        if let Some(record) = self.records.get_mut(tag_hash) {
             if record.hardened_at.is_some() {
                 return false; // already hardened
             }
@@ -219,7 +229,6 @@ impl TagDht {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vess_tag::VessTag;
     use vess_stealth::MasterStealthAddress;
 
     fn dummy_address() -> MasterStealthAddress {
@@ -229,7 +238,7 @@ mod tests {
 
     fn make_record(tag: &str) -> TagRecord {
         TagRecord {
-            tag: VessTag::new(tag).unwrap(),
+            tag_hash: *blake3::hash(tag.as_bytes()).as_bytes(),
             master_address: dummy_address(),
             pow_nonce: rand::random(),
             pow_hash: vec![0xAA; 32],
@@ -242,7 +251,7 @@ mod tests {
 
     fn make_record_with_address(tag: &str, addr: MasterStealthAddress) -> TagRecord {
         TagRecord {
-            tag: VessTag::new(tag).unwrap(),
+            tag_hash: *blake3::hash(tag.as_bytes()).as_bytes(),
             master_address: addr,
             pow_nonce: rand::random(),
             pow_hash: vec![0xBB; 32],
@@ -295,7 +304,7 @@ mod tests {
         assert!(dht.store(make_record_with_address("alice", addr)));
         let found = dht.lookup_by_address(&addr_fp);
         assert!(found.is_some());
-        assert_eq!(found.unwrap().tag.as_str(), "alice");
+        assert_eq!(found.unwrap().tag_hash, *blake3::hash(b"alice").as_bytes());
     }
 
     #[test]

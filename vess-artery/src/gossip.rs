@@ -78,6 +78,19 @@ pub const RANDOM_FAN_OUT: usize = 4;
 /// fan-out ensures claims propagate to more diverse network regions.
 pub const OWNERSHIP_FAN_OUT: usize = 8;
 
+/// Compute a dynamic random fan-out that scales with estimated network
+/// size.  At small scales (< 1 000 nodes) this returns the hardcoded
+/// `base` value.  For larger networks it grows as
+/// `min(base + ceil(ln(N) / ln(100)), max_fan)` to ensure gossip
+/// coverage keeps pace with network growth.
+pub fn dynamic_fan_out(estimated_network_size: usize, base: usize, max_fan: usize) -> usize {
+    if estimated_network_size <= 1_000 {
+        return base;
+    }
+    let log_ratio = ((estimated_network_size as f64).ln() / 100_f64.ln()).ceil() as usize;
+    base.saturating_add(log_ratio).min(max_fan)
+}
+
 /// Select R random peer indices that are NOT in the `exclude` set.
 ///
 /// Uses Fisher-Yates partial shuffle for O(R) performance.
@@ -245,5 +258,20 @@ mod tests {
         let exclude = vec![0, 1, 2];
         let result = random_fan_out(3, &exclude, 2);
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn dynamic_fan_out_stays_at_base_for_small_networks() {
+        assert_eq!(dynamic_fan_out(100, 4, 12), 4);
+        assert_eq!(dynamic_fan_out(1_000, 4, 12), 4);
+    }
+
+    #[test]
+    fn dynamic_fan_out_grows_with_network_size() {
+        let f_10k = dynamic_fan_out(10_000, 4, 12);
+        let f_1m = dynamic_fan_out(1_000_000, 4, 12);
+        assert!(f_10k > 4, "should grow beyond base at 10K nodes");
+        assert!(f_1m > f_10k, "should grow further at 1M nodes");
+        assert!(f_1m <= 12, "should not exceed max_fan");
     }
 }

@@ -24,6 +24,10 @@ pub struct BillFold {
     /// The sender can release them on retraction.
     #[serde(default)]
     reserved: HashSet<[u8; 32]>,
+    /// Unix timestamp (seconds) when each bill was reserved.
+    /// Used to auto-release after the limbo TTL expires.
+    #[serde(default)]
+    reserve_times: HashMap<[u8; 32], u64>,
     /// ML-DSA-65 spend credentials keyed by mint_id.
     /// Required to sign ownership transfers.
     #[serde(default)]
@@ -36,6 +40,7 @@ impl BillFold {
         Self {
             bills: Vec::new(),
             reserved: HashSet::new(),
+            reserve_times: HashMap::new(),
             spend_credentials: HashMap::new(),
         }
     }
@@ -130,9 +135,11 @@ impl BillFold {
 
     /// Reserve mint_ids (bills are in-flight or limbo).
     /// Reserved bills remain in the billfold but are excluded from selection.
-    pub fn reserve(&mut self, mint_ids: &[[u8; 32]]) {
+    /// `now` is the current Unix timestamp in seconds.
+    pub fn reserve(&mut self, mint_ids: &[[u8; 32]], now: u64) {
         for mid in mint_ids {
             self.reserved.insert(*mid);
+            self.reserve_times.insert(*mid, now);
         }
     }
 
@@ -140,7 +147,24 @@ impl BillFold {
     pub fn release(&mut self, mint_ids: &[[u8; 32]]) {
         for mid in mint_ids {
             self.reserved.remove(mid);
+            self.reserve_times.remove(mid);
         }
+    }
+
+    /// Release all reservations older than `ttl_secs`.
+    /// Returns the mint_ids that were released.
+    pub fn release_expired(&mut self, ttl_secs: u64, now: u64) -> Vec<[u8; 32]> {
+        let expired: Vec<[u8; 32]> = self
+            .reserve_times
+            .iter()
+            .filter(|(_, &ts)| now.saturating_sub(ts) > ttl_secs)
+            .map(|(mid, _)| *mid)
+            .collect();
+        for mid in &expired {
+            self.reserved.remove(mid);
+            self.reserve_times.remove(mid);
+        }
+        expired
     }
 
     /// Bills available for spending (excludes reserved).
@@ -167,6 +191,11 @@ impl BillFold {
     /// Check if a mint_id is reserved.
     pub fn is_reserved(&self, mint_id: &[u8; 32]) -> bool {
         self.reserved.contains(mint_id)
+    }
+
+    /// Read-only access to the reserved set.
+    pub fn reserved_set(&self) -> &HashSet<[u8; 32]> {
+        &self.reserved
     }
 }
 

@@ -133,6 +133,7 @@ async fn payment_message_survives_wire_roundtrip() {
         created_at: now_unix(),
         mint_ids: vec![bill.mint_id],
         denomination_values: vec![bill.denomination.value()],
+        bill_count: 1,
     });
 
     node_a.send_message(addr_b, &payment).await.unwrap();
@@ -281,6 +282,7 @@ async fn three_node_relay() {
         created_at: now_unix(),
         mint_ids: vec![bill.mint_id],
         denomination_values: vec![10],
+        bill_count: 1,
     });
 
     node_a.send_message(addr_b, &payment_msg).await.unwrap();

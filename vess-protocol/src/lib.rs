@@ -132,9 +132,11 @@ pub enum PulseMessage {
 
 /// A stealth-encrypted payment from sender to recipient.
 ///
-/// In addition to the encrypted payload, each Payment carries public
-/// relay metadata so that intermediate nodes can verify the bills
-/// are unspent without decrypting anything.
+/// The stealth payload carries all bill data encrypted to the recipient.
+/// Relay metadata is intentionally minimal to prevent passive traffic
+/// analysis — `mint_ids` and `denomination_values` are **deprecated**
+/// (privacy leak) and should be left empty.  Use `bill_count` for
+/// relay-side accounting without revealing bill identities.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Payment {
     /// Unique payment ID for tracking in-flight state.
@@ -148,14 +150,21 @@ pub struct Payment {
     pub stealth_id: [u8; 32],
     /// Unix timestamp when payment was created.
     pub created_at: u64,
-    /// Public bill identifiers (mint_ids) for each bill in the payment.
-    /// Relay nodes use these to check the ownership registry — if any
-    /// mint_id is not active, the payment is rejected.
+    /// **Deprecated — privacy leak.**  Cleartext bill identifiers allow
+    /// relay nodes to track bill movements across transfers.  Leave empty;
+    /// relay nodes should use `bill_count` and `payment_id` instead.
     #[serde(default)]
     pub mint_ids: Vec<[u8; 32]>,
-    /// Denomination values of the bills (parallel to `bill_ids`).
+    /// **Deprecated — privacy leak.**  Cleartext denomination values
+    /// expose exact payment amounts to every relay.  Leave empty.
     #[serde(default)]
     pub denomination_values: Vec<u64>,
+    /// Number of bills in this payment (relay-safe metadata).
+    ///
+    /// Relays use this for lightweight accounting and rate limiting
+    /// without learning which specific bills are being transferred.
+    #[serde(default)]
+    pub bill_count: u8,
 }
 
 // ── Tag Operations ───────────────────────────────────────────────────
@@ -163,8 +172,8 @@ pub struct Payment {
 /// Register a VessTag by computing an Argon2id proof-of-work.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TagRegister {
-    /// The tag being registered.
-    pub tag: String,
+    /// Blake3 hash of the tag string (plaintext never leaves the client).
+    pub tag_hash: [u8; 32],
     /// Scan encapsulation key (public).
     pub scan_ek: Vec<u8>,
     /// Spend encapsulation key (public).
@@ -186,8 +195,8 @@ pub struct TagRegister {
 /// Query a VessTag's associated stealth address.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TagLookup {
-    /// The tag to look up (without + prefix).
-    pub tag: String,
+    /// Blake3 hash of the tag to look up (plaintext never sent over wire).
+    pub tag_hash: [u8; 32],
     /// Nonce for request deduplication.
     pub nonce: [u8; 16],
 }
@@ -195,8 +204,8 @@ pub struct TagLookup {
 /// Response to a tag lookup.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TagLookupResponse {
-    /// The tag that was queried.
-    pub tag: String,
+    /// Blake3 hash of the tag that was queried.
+    pub tag_hash: [u8; 32],
     /// The lookup nonce (echoed).
     pub nonce: [u8; 16],
     /// The result — None if tag not found.
@@ -412,8 +421,8 @@ pub struct LimboDeliver {
 /// DHT key, achieving 16× replication like bills.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TagStore {
-    /// The tag string.
-    pub tag: String,
+    /// Blake3 hash of the tag string (plaintext never sent over wire).
+    pub tag_hash: [u8; 32],
     /// Scan encapsulation key (from the master stealth address).
     pub scan_ek: Vec<u8>,
     /// Spend encapsulation key (from the master stealth address).
@@ -447,13 +456,13 @@ pub struct TagStore {
 /// pruned after 30 days.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TagConfirm {
-    /// The tag to confirm/harden.
-    pub tag: String,
+    /// Blake3 hash of the tag to confirm/harden.
+    pub tag_hash: [u8; 32],
     /// A mint_id that exists in the ownership registry (proof a real spend happened).
     pub mint_id: [u8; 32],
     /// ML-DSA-65 verification key of the registrant (must match the tag record).
     pub registrant_vk: Vec<u8>,
-    /// ML-DSA-65 signature over `Blake3("vess-tag-confirm-v1" || tag || mint_id)`.
+    /// ML-DSA-65 signature over `Blake3("vess-tag-confirm-v1" || tag_hash || mint_id)`.
     pub signature: Vec<u8>,
     /// Remaining gossip hops (decremented each forward).
     pub hops_remaining: u8,
@@ -729,6 +738,7 @@ mod tests {
             created_at: 1000,
             mint_ids: vec![[0x11; 32]],
             denomination_values: vec![10],
+            bill_count: 1,
         });
         let bytes = msg.to_bytes().unwrap();
         let decoded = PulseMessage::from_bytes(&bytes).unwrap();
@@ -743,14 +753,15 @@ mod tests {
 
     #[test]
     fn tag_lookup_round_trip() {
+        let tag_hash = *blake3::hash(b"alice").as_bytes();
         let msg = PulseMessage::TagLookup(TagLookup {
-            tag: "alice".into(),
+            tag_hash,
             nonce: [0xFF; 16],
         });
         let bytes = msg.to_bytes().unwrap();
         let decoded = PulseMessage::from_bytes(&bytes).unwrap();
         match decoded {
-            PulseMessage::TagLookup(t) => assert_eq!(t.tag, "alice"),
+            PulseMessage::TagLookup(t) => assert_eq!(t.tag_hash, tag_hash),
             _ => panic!("wrong variant"),
         }
     }

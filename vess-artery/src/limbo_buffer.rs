@@ -289,6 +289,7 @@ mod tests {
             created_at: 1000,
             mint_ids: bill_ids.to_vec(),
             denomination_values: vec![denom; bill_ids.len()],
+            bill_count: bill_ids.len() as u8,
         }
     }
 

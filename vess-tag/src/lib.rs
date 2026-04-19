@@ -104,11 +104,11 @@ pub const TAG_POW_HASH_LEN: usize = 32;
 
 /// Build the Argon2id password input for a tag PoW.
 ///
-/// `password = "vess-tag-pow-v1" || tag_bytes || scan_ek || spend_ek`
-fn pow_password(tag: &VessTag, scan_ek: &[u8], spend_ek: &[u8]) -> Vec<u8> {
-    let mut pwd = Vec::with_capacity(16 + tag.as_str().len() + scan_ek.len() + spend_ek.len());
-    pwd.extend_from_slice(b"vess-tag-pow-v1\0");
-    pwd.extend_from_slice(tag.as_str().as_bytes());
+/// `password = "vess-tag-pow-v2" || tag_hash || scan_ek || spend_ek`
+fn pow_password(tag_hash: &[u8; 32], scan_ek: &[u8], spend_ek: &[u8]) -> Vec<u8> {
+    let mut pwd = Vec::with_capacity(16 + 32 + scan_ek.len() + spend_ek.len());
+    pwd.extend_from_slice(b"vess-tag-pow-v2\0");
+    pwd.extend_from_slice(tag_hash);
     pwd.extend_from_slice(scan_ek);
     pwd.extend_from_slice(spend_ek);
     pwd
@@ -120,12 +120,12 @@ fn pow_password(tag: &VessTag, scan_ek: &[u8], spend_ek: &[u8]) -> Vec<u8> {
 /// is the 32-byte Argon2id output.  This function is deliberately
 /// expensive (~10 s, 2 GiB RAM) — that cost IS the anti-spam mechanism.
 pub fn compute_tag_pow(
-    tag: &VessTag,
+    tag_hash: &[u8; 32],
     scan_ek: &[u8],
     spend_ek: &[u8],
 ) -> Result<([u8; 32], Vec<u8>)> {
     let nonce: [u8; 32] = rand::random();
-    let password = pow_password(tag, scan_ek, spend_ek);
+    let password = pow_password(tag_hash, scan_ek, spend_ek);
 
     let params = argon2::Params::new(TAG_POW_M_COST, TAG_POW_T_COST, TAG_POW_P_COST, Some(TAG_POW_HASH_LEN))
         .map_err(|e| anyhow!("argon2 params: {e}"))?;
@@ -145,7 +145,7 @@ pub fn compute_tag_pow(
 /// `expected_hash`.  This is as expensive as computing the PoW (~10 s,
 /// 2 GiB RAM).
 pub fn verify_tag_pow(
-    tag: &VessTag,
+    tag_hash: &[u8; 32],
     scan_ek: &[u8],
     spend_ek: &[u8],
     nonce: &[u8; 32],
@@ -155,7 +155,7 @@ pub fn verify_tag_pow(
         return Ok(false);
     }
 
-    let password = pow_password(tag, scan_ek, spend_ek);
+    let password = pow_password(tag_hash, scan_ek, spend_ek);
 
     let params = argon2::Params::new(TAG_POW_M_COST, TAG_POW_T_COST, TAG_POW_P_COST, Some(TAG_POW_HASH_LEN))
         .map_err(|e| anyhow!("argon2 params: {e}"))?;
@@ -173,12 +173,12 @@ pub fn verify_tag_pow(
 /// so unit tests finish in milliseconds.
 #[cfg(any(test, feature = "test-pow"))]
 pub fn compute_tag_pow_test(
-    tag: &VessTag,
+    tag_hash: &[u8; 32],
     scan_ek: &[u8],
     spend_ek: &[u8],
 ) -> Result<([u8; 32], Vec<u8>)> {
     let nonce: [u8; 32] = rand::random();
-    let password = pow_password(tag, scan_ek, spend_ek);
+    let password = pow_password(tag_hash, scan_ek, spend_ek);
 
     let params = argon2::Params::new(64, 1, 1, Some(TAG_POW_HASH_LEN))
         .map_err(|e| anyhow!("argon2 params: {e}"))?;
@@ -195,7 +195,7 @@ pub fn compute_tag_pow_test(
 /// Verify a PoW hash with **test-friendly** parameters (tiny memory).
 #[cfg(any(test, feature = "test-pow"))]
 pub fn verify_tag_pow_test(
-    tag: &VessTag,
+    tag_hash: &[u8; 32],
     scan_ek: &[u8],
     spend_ek: &[u8],
     nonce: &[u8; 32],
@@ -204,7 +204,7 @@ pub fn verify_tag_pow_test(
     if expected_hash.len() != TAG_POW_HASH_LEN {
         return Ok(false);
     }
-    let password = pow_password(tag, scan_ek, spend_ek);
+    let password = pow_password(tag_hash, scan_ek, spend_ek);
 
     let params = argon2::Params::new(64, 1, 1, Some(TAG_POW_HASH_LEN))
         .map_err(|e| anyhow!("argon2 params: {e}"))?;
@@ -232,11 +232,13 @@ pub fn address_fingerprint(addr: &MasterStealthAddress) -> [u8; 32] {
 /// A VessTag registration record stored in the DHT.
 ///
 /// Small enough to replicate across K artery nodes responsible for the
-/// tag's DHT region.
+/// tag's DHT region. The plaintext tag name never leaves the client —
+/// only the Blake3 hash is stored and transmitted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TagRecord {
-    /// The validated tag string.
-    pub tag: VessTag,
+    /// Blake3 hash of the tag string. The plaintext is never stored
+    /// on relay nodes, preventing tag → address correlation by observers.
+    pub tag_hash: [u8; 32],
     /// The owner's master stealth address (scan + spend public keys).
     pub master_address: MasterStealthAddress,
     /// Random 32-byte nonce used as salt for the Argon2id PoW.
@@ -264,8 +266,8 @@ impl TagRecord {
     /// Includes registrant_vk so the signature is self-authenticating.
     pub fn digest(&self) -> [u8; 32] {
         let mut h = Hasher::new();
-        h.update(b"vess-tag-record-v2");
-        h.update(self.tag.as_str().as_bytes());
+        h.update(b"vess-tag-record-v3");
+        h.update(&self.tag_hash);
         h.update(&self.master_address.scan_ek);
         h.update(&self.master_address.spend_ek);
         h.update(&self.pow_nonce);
@@ -275,9 +277,9 @@ impl TagRecord {
         *h.finalize().as_bytes()
     }
 
-    /// DHT key for this record (same as the tag's DHT key).
+    /// DHT key for this record (same as the tag hash).
     pub fn dht_key(&self) -> [u8; 32] {
-        self.tag.dht_key()
+        self.tag_hash
     }
 
     /// Blake3 fingerprint of this record's master stealth address.
@@ -291,8 +293,8 @@ impl TagRecord {
 /// A request to register a VessTag, broadcast to artery nodes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TagRegistration {
-    /// The desired tag.
-    pub tag: VessTag,
+    /// Blake3 hash of the desired tag.
+    pub tag_hash: [u8; 32],
     /// The owner's master stealth address.
     pub master_address: MasterStealthAddress,
     /// Random 32-byte nonce (salt) for the Argon2id PoW.
@@ -369,25 +371,27 @@ mod tests {
     #[test]
     fn pow_compute_and_verify() {
         let tag = VessTag::new("alice").unwrap();
+        let tag_hash = tag.dht_key();
         let (_s, addr) = vess_stealth::generate_master_keys();
 
-        let (nonce, hash) = compute_tag_pow_test(&tag, &addr.scan_ek, &addr.spend_ek).unwrap();
+        let (nonce, hash) = compute_tag_pow_test(&tag_hash, &addr.scan_ek, &addr.spend_ek).unwrap();
         assert_eq!(hash.len(), TAG_POW_HASH_LEN);
 
-        let ok = verify_tag_pow_test(&tag, &addr.scan_ek, &addr.spend_ek, &nonce, &hash).unwrap();
+        let ok = verify_tag_pow_test(&tag_hash, &addr.scan_ek, &addr.spend_ek, &nonce, &hash).unwrap();
         assert!(ok);
 
         // Wrong nonce → different hash → fails.
         let bad_nonce = [0xFF; 32];
-        let bad = verify_tag_pow_test(&tag, &addr.scan_ek, &addr.spend_ek, &bad_nonce, &hash).unwrap();
+        let bad = verify_tag_pow_test(&tag_hash, &addr.scan_ek, &addr.spend_ek, &bad_nonce, &hash).unwrap();
         assert!(!bad);
     }
 
     #[test]
     fn registration_invalid_pow_hash_length() {
         let (_s, addr) = vess_stealth::generate_master_keys();
+        let tag_hash = VessTag::new("abc").unwrap().dht_key();
         let reg = TagRegistration {
-            tag: VessTag::new("abc").unwrap(),
+            tag_hash,
             master_address: addr,
             pow_nonce: [0x00; 32],
             pow_hash: vec![0u8; 16], // too short
@@ -398,8 +402,9 @@ mod tests {
     #[test]
     fn registration_valid_pow_hash_length() {
         let (_s, addr) = vess_stealth::generate_master_keys();
+        let tag_hash = VessTag::new("shop99").unwrap().dht_key();
         let reg = TagRegistration {
-            tag: VessTag::new("shop99").unwrap(),
+            tag_hash,
             master_address: addr,
             pow_nonce: [0x00; 32],
             pow_hash: vec![0u8; 32],
@@ -426,8 +431,9 @@ mod tests {
     #[test]
     fn tag_record_digest_changes_with_content() {
         let (_s, addr) = vess_stealth::generate_master_keys();
+        let tag_hash = VessTag::new("alice").unwrap().dht_key();
         let r1 = TagRecord {
-            tag: VessTag::new("alice").unwrap(),
+            tag_hash,
             master_address: addr.clone(),
             pow_nonce: [0x01; 32],
             pow_hash: vec![0xAA; 32],
@@ -437,7 +443,7 @@ mod tests {
             hardened_at: None,
         };
         let r2 = TagRecord {
-            tag: VessTag::new("alice").unwrap(),
+            tag_hash,
             master_address: addr,
             pow_nonce: [0x02; 32],
             pow_hash: vec![0xBB; 32],
@@ -451,13 +457,13 @@ mod tests {
 
     #[test]
     fn pow_verify_rejects_wrong_tag() {
-        let tag1 = VessTag::new("alice").unwrap();
-        let tag2 = VessTag::new("bob").unwrap();
+        let tag1_hash = VessTag::new("alice").unwrap().dht_key();
+        let tag2_hash = VessTag::new("bob").unwrap().dht_key();
         let (_s, addr) = vess_stealth::generate_master_keys();
 
-        let (nonce, hash) = compute_tag_pow_test(&tag1, &addr.scan_ek, &addr.spend_ek).unwrap();
+        let (nonce, hash) = compute_tag_pow_test(&tag1_hash, &addr.scan_ek, &addr.spend_ek).unwrap();
         // Verify with different tag → fails.
-        let ok = verify_tag_pow_test(&tag2, &addr.scan_ek, &addr.spend_ek, &nonce, &hash).unwrap();
+        let ok = verify_tag_pow_test(&tag2_hash, &addr.scan_ek, &addr.spend_ek, &nonce, &hash).unwrap();
         assert!(!ok);
     }
 }
