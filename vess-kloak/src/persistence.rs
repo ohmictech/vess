@@ -3,8 +3,10 @@
 //! The wallet file contains:
 //! - Encrypted ML-KEM secret keys (protected by recovery phrase).
 //! - Public master stealth address (plaintext, for receiving).
-//! - BillFold contents (plaintext — bills are public after mint).
+//! - BillFold contents (bills are public after mint, but spend credentials are encrypted).
 //! - Encrypted spend seed (protected by recovery-phrase-derived key).
+//! - Encrypted spend credentials (ML-DSA-65 signing keys for each bill).
+//! - Encrypted tag registrant signing key.
 
 use std::path::Path;
 
@@ -16,6 +18,42 @@ use crate::billfold::BillFold;
 use crate::recovery::EncryptedSecrets;
 use vess_stealth::MasterStealthAddress;
 
+/// Generic AEAD-encrypted blob (ChaCha20-Poly1305).
+#[derive(Clone, Serialize, Deserialize)]
+pub struct EncryptedBlob {
+    pub ciphertext: Vec<u8>,
+    pub nonce: [u8; 12],
+}
+
+impl EncryptedBlob {
+    /// Encrypt arbitrary bytes under a 32-byte key.
+    pub fn encrypt(plaintext: &[u8], enc_key: &[u8; 32]) -> Result<Self> {
+        use chacha20poly1305::{aead::{Aead, KeyInit, generic_array::GenericArray}, ChaCha20Poly1305};
+        use rand::RngCore;
+
+        let cipher = ChaCha20Poly1305::new(GenericArray::from_slice(enc_key));
+        let mut nonce_bytes = [0u8; 12];
+        rand::thread_rng().fill_bytes(&mut nonce_bytes);
+        let nonce = GenericArray::from_slice(&nonce_bytes);
+
+        let ciphertext = cipher.encrypt(nonce, plaintext)
+            .map_err(|e| anyhow::anyhow!("encryption failed: {e}"))?;
+
+        Ok(Self { ciphertext, nonce: nonce_bytes })
+    }
+
+    /// Decrypt to raw bytes.
+    pub fn decrypt(&self, enc_key: &[u8; 32]) -> Result<Vec<u8>> {
+        use chacha20poly1305::{aead::{Aead, KeyInit, generic_array::GenericArray}, ChaCha20Poly1305};
+
+        let cipher = ChaCha20Poly1305::new(GenericArray::from_slice(enc_key));
+        let nonce = GenericArray::from_slice(&self.nonce);
+
+        cipher.decrypt(nonce, self.ciphertext.as_slice())
+            .map_err(|e| anyhow::anyhow!("decryption failed (wrong key?): {e}"))
+    }
+}
+
 /// On-disk wallet file format.
 #[derive(Serialize, Deserialize)]
 pub struct WalletFile {
@@ -25,7 +63,8 @@ pub struct WalletFile {
     pub master_address: MasterStealthAddress,
     /// Encrypted secret keys (requires recovery phrase to decrypt).
     pub encrypted_secrets: EncryptedSecrets,
-    /// The billfold (unencrypted — bills are publicly visible post-mint).
+    /// The billfold (bills are publicly visible post-mint, but spend
+    /// credentials are stripped and stored encrypted separately).
     pub billfold: BillFold,
     /// Encrypted spend seed (ChaCha20-Poly1305, keyed from recovery phrase).
     /// Replaces the old plaintext `spend_seed` field.
@@ -39,13 +78,20 @@ pub struct WalletFile {
     #[serde(default)]
     pub next_dht_index: u64,
 
-    /// ML-DSA-65 verification key used for VessTag registration.
-    /// Stored so the owner can later confirm (harden) the tag.
+    /// ML-DSA-65 verification key used for VessTag registration (public).
     #[serde(default)]
     pub tag_registrant_vk: Vec<u8>,
-    /// ML-DSA-65 signing key used for VessTag registration.
-    #[serde(default)]
+    /// Legacy plaintext tag signing key — only read for migration.
+    #[serde(default, skip_serializing)]
     pub tag_registrant_sk: Vec<u8>,
+    /// Encrypted ML-DSA-65 tag signing key.
+    #[serde(default)]
+    pub encrypted_tag_sk: Option<EncryptedBlob>,
+
+    /// Encrypted spend credentials (ML-DSA-65 signing keys for each bill).
+    /// Keyed by mint_id, serialized via serde_json then AEAD-encrypted.
+    #[serde(default)]
+    pub encrypted_spend_credentials: Option<EncryptedBlob>,
 
     /// Password-encrypted copy of the encryption key for fast daily unlock.
     /// Set via `vess init --password` or `vess set-password`.
@@ -118,6 +164,8 @@ impl WalletFile {
             next_dht_index: 0,
             tag_registrant_vk: Vec::new(),
             tag_registrant_sk: Vec::new(),
+            encrypted_tag_sk: None,
+            encrypted_spend_credentials: None,
             password_cache: None,
         })
     }
@@ -141,6 +189,62 @@ impl WalletFile {
             Ok(self.spend_seed)
         } else {
             anyhow::bail!("wallet has no spend seed (encrypted or plaintext)")
+        }
+    }
+
+    // ── Spend credential encryption ─────────────────────────────
+
+    /// Encrypt the billfold's spend credentials and store in the wallet.
+    pub fn encrypt_spend_credentials(&mut self, billfold: &BillFold, enc_key: &[u8; 32]) -> Result<()> {
+        let creds = billfold.export_credentials();
+        if creds.is_empty() {
+            self.encrypted_spend_credentials = None;
+            return Ok(());
+        }
+        let json = serde_json::to_vec(creds)
+            .context("serialize spend credentials")?;
+        self.encrypted_spend_credentials = Some(EncryptedBlob::encrypt(&json, enc_key)?);
+        Ok(())
+    }
+
+    /// Decrypt spend credentials and import them into the billfold.
+    ///
+    /// Handles migration: if the billfold already has legacy plaintext
+    /// credentials (from an old wallet), those are preserved.
+    pub fn decrypt_spend_credentials_into(&self, billfold: &mut BillFold, enc_key: &[u8; 32]) -> Result<()> {
+        if let Some(ref blob) = self.encrypted_spend_credentials {
+            let json = blob.decrypt(enc_key)?;
+            let creds: std::collections::HashMap<[u8; 32], crate::billfold::SpendCredential> =
+                serde_json::from_slice(&json).context("deserialize spend credentials")?;
+            billfold.import_credentials(creds);
+        }
+        // If no encrypted blob, the billfold may still have legacy plaintext
+        // credentials from deserialization — those remain untouched.
+        Ok(())
+    }
+
+    // ── Tag key encryption ──────────────────────────────────────
+
+    /// Encrypt and store the tag registrant signing key.
+    pub fn set_encrypted_tag_sk(&mut self, sk: &[u8], enc_key: &[u8; 32]) -> Result<()> {
+        self.encrypted_tag_sk = Some(EncryptedBlob::encrypt(sk, enc_key)?);
+        // Clear any legacy plaintext (not serialized, but zero in memory).
+        self.tag_registrant_sk = Vec::new();
+        Ok(())
+    }
+
+    /// Decrypt the tag registrant signing key.
+    ///
+    /// Handles migration: returns the legacy plaintext key if no encrypted
+    /// version exists yet.
+    pub fn decrypt_tag_sk(&self, enc_key: &[u8; 32]) -> Result<Vec<u8>> {
+        if let Some(ref blob) = self.encrypted_tag_sk {
+            blob.decrypt(enc_key)
+        } else if !self.tag_registrant_sk.is_empty() {
+            // Legacy wallet with plaintext tag SK.
+            Ok(self.tag_registrant_sk.clone())
+        } else {
+            anyhow::bail!("no tag registrant signing key (encrypted or plaintext)")
         }
     }
 

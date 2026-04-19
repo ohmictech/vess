@@ -347,7 +347,7 @@ async fn cmd_init(cli: &Cli, tag_str: &str) -> Result<()> {
         let (registrant_vk, registrant_sk) = vess_foundry::spend_auth::generate_spend_keypair();
 
         wallet.tag_registrant_vk = registrant_vk.clone();
-        wallet.tag_registrant_sk = registrant_sk.clone();
+        wallet.set_encrypted_tag_sk(&registrant_sk, &enc_key)?;
 
         let tmp_record = vess_tag::TagRecord {
             tag_hash,
@@ -862,6 +862,12 @@ async fn cmd_register_tag(cli: &Cli, tag_str: &str) -> Result<()> {
     let path = wallet_path(cli)?;
     let mut wallet = WalletFile::load(&path)?;
 
+    // Derive enc_key — needed to encrypt the new tag signing key.
+    let password = std::env::var("VESS_WALLET_PASSWORD")
+        .map_err(|_| anyhow::anyhow!("VESS_WALLET_PASSWORD required for register-tag (encrypts tag signing key)"))?;
+    let raw_seed = wallet.unlock_with_password(&password)?;
+    let enc_key = vess_kloak::recovery::encryption_key_from_seed(&raw_seed);
+
     let tag = VessTag::new(tag_str)?;
 
     println!("Registering tag {}", tag.display());
@@ -879,9 +885,9 @@ async fn cmd_register_tag(cli: &Cli, tag_str: &str) -> Result<()> {
     // Generate an ML-DSA keypair to sign the tag record.
     let (registrant_vk, registrant_sk) = vess_foundry::spend_auth::generate_spend_keypair();
 
-    // Save the registrant keypair to the wallet so we can confirm (harden) later.
+    // Save the registrant keypair (encrypted) to the wallet.
     wallet.tag_registrant_vk = registrant_vk.clone();
-    wallet.tag_registrant_sk = registrant_sk.clone();
+    wallet.set_encrypted_tag_sk(&registrant_sk, &enc_key)?;
     wallet.save(&path)?;
 
     // Construct a temporary TagRecord to compute the digest for signing.

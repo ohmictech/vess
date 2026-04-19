@@ -236,6 +236,8 @@ pub(crate) struct WalletState {
     pub(crate) stealth_secret: StealthSecretKey,
     pub(crate) billfold: vess_kloak::BillFold,
     pub(crate) wallet_path: PathBuf,
+    /// Encryption key for spend credentials and tag keys on disk.
+    pub(crate) enc_key: [u8; 32],
 }
 
 /// Shared artery node state behind a mutex.
@@ -280,11 +282,16 @@ pub(crate) struct ArteryState {
 
 impl ArteryState {
     /// Persist the in-memory wallet billfold to disk immediately.
+    /// Spend credentials are encrypted before writing.
     /// No-op if no wallet is loaded.
     pub(crate) fn flush_wallet(&self) {
         if let Some(ref ws) = self.wallet {
             if let Ok(mut wf) = vess_kloak::WalletFile::load(&ws.wallet_path) {
                 wf.billfold = ws.billfold.clone();
+                // Encrypt spend credentials before persisting.
+                if let Err(e) = wf.encrypt_spend_credentials(&ws.billfold, &ws.enc_key) {
+                    tracing::warn!(error = %e, "failed to encrypt spend credentials");
+                }
                 if let Err(e) = wf.save(&ws.wallet_path) {
                     tracing::warn!(error = %e, "failed to flush wallet to disk");
                 }
@@ -436,6 +443,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
     // ── Load embedded wallet (if configured) ────────────────────────
     let wallet_state = if let Some(ref wallet_path) = config.wallet_path {
         use vess_kloak::WalletFile;
+        use vess_kloak::recovery::encryption_key_from_seed;
 
         let wallet = WalletFile::load(wallet_path)?;
 
@@ -464,16 +472,23 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
             derive_raw_seed(&phrase)?
         };
 
-        // Derive stealth keys from the raw seed — instant, no decryption.
+        // Derive stealth keys and encryption key from the raw seed.
         let (stealth_secret, _address) =
             vess_stealth::generate_master_keys_from_seed(&raw_seed);
-        let billfold = wallet.billfold.clone();
+        let enc_key = encryption_key_from_seed(&raw_seed);
+
+        // Load billfold and decrypt spend credentials into it.
+        let mut billfold = wallet.billfold.clone();
+        if let Err(e) = wallet.decrypt_spend_credentials_into(&mut billfold, &enc_key) {
+            tracing::warn!(error = %e, "failed to decrypt spend credentials — wallet may be from older version");
+        }
 
         info!(path = %wallet_path.display(), "wallet loaded — auto-receive enabled");
         Some(WalletState {
             stealth_secret,
             billfold,
             wallet_path: wallet_path.clone(),
+            enc_key,
         })
     } else {
         None
@@ -2760,6 +2775,9 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
         if let Some(ref ws) = s.wallet {
             if let Ok(mut wf) = vess_kloak::WalletFile::load(&ws.wallet_path) {
                 wf.billfold = ws.billfold.clone();
+                if let Err(e) = wf.encrypt_spend_credentials(&ws.billfold, &ws.enc_key) {
+                    warn!(error = %e, "failed to encrypt spend credentials on shutdown");
+                }
                 if let Err(e) = wf.save(&ws.wallet_path) {
                     warn!(error = %e, "failed to save wallet on shutdown");
                 } else {

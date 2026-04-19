@@ -30,7 +30,8 @@ pub struct BillFold {
     reserve_times: HashMap<[u8; 32], u64>,
     /// ML-DSA-65 spend credentials keyed by mint_id.
     /// Required to sign ownership transfers.
-    #[serde(default)]
+    /// Never written to disk as plaintext — encrypted separately in WalletFile.
+    #[serde(skip_serializing, default)]
     spend_credentials: HashMap<[u8; 32], SpendCredential>,
 }
 
@@ -196,6 +197,16 @@ impl BillFold {
     /// Read-only access to the reserved set.
     pub fn reserved_set(&self) -> &HashSet<[u8; 32]> {
         &self.reserved
+    }
+
+    /// Export spend credentials for encryption before disk persistence.
+    pub fn export_credentials(&self) -> &HashMap<[u8; 32], SpendCredential> {
+        &self.spend_credentials
+    }
+
+    /// Import decrypted spend credentials (e.g. after loading from encrypted blob).
+    pub fn import_credentials(&mut self, creds: HashMap<[u8; 32], SpendCredential>) {
+        self.spend_credentials.extend(creds);
     }
 }
 

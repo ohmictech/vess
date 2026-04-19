@@ -6,6 +6,34 @@ Bills are minted via proof-of-work, owned via hash chains, and transferred throu
 
 ---
 
+## Why Vess Exists
+
+Crypto was supposed to be freedom money. It isn't.
+
+Bitcoin promised decentralization. Today 4 mining pools control over 50% of hash rate, every transaction is permanently etched in a public ledger, and chain analysis firms sell your financial history to anyone who asks. Ethereum added smart contracts and got a surveillance-friendly account model where your entire token portfolio is one subpoena away. "Privacy coins" like Monero and Zcash exist — and are being systematically delisted from every exchange under regulatory pressure, pushing users back toward the transparent chains.
+
+Meanwhile, governments are building CBDCs — Central Bank Digital Currencies — which are cashless surveillance systems with a currency symbol, using precious blockchain. Programmable money that can be frozen, expired, or restricted to approved merchants. The trajectory is clear: the financial system is converging on total visibility, whether it's run by a central bank or a public blockchain.
+
+The original cypherpunk promise — **send money like handing someone a bill, with nobody watching** — has been abandoned by every major protocol.
+
+Vess picks it up.
+
+### What's different
+
+**No ledger. No history. No trace.** There is no blockchain. No growing chain of blocks that every node must download and store forever. Bills are self-contained bearer instruments — like physical cash, they carry their own proof of value. A new node joins the network, participates fully, and never needs to download a single byte of transaction history.
+
+**Your computer mints real money.** The 1 GiB memory-hard VM means regular laptops and desktops can mint competitively. No ASIC farms. No GPU warehouses. No staking cartels. You convert your own electricity into money on your own hardware. This is the "Bitcoin in 2009" story, except the architecture is designed to keep it that way.
+
+**Privacy isn't a feature — it's the architecture.** Every payment targets a unique one-time stealth address. Human-readable names are hashed before they ever touch the network. There are no accounts to freeze, no addresses to blacklist, no transaction graph to analyze. Chain analysis doesn't work when there's no chain.
+
+**Post-quantum from day one.** Not bolted on later, not "quantum-resistant roadmap." Every signature is ML-DSA-65. Every key exchange is ML-KEM-768. When quantum computers break ECDSA (and they will), Vess doesn't need a hard fork.
+
+**Scales without the baggage.** DHT replication with k=20 means the early network (5–25 nodes) behaves like full consensus — every node sees everything. As the network grows, it naturally transitions to efficient sharded replication. No "bootstrap mode," no fragile early phase, no 500 GB initial sync.
+
+**Anyone with a phone can participate.** The 1 GiB scratchpad fits comfortably on any smartphone made in the last five years. You won't get rich mining on a phone — maybe a few cents a day. But that's the point. In economies where a dollar is a meal, the ability to create money from a device you already own, with no bank account, no KYC, no intermediary taking a cut, is the difference between participating in the financial system and being locked out of it entirely. Bitcoin mining requires a warehouse. Ethereum staking requires capital. Vess requires a phone and electricity.
+
+---
+
 ## How It Works
 
 **Minting creates value.** A memory-hard VM grinds through a 1 GiB scratchpad until it finds a nonce that satisfies a STARK-provable difficulty target. The resulting `VessBill` carries an unforgeable proof of computation tied to a denomination and owner. Difficulty is hardcoded — no adjustment, no inflation schedule, no halvings.

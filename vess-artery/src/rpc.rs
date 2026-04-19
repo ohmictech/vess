@@ -588,11 +588,16 @@ fn handle_wallet_unlock(
         Err(e) => return RpcResponse::err(format!("{e}")),
     };
 
-    // Derive stealth keys from raw_seed — instant, no decryption needed.
-    // raw_seed is NOT stored in WalletState; it is zeroized after this block.
+    // Derive stealth keys and encryption key from raw_seed.
     let (stealth_secret, _address) =
         vess_stealth::generate_master_keys_from_seed(&raw_seed);
-    let billfold = wallet.billfold.clone();
+    let enc_key = vess_kloak::recovery::encryption_key_from_seed(&raw_seed);
+
+    // Load billfold and decrypt spend credentials into it.
+    let mut billfold = wallet.billfold.clone();
+    if let Err(e) = wallet.decrypt_spend_credentials_into(&mut billfold, &enc_key) {
+        tracing::warn!(error = %e, "failed to decrypt spend credentials on unlock");
+    }
 
     // 4. Set wallet state + sweep limbo.
     let mut s = state.lock().unwrap();
@@ -600,6 +605,7 @@ fn handle_wallet_unlock(
         stealth_secret: stealth_secret.clone(),
         billfold,
         wallet_path: wallet_path.clone(),
+        enc_key,
     });
 
     // Sweep existing limbo entries through the newly unlocked wallet.
