@@ -263,6 +263,7 @@ async fn three_node_mint_send_claim() {
         1,
         &bob_address,
         &alice.credentials,
+        None,
     )
     .expect("prepare payment Alice → Bob");
 
@@ -366,6 +367,7 @@ async fn three_node_mint_send_claim() {
         1,
         &charlie_address,
         &bob.credentials,
+        None,
     )
     .expect("prepare payment Bob → Charlie");
 

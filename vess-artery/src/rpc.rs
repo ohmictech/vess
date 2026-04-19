@@ -71,7 +71,7 @@ pub enum RpcRequest {
     Balance,
     NodeInfo,
     TagLookup { tag: String },
-    Send { amount: u64, recipient: String },
+    Send { amount: u64, recipient: String, #[serde(default)] memo: Option<String> },
     WalletUnlock { password: String },
     WalletSetPassword { current_password: String, new_password: String },
     WalletLock,
@@ -234,7 +234,7 @@ fn handle_request(line: &str, state: &Arc<Mutex<ArteryState>>, senders: &QueueSe
         RpcRequest::Balance => handle_balance(state),
         RpcRequest::NodeInfo => handle_node_info(state),
         RpcRequest::TagLookup { tag } => handle_tag_lookup(state, &tag),
-        RpcRequest::Send { amount, recipient } => handle_send(state, amount, &recipient, senders),
+        RpcRequest::Send { amount, recipient, memo } => handle_send(state, amount, &recipient, memo, senders),
         RpcRequest::WalletUnlock { password } => handle_wallet_unlock(state, &password, &senders.oc_tx),
         RpcRequest::WalletSetPassword { current_password, new_password } => handle_wallet_set_password(state, &current_password, &new_password),
         RpcRequest::WalletLock => handle_wallet_lock(state),
@@ -302,6 +302,7 @@ fn handle_send(
     state: &Arc<Mutex<ArteryState>>,
     amount: u64,
     recipient_tag: &str,
+    memo: Option<String>,
     senders: &QueueSenders,
 ) -> RpcResponse {
     let tag_str = recipient_tag.strip_prefix('+').unwrap_or(recipient_tag);
@@ -341,6 +342,13 @@ fn handle_send(
             "insufficient funds: need {amount}, have {}",
             ws.billfold.balance()
         ));
+    }
+
+    // Validate memo length.
+    if let Some(ref m) = memo {
+        if m.len() > 256 {
+            return RpcResponse::err("memo exceeds 256 byte limit");
+        }
     }
 
     // ── Bill selection (excludes reserved / in-flight bills) ────────
@@ -395,6 +403,7 @@ fn handle_send(
             &send_bills,
             &recipient_address,
             &reforged_creds,
+            memo.clone(),
         ) {
             Ok(v) => v,
             Err(e) => return RpcResponse::err(format!("prepare payment failed: {e}")),
@@ -511,6 +520,7 @@ fn handle_send(
             amount,
             &recipient_address,
             &cred_map,
+            memo.clone(),
         ) {
             Ok(v) => v,
             Err(e) => return RpcResponse::err(format!("prepare payment failed: {e}")),

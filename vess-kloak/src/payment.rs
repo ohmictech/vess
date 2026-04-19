@@ -24,7 +24,8 @@ use crate::billfold::SpendCredential;
 /// Payload encrypted inside stealth addressing for ownership transfers.
 ///
 /// The sender encrypts this for the recipient. It contains the bills
-/// plus the transfer authorization signatures needed to claim ownership.
+/// plus the transfer authorization signatures needed to claim ownership,
+/// and an optional plaintext memo visible only to sender and recipient.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TransferPayload {
     /// The bills being transferred.
@@ -36,6 +37,10 @@ pub struct TransferPayload {
     pub transfer_sigs: Vec<Vec<u8>>,
     /// Unix timestamp of the transfer.
     pub timestamp: u64,
+    /// Optional end-to-end encrypted memo (e.g. order ID, invoice ref, note).
+    /// Visible only to sender and recipient. Max 256 bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memo: Option<String>,
 }
 use vess_stealth::{
     MasterStealthAddress, StealthPayload, StealthSecretKey,
@@ -194,6 +199,7 @@ pub fn prepare_payment_with_transfer(
     amount: u64,
     recipient: &MasterStealthAddress,
     credentials: &HashMap<[u8; 32], crate::billfold::SpendCredential>,
+    memo: Option<String>,
 ) -> Result<(PulseMessage, [u8; 32], Vec<usize>)> {
     let selection = select_bills(billfold.bills(), amount)?;
 
@@ -238,6 +244,7 @@ pub fn prepare_payment_with_transfer(
         sender_vks,
         transfer_sigs,
         timestamp,
+        memo: memo.clone(),
     };
 
     let plaintext = serde_json::to_vec(&transfer_payload)
@@ -269,6 +276,7 @@ pub fn prepare_payment_from_bills(
     bills: &[VessBill],
     recipient: &MasterStealthAddress,
     credentials: &HashMap<[u8; 32], crate::billfold::SpendCredential>,
+    memo: Option<String>,
 ) -> Result<(PulseMessage, [u8; 32])> {
     let bill_count = bills.len() as u8;
 
@@ -300,6 +308,7 @@ pub fn prepare_payment_from_bills(
         sender_vks,
         transfer_sigs,
         timestamp,
+        memo,
     };
 
     let plaintext = serde_json::to_vec(&transfer_payload)
@@ -377,6 +386,7 @@ pub fn prepare_direct_payment(
         sender_vks,
         transfer_sigs,
         timestamp,
+        memo: None,
     };
 
     let tp_bytes = serde_json::to_vec(&transfer_payload)

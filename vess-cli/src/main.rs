@@ -74,6 +74,9 @@ enum Command {
         amount: u64,
         /// Recipient: +tag or stealth address.
         recipient: String,
+        /// Optional encrypted memo (max 256 bytes, e.g. order ID or note).
+        #[arg(long)]
+        memo: Option<String>,
     },
 
     /// Mint new vess via proof-of-work (flow-based: mine until Ctrl+C).
@@ -169,8 +172,8 @@ async fn main() -> Result<()> {
         Command::Init { tag } => cmd_init(&cli, tag).await,
         Command::Recover { words, pin } => cmd_recover(&cli, words, pin).await,
         Command::Balance => cmd_balance(&cli).await,
-        Command::Send { amount, recipient } => {
-            cmd_send(&cli, *amount, recipient).await
+        Command::Send { amount, recipient, memo } => {
+            cmd_send(&cli, *amount, recipient, memo.as_deref()).await
         }
         Command::Mint { finalize, status } => cmd_mint(&cli, *finalize, *status).await,
         Command::RegisterTag { tag } => cmd_register_tag(&cli, tag).await,
@@ -386,22 +389,46 @@ async fn cmd_init(cli: &Cli, tag_str: &str) -> Result<()> {
         }
     }
 
-    wallet.save(&path)?;
-
     if cli.json {
+        wallet.save(&path)?;
         println!("{}", json!({
             "ok": true,
             "recovery_phrase": phrase.display_phrase(),
             "wallet_path": path.display().to_string(),
         }));
     } else {
-        println!("=== WRITE DOWN YOUR RECOVERY PHRASE ===");
-        println!();
-        println!("  {}", phrase.display_phrase());
-        println!();
+        println!("\n=== WRITE DOWN YOUR RECOVERY PHRASE ===\n");
+        println!("  {}\n", phrase.display_phrase());
         println!("This is the ONLY way to recover your wallet.");
-        println!("=========================================");
-        println!("\nWallet created at {}", path.display());
+        println!("=========================================\n");
+
+        // Require re-entry before saving.
+        use std::io::{self, Write};
+
+        println!("Please re-enter your recovery phrase to confirm you saved it.\n");
+
+        print!("Enter your 5 words (space-separated): ");
+        io::stdout().flush()?;
+        let mut words_input = String::new();
+        io::stdin().read_line(&mut words_input)?;
+
+        print!("Enter your 5-digit PIN: ");
+        io::stdout().flush()?;
+        let mut pin_input = String::new();
+        io::stdin().read_line(&mut pin_input)?;
+
+        let words_match = words_input.trim().split_whitespace().collect::<Vec<_>>()
+            == phrase.words;
+        let pin_match = pin_input.trim() == phrase.pin;
+
+        if !words_match || !pin_match {
+            anyhow::bail!(
+                "recovery phrase verification failed — wallet NOT saved. Run `vess init` again."
+            );
+        }
+
+        wallet.save(&path)?;
+        println!("Recovery phrase verified. Wallet created at {}", path.display());
     }
 
     Ok(())
@@ -628,13 +655,17 @@ async fn cmd_balance(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_send(cli: &Cli, amount: u64, recipient_id: &str) -> Result<()> {
+async fn cmd_send(cli: &Cli, amount: u64, recipient_id: &str, memo: Option<&str>) -> Result<()> {
     let port = rpc_port(cli);
-    let resp = rpc_call(port, &json!({
+    let mut req = json!({
         "method": "send",
         "amount": amount,
         "recipient": recipient_id,
-    })).await?;
+    });
+    if let Some(m) = memo {
+        req["memo"] = json!(m);
+    }
+    let resp = rpc_call(port, &req).await?;
     if resp["ok"] == true {
         if cli.json {
             println!("{resp}");
