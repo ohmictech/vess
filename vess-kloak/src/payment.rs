@@ -39,7 +39,7 @@ pub struct TransferPayload {
     pub timestamp: u64,
     /// Optional end-to-end encrypted memo (e.g. order ID, invoice ref, note).
     /// Visible only to sender and recipient. Max 256 bytes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub memo: Option<String>,
 }
 use vess_stealth::{
@@ -164,7 +164,7 @@ pub fn prepare_payment(
     let bill_count = bill_data.len() as u8;
 
     // Serialize bill data for the stealth payload.
-    let plaintext = serde_json::to_vec(&bill_data)
+    let plaintext = postcard::to_allocvec(&bill_data)
         .map_err(|e| anyhow!("serialize bills: {e}"))?;
 
     let stealth = prepare_stealth_payload(recipient, &plaintext)?;
@@ -173,7 +173,7 @@ pub fn prepare_payment(
 
     let msg = PulseMessage::Payment(Payment {
         payment_id,
-        stealth_payload: serde_json::to_vec(&stealth)
+        stealth_payload: postcard::to_allocvec(&stealth)
             .map_err(|e| anyhow!("serialize stealth payload: {e}"))?,
         view_tag: stealth.view_tag,
         stealth_id: stealth.stealth_id,
@@ -247,7 +247,7 @@ pub fn prepare_payment_with_transfer(
         memo: memo.clone(),
     };
 
-    let plaintext = serde_json::to_vec(&transfer_payload)
+    let plaintext = postcard::to_allocvec(&transfer_payload)
         .map_err(|e| anyhow!("serialize transfer payload: {e}"))?;
 
     let stealth = stealth_ctx.encrypt(&plaintext)?;
@@ -255,7 +255,7 @@ pub fn prepare_payment_with_transfer(
 
     let msg = PulseMessage::Payment(Payment {
         payment_id,
-        stealth_payload: serde_json::to_vec(&stealth)
+        stealth_payload: postcard::to_allocvec(&stealth)
             .map_err(|e| anyhow!("serialize stealth payload: {e}"))?,
         view_tag: stealth.view_tag,
         stealth_id: stealth.stealth_id,
@@ -311,7 +311,7 @@ pub fn prepare_payment_from_bills(
         memo,
     };
 
-    let plaintext = serde_json::to_vec(&transfer_payload)
+    let plaintext = postcard::to_allocvec(&transfer_payload)
         .map_err(|e| anyhow!("serialize transfer payload: {e}"))?;
 
     let stealth = stealth_ctx.encrypt(&plaintext)?;
@@ -319,7 +319,7 @@ pub fn prepare_payment_from_bills(
 
     let msg = PulseMessage::Payment(Payment {
         payment_id,
-        stealth_payload: serde_json::to_vec(&stealth)
+        stealth_payload: postcard::to_allocvec(&stealth)
             .map_err(|e| anyhow!("serialize stealth payload: {e}"))?,
         view_tag: stealth.view_tag,
         stealth_id: stealth.stealth_id,
@@ -389,7 +389,7 @@ pub fn prepare_direct_payment(
         memo: None,
     };
 
-    let tp_bytes = serde_json::to_vec(&transfer_payload)
+    let tp_bytes = postcard::to_allocvec(&transfer_payload)
         .map_err(|e| anyhow!("serialize transfer payload: {e}"))?;
 
     let payment_id = {
@@ -424,7 +424,7 @@ pub fn receive_direct_payment(
     dp: &vess_protocol::DirectPayment,
 ) -> Result<TransferClaimResult> {
     // Deserialize the TransferPayload.
-    let payload: TransferPayload = serde_json::from_slice(&dp.transfer_payload)
+    let payload: TransferPayload = postcard::from_bytes(&dp.transfer_payload)
         .map_err(|e| anyhow!("deserialize transfer payload: {e}"))?;
 
     // Sanity: array lengths must match.
@@ -460,7 +460,7 @@ pub fn try_decrypt_stealth_payload(
     stealth_payload: &[u8],
 ) -> Result<Option<Vec<VessBill>>> {
     // Deserialize the stealth payload.
-    let stealth: StealthPayload = serde_json::from_slice(stealth_payload)
+    let stealth: StealthPayload = postcard::from_bytes(stealth_payload)
         .map_err(|e| anyhow!("deserialize stealth payload: {e}"))?;
 
     // Quick scan.
@@ -471,7 +471,7 @@ pub fn try_decrypt_stealth_payload(
     // Full decrypt.
     let (plaintext, _stealth_id) = open_stealth_payload(secret, &stealth)?;
 
-    let bills: Vec<VessBill> = serde_json::from_slice(&plaintext)
+    let bills: Vec<VessBill> = postcard::from_bytes(&plaintext)
         .map_err(|e| anyhow!("deserialize bills: {e}"))?;
 
     Ok(Some(bills))
@@ -486,7 +486,7 @@ pub fn try_decrypt_transfer_payload(
     secret: &StealthSecretKey,
     stealth_payload: &[u8],
 ) -> Result<Option<DecryptedTransfer>> {
-    let stealth: StealthPayload = serde_json::from_slice(stealth_payload)
+    let stealth: StealthPayload = postcard::from_bytes(stealth_payload)
         .map_err(|e| anyhow!("deserialize stealth payload: {e}"))?;
 
     if !scan_view_tag(secret, &stealth.ct_scan, stealth.view_tag)? {
@@ -495,7 +495,7 @@ pub fn try_decrypt_transfer_payload(
 
     let (plaintext, stealth_id) = open_stealth_payload(secret, &stealth)?;
 
-    let tp = serde_json::from_slice::<TransferPayload>(&plaintext)
+    let tp = postcard::from_bytes::<TransferPayload>(&plaintext)
         .map_err(|e| anyhow!("stealth payload decrypted but not a valid TransferPayload: {e}"))?;
     Ok(Some(DecryptedTransfer::WithAuth(tp, stealth_id)))
 }
@@ -595,7 +595,7 @@ pub fn claim_transfer_bills(
             kh.update(&bill.mint_id);
             kh.update(b"vess-claim-bill-v0");
             let key = kh.finalize();
-            let bill_bytes = serde_json::to_vec(&bill).unwrap_or_default();
+            let bill_bytes = postcard::to_allocvec(&bill).unwrap_or_default();
             // Simple XOR-mask for lightweight confidentiality — the true
             // security comes from DKSAP (only recipient knows stealth_id
             // secret key). The mask prevents casual inspection by DHT nodes.
