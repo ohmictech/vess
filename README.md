@@ -1,6 +1,6 @@
 # Vess Protocol
 
-Post-quantum digital cash. No blockchain. Deterministic finality in under one second. Unlimited throughput.
+Post-quantum digital cash. No blockchain. Deterministic finality in under one second. Unlimited throughput. Zero fees.
 
 Bills are minted via proof-of-work, owned via hash chains, and transferred through a peer-to-peer mesh. Payments settle the moment the recipient claims the bill — no block confirmations, no epochs, no probabilistic waiting. Throughput has no protocol ceiling because there is no shared ledger to bottleneck: every payment is an independent message between two peers. All cryptography is post-quantum. There is no consensus mechanism because there is nothing to reach consensus about.
 
