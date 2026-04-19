@@ -117,6 +117,9 @@ vess send 50 +alice
 # Send directly to a specific node (instant IRL payments, no mesh relay)
 vess send 50 +alice --node-direct <hex_node_id>
 
+# Recover a wallet from its 5-word recovery phrase + PIN
+vess recover --words "apple brave clock delta echo" --pin 83921
+
 # Mint new bills (writes session to disk, Ctrl+C to stop)
 vess mint
 vess mint --finalize   # aggregate solves into bills and register ownership
