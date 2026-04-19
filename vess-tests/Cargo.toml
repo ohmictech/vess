@@ -1,0 +1,21 @@
+[package]
+name = "vess-tests"
+version = "0.1.0"
+edition = "2021"
+license-file = "../LICENSE"
+publish = false
+
+[dependencies]
+vess-vascular = { path = "../vess-vascular" }
+vess-artery = { path = "../vess-artery", features = ["test-pow", "test-mint"] }
+vess-kloak = { path = "../vess-kloak" }
+vess-foundry = { path = "../vess-foundry", features = ["test-mint"] }
+vess-stealth = { path = "../vess-stealth" }
+vess-tag = { path = "../vess-tag", features = ["test-pow"] }
+vess-protocol = { path = "../vess-protocol" }
+rand = "0.8"
+blake3 = "1"
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tempfile = "3"
+iroh = "0.97"

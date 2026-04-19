@@ -1,0 +1,12 @@
+[package]
+name = "vess-vascular"
+version = "0.1.0"
+edition = "2021"
+license-file = "../LICENSE"
+
+[dependencies]
+vess-protocol = { path = "../vess-protocol" }
+iroh = { version = "0.97", features = ["address-lookup-mdns"] }
+anyhow = "1"
+tracing = "0.1"
+tokio = { version = "1", features = ["rt", "macros"] }

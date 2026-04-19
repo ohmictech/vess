@@ -1,0 +1,14 @@
+# Allowed protocol version hashes (one hex-encoded hash per line).
+#
+# The current build's PROTOCOL_VERSION_HASH is ALWAYS accepted
+# regardless of this file.  List previous version hashes here
+# during rolling upgrades so that peers running older builds
+# are still admitted until the network has fully migrated.
+#
+# After all nodes have upgraded, remove old hashes from this file.
+#
+# Format: 64-character lowercase hex string (32 bytes).
+# Lines starting with # and blank lines are ignored.
+#
+# Example:
+# a1b2c3d4e5f6...  (64 hex chars)

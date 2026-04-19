@@ -1,0 +1,17 @@
+[package]
+name = "vess-tag"
+version = "0.1.0"
+edition = "2021"
+license-file = "../LICENSE"
+
+[features]
+test-pow = []
+
+[dependencies]
+vess-stealth = { path = "../vess-stealth" }
+vess-foundry = { path = "../vess-foundry" }
+blake3 = "1"
+serde = { version = "1", features = ["derive"] }
+anyhow = "1"
+argon2 = "0.5"
+rand = "0.8"

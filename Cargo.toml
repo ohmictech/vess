@@ -1,0 +1,13 @@
+[workspace]
+members = [
+    "vess-vascular",
+    "vess-cli",
+    "vess-foundry",
+    "vess-stealth",
+    "vess-tag",
+    "vess-artery",
+    "vess-kloak",
+    "vess-protocol",
+    "vess-tests",
+]
+resolver = "2"
