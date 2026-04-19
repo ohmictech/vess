@@ -640,8 +640,9 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
             ra_tx: ra_tx.clone(),
             pay_tx: pay_tx.clone(),
         };
+        let rpc_node = node.clone();
         tokio::spawn(async move {
-            if let Err(e) = crate::rpc::run_rpc_server(port, rpc_state, rpc_senders).await {
+            if let Err(e) = crate::rpc::run_rpc_server(port, rpc_state, rpc_senders, rpc_node).await {
                 warn!(error = %e, "RPC server exited with error");
             }
         });
@@ -1852,6 +1853,17 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                             for oc in pending_oc { let _ = h_oc_tx.send(oc); }
                             // Persist wallet immediately after receiving bills.
                             state.flush_wallet();
+
+                            // Return acknowledgment so direct senders get
+                            // instant confirmation. Relay nodes use fire-and-
+                            // forget so this response is harmlessly dropped.
+                            return Some(PulseMessage::DirectPaymentResponse(
+                                vess_protocol::DirectPaymentResponse {
+                                    payment_id,
+                                    accepted: true,
+                                    reason: String::new(),
+                                },
+                            ));
                         }
                         Ok(None) => {} // Not for us — normal relay.
                         Err(e) => {

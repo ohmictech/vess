@@ -24,6 +24,7 @@ use vess_foundry::spend_auth::generate_spend_keypair;
 use vess_protocol::{PulseMessage, TagStore, ManifestStore};
 use vess_stealth::MasterStealthAddress;
 use vess_tag::{VessTag, TagRecord};
+use vess_vascular::VessNode;
 
 use crate::node_runner::ArteryState;
 use crate::node_runner::WalletState;
@@ -72,6 +73,7 @@ pub enum RpcRequest {
     NodeInfo,
     TagLookup { tag: String },
     Send { amount: u64, recipient: String, #[serde(default)] memo: Option<String> },
+    SendDirect { amount: u64, recipient: String, node_id: String, #[serde(default)] memo: Option<String> },
     WalletUnlock { password: String },
     WalletSetPassword { current_password: String, new_password: String },
     WalletLock,
@@ -184,6 +186,7 @@ pub(crate) async fn run_rpc_server(
     port: u16,
     state: Arc<Mutex<ArteryState>>,
     senders: QueueSenders,
+    node: VessNode,
 ) -> Result<()> {
     let addr = format!("127.0.0.1:{port}");
     let listener = TcpListener::bind(&addr).await?;
@@ -201,12 +204,13 @@ pub(crate) async fn run_rpc_server(
 
         let st = state.clone();
         let snd = senders.clone();
+        let nd = node.clone();
         tokio::spawn(async move {
             let (reader, mut writer) = stream.into_split();
             let mut lines = BufReader::new(reader).lines();
 
             while let Ok(Some(line)) = lines.next_line().await {
-                let resp = handle_request(&line, &st, &snd);
+                let resp = handle_request(&line, &st, &snd, &nd).await;
                 let mut buf = match serde_json::to_vec(&resp) {
                     Ok(b) => b,
                     Err(e) => {
@@ -224,7 +228,7 @@ pub(crate) async fn run_rpc_server(
     }
 }
 
-fn handle_request(line: &str, state: &Arc<Mutex<ArteryState>>, senders: &QueueSenders) -> RpcResponse {
+async fn handle_request(line: &str, state: &Arc<Mutex<ArteryState>>, senders: &QueueSenders, node: &VessNode) -> RpcResponse {
     let req: RpcRequest = match serde_json::from_str(line) {
         Ok(r) => r,
         Err(e) => return RpcResponse::err(format!("invalid request: {e}")),
@@ -235,6 +239,7 @@ fn handle_request(line: &str, state: &Arc<Mutex<ArteryState>>, senders: &QueueSe
         RpcRequest::NodeInfo => handle_node_info(state),
         RpcRequest::TagLookup { tag } => handle_tag_lookup(state, &tag),
         RpcRequest::Send { amount, recipient, memo } => handle_send(state, amount, &recipient, memo, senders),
+        RpcRequest::SendDirect { amount, recipient, node_id, memo } => handle_send_direct(state, amount, &recipient, &node_id, memo, senders, node).await,
         RpcRequest::WalletUnlock { password } => handle_wallet_unlock(state, &password, &senders.oc_tx),
         RpcRequest::WalletSetPassword { current_password, new_password } => handle_wallet_set_password(state, &current_password, &new_password),
         RpcRequest::WalletLock => handle_wallet_lock(state),
@@ -561,6 +566,310 @@ fn handle_send(
         amount,
         remaining_balance: remaining,
     })
+}
+
+/// Direct peer-to-peer send: connect to a specific node via QUIC and deliver
+/// the payment with a 5-second timeout. No PoW handshake required — the
+/// connection is ephemeral and drops after the response.
+#[allow(clippy::too_many_arguments)]
+async fn handle_send_direct(
+    state: &Arc<Mutex<ArteryState>>,
+    amount: u64,
+    recipient_tag: &str,
+    node_id_str: &str,
+    memo: Option<String>,
+    senders: &QueueSenders,
+    node: &VessNode,
+) -> RpcResponse {
+    // Parse node ID.
+    let target: iroh::EndpointId = match node_id_str.parse() {
+        Ok(id) => id,
+        Err(_) => return RpcResponse::err("invalid node_id: expected hex-encoded endpoint ID"),
+    };
+
+    let (msg, payment_id, sent_mints) = {
+        let tag_str = recipient_tag.strip_prefix('+').unwrap_or(recipient_tag);
+        let mut s = state.lock().unwrap();
+
+        if s.wallet.is_none() {
+            return RpcResponse::err("wallet not loaded");
+        }
+
+        let recipient_address = match s.tag_dht.lookup(tag_str) {
+            Some(record) => MasterStealthAddress {
+                scan_ek: record.master_address.scan_ek.clone(),
+                spend_ek: record.master_address.spend_ek.clone(),
+            },
+            None => return RpcResponse::err(format!("tag +{tag_str} not found")),
+        };
+
+        let ws = s.wallet.as_ref().unwrap();
+        let cred_map: HashMap<[u8; 32], SpendCredential> = ws
+            .billfold
+            .bills()
+            .iter()
+            .filter_map(|b| {
+                ws.billfold
+                    .get_credentials(&b.mint_id)
+                    .cloned()
+                    .map(|c| (b.mint_id, c))
+            })
+            .collect();
+
+        if !ws.billfold.can_afford(amount) {
+            return RpcResponse::err(format!(
+                "insufficient funds: need {amount}, have {}",
+                ws.billfold.balance()
+            ));
+        }
+
+        if let Some(ref m) = memo {
+            if m.len() > 256 {
+                return RpcResponse::err("memo exceeds 256 byte limit");
+            }
+        }
+
+        let reserved: Vec<[u8; 32]> = ws.billfold.reserved_set().iter().copied().collect();
+        let selection = match select_bills_filtered(ws.billfold.bills(), amount, &reserved) {
+            Ok(sel) => sel,
+            Err(e) => return RpcResponse::err(format!("bill selection failed: {e}")),
+        };
+
+        if selection.change > 0 {
+            // === CHANGE PATH: reforge ===
+            let input_bills: Vec<vess_foundry::VessBill> = selection
+                .send_indices
+                .iter()
+                .map(|&i| ws.billfold.bills()[i].clone())
+                .collect();
+
+            let send_denoms = decompose_amount(amount);
+            let mut all_denoms = send_denoms.clone();
+            all_denoms.extend(&selection.change_denominations);
+
+            let stealth_ids: Vec<[u8; 32]> = all_denoms
+                .iter()
+                .map(|_| input_bills[0].stealth_id)
+                .collect();
+
+            let result = match reforge(ReforgeRequest {
+                inputs: input_bills,
+                output_denominations: all_denoms,
+                output_stealth_ids: stealth_ids,
+            }) {
+                Ok(r) => r,
+                Err(e) => return RpcResponse::err(format!("reforge failed: {e}")),
+            };
+
+            let send_count = send_denoms.len();
+            let send_bills: Vec<vess_foundry::VessBill> =
+                result.outputs[..send_count].iter().map(|(b, _)| b.clone()).collect();
+            let change_bills: Vec<(vess_foundry::VessBill, Vec<u8>)> =
+                result.outputs[send_count..].to_vec();
+
+            let mut reforged_creds: HashMap<[u8; 32], SpendCredential> = HashMap::new();
+            for (bill, _) in &result.outputs {
+                let (vk, sk) = generate_spend_keypair();
+                reforged_creds.insert(bill.mint_id, SpendCredential {
+                    spend_vk: vk,
+                    spend_sk: sk,
+                });
+            }
+
+            let (msg, pid) = match prepare_payment_from_bills(
+                &send_bills,
+                &recipient_address,
+                &reforged_creds,
+                memo.clone(),
+            ) {
+                Ok(v) => v,
+                Err(e) => return RpcResponse::err(format!("prepare payment failed: {e}")),
+            };
+
+            let ws_mut = s.wallet.as_mut().unwrap();
+
+            for mid in &result.consumed_mint_ids {
+                ws_mut.billfold.withdraw(mid);
+            }
+            for (bill, _) in &change_bills {
+                if let Some(cred) = reforged_creds.get(&bill.mint_id) {
+                    ws_mut.billfold.deposit_with_credentials(bill.clone(), cred.clone());
+                }
+            }
+
+            let sent_mints: Vec<[u8; 32]> = send_bills.iter().map(|b| b.mint_id).collect();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            ws_mut.billfold.reserve(&sent_mints, now);
+
+            // Broadcast reforge attestation + ownership genesis.
+            let mut sorted_consumed = result.consumed_mint_ids.clone();
+            sorted_consumed.sort();
+            let reforge_id = {
+                let mut h = blake3::Hasher::new();
+                h.update(b"vess-reforge-id-v0");
+                for mid in &sorted_consumed {
+                    h.update(mid);
+                }
+                *h.finalize().as_bytes()
+            };
+
+            let mut consume_sigs = Vec::new();
+            let mut owner_vk_for_ra = Vec::new();
+            for mid in &result.consumed_mint_ids {
+                if let Some(cred) = cred_map.get(mid) {
+                    let digest = {
+                        let mut h = blake3::Hasher::new();
+                        h.update(b"vess-reforge-consume-v0");
+                        h.update(mid);
+                        h.update(&reforge_id);
+                        *h.finalize().as_bytes()
+                    };
+                    if let Ok(sig) = vess_foundry::spend_auth::sign_spend(&cred.spend_sk, &digest) {
+                        consume_sigs.push(sig);
+                        if owner_vk_for_ra.is_empty() {
+                            owner_vk_for_ra = cred.spend_vk.clone();
+                        }
+                    }
+                }
+            }
+            if consume_sigs.len() == result.consumed_mint_ids.len() {
+                let _ = senders.ra_tx.send(vess_protocol::ReforgeAttestation {
+                    consumed_mint_ids: result.consumed_mint_ids,
+                    owner_vk: owner_vk_for_ra,
+                    consume_sigs,
+                    reforge_id,
+                    hops_remaining: 6,
+                });
+            }
+
+            for (bill, _) in &change_bills {
+                if let Some(cred) = reforged_creds.get(&bill.mint_id) {
+                    let owner_vk_hash = vess_foundry::spend_auth::vk_hash(&cred.spend_vk);
+                    let _ = senders.og_tx.send(vess_protocol::OwnershipGenesis {
+                        mint_id: bill.mint_id,
+                        chain_tip: bill.chain_tip,
+                        owner_vk_hash,
+                        owner_vk: cred.spend_vk.clone(),
+                        denomination_value: bill.denomination.value(),
+                        proof: Vec::new(),
+                        digest: bill.digest,
+                        hops_remaining: 6,
+                        chain_depth: 0,
+                    });
+                }
+            }
+
+            for (i, bill) in send_bills.iter().enumerate() {
+                if let Some(cred) = reforged_creds.get(&bill.mint_id) {
+                    let proof_bytes = result.outputs[i].1.clone();
+                    let owner_vk_hash = vess_foundry::spend_auth::vk_hash(&cred.spend_vk);
+                    let _ = senders.og_tx.send(vess_protocol::OwnershipGenesis {
+                        mint_id: bill.mint_id,
+                        chain_tip: bill.chain_tip,
+                        owner_vk_hash,
+                        owner_vk: cred.spend_vk.clone(),
+                        denomination_value: bill.denomination.value(),
+                        proof: proof_bytes,
+                        digest: bill.digest,
+                        hops_remaining: 6,
+                        chain_depth: 0,
+                    });
+                }
+            }
+
+            s.flush_wallet();
+            (msg, pid, sent_mints)
+        } else {
+            // === EXACT MATCH PATH ===
+            let (msg, pid, send_indices) = match prepare_payment_with_transfer(
+                &ws.billfold,
+                amount,
+                &recipient_address,
+                &cred_map,
+                memo.clone(),
+            ) {
+                Ok(v) => v,
+                Err(e) => return RpcResponse::err(format!("prepare payment failed: {e}")),
+            };
+
+            let ws_mut = s.wallet.as_mut().unwrap();
+            let mint_ids: Vec<[u8; 32]> = send_indices
+                .iter()
+                .map(|&i| ws_mut.billfold.bills()[i].mint_id)
+                .collect();
+
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            ws_mut.billfold.reserve(&mint_ids, now);
+            s.flush_wallet();
+
+            (msg, pid, mint_ids)
+        }
+    };
+
+    // Send directly to the target node with a 5-second timeout.
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        node.send_message_with_response(target, &msg),
+    ).await;
+
+    match result {
+        Ok(Ok(Some(PulseMessage::DirectPaymentResponse(dpr)))) => {
+            if dpr.accepted {
+                let mut s = state.lock().unwrap();
+                if let Some(ref mut ws) = s.wallet {
+                    for mid in &sent_mints {
+                        ws.billfold.withdraw(mid);
+                    }
+                    s.flush_wallet();
+                }
+                let remaining = s.wallet.as_ref()
+                    .map(|w| w.billfold.available_balance())
+                    .unwrap_or(0);
+                RpcResponse::ok(RpcData::Send {
+                    payment_id: hex_key(&payment_id),
+                    amount,
+                    remaining_balance: remaining,
+                })
+            } else {
+                let mut s = state.lock().unwrap();
+                if let Some(ref mut ws) = s.wallet {
+                    ws.billfold.release(&sent_mints);
+                    s.flush_wallet();
+                }
+                RpcResponse::err(format!("recipient rejected: {}", dpr.reason))
+            }
+        }
+        Ok(Ok(_)) => {
+            let mut s = state.lock().unwrap();
+            if let Some(ref mut ws) = s.wallet {
+                ws.billfold.release(&sent_mints);
+                s.flush_wallet();
+            }
+            RpcResponse::err("unexpected response from recipient node")
+        }
+        Ok(Err(e)) => {
+            let mut s = state.lock().unwrap();
+            if let Some(ref mut ws) = s.wallet {
+                ws.billfold.release(&sent_mints);
+                s.flush_wallet();
+            }
+            RpcResponse::err(format!("direct send failed: {e}"))
+        }
+        Err(_) => {
+            let mut s = state.lock().unwrap();
+            if let Some(ref mut ws) = s.wallet {
+                ws.billfold.release(&sent_mints);
+                s.flush_wallet();
+            }
+            RpcResponse::err("direct send timed out (5s) — recipient node may be unreachable")
+        }
+    }
 }
 
 fn handle_wallet_unlock(

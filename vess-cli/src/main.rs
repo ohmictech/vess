@@ -77,6 +77,10 @@ enum Command {
         /// Optional encrypted memo (max 256 bytes, e.g. order ID or note).
         #[arg(long)]
         memo: Option<String>,
+        /// Send directly to a specific node via QUIC (hex node ID).
+        /// Bypasses mesh relay for instant IRL payments.
+        #[arg(long)]
+        node_direct: Option<String>,
     },
 
     /// Mint new vess via proof-of-work (flow-based: mine until Ctrl+C).
@@ -172,8 +176,8 @@ async fn main() -> Result<()> {
         Command::Init { tag } => cmd_init(&cli, tag).await,
         Command::Recover { words, pin } => cmd_recover(&cli, words, pin).await,
         Command::Balance => cmd_balance(&cli).await,
-        Command::Send { amount, recipient, memo } => {
-            cmd_send(&cli, *amount, recipient, memo.as_deref()).await
+        Command::Send { amount, recipient, memo, node_direct } => {
+            cmd_send(&cli, *amount, recipient, memo.as_deref(), node_direct.as_deref()).await
         }
         Command::Mint { finalize, status } => cmd_mint(&cli, *finalize, *status).await,
         Command::RegisterTag { tag } => cmd_register_tag(&cli, tag).await,
@@ -655,13 +659,22 @@ async fn cmd_balance(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_send(cli: &Cli, amount: u64, recipient_id: &str, memo: Option<&str>) -> Result<()> {
+async fn cmd_send(cli: &Cli, amount: u64, recipient_id: &str, memo: Option<&str>, node_direct: Option<&str>) -> Result<()> {
     let port = rpc_port(cli);
-    let mut req = json!({
-        "method": "send",
-        "amount": amount,
-        "recipient": recipient_id,
-    });
+    let mut req = if let Some(node_id) = node_direct {
+        json!({
+            "method": "send_direct",
+            "amount": amount,
+            "recipient": recipient_id,
+            "node_id": node_id,
+        })
+    } else {
+        json!({
+            "method": "send",
+            "amount": amount,
+            "recipient": recipient_id,
+        })
+    };
     if let Some(m) = memo {
         req["memo"] = json!(m);
     }
@@ -670,7 +683,11 @@ async fn cmd_send(cli: &Cli, amount: u64, recipient_id: &str, memo: Option<&str>
         if cli.json {
             println!("{resp}");
         } else {
-            println!("Payment sent!");
+            if node_direct.is_some() {
+                println!("Direct payment accepted!");
+            } else {
+                println!("Payment sent!");
+            }
             println!("Payment ID: {}", resp["payment_id"].as_str().unwrap_or("?"));
             println!("Amount:     {} Vess", resp["amount"]);
             println!("Balance:    {} Vess", resp["remaining_balance"]);
