@@ -235,7 +235,7 @@ fn derive_raw_seed_for_wallet(cli: &Cli) -> Result<[u8; 64]> {
         anyhow::anyhow!("set VESS_RECOVERY_PIN env var for this operation")
     })?;
     let phrase = RecoveryPhrase::from_input(&words, &pin)?;
-    Ok(derive_raw_seed(&phrase)?)
+    derive_raw_seed(&phrase)
 }
 
 /// Send a JSON-RPC request to the node's local RPC server and return the
@@ -417,7 +417,7 @@ async fn cmd_init(cli: &Cli, tag_str: &str) -> Result<()> {
         let mut pin_input = String::new();
         io::stdin().read_line(&mut pin_input)?;
 
-        let words_match = words_input.trim().split_whitespace().collect::<Vec<_>>()
+        let words_match = words_input.split_whitespace().collect::<Vec<_>>()
             == phrase.words;
         let pin_match = pin_input.trim() == phrase.pin;
 

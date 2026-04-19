@@ -54,6 +54,12 @@ pub struct LimboBuffer {
     per_peer_count: HashMap<[u8; 32], usize>,
 }
 
+impl Default for LimboBuffer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LimboBuffer {
     pub fn new() -> Self {
         Self {

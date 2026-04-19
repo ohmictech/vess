@@ -48,7 +48,7 @@ fn to_hex(bytes: &[u8]) -> String {
 
 /// Decode a hex string into bytes.
 fn from_hex(hex_str: &str) -> Result<Vec<u8>, String> {
-    if hex_str.len() % 2 != 0 {
+    if !hex_str.len().is_multiple_of(2) {
         return Err("odd-length hex string".to_string());
     }
     (0..hex_str.len())
@@ -358,7 +358,7 @@ fn handle_send(
         Err(e) => return RpcResponse::err(format!("bill selection failed: {e}")),
     };
 
-    let (msg, payment_id, sent_mints) = if selection.change > 0 {
+    let (msg, payment_id, _sent_mints) = if selection.change > 0 {
         // === CHANGE PATH: reforge ===
         let input_bills: Vec<vess_foundry::VessBill> = selection
             .send_indices
@@ -729,6 +729,7 @@ fn decode_hex_fixed<const N: usize>(hex_str: &str) -> Result<[u8; N], String> {
     Ok(arr)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_tag_register(
     state: &Arc<Mutex<ArteryState>>,
     tag: &str,
@@ -864,6 +865,7 @@ fn handle_tag_confirm(
     RpcResponse::ok(RpcData::Empty {})
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_ownership_genesis(
     _state: &Arc<Mutex<ArteryState>>,
     mint_id_hex: &str,

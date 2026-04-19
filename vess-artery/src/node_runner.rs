@@ -77,6 +77,7 @@ const DUPLICATE_WINDOW_SECS: u64 = 60;
 /// times within `DUPLICATE_WINDOW_SECS`, they are flagged for banishment.
 pub(crate) struct DuplicateTracker {
     /// Peer → { payload_hash → (count, first_seen_ts) }.
+    #[allow(clippy::type_complexity)]
     table: HashMap<[u8; 32], HashMap<[u8; 32], (u32, u64)>>,
 }
 
@@ -1154,8 +1155,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     let msg = PulseMessage::PeerExchange(PeerExchange {
                         sender_id: pex_node.id().as_bytes().to_vec(),
                     });
-                    match pex_node.send_message_with_response(target, &msg).await {
-                        Ok(Some(PulseMessage::PeerExchangeResponse(resp))) => {
+                    if let Ok(Some(PulseMessage::PeerExchangeResponse(resp))) = pex_node.send_message_with_response(target, &msg).await {
                             let mut s = pex_state.lock().unwrap();
                             let now = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
@@ -1178,8 +1178,6 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                                     }
                                 }
                             }
-                        }
-                        _ => {}
                     }
                 }
             }
@@ -1223,27 +1221,24 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 };
 
                 let challenge = PulseMessage::HandshakeChallenge(HandshakeChallenge { nonce });
-                match hs_node.send_message_with_response(target, &challenge).await {
-                    Ok(Some(PulseMessage::HandshakeResponse(resp))) => {
-                        let mut s = hs_state.lock().unwrap();
-                        if s.peer_registry.verify_response(&peer_hash, &resp.hmac, &ALLOWED_VERSIONS) {
-                            // Verify Argon2id PoW from the peer.
-                            if resp.pow_hash.is_empty()
-                                || !verify_handshake_pow(&id_bytes, &nonce, &resp.pow_hash)
-                            {
-                                warn!("peer PoW verification failed — banishing");
-                                s.peer_registry.mark_banished(peer_hash);
-                                hs_ban.banish(peer_hash);
-                            } else {
-                                info!("peer verified via handshake");
-                            }
-                        } else {
+                if let Ok(Some(PulseMessage::HandshakeResponse(resp))) = hs_node.send_message_with_response(target, &challenge).await {
+                    let mut s = hs_state.lock().unwrap();
+                    if s.peer_registry.verify_response(&peer_hash, &resp.hmac, &ALLOWED_VERSIONS) {
+                        // Verify Argon2id PoW from the peer.
+                        if resp.pow_hash.is_empty()
+                            || !verify_handshake_pow(&id_bytes, &nonce, &resp.pow_hash)
+                        {
+                            warn!("peer PoW verification failed — banishing");
                             s.peer_registry.mark_banished(peer_hash);
                             hs_ban.banish(peer_hash);
-                            info!("peer banished — invalid handshake response");
+                        } else {
+                            info!("peer verified via handshake");
                         }
+                    } else {
+                        s.peer_registry.mark_banished(peer_hash);
+                        hs_ban.banish(peer_hash);
+                        info!("peer banished — invalid handshake response");
                     }
-                    _ => {}
                 }
             }
         }

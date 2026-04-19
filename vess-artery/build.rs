@@ -31,7 +31,7 @@ fn collect_rs_files(dir: &Path, root: &Path, out: &mut Vec<(String, PathBuf)>) {
         let path = entry.path();
         if path.is_dir() {
             collect_rs_files(&path, root, out);
-        } else if path.extension().map_or(false, |ext| ext == "rs") {
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
             let rel = path.strip_prefix(root).unwrap();
             let key = rel.to_str().unwrap().replace('\\', "/");
             out.push((key, path));

@@ -77,7 +77,7 @@ impl Denomination {
             return false;
         }
         let mut n = v;
-        while n % 10 == 0 {
+        while n.is_multiple_of(10) {
             n /= 10;
         }
         n == 1 || n == 2 || n == 5
@@ -110,7 +110,7 @@ impl Denomination {
     pub fn series_position(self) -> u32 {
         let mut n = self.0;
         let mut k = 0u32;
-        while n % 10 == 0 {
+        while n.is_multiple_of(10) {
             n /= 10;
             k += 1;
         }
@@ -142,7 +142,7 @@ impl Denomination {
             }
         }
         values.sort_unstable_by(|a, b| b.cmp(a));
-        values.into_iter().map(|v| Denomination(v)).collect()
+        values.into_iter().map(Denomination).collect()
     }
 }
 

@@ -211,8 +211,8 @@ fn execute_one_step(
         }
         6 => {
             let dst = ((step_idx as usize) + 7) % NUM_REGS;
-            for j in 0..LINE_U64S {
-                regs[dst] ^= line[j];
+            for val in &line[..LINE_U64S] {
+                regs[dst] ^= val;
             }
             regs[dst] = regs[dst].rotate_right(11);
         }

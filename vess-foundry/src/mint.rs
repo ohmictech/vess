@@ -171,7 +171,7 @@ pub fn mint_blocking(denom: Denomination, owner_vk_hash: &[u8; 32]) -> (VessBill
     let mut attempts = 0u64;
     loop {
         attempts += 1;
-        if attempts % 10 == 0 {
+        if attempts.is_multiple_of(10) {
             tracing::info!(attempts, denomination = ?denom, "Minting in progress…");
         }
         match try_mint(denom, owner_vk_hash) {
@@ -285,7 +285,7 @@ impl MintSessionState {
     /// Atomically save to disk (write to temp + rename).
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         let data = serde_json::to_vec_pretty(self)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(std::io::Error::other)?;
         let tmp = path.with_extension("tmp");
         std::fs::write(&tmp, &data)?;
         std::fs::rename(&tmp, path)?;
@@ -398,7 +398,7 @@ pub fn mine_flow(
             on_solve(count, state.total_attempts);
         }
 
-        if state.total_attempts % 10_000 == 0 {
+        if state.total_attempts.is_multiple_of(10_000) {
             tracing::debug!(attempts = state.total_attempts, "Mining in progress…");
         }
     }

@@ -114,6 +114,12 @@ pub struct ReputationTable {
     peers: HashMap<[u8; 32], PeerReputation>,
 }
 
+impl Default for ReputationTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ReputationTable {
     /// Create an empty reputation table.
     pub fn new() -> Self {

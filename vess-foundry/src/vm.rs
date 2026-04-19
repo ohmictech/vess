@@ -15,7 +15,7 @@ use blake3::Hasher;
 pub const SCRATCHPAD_LINES: usize = 1024 * 1024 * 1024 / 64; // 16_777_216 lines
 
 #[cfg(feature = "test-mint")]
-pub const SCRATCHPAD_LINES: usize = 1 * 1024 * 1024 / 64; // 16_384 lines (1 MiB)
+pub const SCRATCHPAD_LINES: usize = 1024 * 1024 / 64; // 16_384 lines (1 MiB)
 
 /// Each cache line is 64 bytes (8 × u64).
 const LINE_U64S: usize = 8;
