@@ -114,6 +114,9 @@ vess balance
 # Send payment
 vess send 50 +alice
 
+# Send directly to a specific node (instant IRL payments, no mesh relay)
+vess send 50 +alice --node-direct <hex_node_id>
+
 # Mint new bills (writes session to disk, Ctrl+C to stop)
 vess mint
 vess mint --finalize   # aggregate solves into bills and register ownership
