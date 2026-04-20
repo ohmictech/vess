@@ -691,6 +691,79 @@ pub fn receive_and_claim(
     }
 }
 
+// ── Bill Verification ───────────────────────────────────────────────
+
+/// Verify deposited bills against the registry and silently remove any
+/// that were rejected (not active in DHT).
+///
+/// Call this after:
+/// 1. Depositing bills to the billfold
+/// 2. Broadcasting OwnershipClaim messages
+/// 3. Waiting for DHT convergence (e.g., 500ms)
+///
+/// If all K nodes rejected a bill's ownership claim (bill is inactive in
+/// registry), it means:
+/// - Sender may have already spent the bill (deeper chain_depth)
+/// - Bill was fake/forged
+/// - Another recipient beat us to claiming it
+///
+/// We silently remove it from the billfold to prevent user confusion
+/// (seeing money that's unspendable).
+///
+/// # Arguments
+///
+/// - `billfold`: The wallet's billfold (mutably modified if removals needed)
+/// - `deposited_mint_ids`: The set of mint_ids that were just claimed
+/// - `active`: Parallel bool array from [`RegistryQueryResponse`], where
+///   `active[i]` corresponds to `deposited_mint_ids[i]`
+///
+/// # Returns
+///
+/// Vector of mint_ids that were silently removed (rejected claims).
+///
+/// # Example
+///
+/// ```no_run
+/// # use vess_kloak::payment::cleanup_rejected_bills;
+/// # use vess_kloak::billfold::BillFold;
+/// let deposited_ids = vec![[0x01; 32], [0x02; 32]];
+/// let active_response = vec![true, false]; // Bill 2 was rejected
+///
+/// let mut billfold = BillFold::new();
+/// let removed = cleanup_rejected_bills(&mut billfold, &deposited_ids, &active_response);
+/// assert!(!removed.is_empty()); // [0x02; 32] was removed
+/// ```
+pub fn cleanup_rejected_bills(
+    billfold: &mut BillFold,
+    deposited_mint_ids: &[[u8; 32]],
+    active: &[bool],
+) -> Vec<[u8; 32]> {
+    let mut removed = Vec::new();
+
+    for (i, &mint_id) in deposited_mint_ids.iter().enumerate() {
+        // Safety: active should have same length as deposited_mint_ids from protocol
+        if i >= active.len() {
+            // Malformed response; log warning but continue
+            eprintln!(
+                "WARNING: registry response mismatch: {} deposits, {} statuses",
+                deposited_mint_ids.len(),
+                active.len()
+            );
+            continue;
+        }
+
+        if !active[i] {
+            // Bill is inactive in registry — ownership claim was rejected.
+            // Silently remove from billfold.
+            if billfold.withdraw(&mint_id).is_some() {
+                removed.push(mint_id);
+            }
+        }
+    }
+
+    removed
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────
 
 fn derive_payment_id(stealth: &StealthPayload) -> [u8; 32] {
@@ -725,6 +798,68 @@ mod tests {
             chain_tip: rand::random(),
             chain_depth: 0,
         }
+    }
+
+    #[test]
+    fn test_cleanup_rejected_bills() {
+        use crate::billfold::SpendCredential;
+
+        let mut billfold = BillFold::new();
+
+        // Create 3 test bills
+        let bill1 = test_bill(Denomination::D1);
+        let bill2 = test_bill(Denomination::D5);
+        let bill3 = test_bill(Denomination::D10);
+
+        let id1 = bill1.mint_id;
+        let id2 = bill2.mint_id;
+        let id3 = bill3.mint_id;
+
+        // Deposit all three
+        billfold.deposit_with_credentials(
+            bill1,
+            SpendCredential {
+                spend_vk: vec![0xAA; 32],
+                spend_sk: vec![0xBB; 32],
+            },
+        );
+        billfold.deposit_with_credentials(
+            bill2,
+            SpendCredential {
+                spend_vk: vec![0xCC; 32],
+                spend_sk: vec![0xDD; 32],
+            },
+        );
+        billfold.deposit_with_credentials(
+            bill3,
+            SpendCredential {
+                spend_vk: vec![0xEE; 32],
+                spend_sk: vec![0xFF; 32],
+            },
+        );
+
+        assert_eq!(billfold.count(), 3);
+        assert_eq!(billfold.balance(), 16); // 1 + 5 + 10
+
+        // Simulate registry response: bill1 active, bill2 REJECTED, bill3 active
+        let deposited = vec![id1, id2, id3];
+        let active = vec![true, false, true];
+
+        let removed = cleanup_rejected_bills(&mut billfold, &deposited, &active);
+
+        // Should have removed only bill2
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0], id2);
+
+        // Billfold should have 2 bills left (1 + 10 = 11 value)
+        assert_eq!(billfold.count(), 2);
+        assert_eq!(billfold.balance(), 11);
+
+        // Verify the remaining bills are correct
+        let remaining_ids: Vec<_> = billfold.bills().iter().map(|b| b.mint_id).collect();
+        assert!(remaining_ids.contains(&id1));
+        assert!(!remaining_ids.contains(&id2)); // Removed
+        assert!(remaining_ids.contains(&id3));
     }
 
     #[test]
