@@ -693,6 +693,23 @@ pub fn receive_and_claim(
 
 // ── Bill Verification ───────────────────────────────────────────────
 
+/// Extract mint_ids from a slice of OwnershipClaim messages.
+///
+/// Filters for `PulseMessage::OwnershipClaim` variants and extracts their
+/// mint_ids for use in registry queries.
+pub fn extract_mint_ids_from_claims(claims: &[PulseMessage]) -> Vec<[u8; 32]> {
+    claims
+        .iter()
+        .filter_map(|msg| {
+            if let PulseMessage::OwnershipClaim(claim) = msg {
+                Some(claim.mint_id)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 /// Verify deposited bills against the registry and silently remove any
 /// that were rejected (not active in DHT).
 ///

@@ -19,7 +19,7 @@ use vess_foundry::Denomination;
 use vess_kloak::billfold::{BillFold, SpendCredential};
 use vess_kloak::payment::{
     claim_transfer_bills, prepare_payment_with_transfer, try_decrypt_transfer_payload,
-    DecryptedTransfer,
+    DecryptedTransfer, extract_mint_ids_from_claims, cleanup_rejected_bills,
 };
 use vess_protocol::{
     OwnershipClaim, OwnershipGenesis, PulseMessage, RegistryQuery, RegistryQueryResponse,
@@ -317,7 +317,9 @@ async fn three_node_mint_send_claim() {
     }
     assert_eq!(bob.billfold.balance(), 1);
 
-    // ── 10. Bob broadcasts OwnershipClaim to the artery ─────────────
+    // ── 10. Bob broadcasts OwnershipClaim and auto-verifies ──────────
+    let bill_ids_to_verify = extract_mint_ids_from_claims(&claim_result.ownership_claims);
+    
     for claim_msg in &claim_result.ownership_claims {
         client_b
             .send_message(artery_addr.clone(), claim_msg)
@@ -325,9 +327,13 @@ async fn three_node_mint_send_claim() {
             .expect("send OwnershipClaim (Bob)");
     }
 
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    // Wait for DHT convergence
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
-    // Verify ownership transferred to Bob on artery.
+    // Automatically verify and clean up rejected bills
+    let query = PulseMessage::RegistryQuery(RegistryQuery {
+        mint_ids: bill_ids_to_verify.clone(),
+    });
     let resp = client_b
         .send_message_with_response(artery_addr.clone(), &query)
         .await
@@ -336,6 +342,11 @@ async fn three_node_mint_send_claim() {
     match resp {
         Some(PulseMessage::RegistryQueryResponse(rqr)) => {
             assert!(rqr.active[0], "bill should still be active after ownership transfer");
+            // Silently remove any rejected bills
+            let removed = cleanup_rejected_bills(&mut bob.billfold, &bill_ids_to_verify, &rqr.active);
+            if !removed.is_empty() {
+                eprintln!("WARNING: {} bills were rejected and removed from wallet", removed.len());
+            }
         }
         other => panic!("expected RegistryQueryResponse, got: {other:?}"),
     }
@@ -412,7 +423,9 @@ async fn three_node_mint_send_claim() {
     }
     assert_eq!(charlie.billfold.balance(), 1);
 
-    // ── 14. Charlie broadcasts OwnershipClaim ──────────────────────
+    // ── 14. Charlie broadcasts OwnershipClaim and auto-verifies ──────
+    let bill_ids_to_verify_2 = extract_mint_ids_from_claims(&claim_result_2.ownership_claims);
+    
     for claim_msg in &claim_result_2.ownership_claims {
         client_c
             .send_message(artery_addr.clone(), claim_msg)
@@ -420,17 +433,26 @@ async fn three_node_mint_send_claim() {
             .expect("send OwnershipClaim (Charlie)");
     }
 
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    // Wait for DHT convergence
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
-    // ── 15. Verify final state ──────────────────────────────────────
+    // ── 15. Auto-verify and cleanup ─────────────────────────────────
+    let query_2 = PulseMessage::RegistryQuery(RegistryQuery {
+        mint_ids: bill_ids_to_verify_2.clone(),
+    });
     let resp = client_c
-        .send_message_with_response(artery_addr.clone(), &query)
+        .send_message_with_response(artery_addr.clone(), &query_2)
         .await
         .expect("final registry query");
 
     match resp {
         Some(PulseMessage::RegistryQueryResponse(rqr)) => {
             assert!(rqr.active[0], "bill should still be active after second transfer");
+            // Silently remove any rejected bills
+            let removed = cleanup_rejected_bills(&mut charlie.billfold, &bill_ids_to_verify_2, &rqr.active);
+            if !removed.is_empty() {
+                eprintln!("WARNING: {} bills were rejected and removed from wallet", removed.len());
+            }
         }
         other => panic!("expected RegistryQueryResponse, got: {other:?}"),
     }

@@ -32,5 +32,5 @@ pub use selection::select_bills;
 pub use auto_reforge::ConsolidationScheduler;
 pub use recovery::{RecoveryPhrase, EncryptedSecrets};
 pub use persistence::WalletFile;
-pub use payment::{PaymentTracker, cleanup_rejected_bills};
+pub use payment::{PaymentTracker, cleanup_rejected_bills, extract_mint_ids_from_claims};
 pub use tag_cache::TagCache;
