@@ -17,7 +17,7 @@ use blake3::Hasher;
 use serde::{Deserialize, Serialize};
 
 use crate::merkle::{self, MerkleTree};
-use crate::vm::{self, CacheLine, VmStep, VmTrace};
+use crate::vm::{self, CacheLine, VmStep, VmTrace, EXTRA_READS, DISK_READ_INTERVAL};
 use crate::Denomination;
 
 /// Number of random queries the verifier checks.
@@ -43,10 +43,18 @@ pub struct QueryOpening {
     pub prev_row_bytes: Vec<u8>,
     /// Merkle authentication path for the previous row.
     pub prev_row_path: Vec<[u8; 32]>,
-    /// The scratchpad cache line read during this step.
+    /// The primary scratchpad cache line read during this step.
     pub scratchpad_line: [u64; LINE_U64S],
-    /// Merkle authentication path for the scratchpad line.
+    /// Merkle authentication path for the primary scratchpad line.
     pub scratchpad_path: Vec<[u8; 32]>,
+    /// Extra scratchpad lines for bandwidth amplification.
+    pub extra_scratchpad_lines: Vec<[u64; LINE_U64S]>,
+    /// Merkle authentication paths for the extra scratchpad lines.
+    pub extra_scratchpad_paths: Vec<Vec<[u8; 32]>>,
+    /// Disk dataset line (only meaningful when step_index % DISK_READ_INTERVAL == 0).
+    pub disk_line: [u64; LINE_U64S],
+    /// Merkle authentication path for the disk dataset line.
+    pub disk_path: Vec<[u8; 32]>,
 }
 
 /// A complete Vess minting proof.
@@ -56,6 +64,8 @@ pub struct VessProof {
     pub trace_root: [u8; 32],
     /// Merkle root of the scratchpad.
     pub scratchpad_root: [u8; 32],
+    /// Merkle root of the disk dataset.
+    pub disk_root: [u8; 32],
     /// The minting nonce.
     pub nonce: [u8; 32],
     /// The denomination minted.
@@ -75,8 +85,13 @@ pub struct VessProof {
 
 /// Serialise a VmStep into a fixed byte layout for Merkle leaf hashing.
 fn step_to_bytes(step: &VmStep) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(4 + 8 * NUM_REGS + 1);
+    // Layout: mem_addr(4) + extra_addrs(4*EXTRA_READS) + disk_addr(4) + regs(8*8) + opcode(1)
+    let mut buf = Vec::with_capacity(4 + 4 * EXTRA_READS + 4 + 8 * NUM_REGS + 1);
     buf.extend_from_slice(&step.mem_addr.to_le_bytes());
+    for &ea in &step.extra_addrs {
+        buf.extend_from_slice(&ea.to_le_bytes());
+    }
+    buf.extend_from_slice(&step.disk_addr.to_le_bytes());
     for reg in &step.regs {
         buf.extend_from_slice(&reg.to_le_bytes());
     }
@@ -84,20 +99,34 @@ fn step_to_bytes(step: &VmStep) -> Vec<u8> {
     buf
 }
 
+/// Expected byte size of a serialised VmStep.
+const STEP_BYTES_LEN: usize = 4 + 4 * EXTRA_READS + 4 + 8 * NUM_REGS + 1;
+
 /// Deserialise bytes back into a VmStep.
 fn bytes_to_step(data: &[u8]) -> Option<VmStep> {
-    if data.len() < 4 + 8 * NUM_REGS + 1 {
+    if data.len() < STEP_BYTES_LEN {
         return None;
     }
-    let mem_addr = u32::from_le_bytes(data[0..4].try_into().ok()?);
-    let mut regs = [0u64; NUM_REGS];
-    for (i, reg) in regs.iter_mut().enumerate() {
-        let offset = 4 + i * 8;
-        *reg = u64::from_le_bytes(data[offset..offset + 8].try_into().ok()?);
+    let mut off = 0;
+    let mem_addr = u32::from_le_bytes(data[off..off + 4].try_into().ok()?);
+    off += 4;
+    let mut extra_addrs = [0u32; EXTRA_READS];
+    for ea in extra_addrs.iter_mut() {
+        *ea = u32::from_le_bytes(data[off..off + 4].try_into().ok()?);
+        off += 4;
     }
-    let opcode = data[4 + 8 * NUM_REGS];
+    let disk_addr = u32::from_le_bytes(data[off..off + 4].try_into().ok()?);
+    off += 4;
+    let mut regs = [0u64; NUM_REGS];
+    for reg in regs.iter_mut() {
+        *reg = u64::from_le_bytes(data[off..off + 8].try_into().ok()?);
+        off += 8;
+    }
+    let opcode = data[off];
     Some(VmStep {
         mem_addr,
+        extra_addrs,
+        disk_addr,
         regs,
         opcode,
     })
@@ -116,6 +145,7 @@ fn line_to_bytes(line: &[u64; LINE_U64S]) -> Vec<u8> {
 fn derive_query_indices(
     trace_root: &[u8; 32],
     scratchpad_root: &[u8; 32],
+    disk_root: &[u8; 32],
     nonce: &[u8; 32],
     trace_digest: &[u8; 32],
     trace_len: u64,
@@ -124,6 +154,7 @@ fn derive_query_indices(
     h.update(b"vess-iop-challenges");
     h.update(trace_root);
     h.update(scratchpad_root);
+    h.update(disk_root);
     h.update(nonce);
     h.update(trace_digest);
     let mut seed = *h.finalize().as_bytes();
@@ -164,14 +195,33 @@ fn initial_registers(seed: &[u8; 32]) -> [u64; NUM_REGS] {
 }
 
 /// Execute a single VM step given the previous register state, the
-/// scratchpad line at the read address, and the step index.
-/// Returns the expected (regs_after, opcode).
+/// primary scratchpad line, extra scratchpad lines, an optional disk line,
+/// and the step index.  Returns the expected (regs_after, opcode).
 fn execute_one_step(
     prev_regs: &[u64; NUM_REGS],
     line: &[u64; LINE_U64S],
+    extra_lines: &[[u64; LINE_U64S]],
+    disk_line: Option<&[u64; LINE_U64S]>,
     step_idx: u64,
 ) -> ([u64; NUM_REGS], u8) {
     let mut regs = *prev_regs;
+
+    // ── Bandwidth amplification: extra scratchpad reads ──────
+    for (k, extra_line) in extra_lines.iter().enumerate() {
+        let dst = ((step_idx as usize) + k + 3) % NUM_REGS;
+        regs[dst] ^= extra_line[(step_idx as usize + k) % LINE_U64S];
+        regs[dst] = regs[dst].rotate_right((11 + k as u32 * 3) & 63);
+    }
+
+    // ── Disk dataset read ────────────────────────────────────
+    if let Some(dl) = disk_line {
+        let d0 = (step_idx as usize) % NUM_REGS;
+        let d1 = ((step_idx as usize) + 4) % NUM_REGS;
+        regs[d0] = regs[d0].wrapping_add(dl[0] ^ dl[3]);
+        regs[d1] ^= dl[5].rotate_left(19);
+    }
+
+    // ── Primary opcode execution ─────────────────────────────
     let opcode = ((step_idx ^ regs[0]) & 0x07) as u8;
 
     match opcode {
@@ -236,6 +286,7 @@ fn execute_one_step(
 pub fn generate_proof(
     trace: &VmTrace,
     scratchpad: &[CacheLine],
+    disk_dataset: &[CacheLine],
     nonce: &[u8; 32],
     denom: Denomination,
     owner_vk_hash: &[u8; 32],
@@ -256,11 +307,20 @@ pub fn generate_proof(
     let pad_refs: Vec<&[u8]> = pad_bytes.iter().map(|v| v.as_slice()).collect();
     let pad_tree = MerkleTree::build(&pad_refs);
 
+    // Build disk dataset Merkle tree.
+    let disk_bytes: Vec<Vec<u8>> = disk_dataset
+        .iter()
+        .map(|cl| line_to_bytes(&cl.0))
+        .collect();
+    let disk_refs: Vec<&[u8]> = disk_bytes.iter().map(|v| v.as_slice()).collect();
+    let disk_tree = MerkleTree::build(&disk_refs);
+
     let trace_root = trace_tree.root();
     let scratchpad_root = pad_tree.root();
+    let disk_root = disk_tree.root();
 
     // Derive query indices (Fiat-Shamir).
-    let query_indices = derive_query_indices(&trace_root, &scratchpad_root, nonce, &trace.digest, n_steps);
+    let query_indices = derive_query_indices(&trace_root, &scratchpad_root, &disk_root, nonce, &trace.digest, n_steps);
 
     // Open each query.
     let seed = crate::mint::derive_seed_pub(nonce, denom, owner_vk_hash);
@@ -282,9 +342,29 @@ pub fn generate_proof(
                 (step_to_bytes(prev), trace_tree.proof(i - 1))
             };
 
+            // Primary scratchpad line.
             let pad_idx = step.mem_addr as usize;
             let scratchpad_line = scratchpad[pad_idx].0;
             let scratchpad_path = pad_tree.proof(pad_idx);
+
+            // Extra scratchpad lines (bandwidth amplification).
+            // Use addresses recorded in the trace — the VM mutates registers
+            // between extra reads, so static prev_regs can't derive later addrs.
+            let mut extra_scratchpad_lines = Vec::with_capacity(EXTRA_READS);
+            let mut extra_scratchpad_paths = Vec::with_capacity(EXTRA_READS);
+            for k in 0..EXTRA_READS {
+                let extra_addr = step.extra_addrs[k] as usize;
+                extra_scratchpad_lines.push(scratchpad[extra_addr].0);
+                extra_scratchpad_paths.push(pad_tree.proof(extra_addr));
+            }
+
+            // Disk dataset line (if applicable).
+            let (disk_line, disk_path) = if idx as u64 % DISK_READ_INTERVAL == 0 {
+                let da = step.disk_addr as usize;
+                (disk_dataset[da].0, disk_tree.proof(da))
+            } else {
+                ([0u64; LINE_U64S], Vec::new())
+            };
 
             QueryOpening {
                 step_index: idx,
@@ -294,6 +374,10 @@ pub fn generate_proof(
                 prev_row_path,
                 scratchpad_line,
                 scratchpad_path,
+                extra_scratchpad_lines,
+                extra_scratchpad_paths,
+                disk_line,
+                disk_path,
             }
         })
         .collect();
@@ -301,6 +385,7 @@ pub fn generate_proof(
     VessProof {
         trace_root,
         scratchpad_root,
+        disk_root,
         nonce: *nonce,
         denomination: denom,
         queries,
@@ -346,10 +431,14 @@ pub fn verify_proof(proof: &VessProof, expected_digest: &[u8; 32]) -> Result<(),
     let expected_indices = derive_query_indices(
         &proof.trace_root,
         &proof.scratchpad_root,
+        &proof.disk_root,
         &proof.nonce,
         expected_digest,
         n_steps,
     );
+
+    let mask = (vm::SCRATCHPAD_LINES - 1) as u32;
+    let disk_mask = (vm::DISK_DATASET_LINES - 1) as u32;
 
     // Verify each query opening.
     for (qi, query) in proof.queries.iter().enumerate() {
@@ -388,14 +477,13 @@ pub fn verify_proof(proof: &VessProof, expected_digest: &[u8; 32]) -> Result<(),
             prev_step.regs
         };
 
-        // 4. Verify address derivation.
-        let mask = (vm::SCRATCHPAD_LINES - 1) as u32;
+        // 4. Verify primary address derivation.
         let expected_addr = (prev_regs[(step_idx as usize) % NUM_REGS] as u32) & mask;
         if current_step.mem_addr != expected_addr {
             return Err(VerifyError::TransitionMismatch(step_idx));
         }
 
-        // 5. Verify scratchpad Merkle path.
+        // 5. Verify primary scratchpad Merkle path.
         let pad_leaf = line_to_bytes(&query.scratchpad_line);
         if !merkle::verify_path(
             &pad_leaf,
@@ -406,20 +494,75 @@ pub fn verify_proof(proof: &VessProof, expected_digest: &[u8; 32]) -> Result<(),
             return Err(VerifyError::ScratchpadPathInvalid(step_idx));
         }
 
-        // 6. Re-execute the step and check the result matches.
-        let (expected_regs, expected_opcode) =
-            execute_one_step(&prev_regs, &query.scratchpad_line, step_idx);
+        // 6. Verify extra scratchpad lines (bandwidth amplification).
+        //    The VM mutates registers between extra reads, so we must
+        //    iteratively track register state to derive later addresses.
+        if query.extra_scratchpad_lines.len() != EXTRA_READS
+            || query.extra_scratchpad_paths.len() != EXTRA_READS
+        {
+            return Err(VerifyError::TransitionMismatch(step_idx));
+        }
+        let mut working_regs = prev_regs;
+        for k in 0..EXTRA_READS {
+            let extra_reg = working_regs[((step_idx as usize) + k + 1) % NUM_REGS];
+            let expected_extra_addr =
+                (extra_reg.rotate_left((k as u32 + 1) * 7) as u32) & mask;
+            if current_step.extra_addrs[k] != expected_extra_addr {
+                return Err(VerifyError::TransitionMismatch(step_idx));
+            }
+            let extra_leaf = line_to_bytes(&query.extra_scratchpad_lines[k]);
+            if !merkle::verify_path(
+                &extra_leaf,
+                expected_extra_addr as usize,
+                &query.extra_scratchpad_paths[k],
+                &proof.scratchpad_root,
+            ) {
+                return Err(VerifyError::ScratchpadPathInvalid(step_idx));
+            }
+            // Apply the same register mutation the VM does.
+            let dst = ((step_idx as usize) + k + 3) % NUM_REGS;
+            working_regs[dst] ^= query.extra_scratchpad_lines[k]
+                [(step_idx as usize + k) % LINE_U64S];
+            working_regs[dst] = working_regs[dst].rotate_right((11 + k as u32 * 3) & 63);
+        }
+
+        // 7. Verify disk dataset line (if this is a disk-read step).
+        //    working_regs already has bandwidth amp applied.
+        let disk_line_opt = if step_idx % DISK_READ_INTERVAL == 0 {
+            let disk_reg = working_regs[((step_idx as usize) + 5) % NUM_REGS];
+            let expected_disk_addr = (disk_reg as u32) & disk_mask;
+            if current_step.disk_addr != expected_disk_addr {
+                return Err(VerifyError::TransitionMismatch(step_idx));
+            }
+            let disk_leaf = line_to_bytes(&query.disk_line);
+            if !merkle::verify_path(
+                &disk_leaf,
+                expected_disk_addr as usize,
+                &query.disk_path,
+                &proof.disk_root,
+            ) {
+                return Err(VerifyError::ScratchpadPathInvalid(step_idx));
+            }
+            Some(&query.disk_line)
+        } else {
+            None
+        };
+
+        // 8. Re-execute the step and check the result matches.
+        let (expected_regs, expected_opcode) = execute_one_step(
+            &prev_regs,
+            &query.scratchpad_line,
+            &query.extra_scratchpad_lines,
+            disk_line_opt,
+            step_idx,
+        );
 
         if current_step.regs != expected_regs || current_step.opcode != expected_opcode {
             return Err(VerifyError::TransitionMismatch(step_idx));
         }
     }
 
-    // 7. Verify the digest: the proof's trace_digest must match what the
-    //    caller expects (the bill digest from the Payment message).  The
-    //    trace_digest is already included in the Fiat-Shamir challenge
-    //    derivation, so any mismatch would also invalidate the query
-    //    indices above.
+    // 9. Verify the digest.
     if proof.trace_digest != *expected_digest {
         return Err(VerifyError::DigestMismatch);
     }
@@ -754,12 +897,16 @@ mod tests {
     fn step_serialization_round_trip() {
         let step = VmStep {
             mem_addr: 42,
+            extra_addrs: [10, 20, 30],
+            disk_addr: 99,
             regs: [1, 2, 3, 4, 5, 6, 7, 8],
             opcode: 3,
         };
         let bytes = step_to_bytes(&step);
         let recovered = bytes_to_step(&bytes).unwrap();
         assert_eq!(recovered.mem_addr, 42);
+        assert_eq!(recovered.extra_addrs, [10, 20, 30]);
+        assert_eq!(recovered.disk_addr, 99);
         assert_eq!(recovered.regs, [1, 2, 3, 4, 5, 6, 7, 8]);
         assert_eq!(recovered.opcode, 3);
     }
@@ -769,22 +916,54 @@ mod tests {
         // Build a small trace and verify our re-execution matches.
         let seed = [0x42u8; 32];
         let scratchpad = vm::build_scratchpad(&seed);
-        let trace = vm::execute(&scratchpad, &seed, 10);
+        let disk_dataset = vm::build_disk_dataset(&seed);
+        let trace = vm::execute(&scratchpad, &disk_dataset, &seed, 10);
         let init_regs = initial_registers(&seed);
 
-        // Verify step 0 (boundary).
-        let (regs, opcode) =
-            execute_one_step(&init_regs, &scratchpad[trace.steps[0].mem_addr as usize].0, 0);
-        assert_eq!(trace.steps[0].regs, regs);
-        assert_eq!(trace.steps[0].opcode, opcode);
+        // Build extra lines for step 0.
+        let step0 = &trace.steps[0];
+        let extra0: Vec<[u64; LINE_U64S]> = (0..EXTRA_READS)
+            .map(|k| {
+                let ea = step0.extra_addrs[k] as usize;
+                scratchpad[ea].0
+            })
+            .collect();
+        let disk0 = if 0 % DISK_READ_INTERVAL == 0 {
+            Some(&disk_dataset[step0.disk_addr as usize].0)
+        } else {
+            None
+        };
+        let (regs, opcode) = execute_one_step(
+            &init_regs,
+            &scratchpad[step0.mem_addr as usize].0,
+            &extra0,
+            disk0,
+            0,
+        );
+        assert_eq!(step0.regs, regs);
+        assert_eq!(step0.opcode, opcode);
 
         // Verify step 5 (middle).
+        let step5 = &trace.steps[5];
+        let extra5: Vec<[u64; LINE_U64S]> = (0..EXTRA_READS)
+            .map(|k| {
+                let ea = step5.extra_addrs[k] as usize;
+                scratchpad[ea].0
+            })
+            .collect();
+        let disk5 = if 5 % DISK_READ_INTERVAL == 0 {
+            Some(&disk_dataset[step5.disk_addr as usize].0)
+        } else {
+            None
+        };
         let (regs, opcode) = execute_one_step(
             &trace.steps[4].regs,
-            &scratchpad[trace.steps[5].mem_addr as usize].0,
+            &scratchpad[step5.mem_addr as usize].0,
+            &extra5,
+            disk5,
             5,
         );
-        assert_eq!(trace.steps[5].regs, regs);
-        assert_eq!(trace.steps[5].opcode, opcode);
+        assert_eq!(step5.regs, regs);
+        assert_eq!(step5.opcode, opcode);
     }
 }

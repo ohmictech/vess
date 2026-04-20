@@ -108,11 +108,12 @@ pub fn try_mint(denom: Denomination, owner_vk_hash: &[u8; 32]) -> MintOutcome {
         "Starting minting attempt"
     );
 
-    // Build scratchpad.
+    // Build scratchpad and disk dataset.
     let scratchpad = vm::build_scratchpad(&seed);
+    let disk_dataset = vm::build_disk_dataset(owner_vk_hash);
 
     // Phase 1: fast digest-only check (no trace allocation).
-    let digest = vm::execute_digest_only(&scratchpad, &seed, iters);
+    let digest = vm::execute_digest_only(&scratchpad, &disk_dataset, &seed, iters);
 
     if !meets_difficulty(&digest, diff) {
         return MintOutcome::Miss;
@@ -121,12 +122,12 @@ pub fn try_mint(denom: Denomination, owner_vk_hash: &[u8; 32]) -> MintOutcome {
     tracing::info!(denomination = ?denom, "Minting hit — re-executing with trace for proof");
 
     // Phase 2: re-execute with full trace for STARK proof generation.
-    let trace = vm::execute(&scratchpad, &seed, iters);
+    let trace = vm::execute(&scratchpad, &disk_dataset, &seed, iters);
     debug_assert_eq!(trace.digest, digest, "deterministic re-execution diverged");
 
-    // Generate the IOP proof: Merkle-commit the trace + scratchpad,
+    // Generate the IOP proof: Merkle-commit the trace + scratchpad + disk,
     // derive Fiat-Shamir challenges, and open queried positions.
-    let iop_proof = proof::generate_proof(&trace, &scratchpad, &nonce, denom, owner_vk_hash);
+    let iop_proof = proof::generate_proof(&trace, &scratchpad, &disk_dataset, &nonce, denom, owner_vk_hash);
     let proof_bytes = proof::serialize_proof(&iop_proof);
 
     let now = std::time::SystemTime::now()
@@ -309,11 +310,12 @@ pub fn try_mint_d1(owner_vk_hash: &[u8; 32]) -> Option<CompletedSolve> {
     let iters = iterations_for(denom);
     let diff = difficulty_bits_for(denom);
 
-    // Build scratchpad.
+    // Build scratchpad and disk dataset.
     let scratchpad = vm::build_scratchpad(&seed);
+    let disk_dataset = vm::build_disk_dataset(owner_vk_hash);
 
     // Fast path: compute only the digest (no trace allocation).
-    let digest = vm::execute_digest_only(&scratchpad, &seed, iters);
+    let digest = vm::execute_digest_only(&scratchpad, &disk_dataset, &seed, iters);
 
     if !meets_difficulty(&digest, diff) {
         return None;
@@ -364,10 +366,11 @@ pub fn regenerate_proof(solve: &CompletedSolve, owner_vk_hash: &[u8; 32]) -> Vec
     let iters = iterations_for(denom);
 
     let scratchpad = vm::build_scratchpad(&seed);
-    let trace = vm::execute(&scratchpad, &seed, iters);
+    let disk_dataset = vm::build_disk_dataset(owner_vk_hash);
+    let trace = vm::execute(&scratchpad, &disk_dataset, &seed, iters);
     debug_assert_eq!(trace.digest, solve.bill.digest, "deterministic re-execution diverged");
 
-    let iop_proof = proof::generate_proof(&trace, &scratchpad, &solve.nonce, denom, owner_vk_hash);
+    let iop_proof = proof::generate_proof(&trace, &scratchpad, &disk_dataset, &solve.nonce, denom, owner_vk_hash);
     proof::serialize_proof(&iop_proof)
 }
 
