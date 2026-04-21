@@ -1,0 +1,17 @@
+[package]
+name = "vess-android"
+version = "0.1.0"
+edition = "2021"
+license-file = "../LICENSE"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+jni = { version = "0.21", default-features = false }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+tracing = "0.1"
+# Uncomment once NDK cross-compilation is set up:
+# vess-protocol = { path = "../vess-protocol" }
+# vess-kloak    = { path = "../vess-kloak" }
+# vess-artery   = { path = "../vess-artery" }

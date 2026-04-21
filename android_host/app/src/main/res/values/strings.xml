@@ -1,0 +1,17 @@
+<resources>
+    <string name="app_name">Vess</string>
+
+    <!-- Foreground service notification -->
+    <string name="notif_channel_name">Vess Node</string>
+    <string name="notif_title">Vess Node</string>
+    <string name="notif_text">Running in background</string>
+
+    <!-- Main activity labels -->
+    <string name="label_node_id">Node ID: %1$s</string>
+    <string name="label_balance">Balance: %1$d VESS</string>
+    <string name="label_peers">Peers: %1$d</string>
+
+    <!-- Buttons -->
+    <string name="btn_start">Start Node</string>
+    <string name="btn_stop">Stop Node</string>
+</resources>

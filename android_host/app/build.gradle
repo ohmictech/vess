@@ -1,0 +1,75 @@
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+}
+
+android {
+    namespace 'com.vess.app'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.vess.app"
+        minSdk 26
+        targetSdk 34
+        versionCode 1
+        versionName "0.1.0"
+
+        // ABI filters — only ship what we actually build via cargo-ndk.
+        ndk {
+            abiFilters 'arm64-v8a', 'armeabi-v7a'
+        }
+    }
+
+    sourceSets {
+        main {
+            // Pre-built .so files dropped here by the cargoNdkBuild task.
+            jniLibs.srcDirs = ['src/main/jniLibs']
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+    kotlinOptions {
+        jvmTarget = '1.8'
+    }
+}
+
+dependencies {
+    implementation 'androidx.appcompat:appcompat:1.7.0'
+    implementation 'com.google.android.material:material:1.12.0'
+    implementation 'androidx.constraintlayout:constraintlayout:2.1.4'
+    implementation 'androidx.core:core-ktx:1.13.1'
+    implementation 'androidx.lifecycle:lifecycle-service:2.8.1'
+}
+
+// ── Rust / cargo-ndk integration ───────────────────────────────────────────
+//
+// Prerequisites:
+//   cargo install cargo-ndk
+//   (Android NDK installed via SDK Manager; ANDROID_NDK_HOME must be set)
+//
+// Run manually:      ./gradlew cargoNdkBuild
+// Auto before APK:   uncomment preBuild.dependsOn line below.
+
+task cargoNdkBuild(type: Exec) {
+    description = 'Cross-compile vess-android Rust crate for Android via cargo-ndk'
+    group = 'build'
+    workingDir "${rootProject.projectDir}/../vess-android"
+    commandLine 'cargo', 'ndk',
+            '--target', 'arm64-v8a',
+            '--target', 'armeabi-v7a',
+            '--output-dir', "${projectDir}/src/main/jniLibs",
+            'build', '--release'
+}
+
+// Uncomment to automatically build Rust before every Android build:
+// preBuild.dependsOn cargoNdkBuild
