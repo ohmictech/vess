@@ -729,10 +729,10 @@ pub fn cleanup_rejected_bills(
         // Safety: active should have same length as deposited_mint_ids from protocol
         if i >= active.len() {
             // Malformed response; log warning but continue
-            eprintln!(
-                "WARNING: registry response mismatch: {} deposits, {} statuses",
-                deposited_mint_ids.len(),
-                active.len()
+            tracing::warn!(
+                deposits = deposited_mint_ids.len(),
+                statuses = active.len(),
+                "registry response mismatch"
             );
             continue;
         }

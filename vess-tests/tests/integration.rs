@@ -327,8 +327,6 @@ fn protocol_message_serialization() {
         view_tag: 0x42,
         stealth_id: [0xBB; 32],
         created_at: 1000,
-        mint_ids: vec![],
-        denomination_values: vec![],
         bill_count: 0,
     })];
 

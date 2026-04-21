@@ -25,9 +25,11 @@ pub struct ArterySnapshot {
     pub tags: BTreeMap<String, TagRecord>,
     /// Legacy bill DHT records — kept for deserialization compatibility.
     /// No longer populated; sealed bills are embedded in ownership records.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub bills: BTreeMap<String, serde_json::Value>,
-    /// Mailbox buffers keyed by hex-encoded stealth ID.
+    /// Legacy mailbox buffers — kept for deserialization compatibility.
+    /// Payments are now served from limbo_buffer.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub mailbox: BTreeMap<String, Vec<serde_json::Value>>,
     /// Known peer node IDs.
     pub known_peers: Vec<[u8; 32]>,

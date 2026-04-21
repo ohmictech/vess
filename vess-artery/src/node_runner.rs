@@ -208,7 +208,7 @@ impl Default for NodeConfig {
 /// claim confirmation).  Keeps a bounded sliding window so memory is fixed.
 pub(crate) struct PaymentLatencyTracker {
     /// Recent latency samples in milliseconds.
-    samples: Vec<u64>,
+    samples: VecDeque<u64>,
     /// Maximum number of samples to retain.
     max_samples: usize,
 }
@@ -216,7 +216,7 @@ pub(crate) struct PaymentLatencyTracker {
 impl PaymentLatencyTracker {
     fn new(max_samples: usize) -> Self {
         Self {
-            samples: Vec::new(),
+            samples: VecDeque::new(),
             max_samples,
         }
     }
@@ -224,9 +224,9 @@ impl PaymentLatencyTracker {
     /// Record a latency observation in milliseconds.
     fn record(&mut self, latency_ms: u64) {
         if self.samples.len() >= self.max_samples {
-            self.samples.remove(0); // drop oldest
+            self.samples.pop_front(); // drop oldest
         }
-        self.samples.push(latency_ms);
+        self.samples.push_back(latency_ms);
     }
 
     /// Median latency (0 if no samples).
@@ -234,7 +234,7 @@ impl PaymentLatencyTracker {
         if self.samples.is_empty() {
             return 0;
         }
-        let mut sorted = self.samples.clone();
+        let mut sorted: Vec<u64> = self.samples.iter().copied().collect();
         sorted.sort_unstable();
         sorted[sorted.len() / 2]
     }
@@ -244,7 +244,7 @@ impl PaymentLatencyTracker {
         if self.samples.is_empty() {
             return 0;
         }
-        let mut sorted = self.samples.clone();
+        let mut sorted: Vec<u64> = self.samples.iter().copied().collect();
         sorted.sort_unstable();
         let idx = ((sorted.len() as f64) * 0.95).ceil() as usize;
         sorted[idx.min(sorted.len() - 1)]
@@ -294,7 +294,8 @@ pub(crate) struct ArteryState {
     pub(crate) limbo_payment_ids: std::collections::HashSet<[u8; 32]>,
     /// Encrypted wallet manifests keyed by DHT key.
     pub(crate) manifest_store: HashMap<[u8; 32], Vec<u8>>,
-    /// Unix-millis timestamp when each mint_id entered limbo (for latency tracking).
+    /// Unix-millis timestamp when each bill entered limbo (keyed by mint_id,
+    /// populated at auto-receive time for end-to-end latency tracking).
     pub(crate) limbo_entry_times: HashMap<[u8; 32], u64>,
     /// Payment latency tracker (payment relay → ownership claim completion).
     pub(crate) payment_latency: PaymentLatencyTracker,
@@ -619,7 +620,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
         let raw_seed = if let Some(ref pwd) = password {
             wallet.unlock_with_password(pwd)?
         } else {
-            // Legacy path: recovery phrase + PIN from env vars.
+            // Fallback: recovery phrase + PIN from env vars (VESS_RECOVERY_PHRASE + VESS_RECOVERY_PIN).
             use vess_kloak::recovery::{derive_raw_seed, RecoveryPhrase};
             let phrase_words = std::env::var("VESS_RECOVERY_PHRASE").map_err(|_| {
                 anyhow::anyhow!(
@@ -787,18 +788,14 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
         }
     }
 
-    println!("Artery node online.");
-    println!("Node ID: {}", node.id());
-    println!("State:   {}", config.state_dir.display());
-    println!("Version: {}", hex_key(&PROTOCOL_VERSION_HASH));
-    println!("K={}, max_hops={}", config.k_neighbors, config.max_hops);
+    info!(node_id = %node.id(), state = %config.state_dir.display(), version = %hex_key(&PROTOCOL_VERSION_HASH), k = config.k_neighbors, max_hops = config.max_hops, "Artery node online");
     if config.wallet_path.is_some() {
         let s = state.lock().unwrap();
         let bal = s.wallet.as_ref().map(|w| w.billfold.balance()).unwrap_or(0);
-        println!("Wallet:  enabled (balance: {} Vess)", bal);
+        info!(balance = bal, "wallet enabled");
     }
     if let Some(port) = config.rpc_port {
-        println!("RPC:     127.0.0.1:{}", port);
+        info!(port, "RPC server listening");
         let rpc_state = state.clone();
         let rpc_senders = crate::rpc::QueueSenders {
             manifest_tx: manifest_tx.clone(),
@@ -817,7 +814,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
             }
         });
     }
-    println!("Listening for protocol messages…\n");
+    info!("listening for protocol messages");
 
     // ── Periodic state flush (every 60 seconds) ─────────────────────
     let flush_state = state.clone();
@@ -2103,12 +2100,11 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     .unwrap_or_default()
                     .as_millis() as u64;
 
-                let mint_ids: Vec<[u8; 32]> = Vec::new();
                 let stealth_id = p.stealth_id;
                 let relay_copy = p.clone();
                 let payment_id = p.payment_id;
 
-                if !state.limbo_buffer.hold(stealth_id, p, mint_ids.clone(), now, peer_id) {
+                if !state.limbo_buffer.hold(stealth_id, p, Vec::new(), now, peer_id) {
                     warn!(%peer, "payment rejected: limbo buffer at capacity or peer quota exceeded");
                     return None;
                 }
@@ -2116,10 +2112,6 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 // Track AFTER successful hold so rejected payments don't
                 // leave stale entries that block legitimate payments.
                 state.limbo_payment_ids.insert(payment_id);
-                for mid in &mint_ids {
-                    state.limbo_mint_ids.insert(*mid);
-                    state.limbo_entry_times.insert(*mid, now_ms);
-                }
 
                 // Forward to K-nearest by stealth_id so multiple relay
                 // nodes hold the payment (prevents single-node censorship).
@@ -2138,8 +2130,10 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                         Ok(Some(result)) => {
                             let mut total = 0u64;
                             let mut pending_oc = Vec::new();
+                            let mut claimed_mids: Vec<[u8; 32]> = Vec::new();
                             for claimed in result.claimed {
                                 total += claimed.bill.denomination.value();
+                                claimed_mids.push(claimed.bill.mint_id);
                                 ws.billfold.deposit_with_credentials(
                                     claimed.bill,
                                     SpendCredential {
@@ -2147,6 +2141,11 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                                         spend_sk: claimed.spend_sk,
                                     },
                                 );
+                            }
+                            // ws is no longer used after this point; record
+                            // entry times keyed by mint_id for latency tracking.
+                            for mid in &claimed_mids {
+                                state.limbo_entry_times.insert(*mid, now_ms);
                             }
                             for claim in result.ownership_claims {
                                 if let PulseMessage::OwnershipClaim(oc) = claim {
@@ -2267,7 +2266,6 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
 
                 // Registry-only model: no inline STARK verification.
 
-                let mint_ids: Vec<[u8; 32]> = Vec::new();
                 let stealth_id = p.stealth_id;
                 let payment_id = p.payment_id;
                 let now = std::time::SystemTime::now()
@@ -2275,16 +2273,13 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     .unwrap_or_default()
                     .as_secs();
 
-                if !state.limbo_buffer.hold(stealth_id, ld.payment, mint_ids.clone(), now, peer_id) {
+                if !state.limbo_buffer.hold(stealth_id, ld.payment, Vec::new(), now, peer_id) {
                     warn!(%peer, "limbo deliver rejected: buffer at capacity");
                     return None;
                 }
 
                 // Track AFTER successful hold.
                 state.limbo_payment_ids.insert(payment_id);
-                for mid in &mint_ids {
-                    state.limbo_mint_ids.insert(*mid);
-                }
 
                 // Auto-receive trial-decrypt for LimboDeliver too.
                 let maybe_payload = state.limbo_buffer.peek(&stealth_id)
@@ -2865,7 +2860,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                             rec.encrypted_bill = oc.encrypted_bill.clone();
                             info!("ownership transferred (depth {}) for mint_id {:?}", oc.chain_depth, &oc.mint_id[..4]);
 
-                            // Record payment latency if this mint_id came through limbo.
+                            // Record payment latency if this bill came through limbo.
                             if let Some(entry_ms) = state.limbo_entry_times.remove(&oc.mint_id) {
                                 let now_ms = std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)

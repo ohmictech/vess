@@ -88,7 +88,7 @@ impl LimboBuffer {
 
         // Denomination-weighted priority eviction (Fix 3B).
         if self.total_entries() >= EVICTION_THRESHOLD {
-            self.evict_lowest_denomination();
+            self.evict_oldest();
         }
 
         if self.total_entries() >= MAX_TOTAL_ENTRIES {
@@ -203,7 +203,7 @@ impl LimboBuffer {
     /// Evict the oldest entries until total entries drop below
     /// `EVICTION_THRESHOLD`. Oldest-first protects recently-arrived
     /// payments during a relay flood.
-    fn evict_lowest_denomination(&mut self) {
+    fn evict_oldest(&mut self) {
         let target = EVICTION_THRESHOLD * 9 / 10; // evict down to ~90% of threshold
         if self.total_entries() <= target {
             return;
