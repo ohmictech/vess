@@ -359,7 +359,7 @@ pub fn generate_proof(
             }
 
             // Disk dataset line (if applicable).
-            let (disk_line, disk_path) = if idx as u64 % DISK_READ_INTERVAL == 0 {
+            let (disk_line, disk_path) = if idx.is_multiple_of(DISK_READ_INTERVAL) {
                 let da = step.disk_addr as usize;
                 (disk_dataset[da].0, disk_tree.proof(da))
             } else {
