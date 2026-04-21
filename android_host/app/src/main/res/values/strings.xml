@@ -14,4 +14,9 @@
     <!-- Buttons -->
     <string name="btn_start">Start Node</string>
     <string name="btn_stop">Stop Node</string>
+    <string name="btn_terminal">Open Terminal</string>
+
+    <!-- Terminal activity -->
+    <string name="title_terminal">Vess Terminal</string>
+    <string name="hint_command">enter command…</string>
 </resources>

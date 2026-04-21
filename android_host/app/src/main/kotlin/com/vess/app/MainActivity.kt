@@ -15,7 +15,6 @@ import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
-
 class MainActivity : AppCompatActivity() {
 
     private lateinit var tvNodeId: TextView
@@ -60,6 +59,10 @@ class MainActivity : AppCompatActivity() {
 
         btnToggle.setOnClickListener {
             if (serviceBound) stopNode() else startNode()
+        }
+
+        findViewById<Button>(R.id.btnTerminal).setOnClickListener {
+            startActivity(Intent(this, TerminalActivity::class.java))
         }
 
         requestNotificationPermission()

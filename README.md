@@ -22,7 +22,7 @@ Vess picks it up.
 
 **No ledger. No history. No trace.** There is no blockchain. No growing chain of blocks that every node must download and store forever. Bills are self-contained bearer instruments — like physical cash, they carry their own proof of value. A new node joins the network, participates fully, and never needs to download a single byte of transaction history.
 
-**Your computer mints real money.** The 1 GiB memory-hard VM means regular laptops and desktops can mint competitively. No ASIC farms. No GPU warehouses. No staking cartels. You convert your own electricity into money on your own hardware. This is the "Bitcoin in 2009" story, except the architecture is designed to keep it that way.
+**Your computer mints real money.** The minting VM uses 1 GiB of RAM, saturates the memory bus with 4 reads per step, and reads an 8 GiB per-identity dataset from NVMe/SSD — three layers that make regular laptops and desktops competitive miners. No ASIC farms. No GPU warehouses. No staking cartels. You convert your own electricity into money on your own hardware. This is the "Bitcoin in 2009" story, except the architecture is designed to keep it that way.
 
 **Privacy isn't a feature — it's the architecture.** Every payment targets a unique one-time stealth address. Human-readable names are hashed before they ever touch the network. There are no accounts to freeze, no addresses to blacklist, no transaction graph to analyze. Chain analysis doesn't work when there's no chain.
 
@@ -30,13 +30,23 @@ Vess picks it up.
 
 **Scales without the baggage.** DHT replication with k=20 means the early network (5–25 nodes) behaves like full consensus — every node sees everything. As the network grows, it naturally transitions to efficient sharded replication. No "bootstrap mode," no fragile early phase, no 500 GB initial sync.
 
-**Anyone with a phone can participate.** The 1 GiB scratchpad fits comfortably on any smartphone made in the last five years. You won't get rich mining on a phone — maybe a few cents a day. But that's the point. In economies where a dollar is a meal, the ability to create money from a device you already own, with no bank account, no KYC, no intermediary taking a cut, is the difference between participating in the financial system and being locked out of it entirely. Bitcoin mining requires a warehouse. Ethereum staking requires capital. Vess requires a phone and electricity.
+**Anyone with a phone can participate.** The 1 GiB scratchpad fits comfortably on any smartphone made in the last five years, and the 8 GiB disk dataset fits on a cheap microSD card or internal storage. You won't get rich mining on a phone — maybe a few cents a day. But that's the point. In economies where a dollar is a meal, the ability to create money from a device you already own, with no bank account, no KYC, no intermediary taking a cut, is the difference between participating in the financial system and being locked out of it entirely. Bitcoin mining requires a warehouse. Ethereum staking requires capital. Vess requires a phone and electricity.
 
 ---
 
 ## How It Works
 
-**Minting creates value.** A memory-hard VM grinds through a 1 GiB scratchpad until it finds a nonce that satisfies a STARK-provable difficulty target. The resulting `VessBill` carries an unforgeable proof of computation tied to a denomination and owner. Difficulty is hardcoded — no adjustment, no inflation schedule, no halvings.
+**Minting creates value.** Running `vess mint` starts a continuous minting loop. The VM executes until it finds a nonce satisfying the difficulty target; on a hit, a `VessBill` with an unforgeable STARK proof is emitted. Difficulty is hardcoded — no adjustment, no inflation schedule, no halvings. Higher-denomination bills cost proportionally more work.
+
+**Three-layer ASIC resistance.** The minting VM is designed so that a purpose-built ASIC cannot gain a meaningful advantage over a commodity laptop, desktop, or smartphone:
+
+1. **Memory-hard scratchpad (1 GiB RAM).** At the start of each attempt the VM builds a 1 GiB random-access scratchpad seeded from the minter's identity. The entire scratchpad participates in every execution — keeping it at D-DRAM speed on-chip would require 1 GiB of SRAM, which is economically infeasible compared to cheap DRAM on a consumer motherboard.
+
+2. **Bandwidth amplification (4× memory reads/step).** Each VM step performs 4 non-sequential scratchpad reads instead of 1, saturating the memory bus at full bandwidth. An ASIC with fast memory still pays the same bus bandwidth cost as consumer hardware — the bottleneck shifts from compute to memory I/O where ASICs have no structural advantage.
+
+3. **Disk dataset (8 GiB NVMe/SSD).** A per-identity 8 GiB dataset is generated on first run and stored on local NVMe or SSD. The VM reads one dataset cache line every 8 steps, mixing it into register state. Storing 8 GiB per miner identity on-die is cost-prohibitive for ASICs; consumer SSDs handle it for a few dollars. Under the `test-mint` feature both the scratchpad and dataset shrink to 1 MiB (in-memory) so CI and tests complete in seconds.
+
+Together these constraints mean your laptop or phone can mint competitively. All three resources — RAM, memory bandwidth, and fast storage — are cheap and abundant on commodity hardware but expensive to provision in the geometric quantities required for an ASIC advantage.
 
 **Ownership is a hash chain.** Each bill has a `chain_tip` and `chain_depth`. At genesis the minter's verification key is hashed into the tip. On transfer the new owner's key and an ML-DSA-65 signature advance the chain. Deeper chains are authoritative. Same-depth conflicts resolve deterministically (lowest hash wins). Re-spending supersedes any pending delivery, so no retraction mechanism is needed.
 
@@ -77,6 +87,7 @@ Vess picks it up.
 | **vess-tag** | `+tag` validation and Argon2id proof-of-work registration |
 | **vess-vascular** | Iroh QUIC transport (`vess/pulse/0` ALPN) |
 | **vess-cli** | Unified CLI — wallet init, send, mint, balance, tag management, node operation |
+| **vess-android** | Android JNI bridge (`cdylib`) + Kotlin app — foreground service node, terminal CLI activity with full command parity |
 | **vess-tests** | Integration and network tests |
 
 ---

@@ -14,9 +14,7 @@ use std::sync::{Mutex, OnceLock};
 
 use jni::objects::{JClass, JString};
 use jni::sys::{jboolean, jint, jlong, jstring, JNI_FALSE, JNI_TRUE};
-use jni::JNIEnv;
-
-// ── Shared node state ──────────────────────────────────────────────────────
+use jni::JNIEnv;// ── Shared node state ──────────────────────────────────────────────────────
 
 struct NodeState {
     running: bool,
@@ -119,4 +117,166 @@ pub extern "system" fn Java_com_vess_app_VessNode_nativeGetPeerCount<'local>(
         Ok(n) if n.running => 0, // TODO: real peer count from routing table
         _ => -1,
     }
+}
+
+/// Make a JSON-RPC call to the local artery node's RPC server.
+/// `request_json` is a single JSON object; returns the response JSON string or
+/// an error JSON object `{"error": "..."}` on failure.
+#[no_mangle]
+pub extern "system" fn Java_com_vess_app_VessNode_nativeRpc<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    port: jint,
+    request_json: JString<'local>,
+) -> jstring {
+    let req: String = match env.get_string(&request_json) {
+        Ok(s) => s.into(),
+        Err(_) => return err_string(&mut env, "invalid request string"),
+    };
+
+    // Synchronous loopback TCP call on a temporary thread-local runtime.
+    let result: anyhow::Result<String> = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        rt.block_on(async move {
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+            use tokio::net::TcpStream;
+
+            let addr = format!("127.0.0.1:{port}");
+            let stream = TcpStream::connect(&addr).await?;
+            let (reader, mut writer) = stream.into_split();
+            let mut buf = BufReader::new(reader);
+            let mut req_bytes = req.into_bytes();
+            req_bytes.push(b'\n');
+            writer.write_all(&req_bytes).await?;
+            let mut line = String::new();
+            buf.read_line(&mut line).await?;
+            Ok(line.trim().to_string())
+        })
+    })
+    .join()
+    .unwrap_or_else(|_| Err(anyhow::anyhow!("thread panicked")));
+
+    let s = match result {
+        Ok(s) => s,
+        Err(e) => format!("{{\"error\":\"{e}\"}}"),
+    };
+    env.new_string(&s)
+        .unwrap_or_else(|_| env.new_string("{}").unwrap())
+        .into_raw()
+}
+
+/// Initialise a new wallet: derives keys, computes tag PoW, sends TagRegister.
+/// Returns a JSON object `{"ok":bool, "recovery_phrase":"...", "error":"..."}`.
+/// Long-running (~10 s due to Argon2id PoW) — call from a background thread.
+#[no_mangle]
+pub extern "system" fn Java_com_vess_app_VessNode_nativeWalletInit<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    data_dir: JString<'local>,
+    tag_str: JString<'local>,
+) -> jstring {
+    let _dir: String = match env.get_string(&data_dir) {
+        Ok(s) => s.into(),
+        Err(_) => return err_string(&mut env, "invalid data_dir"),
+    };
+    let _tag: String = match env.get_string(&tag_str) {
+        Ok(s) => s.into(),
+        Err(_) => return err_string(&mut env, "invalid tag"),
+    };
+
+    // TODO: call vess_kloak::recovery::RecoveryPhrase::generate(),
+    //   derive keys, compute vess_tag::compute_tag_pow(), build TagRegister,
+    //   send via VessNode JNI handle, save WalletFile to data_dir/wallet.json.
+    let resp = r#"{"ok":false,"error":"wallet init not yet wired to artery (TODO)"}"#;
+    env.new_string(resp)
+        .unwrap_or_else(|_| env.new_string("{}").unwrap())
+        .into_raw()
+}
+
+/// Recover a wallet from a 5-word recovery phrase and 5-digit PIN.
+/// Returns `{"ok":bool, "balance":N, "recovered_bills":N, "error":"..."}`.
+/// Long-running — call from a background thread.
+#[no_mangle]
+pub extern "system" fn Java_com_vess_app_VessNode_nativeWalletRecover<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    data_dir: JString<'local>,
+    words: JString<'local>,
+    pin: JString<'local>,
+) -> jstring {
+    let _dir: String = match env.get_string(&data_dir) {
+        Ok(s) => s.into(),
+        Err(_) => return err_string(&mut env, "invalid data_dir"),
+    };
+    let _words: String = match env.get_string(&words) {
+        Ok(s) => s.into(),
+        Err(_) => return err_string(&mut env, "invalid words"),
+    };
+    let _pin: String = match env.get_string(&pin) {
+        Ok(s) => s.into(),
+        Err(_) => return err_string(&mut env, "invalid pin"),
+    };
+
+    // TODO: call vess_kloak recovery path, fetch manifest from network,
+    //   reconstruct billfold, save WalletFile.
+    let resp = r#"{"ok":false,"error":"wallet recovery not yet wired to artery (TODO)"}"#;
+    env.new_string(resp)
+        .unwrap_or_else(|_| env.new_string("{}").unwrap())
+        .into_raw()
+}
+
+/// Run one mint iteration.  Returns JSON `{"ok":true,"hit":bool,"solves":N,"attempts":N}`.
+/// Runs synchronously — always call from a background thread.  Caller loops
+/// until `should_stop` is set; each call is one VM execution + difficulty check.
+#[no_mangle]
+pub extern "system" fn Java_com_vess_app_VessNode_nativeMintStep<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    data_dir: JString<'local>,
+) -> jstring {
+    let _dir: String = match env.get_string(&data_dir) {
+        Ok(s) => s.into(),
+        Err(_) => return err_string(&mut env, "invalid data_dir"),
+    };
+
+    // TODO: call vess_foundry::mint::mine_flow() for one step,
+    //   persist session file in data_dir, return progress JSON.
+    let resp = r#"{"ok":false,"error":"mint not yet wired (TODO)"}"#;
+    env.new_string(resp)
+        .unwrap_or_else(|_| env.new_string("{}").unwrap())
+        .into_raw()
+}
+
+/// Aggregate accumulated mint solves into bills and broadcast OwnershipGenesis via RPC.
+/// Returns `{"ok":bool,"bills":N,"balance":N,"error":"..."}`.
+#[no_mangle]
+pub extern "system" fn Java_com_vess_app_VessNode_nativeMintFinalize<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    data_dir: JString<'local>,
+    rpc_port: jint,
+) -> jstring {
+    let _dir: String = match env.get_string(&data_dir) {
+        Ok(s) => s.into(),
+        Err(_) => return err_string(&mut env, "invalid data_dir"),
+    };
+    let _ = rpc_port;
+
+    // TODO: call vess_foundry::mint::aggregate_solves(), broadcast
+    //   OwnershipGenesis via nativeRpc, update manifest, save wallet.
+    let resp = r#"{"ok":false,"error":"mint finalize not yet wired (TODO)"}"#;
+    env.new_string(resp)
+        .unwrap_or_else(|_| env.new_string("{}").unwrap())
+        .into_raw()
+}
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+
+fn err_string(env: &mut JNIEnv<'_>, msg: &str) -> jstring {
+    let s = format!("{{\"error\":\"{msg}\"}}");
+    env.new_string(&s)
+        .unwrap_or_else(|_| env.new_string("{}").unwrap())
+        .into_raw()
 }
