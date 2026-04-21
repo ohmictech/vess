@@ -101,8 +101,8 @@ impl NodeStorage {
         }
         let data = fs::read_to_string(&state_path)
             .with_context(|| format!("read state file: {}", state_path.display()))?;
-        let snapshot: ArterySnapshot = serde_json::from_str(&data)
-            .context("deserialize artery state")?;
+        let snapshot: ArterySnapshot =
+            serde_json::from_str(&data).context("deserialize artery state")?;
         Ok(snapshot)
     }
 
@@ -114,8 +114,7 @@ impl NodeStorage {
         let state_path = self.dir.join("state.json");
         let tmp_path = self.dir.join("state.json.tmp");
 
-        let data = serde_json::to_string_pretty(snapshot)
-            .context("serialize artery state")?;
+        let data = serde_json::to_string_pretty(snapshot).context("serialize artery state")?;
         fs::write(&tmp_path, data.as_bytes())
             .with_context(|| format!("write temp state file: {}", tmp_path.display()))?;
         fs::rename(&tmp_path, &state_path)

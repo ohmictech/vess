@@ -16,14 +16,14 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 
-use vess_kloak::billfold::SpendCredential;
-use vess_kloak::payment::{prepare_payment_with_transfer, prepare_payment_from_bills};
-use vess_kloak::selection::{select_bills_filtered, decompose_amount};
 use vess_foundry::reforge::{reforge, ReforgeRequest};
 use vess_foundry::spend_auth::generate_spend_keypair;
-use vess_protocol::{PulseMessage, TagStore, ManifestStore};
+use vess_kloak::billfold::SpendCredential;
+use vess_kloak::payment::{prepare_payment_from_bills, prepare_payment_with_transfer};
+use vess_kloak::selection::{decompose_amount, select_bills_filtered};
+use vess_protocol::{ManifestStore, PulseMessage, TagStore};
 use vess_stealth::MasterStealthAddress;
-use vess_tag::{VessTag, TagRecord};
+use vess_tag::{TagRecord, VessTag};
 use vess_vascular::VessNode;
 
 use crate::node_runner::ArteryState;
@@ -75,11 +75,29 @@ pub enum RpcRequest {
         #[serde(default)]
         max: Option<usize>,
     },
-    TagLookup { tag: String },
-    Send { amount: u64, recipient: String, #[serde(default)] memo: Option<String> },
-    SendDirect { amount: u64, recipient: String, node_id: String, #[serde(default)] memo: Option<String> },
-    WalletUnlock { password: String },
-    WalletSetPassword { current_password: String, new_password: String },
+    TagLookup {
+        tag: String,
+    },
+    Send {
+        amount: u64,
+        recipient: String,
+        #[serde(default)]
+        memo: Option<String>,
+    },
+    SendDirect {
+        amount: u64,
+        recipient: String,
+        node_id: String,
+        #[serde(default)]
+        memo: Option<String>,
+    },
+    WalletUnlock {
+        password: String,
+    },
+    WalletSetPassword {
+        current_password: String,
+        new_password: String,
+    },
     WalletLock,
     TagRegister {
         tag: String,
@@ -235,7 +253,12 @@ pub(crate) async fn run_rpc_server(
     }
 }
 
-async fn handle_request(line: &str, state: &Arc<Mutex<ArteryState>>, senders: &QueueSenders, node: &VessNode) -> RpcResponse {
+async fn handle_request(
+    line: &str,
+    state: &Arc<Mutex<ArteryState>>,
+    senders: &QueueSenders,
+    node: &VessNode,
+) -> RpcResponse {
     let req: RpcRequest = match serde_json::from_str(line) {
         Ok(r) => r,
         Err(e) => return RpcResponse::err(format!("invalid request: {e}")),
@@ -246,19 +269,87 @@ async fn handle_request(line: &str, state: &Arc<Mutex<ArteryState>>, senders: &Q
         RpcRequest::NodeInfo => handle_node_info(state),
         RpcRequest::Notifications { max } => handle_notifications(state, max.unwrap_or(64)),
         RpcRequest::TagLookup { tag } => handle_tag_lookup(state, &tag),
-        RpcRequest::Send { amount, recipient, memo } => handle_send(state, amount, &recipient, memo, senders),
-        RpcRequest::SendDirect { amount, recipient, node_id, memo } => handle_send_direct(state, amount, &recipient, &node_id, memo, senders, node).await,
-        RpcRequest::WalletUnlock { password } => handle_wallet_unlock(state, &password, &senders.oc_tx),
-        RpcRequest::WalletSetPassword { current_password, new_password } => handle_wallet_set_password(state, &current_password, &new_password),
+        RpcRequest::Send {
+            amount,
+            recipient,
+            memo,
+        } => handle_send(state, amount, &recipient, memo, senders),
+        RpcRequest::SendDirect {
+            amount,
+            recipient,
+            node_id,
+            memo,
+        } => handle_send_direct(state, amount, &recipient, &node_id, memo, senders, node).await,
+        RpcRequest::WalletUnlock { password } => {
+            handle_wallet_unlock(state, &password, &senders.oc_tx)
+        }
+        RpcRequest::WalletSetPassword {
+            current_password,
+            new_password,
+        } => handle_wallet_set_password(state, &current_password, &new_password),
         RpcRequest::WalletLock => handle_wallet_lock(state),
-        RpcRequest::TagRegister { tag, scan_ek_hex, spend_ek_hex, pow_nonce_hex, pow_hash_hex, timestamp, registrant_vk_hex, signature_hex } =>
-            handle_tag_register(state, &tag, &scan_ek_hex, &spend_ek_hex, &pow_nonce_hex, &pow_hash_hex, timestamp, &registrant_vk_hex, &signature_hex, &senders.tag_store_tx),
-        RpcRequest::TagConfirm { tag, mint_id_hex, registrant_vk_hex, signature_hex } =>
-            handle_tag_confirm(state, &tag, &mint_id_hex, &registrant_vk_hex, &signature_hex, &senders.tag_confirm_tx),
-        RpcRequest::OwnershipGenesis { mint_id_hex, chain_tip_hex, owner_vk_hash_hex, owner_vk_hex, denomination_value, proof_hex, digest_hex } =>
-            handle_ownership_genesis(state, &mint_id_hex, &chain_tip_hex, &owner_vk_hash_hex, &owner_vk_hex, denomination_value, &proof_hex, &digest_hex, &senders.og_tx),
-        RpcRequest::ManifestStore { dht_key_hex, encrypted_manifest_hex } =>
-            handle_manifest_store(state, &dht_key_hex, &encrypted_manifest_hex, &senders.manifest_tx),
+        RpcRequest::TagRegister {
+            tag,
+            scan_ek_hex,
+            spend_ek_hex,
+            pow_nonce_hex,
+            pow_hash_hex,
+            timestamp,
+            registrant_vk_hex,
+            signature_hex,
+        } => handle_tag_register(
+            state,
+            &tag,
+            &scan_ek_hex,
+            &spend_ek_hex,
+            &pow_nonce_hex,
+            &pow_hash_hex,
+            timestamp,
+            &registrant_vk_hex,
+            &signature_hex,
+            &senders.tag_store_tx,
+        ),
+        RpcRequest::TagConfirm {
+            tag,
+            mint_id_hex,
+            registrant_vk_hex,
+            signature_hex,
+        } => handle_tag_confirm(
+            state,
+            &tag,
+            &mint_id_hex,
+            &registrant_vk_hex,
+            &signature_hex,
+            &senders.tag_confirm_tx,
+        ),
+        RpcRequest::OwnershipGenesis {
+            mint_id_hex,
+            chain_tip_hex,
+            owner_vk_hash_hex,
+            owner_vk_hex,
+            denomination_value,
+            proof_hex,
+            digest_hex,
+        } => handle_ownership_genesis(
+            state,
+            &mint_id_hex,
+            &chain_tip_hex,
+            &owner_vk_hash_hex,
+            &owner_vk_hex,
+            denomination_value,
+            &proof_hex,
+            &digest_hex,
+            &senders.og_tx,
+        ),
+        RpcRequest::ManifestStore {
+            dht_key_hex,
+            encrypted_manifest_hex,
+        } => handle_manifest_store(
+            state,
+            &dht_key_hex,
+            &encrypted_manifest_hex,
+            &senders.manifest_tx,
+        ),
     }
 }
 
@@ -280,9 +371,9 @@ fn handle_node_info(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
     RpcResponse::ok(RpcData::NodeInfo {
         node_id: hex_key(&s.node_id),
         peer_count: s.routing_table.peer_count(),
-        verified_peers: s.peer_registry.count_in_state(
-            crate::handshake::PeerState::Verified,
-        ),
+        verified_peers: s
+            .peer_registry
+            .count_in_state(crate::handshake::PeerState::Verified),
         estimated_network_size: s.estimated_network_size,
         tag_count: s.tag_dht.record_count(),
         registry_count: s.registry.len(),
@@ -405,18 +496,23 @@ fn handle_send(
         };
 
         let send_count = send_denoms.len();
-        let send_bills: Vec<vess_foundry::VessBill> =
-            result.outputs[..send_count].iter().map(|(b, _)| b.clone()).collect();
+        let send_bills: Vec<vess_foundry::VessBill> = result.outputs[..send_count]
+            .iter()
+            .map(|(b, _)| b.clone())
+            .collect();
         let change_bills: Vec<(vess_foundry::VessBill, Vec<u8>)> =
             result.outputs[send_count..].to_vec();
 
         let mut reforged_creds: HashMap<[u8; 32], SpendCredential> = HashMap::new();
         for (bill, _) in &result.outputs {
             let (vk, sk) = generate_spend_keypair();
-            reforged_creds.insert(bill.mint_id, SpendCredential {
-                spend_vk: vk,
-                spend_sk: sk,
-            });
+            reforged_creds.insert(
+                bill.mint_id,
+                SpendCredential {
+                    spend_vk: vk,
+                    spend_sk: sk,
+                },
+            );
         }
 
         let (msg, pid) = match prepare_payment_from_bills(
@@ -437,7 +533,9 @@ fn handle_send(
         }
         for (bill, _) in &change_bills {
             if let Some(cred) = reforged_creds.get(&bill.mint_id) {
-                ws_mut.billfold.deposit_with_credentials(bill.clone(), cred.clone());
+                ws_mut
+                    .billfold
+                    .deposit_with_credentials(bill.clone(), cred.clone());
             }
         }
 
@@ -586,7 +684,9 @@ fn handle_send(
     s.flush_wallet();
 
     // Report available balance (excludes reserved in-flight bills).
-    let remaining = s.wallet.as_ref()
+    let remaining = s
+        .wallet
+        .as_ref()
         .map(|w| w.billfold.available_balance())
         .unwrap_or(0);
 
@@ -691,18 +791,23 @@ async fn handle_send_direct(
             };
 
             let send_count = send_denoms.len();
-            let send_bills: Vec<vess_foundry::VessBill> =
-                result.outputs[..send_count].iter().map(|(b, _)| b.clone()).collect();
+            let send_bills: Vec<vess_foundry::VessBill> = result.outputs[..send_count]
+                .iter()
+                .map(|(b, _)| b.clone())
+                .collect();
             let change_bills: Vec<(vess_foundry::VessBill, Vec<u8>)> =
                 result.outputs[send_count..].to_vec();
 
             let mut reforged_creds: HashMap<[u8; 32], SpendCredential> = HashMap::new();
             for (bill, _) in &result.outputs {
                 let (vk, sk) = generate_spend_keypair();
-                reforged_creds.insert(bill.mint_id, SpendCredential {
-                    spend_vk: vk,
-                    spend_sk: sk,
-                });
+                reforged_creds.insert(
+                    bill.mint_id,
+                    SpendCredential {
+                        spend_vk: vk,
+                        spend_sk: sk,
+                    },
+                );
             }
 
             let (msg, pid) = match prepare_payment_from_bills(
@@ -722,7 +827,9 @@ async fn handle_send_direct(
             }
             for (bill, _) in &change_bills {
                 if let Some(cred) = reforged_creds.get(&bill.mint_id) {
-                    ws_mut.billfold.deposit_with_credentials(bill.clone(), cred.clone());
+                    ws_mut
+                        .billfold
+                        .deposit_with_credentials(bill.clone(), cred.clone());
                 }
             }
 
@@ -845,7 +952,8 @@ async fn handle_send_direct(
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(5),
         node.send_message_with_response(target, &msg),
-    ).await;
+    )
+    .await;
 
     match result {
         Ok(Ok(Some(PulseMessage::DirectPaymentResponse(dpr)))) => {
@@ -857,7 +965,9 @@ async fn handle_send_direct(
                     }
                     s.flush_wallet();
                 }
-                let remaining = s.wallet.as_ref()
+                let remaining = s
+                    .wallet
+                    .as_ref()
                     .map(|w| w.billfold.available_balance())
                     .unwrap_or(0);
                 s.push_notification(crate::node_runner::WalletNotification {
@@ -870,7 +980,9 @@ async fn handle_send_direct(
                     amount: Some(amount),
                     bill_count: Some(sent_mints.len()),
                     counterparty: Some(recipient_tag.to_string()),
-                    message: format!("Direct payment to {recipient_tag} was accepted by the recipient."),
+                    message: format!(
+                        "Direct payment to {recipient_tag} was accepted by the recipient."
+                    ),
                 });
                 RpcResponse::ok(RpcData::Send {
                     payment_id: hex_key(&payment_id),
@@ -918,15 +1030,17 @@ fn handle_wallet_unlock(
     password: &str,
     oc_tx: &tokio::sync::mpsc::UnboundedSender<vess_protocol::OwnershipClaim>,
 ) -> RpcResponse {
-    use vess_kloak::payment::receive_and_claim;
     use vess_kloak::billfold::SpendCredential;
+    use vess_kloak::payment::receive_and_claim;
 
     // 1. Get wallet_path (set from config even when wallet is locked).
     let wallet_path = {
         let s = state.lock().unwrap();
         match &s.wallet_path {
             Some(p) => p.clone(),
-            None => return RpcResponse::err("no wallet path configured — start node with --wallet"),
+            None => {
+                return RpcResponse::err("no wallet path configured — start node with --wallet")
+            }
         }
     };
 
@@ -949,8 +1063,7 @@ fn handle_wallet_unlock(
     };
 
     // Derive stealth keys and encryption key from raw_seed.
-    let (stealth_secret, _address) =
-        vess_stealth::generate_master_keys_from_seed(&raw_seed);
+    let (stealth_secret, _address) = vess_stealth::generate_master_keys_from_seed(&raw_seed);
     let enc_key = vess_kloak::recovery::encryption_key_from_seed(&raw_seed);
 
     // Load billfold and decrypt spend credentials into it.
@@ -1005,18 +1118,31 @@ fn handle_wallet_unlock(
                 Err(_) => {}
             }
         }
-        for claim in pending_claims { let _ = oc_tx.send(claim); }
+        for claim in pending_claims {
+            let _ = oc_tx.send(claim);
+        }
         if received > 0 {
-            tracing::info!(amount = received, bills = bill_count, "swept limbo into wallet after unlock");
+            tracing::info!(
+                amount = received,
+                bills = bill_count,
+                "swept limbo into wallet after unlock"
+            );
             // Persist swept bills immediately.
             s.flush_wallet();
         }
     }
 
     let balance = s.wallet.as_ref().map(|w| w.billfold.balance()).unwrap_or(0);
-    let bill_count = s.wallet.as_ref().map(|w| w.billfold.bills().len()).unwrap_or(0);
+    let bill_count = s
+        .wallet
+        .as_ref()
+        .map(|w| w.billfold.bills().len())
+        .unwrap_or(0);
 
-    RpcResponse::ok(RpcData::Balance { balance, bill_count })
+    RpcResponse::ok(RpcData::Balance {
+        balance,
+        bill_count,
+    })
 }
 
 fn handle_wallet_set_password(

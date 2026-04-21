@@ -127,7 +127,14 @@ pub fn try_mint(denom: Denomination, owner_vk_hash: &[u8; 32]) -> MintOutcome {
 
     // Generate the IOP proof: Merkle-commit the trace + scratchpad + disk,
     // derive Fiat-Shamir challenges, and open queried positions.
-    let iop_proof = proof::generate_proof(&trace, &scratchpad, &disk_dataset, &nonce, denom, owner_vk_hash);
+    let iop_proof = proof::generate_proof(
+        &trace,
+        &scratchpad,
+        &disk_dataset,
+        &nonce,
+        denom,
+        owner_vk_hash,
+    );
     let proof_bytes = proof::serialize_proof(&iop_proof);
 
     let now = std::time::SystemTime::now()
@@ -193,7 +200,11 @@ pub fn mint_blocking(denom: Denomination, owner_vk_hash: &[u8; 32]) -> (VessBill
 /// Including `owner_vk_hash` binds the STARK to a specific genesis
 /// owner — copying the proof with a different owner changes the seed,
 /// which changes the entire execution trace, invalidating the proof.
-pub fn derive_seed_pub(nonce: &[u8; 32], denom: Denomination, owner_vk_hash: &[u8; 32]) -> [u8; 32] {
+pub fn derive_seed_pub(
+    nonce: &[u8; 32],
+    denom: Denomination,
+    owner_vk_hash: &[u8; 32],
+) -> [u8; 32] {
     let mut h = Hasher::new();
     h.update(nonce);
     h.update(&denom.value().to_le_bytes());
@@ -258,10 +269,7 @@ impl MintSessionState {
                     Ok(mut state) => {
                         // Verify the owner matches.
                         if state.owner_vk_hash == owner_vk_hash {
-                            tracing::info!(
-                                solves = state.solves.len(),
-                                "Resuming mint session"
-                            );
+                            tracing::info!(solves = state.solves.len(), "Resuming mint session");
                             return state;
                         }
                         tracing::warn!("Existing session has different owner — starting fresh");
@@ -285,8 +293,7 @@ impl MintSessionState {
 
     /// Atomically save to disk (write to temp + rename).
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
-        let data = serde_json::to_vec_pretty(self)
-            .map_err(std::io::Error::other)?;
+        let data = serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?;
         let tmp = path.with_extension("tmp");
         std::fs::write(&tmp, &data)?;
         std::fs::rename(&tmp, path)?;
@@ -368,9 +375,19 @@ pub fn regenerate_proof(solve: &CompletedSolve, owner_vk_hash: &[u8; 32]) -> Vec
     let scratchpad = vm::build_scratchpad(&seed);
     let disk_dataset = vm::build_disk_dataset(owner_vk_hash);
     let trace = vm::execute(&scratchpad, &disk_dataset, &seed, iters);
-    debug_assert_eq!(trace.digest, solve.bill.digest, "deterministic re-execution diverged");
+    debug_assert_eq!(
+        trace.digest, solve.bill.digest,
+        "deterministic re-execution diverged"
+    );
 
-    let iop_proof = proof::generate_proof(&trace, &scratchpad, &disk_dataset, &solve.nonce, denom, owner_vk_hash);
+    let iop_proof = proof::generate_proof(
+        &trace,
+        &scratchpad,
+        &disk_dataset,
+        &solve.nonce,
+        denom,
+        owner_vk_hash,
+    );
     proof::serialize_proof(&iop_proof)
 }
 
@@ -507,7 +524,8 @@ pub fn aggregate_solves(
                 owner_vk_hash: *owner_vk_hash,
             };
 
-            let compound_digest = agg.compound_digest()
+            let compound_digest = agg
+                .compound_digest()
                 .expect("freshly-created aggregate sub-proofs must deserialize");
             let proof_bytes = agg.serialize();
 
@@ -529,32 +547,30 @@ pub fn aggregate_solves(
                 *h.finalize().as_bytes()
             };
 
-            result.push((VessBill {
-                denomination: denom,
-                digest: compound_digest,
-                created_at: now,
-                stealth_id,
-                dht_index: 0,
-                mint_id,
-                chain_tip,
-                chain_depth: 0,
-            }, proof_bytes));
+            result.push((
+                VessBill {
+                    denomination: denom,
+                    digest: compound_digest,
+                    created_at: now,
+                    stealth_id,
+                    dht_index: 0,
+                    mint_id,
+                    chain_tip,
+                    chain_depth: 0,
+                },
+                proof_bytes,
+            ));
         } else {
             // Large aggregate — sampled proof (~14 MiB constant).
             let digests: Vec<[u8; 32]> = batch.iter().map(|s| s.bill.digest).collect();
             let nonces: Vec<[u8; 32]> = batch.iter().map(|s| s.nonce).collect();
 
-            let sap = proof::build_sampled_aggregate(
-                &digests,
-                &nonces,
-                owner_vk_hash,
-                &|idx| {
-                    if let Some(cb) = on_proof_regen.as_ref() {
-                        cb(solve_offset - count + idx + 1, total_solves);
-                    }
-                    regenerate_proof(&batch[idx], owner_vk_hash)
-                },
-            );
+            let sap = proof::build_sampled_aggregate(&digests, &nonces, owner_vk_hash, &|idx| {
+                if let Some(cb) = on_proof_regen.as_ref() {
+                    cb(solve_offset - count + idx + 1, total_solves);
+                }
+                regenerate_proof(&batch[idx], owner_vk_hash)
+            });
 
             let compound_digest = sap.compound_digest();
             let proof_bytes = sap.serialize();
@@ -573,16 +589,19 @@ pub fn aggregate_solves(
                 *h.finalize().as_bytes()
             };
 
-            result.push((VessBill {
-                denomination: denom,
-                digest: compound_digest,
-                created_at: now,
-                stealth_id,
-                dht_index: 0,
-                mint_id,
-                chain_tip,
-                chain_depth: 0,
-            }, proof_bytes));
+            result.push((
+                VessBill {
+                    denomination: denom,
+                    digest: compound_digest,
+                    created_at: now,
+                    stealth_id,
+                    dht_index: 0,
+                    mint_id,
+                    chain_tip,
+                    chain_depth: 0,
+                },
+                proof_bytes,
+            ));
         }
     }
 
@@ -595,12 +614,13 @@ mod tests {
 
     #[test]
     fn difficulty_check() {
-        let easy = [0x00, 0x00, 0x0F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-                     0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-                     0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-                     0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
-        assert!(meets_difficulty(&easy, 16));  // 16 leading zeros
-        assert!(meets_difficulty(&easy, 20));  // 20 leading zeros (0x0F has 4 lz)
+        let easy = [
+            0x00, 0x00, 0x0F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0xFF, 0xFF, 0xFF, 0xFF,
+        ];
+        assert!(meets_difficulty(&easy, 16)); // 16 leading zeros
+        assert!(meets_difficulty(&easy, 20)); // 20 leading zeros (0x0F has 4 lz)
         assert!(!meets_difficulty(&easy, 21)); // needs 21 but only has 20
     }
 
@@ -626,13 +646,22 @@ mod tests {
         // 2 → [D2]
         assert_eq!(optimal_breakdown(2), vec![Denomination::D2]);
         // 3 → [D2, D1]
-        assert_eq!(optimal_breakdown(3), vec![Denomination::D2, Denomination::D1]);
+        assert_eq!(
+            optimal_breakdown(3),
+            vec![Denomination::D2, Denomination::D1]
+        );
         // 5 → [D5]
         assert_eq!(optimal_breakdown(5), vec![Denomination::D5]);
         // 7 → [D5, D2]
-        assert_eq!(optimal_breakdown(7), vec![Denomination::D5, Denomination::D2]);
+        assert_eq!(
+            optimal_breakdown(7),
+            vec![Denomination::D5, Denomination::D2]
+        );
         // 13 → [D10, D2, D1]
-        assert_eq!(optimal_breakdown(13), vec![Denomination::D10, Denomination::D2, Denomination::D1]);
+        assert_eq!(
+            optimal_breakdown(13),
+            vec![Denomination::D10, Denomination::D2, Denomination::D1]
+        );
     }
 
     #[test]

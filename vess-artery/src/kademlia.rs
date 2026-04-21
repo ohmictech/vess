@@ -332,11 +332,11 @@ impl RoutingTable {
 
     /// Get a peer by id_hash, if present.
     pub fn get(&self, peer_id: &[u8; 32]) -> Option<&RoutingPeer> {
-        self.bucket_index(peer_id)
-            .and_then(|idx| {
-                self.buckets[idx].position(peer_id)
-                    .map(|pos| &self.buckets[idx].peers[pos])
-            })
+        self.bucket_index(peer_id).and_then(|idx| {
+            self.buckets[idx]
+                .position(peer_id)
+                .map(|pos| &self.buckets[idx].peers[pos])
+        })
     }
 
     /// Look up the raw `id_bytes` for a peer by its `id_hash`.
@@ -377,7 +377,11 @@ impl RoutingTable {
 
     /// Collect routable peer hashes, id_bytes, and age factors in parallel vectors
     /// (convenience for drain tasks that need all three).
-    pub fn routable_peer_vecs<F>(&self, filter: F, now: u64) -> (Vec<[u8; 32]>, Vec<Vec<u8>>, Vec<f64>)
+    pub fn routable_peer_vecs<F>(
+        &self,
+        filter: F,
+        now: u64,
+    ) -> (Vec<[u8; 32]>, Vec<Vec<u8>>, Vec<f64>)
     where
         F: Fn(&[u8; 32]) -> bool,
     {
@@ -565,15 +569,30 @@ mod tests {
     #[test]
     fn leading_zeros_cases() {
         assert_eq!(leading_zeros(&[0u8; 32]), 256);
-        assert_eq!(leading_zeros(&{
-            let mut v = [0u8; 32]; v[0] = 0x80; v
-        }), 0);
-        assert_eq!(leading_zeros(&{
-            let mut v = [0u8; 32]; v[0] = 0x01; v
-        }), 7);
-        assert_eq!(leading_zeros(&{
-            let mut v = [0u8; 32]; v[1] = 0x40; v
-        }), 9);
+        assert_eq!(
+            leading_zeros(&{
+                let mut v = [0u8; 32];
+                v[0] = 0x80;
+                v
+            }),
+            0
+        );
+        assert_eq!(
+            leading_zeros(&{
+                let mut v = [0u8; 32];
+                v[0] = 0x01;
+                v
+            }),
+            7
+        );
+        assert_eq!(
+            leading_zeros(&{
+                let mut v = [0u8; 32];
+                v[1] = 0x40;
+                v
+            }),
+            9
+        );
     }
 
     #[test]
@@ -595,13 +614,17 @@ mod tests {
 
         // First MAX_PEERS_PER_PREFIX peers with the same prefix should succeed.
         for i in 0..MAX_PEERS_PER_PREFIX {
-            assert!(table.insert(make_shared_prefix(i as u8)),
-                "peer {i} with shared prefix should be accepted");
+            assert!(
+                table.insert(make_shared_prefix(i as u8)),
+                "peer {i} with shared prefix should be accepted"
+            );
         }
 
         // The next one should be rejected due to prefix diversity.
-        assert!(!table.insert(make_shared_prefix(MAX_PEERS_PER_PREFIX as u8)),
-            "peer beyond MAX_PEERS_PER_PREFIX should be rejected");
+        assert!(
+            !table.insert(make_shared_prefix(MAX_PEERS_PER_PREFIX as u8)),
+            "peer beyond MAX_PEERS_PER_PREFIX should be rejected"
+        );
 
         // A peer with a different prefix should still be accepted.
         let mut diff_prefix = [0xAAu8; 32];
@@ -612,6 +635,9 @@ mod tests {
             last_seen: 99,
             first_seen: 99,
         };
-        assert!(table.insert(different), "peer with different prefix should be accepted");
+        assert!(
+            table.insert(different),
+            "peer with different prefix should be accepted"
+        );
     }
 }

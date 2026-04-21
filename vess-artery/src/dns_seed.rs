@@ -10,8 +10,8 @@
 //! Multiple TXT records may be published for redundancy.
 
 use anyhow::{Context, Result};
-use hickory_resolver::TokioResolver;
 use hickory_resolver::proto::rr::RData;
+use hickory_resolver::TokioResolver;
 use tracing::info;
 
 /// Default DNS seed domain. Nodes query this automatically unless
@@ -44,7 +44,8 @@ pub async fn resolve_seeds(domain: &str) -> Result<Vec<String>> {
     let lookup_name = format!("_vess.{domain}");
     info!(dns = %lookup_name, "resolving DNS seed");
 
-    let records = resolve_txt(&lookup_name).await
+    let records = resolve_txt(&lookup_name)
+        .await
         .with_context(|| format!("DNS seed lookup failed for {lookup_name}"))?;
 
     let mut peers = Vec::new();
@@ -69,13 +70,17 @@ async fn resolve_txt(name: &str) -> Result<Vec<String>> {
         .map_err(|e| anyhow::anyhow!("failed to create DNS resolver: {e}"))?
         .build()?;
 
-    let response = resolver.txt_lookup(name).await
+    let response = resolver
+        .txt_lookup(name)
+        .await
         .map_err(|e| anyhow::anyhow!("TXT lookup failed for {name}: {e}"))?;
 
     let mut records = Vec::new();
     for record in response.answers() {
         if let RData::TXT(ref txt) = record.data {
-            let value: String = txt.txt_data.iter()
+            let value: String = txt
+                .txt_data
+                .iter()
                 .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
                 .collect();
             if !value.is_empty() {
@@ -172,12 +177,16 @@ mod tests {
         std::fs::write(
             dir.path().join(SEEDS_FILENAME),
             "# comment\nnode.vess.network\ncustom.example.com\n\n",
-        ).unwrap();
+        )
+        .unwrap();
         let seeds = load_seeds_file(dir.path());
-        assert_eq!(seeds, vec![
-            "node.vess.network".to_string(),
-            "custom.example.com".to_string(),
-        ]);
+        assert_eq!(
+            seeds,
+            vec![
+                "node.vess.network".to_string(),
+                "custom.example.com".to_string(),
+            ]
+        );
     }
 
     #[test]

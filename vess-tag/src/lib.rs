@@ -44,10 +44,11 @@ impl VessTag {
         if s.len() > 20 {
             return Err(anyhow!("tag too long (max 20 chars): {s:?}"));
         }
-        if !s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()) {
-            return Err(anyhow!(
-                "tag must be lowercase alphanumeric only: {s:?}"
-            ));
+        if !s
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        {
+            return Err(anyhow!("tag must be lowercase alphanumeric only: {s:?}"));
         }
 
         Ok(Self(s.to_owned()))
@@ -127,8 +128,13 @@ pub fn compute_tag_pow(
     let nonce: [u8; 32] = rand::random();
     let password = pow_password(tag_hash, scan_ek, spend_ek);
 
-    let params = argon2::Params::new(TAG_POW_M_COST, TAG_POW_T_COST, TAG_POW_P_COST, Some(TAG_POW_HASH_LEN))
-        .map_err(|e| anyhow!("argon2 params: {e}"))?;
+    let params = argon2::Params::new(
+        TAG_POW_M_COST,
+        TAG_POW_T_COST,
+        TAG_POW_P_COST,
+        Some(TAG_POW_HASH_LEN),
+    )
+    .map_err(|e| anyhow!("argon2 params: {e}"))?;
     let argon2 = Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
 
     let mut hash = vec![0u8; TAG_POW_HASH_LEN];
@@ -157,8 +163,13 @@ pub fn verify_tag_pow(
 
     let password = pow_password(tag_hash, scan_ek, spend_ek);
 
-    let params = argon2::Params::new(TAG_POW_M_COST, TAG_POW_T_COST, TAG_POW_P_COST, Some(TAG_POW_HASH_LEN))
-        .map_err(|e| anyhow!("argon2 params: {e}"))?;
+    let params = argon2::Params::new(
+        TAG_POW_M_COST,
+        TAG_POW_T_COST,
+        TAG_POW_P_COST,
+        Some(TAG_POW_HASH_LEN),
+    )
+    .map_err(|e| anyhow!("argon2 params: {e}"))?;
     let argon2 = Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
 
     let mut hash = vec![0u8; TAG_POW_HASH_LEN];
@@ -377,12 +388,14 @@ mod tests {
         let (nonce, hash) = compute_tag_pow_test(&tag_hash, &addr.scan_ek, &addr.spend_ek).unwrap();
         assert_eq!(hash.len(), TAG_POW_HASH_LEN);
 
-        let ok = verify_tag_pow_test(&tag_hash, &addr.scan_ek, &addr.spend_ek, &nonce, &hash).unwrap();
+        let ok =
+            verify_tag_pow_test(&tag_hash, &addr.scan_ek, &addr.spend_ek, &nonce, &hash).unwrap();
         assert!(ok);
 
         // Wrong nonce → different hash → fails.
         let bad_nonce = [0xFF; 32];
-        let bad = verify_tag_pow_test(&tag_hash, &addr.scan_ek, &addr.spend_ek, &bad_nonce, &hash).unwrap();
+        let bad = verify_tag_pow_test(&tag_hash, &addr.scan_ek, &addr.spend_ek, &bad_nonce, &hash)
+            .unwrap();
         assert!(!bad);
     }
 
@@ -461,9 +474,11 @@ mod tests {
         let tag2_hash = VessTag::new("bob").unwrap().dht_key();
         let (_s, addr) = vess_stealth::generate_master_keys();
 
-        let (nonce, hash) = compute_tag_pow_test(&tag1_hash, &addr.scan_ek, &addr.spend_ek).unwrap();
+        let (nonce, hash) =
+            compute_tag_pow_test(&tag1_hash, &addr.scan_ek, &addr.spend_ek).unwrap();
         // Verify with different tag → fails.
-        let ok = verify_tag_pow_test(&tag2_hash, &addr.scan_ek, &addr.spend_ek, &nonce, &hash).unwrap();
+        let ok =
+            verify_tag_pow_test(&tag2_hash, &addr.scan_ek, &addr.spend_ek, &nonce, &hash).unwrap();
         assert!(!ok);
     }
 }

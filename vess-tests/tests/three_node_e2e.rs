@@ -11,19 +11,19 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use vess_artery::OwnershipRegistry;
 use vess_artery::ownership_registry::OwnershipRecord;
+use vess_artery::OwnershipRegistry;
 use vess_artery::TagDht;
 use vess_foundry::spend_auth;
 use vess_foundry::Denomination;
 use vess_kloak::billfold::{BillFold, SpendCredential};
 use vess_kloak::payment::{
-    claim_transfer_bills, prepare_payment_with_transfer, try_decrypt_transfer_payload,
-    DecryptedTransfer, extract_mint_ids_from_claims, cleanup_rejected_bills,
+    claim_transfer_bills, cleanup_rejected_bills, extract_mint_ids_from_claims,
+    prepare_payment_with_transfer, try_decrypt_transfer_payload, DecryptedTransfer,
 };
 use vess_protocol::{
     OwnershipClaim, OwnershipGenesis, PulseMessage, RegistryQuery, RegistryQueryResponse,
-    TagRegister, TagLookup, TagLookupResponse, TagLookupResult,
+    TagLookup, TagLookupResponse, TagLookupResult, TagRegister,
 };
 use vess_stealth::{generate_master_keys, MasterStealthAddress};
 use vess_tag::TagRecord;
@@ -96,8 +96,8 @@ async fn three_node_mint_send_claim() {
     let artery_handle = tokio::spawn({
         let artery_node = artery_node.clone();
         async move {
-            artery_node.listen_messages_with_response(move |_peer, msg| {
-                match msg {
+            artery_node
+                .listen_messages_with_response(move |_peer, msg| match msg {
                     PulseMessage::OwnershipGenesis(og) => {
                         let mut state = reg.lock().unwrap();
                         handle_ownership_genesis(&mut state, og);
@@ -110,10 +110,10 @@ async fn three_node_mint_send_claim() {
                     }
                     PulseMessage::RegistryQuery(rq) => {
                         let state = reg.lock().unwrap();
-                        let active = rq.mint_ids.iter()
-                            .map(|mid| state.is_active(mid))
-                            .collect();
-                        Some(PulseMessage::RegistryQueryResponse(RegistryQueryResponse { active }))
+                        let active = rq.mint_ids.iter().map(|mid| state.is_active(mid)).collect();
+                        Some(PulseMessage::RegistryQueryResponse(RegistryQueryResponse {
+                            active,
+                        }))
                     }
                     PulseMessage::TagRegister(tr) => {
                         handle_tag_register(&tags, tr);
@@ -121,15 +121,17 @@ async fn three_node_mint_send_claim() {
                     }
                     PulseMessage::TagLookup(tl) => {
                         let dht = tags.lock().unwrap();
-                        let result = dht.lookup_by_hash(&tl.tag_hash).map(|record| TagLookupResult {
-                            scan_ek: record.master_address.scan_ek.clone(),
-                            spend_ek: record.master_address.spend_ek.clone(),
-                            registered_at: record.registered_at,
-                            pow_nonce: record.pow_nonce,
-                            pow_hash: record.pow_hash.clone(),
-                            registrant_vk: record.registrant_vk.clone(),
-                            signature: record.signature.clone(),
-                        });
+                        let result =
+                            dht.lookup_by_hash(&tl.tag_hash)
+                                .map(|record| TagLookupResult {
+                                    scan_ek: record.master_address.scan_ek.clone(),
+                                    spend_ek: record.master_address.spend_ek.clone(),
+                                    registered_at: record.registered_at,
+                                    pow_nonce: record.pow_nonce,
+                                    pow_hash: record.pow_hash.clone(),
+                                    registrant_vk: record.registrant_vk.clone(),
+                                    signature: record.signature.clone(),
+                                });
                         Some(PulseMessage::TagLookupResponse(TagLookupResponse {
                             tag_hash: tl.tag_hash,
                             nonce: tl.nonce,
@@ -137,8 +139,9 @@ async fn three_node_mint_send_claim() {
                         }))
                     }
                     _ => None,
-                }
-            }).await.ok();
+                })
+                .await
+                .ok();
         }
     });
 
@@ -156,11 +159,17 @@ async fn three_node_mint_send_claim() {
     client_c.wait_online().await;
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    client_a.send_message(artery_addr.clone(), &alice.tag_register_msg()).await
+    client_a
+        .send_message(artery_addr.clone(), &alice.tag_register_msg())
+        .await
         .expect("register tag: alice");
-    client_b.send_message(artery_addr.clone(), &bob.tag_register_msg()).await
+    client_b
+        .send_message(artery_addr.clone(), &bob.tag_register_msg())
+        .await
         .expect("register tag: bob");
-    client_c.send_message(artery_addr.clone(), &charlie.tag_register_msg()).await
+    client_c
+        .send_message(artery_addr.clone(), &charlie.tag_register_msg())
+        .await
         .expect("register tag: charlie");
 
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -174,12 +183,11 @@ async fn three_node_mint_send_claim() {
     println!("Minting a D1 bill (test-mint params)…");
     let start = std::time::Instant::now();
     let vk_hash_copy = alice_vk_hash;
-    let (bill, proof_bytes) =
-        tokio::task::spawn_blocking(move || {
-            vess_foundry::mint::mint_blocking(Denomination::D1, &vk_hash_copy)
-        })
-        .await
-        .unwrap();
+    let (bill, proof_bytes) = tokio::task::spawn_blocking(move || {
+        vess_foundry::mint::mint_blocking(Denomination::D1, &vk_hash_copy)
+    })
+    .await
+    .unwrap();
     let elapsed = start.elapsed();
     println!("Minted in {elapsed:.2?}");
 
@@ -192,10 +200,13 @@ async fn three_node_mint_send_claim() {
             spend_sk: alice_spend_sk.clone(),
         },
     );
-    alice.credentials.insert(mint_id, SpendCredential {
-        spend_vk: alice_spend_vk.clone(),
-        spend_sk: alice_spend_sk.clone(),
-    });
+    alice.credentials.insert(
+        mint_id,
+        SpendCredential {
+            spend_vk: alice_spend_vk.clone(),
+            spend_sk: alice_spend_sk.clone(),
+        },
+    );
     assert_eq!(alice.billfold.balance(), 1);
 
     // ── 5. Alice broadcasts OwnershipGenesis to the artery ──────────
@@ -231,7 +242,10 @@ async fn three_node_mint_send_claim() {
     match resp {
         Some(PulseMessage::RegistryQueryResponse(rqr)) => {
             assert_eq!(rqr.active.len(), 1);
-            assert!(rqr.active[0], "bill should be registered after OwnershipGenesis");
+            assert!(
+                rqr.active[0],
+                "bill should be registered after OwnershipGenesis"
+            );
         }
         other => panic!("expected RegistryQueryResponse, got: {other:?}"),
     }
@@ -258,14 +272,9 @@ async fn three_node_mint_send_claim() {
     };
 
     // ── 7. Alice sends payment to Bob ───────────────────────────────
-    let (payment_msg, _payment_id, send_indices) = prepare_payment_with_transfer(
-        &alice.billfold,
-        1,
-        &bob_address,
-        &alice.credentials,
-        None,
-    )
-    .expect("prepare payment Alice → Bob");
+    let (payment_msg, _payment_id, send_indices) =
+        prepare_payment_with_transfer(&alice.billfold, 1, &bob_address, &alice.credentials, None)
+            .expect("prepare payment Alice → Bob");
 
     // Remove sent bills from Alice's billfold.
     let sent_mint_ids: Vec<[u8; 32]> = send_indices
@@ -295,8 +304,8 @@ async fn three_node_mint_send_claim() {
     assert_eq!(transfer_payload.bills[0].mint_id, mint_id);
 
     // ── 9. Bob claims the transfer ──────────────────────────────────
-    let claim_result = claim_transfer_bills(transfer_payload, stealth_id)
-        .expect("claim transfer bills");
+    let claim_result =
+        claim_transfer_bills(transfer_payload, stealth_id).expect("claim transfer bills");
 
     assert_eq!(claim_result.claimed.len(), 1);
     assert_eq!(claim_result.ownership_claims.len(), 1);
@@ -310,16 +319,19 @@ async fn three_node_mint_send_claim() {
                 spend_sk: cb.spend_sk.clone(),
             },
         );
-        bob.credentials.insert(cb.bill.mint_id, SpendCredential {
-            spend_vk: cb.spend_vk.clone(),
-            spend_sk: cb.spend_sk.clone(),
-        });
+        bob.credentials.insert(
+            cb.bill.mint_id,
+            SpendCredential {
+                spend_vk: cb.spend_vk.clone(),
+                spend_sk: cb.spend_sk.clone(),
+            },
+        );
     }
     assert_eq!(bob.billfold.balance(), 1);
 
     // ── 10. Bob broadcasts OwnershipClaim and auto-verifies ──────────
     let bill_ids_to_verify = extract_mint_ids_from_claims(&claim_result.ownership_claims);
-    
+
     for claim_msg in &claim_result.ownership_claims {
         client_b
             .send_message(artery_addr.clone(), claim_msg)
@@ -341,11 +353,18 @@ async fn three_node_mint_send_claim() {
 
     match resp {
         Some(PulseMessage::RegistryQueryResponse(rqr)) => {
-            assert!(rqr.active[0], "bill should still be active after ownership transfer");
+            assert!(
+                rqr.active[0],
+                "bill should still be active after ownership transfer"
+            );
             // Silently remove any rejected bills
-            let removed = cleanup_rejected_bills(&mut bob.billfold, &bill_ids_to_verify, &rqr.active);
+            let removed =
+                cleanup_rejected_bills(&mut bob.billfold, &bill_ids_to_verify, &rqr.active);
             if !removed.is_empty() {
-                eprintln!("WARNING: {} bills were rejected and removed from wallet", removed.len());
+                eprintln!(
+                    "WARNING: {} bills were rejected and removed from wallet",
+                    removed.len()
+                );
             }
         }
         other => panic!("expected RegistryQueryResponse, got: {other:?}"),
@@ -373,14 +392,9 @@ async fn three_node_mint_send_claim() {
     };
 
     // ── 12. Bob sends payment to Charlie ────────────────────────────
-    let (payment_msg_2, _pid2, send_indices_2) = prepare_payment_with_transfer(
-        &bob.billfold,
-        1,
-        &charlie_address,
-        &bob.credentials,
-        None,
-    )
-    .expect("prepare payment Bob → Charlie");
+    let (payment_msg_2, _pid2, send_indices_2) =
+        prepare_payment_with_transfer(&bob.billfold, 1, &charlie_address, &bob.credentials, None)
+            .expect("prepare payment Bob → Charlie");
 
     let sent_mint_ids_2: Vec<[u8; 32]> = send_indices_2
         .iter()
@@ -405,8 +419,7 @@ async fn three_node_mint_send_claim() {
         DecryptedTransfer::WithAuth(tp, sid) => (tp, sid),
     };
 
-    let claim_result_2 = claim_transfer_bills(tp2, sid2)
-        .expect("claim transfer bills (Charlie)");
+    let claim_result_2 = claim_transfer_bills(tp2, sid2).expect("claim transfer bills (Charlie)");
 
     for cb in &claim_result_2.claimed {
         charlie.billfold.deposit_with_credentials(
@@ -416,16 +429,19 @@ async fn three_node_mint_send_claim() {
                 spend_sk: cb.spend_sk.clone(),
             },
         );
-        charlie.credentials.insert(cb.bill.mint_id, SpendCredential {
-            spend_vk: cb.spend_vk.clone(),
-            spend_sk: cb.spend_sk.clone(),
-        });
+        charlie.credentials.insert(
+            cb.bill.mint_id,
+            SpendCredential {
+                spend_vk: cb.spend_vk.clone(),
+                spend_sk: cb.spend_sk.clone(),
+            },
+        );
     }
     assert_eq!(charlie.billfold.balance(), 1);
 
     // ── 14. Charlie broadcasts OwnershipClaim and auto-verifies ──────
     let bill_ids_to_verify_2 = extract_mint_ids_from_claims(&claim_result_2.ownership_claims);
-    
+
     for claim_msg in &claim_result_2.ownership_claims {
         client_c
             .send_message(artery_addr.clone(), claim_msg)
@@ -447,11 +463,18 @@ async fn three_node_mint_send_claim() {
 
     match resp {
         Some(PulseMessage::RegistryQueryResponse(rqr)) => {
-            assert!(rqr.active[0], "bill should still be active after second transfer");
+            assert!(
+                rqr.active[0],
+                "bill should still be active after second transfer"
+            );
             // Silently remove any rejected bills
-            let removed = cleanup_rejected_bills(&mut charlie.billfold, &bill_ids_to_verify_2, &rqr.active);
+            let removed =
+                cleanup_rejected_bills(&mut charlie.billfold, &bill_ids_to_verify_2, &rqr.active);
             if !removed.is_empty() {
-                eprintln!("WARNING: {} bills were rejected and removed from wallet", removed.len());
+                eprintln!(
+                    "WARNING: {} bills were rejected and removed from wallet",
+                    removed.len()
+                );
             }
         }
         other => panic!("expected RegistryQueryResponse, got: {other:?}"),
@@ -466,11 +489,16 @@ async fn three_node_mint_send_claim() {
             record.current_owner_vk_hash, charlie_vk_hash,
             "final owner should be Charlie"
         );
-        assert_eq!(record.chain_depth, 2, "depth should be 2 (genesis→bob→charlie)");
+        assert_eq!(
+            record.chain_depth, 2,
+            "depth should be 2 (genesis→bob→charlie)"
+        );
     }
 
     println!("OwnershipClaim (Bob → Charlie) verified on artery.");
-    println!("Full pipeline: tags → mint → genesis → lookup → send → claim → lookup → send → claim ✓");
+    println!(
+        "Full pipeline: tags → mint → genesis → lookup → send → claim → lookup → send → claim ✓"
+    );
 
     // ── Cleanup ─────────────────────────────────────────────────────
     client_a.shutdown().await;
@@ -533,9 +561,11 @@ fn handle_ownership_genesis(registry: &mut OwnershipRegistry, og: OwnershipGenes
         }
         // Verify denomination matches the proof.
         assert_eq!(
-            iop_proof.denomination.value(), og.denomination_value,
+            iop_proof.denomination.value(),
+            og.denomination_value,
             "denomination mismatch: proof={}, claimed={}",
-            iop_proof.denomination.value(), og.denomination_value,
+            iop_proof.denomination.value(),
+            og.denomination_value,
         );
         // Verify PoW difficulty.
         let required_diff = vess_foundry::mint::difficulty_bits_for(iop_proof.denomination);
@@ -545,7 +575,9 @@ fn handle_ownership_genesis(registry: &mut OwnershipRegistry, og: OwnershipGenes
         );
         proof_nonce = iop_proof.nonce;
     } else if let Ok(agg) = vess_foundry::proof::AggregateProof::deserialize(&og.proof) {
-        if let Err(e) = vess_foundry::proof::verify_aggregate_proof(&agg, &og.digest, og.denomination_value) {
+        if let Err(e) =
+            vess_foundry::proof::verify_aggregate_proof(&agg, &og.digest, og.denomination_value)
+        {
             panic!("aggregate proof verification failed: {e:?}");
         }
         if agg.owner_vk_hash != og.owner_vk_hash {
@@ -560,7 +592,9 @@ fn handle_ownership_genesis(registry: &mut OwnershipRegistry, og: OwnershipGenes
         }
         proof_nonce = *h.finalize().as_bytes();
     } else if let Ok(sap) = vess_foundry::proof::SampledAggregateProof::deserialize(&og.proof) {
-        if let Err(e) = vess_foundry::proof::verify_sampled_aggregate(&sap, &og.digest, og.denomination_value) {
+        if let Err(e) =
+            vess_foundry::proof::verify_sampled_aggregate(&sap, &og.digest, og.denomination_value)
+        {
             panic!("sampled aggregate proof verification failed: {e:?}");
         }
         if sap.owner_vk_hash != og.owner_vk_hash {
@@ -604,16 +638,10 @@ fn handle_ownership_genesis(registry: &mut OwnershipRegistry, og: OwnershipGenes
 
 fn handle_ownership_claim(registry: &mut OwnershipRegistry, oc: OwnershipClaim) {
     // Verify transfer signature.
-    let transfer_msg = vess_foundry::spend_auth::transfer_message(
-        &oc.mint_id,
-        &oc.stealth_id,
-        oc.timestamp,
-    );
-    match vess_foundry::spend_auth::verify_spend(
-        &oc.prev_owner_vk,
-        &transfer_msg,
-        &oc.transfer_sig,
-    ) {
+    let transfer_msg =
+        vess_foundry::spend_auth::transfer_message(&oc.mint_id, &oc.stealth_id, oc.timestamp);
+    match vess_foundry::spend_auth::verify_spend(&oc.prev_owner_vk, &transfer_msg, &oc.transfer_sig)
+    {
         Ok(true) => {}
         Ok(false) => panic!("invalid transfer signature"),
         Err(e) => panic!("transfer signature error: {e}"),
@@ -621,16 +649,21 @@ fn handle_ownership_claim(registry: &mut OwnershipRegistry, oc: OwnershipClaim) 
 
     // Verify new_owner_vk_hash.
     let computed_new_hash = vess_foundry::spend_auth::vk_hash(&oc.new_owner_vk);
-    assert_eq!(computed_new_hash, oc.new_owner_vk_hash, "new_owner_vk_hash mismatch");
+    assert_eq!(
+        computed_new_hash, oc.new_owner_vk_hash,
+        "new_owner_vk_hash mismatch"
+    );
 
     // Verify chain_tip advancement and chain_depth.
     if let Some(rec) = registry.get(&oc.mint_id) {
         let prev_vk_hash = vess_foundry::spend_auth::vk_hash(&oc.prev_owner_vk);
         if prev_vk_hash == rec.current_owner_vk_hash {
             assert_eq!(
-                oc.chain_depth, rec.chain_depth + 1,
+                oc.chain_depth,
+                rec.chain_depth + 1,
                 "chain_depth must be current+1 (got {}, expected {})",
-                oc.chain_depth, rec.chain_depth + 1,
+                oc.chain_depth,
+                rec.chain_depth + 1,
             );
             let expected_tip = vess_foundry::advance_chain_tip(
                 &rec.chain_tip,
@@ -649,7 +682,8 @@ fn handle_ownership_claim(registry: &mut OwnershipRegistry, oc: OwnershipClaim) 
     if let Some(rec) = registry.get_mut(&oc.mint_id) {
         if oc.chain_depth > rec.chain_depth
             || (oc.chain_depth == rec.chain_depth
-                && vess_foundry::spend_auth::vk_hash(&oc.prev_owner_vk) == rec.current_owner_vk_hash)
+                && vess_foundry::spend_auth::vk_hash(&oc.prev_owner_vk)
+                    == rec.current_owner_vk_hash)
         {
             rec.chain_tip = oc.new_chain_tip;
             rec.current_owner_vk_hash = oc.new_owner_vk_hash;

@@ -14,12 +14,10 @@ use blake3::Hasher;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use vess_foundry::VessBill;
-use vess_foundry::spend_auth;
-use vess_protocol::{
-    Payment, PulseMessage,
-};
 use crate::billfold::SpendCredential;
+use vess_foundry::spend_auth;
+use vess_foundry::VessBill;
+use vess_protocol::{Payment, PulseMessage};
 
 /// Payload encrypted inside stealth addressing for ownership transfers.
 ///
@@ -43,8 +41,8 @@ pub struct TransferPayload {
     pub memo: Option<String>,
 }
 use vess_stealth::{
-    MasterStealthAddress, StealthPayload, StealthSecretKey,
-    open_stealth_payload, prepare_stealth_payload, scan_view_tag,
+    open_stealth_payload, prepare_stealth_payload, scan_view_tag, MasterStealthAddress,
+    StealthPayload, StealthSecretKey,
 };
 
 use crate::billfold::BillFold;
@@ -164,8 +162,8 @@ pub fn prepare_payment(
     let bill_count = bill_data.len() as u8;
 
     // Serialize bill data for the stealth payload.
-    let plaintext = postcard::to_allocvec(&bill_data)
-        .map_err(|e| anyhow!("serialize bills: {e}"))?;
+    let plaintext =
+        postcard::to_allocvec(&bill_data).map_err(|e| anyhow!("serialize bills: {e}"))?;
 
     let stealth = prepare_stealth_payload(recipient, &plaintext)?;
 
@@ -228,11 +226,7 @@ pub fn prepare_payment_with_transfer(
             .get(&bill.mint_id)
             .ok_or_else(|| anyhow!("missing spend credential for bill mint_id"))?;
 
-        let msg = spend_auth::transfer_message(
-            &bill.mint_id,
-            &recipient_stealth_id,
-            timestamp,
-        );
+        let msg = spend_auth::transfer_message(&bill.mint_id, &recipient_stealth_id, timestamp);
         let sig = spend_auth::sign_spend(&cred.spend_sk, &msg)?;
 
         sender_vks.push(cred.spend_vk.clone());
@@ -292,11 +286,7 @@ pub fn prepare_payment_from_bills(
             .get(&bill.mint_id)
             .ok_or_else(|| anyhow!("missing spend credential for bill mint_id"))?;
 
-        let msg = spend_auth::transfer_message(
-            &bill.mint_id,
-            &recipient_stealth_id,
-            timestamp,
-        );
+        let msg = spend_auth::transfer_message(&bill.mint_id, &recipient_stealth_id, timestamp);
         let sig = spend_auth::sign_spend(&cred.spend_sk, &msg)?;
 
         sender_vks.push(cred.spend_vk.clone());
@@ -370,11 +360,7 @@ pub fn prepare_direct_payment(
             .get(&bill.mint_id)
             .ok_or_else(|| anyhow!("missing spend credential for bill mint_id"))?;
 
-        let msg = spend_auth::transfer_message(
-            &bill.mint_id,
-            &recipient_stealth_id,
-            timestamp,
-        );
+        let msg = spend_auth::transfer_message(&bill.mint_id, &recipient_stealth_id, timestamp);
         let sig = spend_auth::sign_spend(&cred.spend_sk, &msg)?;
 
         sender_vks.push(cred.spend_vk.clone());
@@ -420,9 +406,7 @@ pub fn prepare_direct_payment(
 ///
 /// STARK proofs are NOT verified here — they were verified once at
 /// OwnershipGenesis time. The receiver trusts the registry.
-pub fn receive_direct_payment(
-    dp: &vess_protocol::DirectPayment,
-) -> Result<TransferClaimResult> {
+pub fn receive_direct_payment(dp: &vess_protocol::DirectPayment) -> Result<TransferClaimResult> {
     // Deserialize the TransferPayload.
     let payload: TransferPayload = postcard::from_bytes(&dp.transfer_payload)
         .map_err(|e| anyhow!("deserialize transfer payload: {e}"))?;
@@ -471,8 +455,8 @@ pub fn try_decrypt_stealth_payload(
     // Full decrypt.
     let (plaintext, _stealth_id) = open_stealth_payload(secret, &stealth)?;
 
-    let bills: Vec<VessBill> = postcard::from_bytes(&plaintext)
-        .map_err(|e| anyhow!("deserialize bills: {e}"))?;
+    let bills: Vec<VessBill> =
+        postcard::from_bytes(&plaintext).map_err(|e| anyhow!("deserialize bills: {e}"))?;
 
     Ok(Some(bills))
 }
@@ -553,23 +537,16 @@ pub fn claim_transfer_bills(
 
     for (i, bill) in payload.bills.into_iter().enumerate() {
         // 1. Verify sender's transfer authorization signature.
-        let transfer_msg = spend_auth::transfer_message(
-            &bill.mint_id,
-            &stealth_id,
-            payload.timestamp,
-        );
+        let transfer_msg =
+            spend_auth::transfer_message(&bill.mint_id, &stealth_id, payload.timestamp);
         match spend_auth::verify_spend(
             &payload.sender_vks[i],
             &transfer_msg,
             &payload.transfer_sigs[i],
         ) {
             Ok(true) => {}
-            Ok(false) => anyhow::bail!(
-                "transfer bill {i}: invalid transfer signature from sender"
-            ),
-            Err(e) => anyhow::bail!(
-                "transfer bill {i}: transfer signature error: {e}"
-            ),
+            Ok(false) => anyhow::bail!("transfer bill {i}: invalid transfer signature from sender"),
+            Err(e) => anyhow::bail!("transfer bill {i}: transfer signature error: {e}"),
         }
 
         // 2. Generate fresh ML-DSA-65 spend keypair for the recipient.
@@ -646,10 +623,7 @@ pub fn claim_transfer_bills(
 /// [`vess_foundry::mint::aggregate_solves`] and the minter's ML-DSA-65
 /// spend credential.  Returns one `PulseMessage::OwnershipGenesis` per
 /// bill, ready to broadcast to the artery network.
-pub fn build_genesis_messages(
-    bills: &[(VessBill, Vec<u8>)],
-    owner_vk: &[u8],
-) -> Vec<PulseMessage> {
+pub fn build_genesis_messages(bills: &[(VessBill, Vec<u8>)], owner_vk: &[u8]) -> Vec<PulseMessage> {
     let owner_vk_hash = spend_auth::vk_hash(owner_vk);
     bills
         .iter()

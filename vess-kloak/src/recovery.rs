@@ -24,7 +24,7 @@ use anyhow::{anyhow, Result};
 use argon2::{Algorithm, Argon2, Params, Version};
 use blake3::Hasher;
 use chacha20poly1305::{
-    aead::{Aead, KeyInit, generic_array::GenericArray},
+    aead::{generic_array::GenericArray, Aead, KeyInit},
     ChaCha20Poly1305,
 };
 use serde::{Deserialize, Serialize};
@@ -205,7 +205,9 @@ pub fn spend_seed_from_raw_seed(seed: &[u8; 64]) -> [u8; 32] {
 ///
 /// This regenerates the exact same keypairs that were created during
 /// wallet init — no wallet file or encrypted secrets needed.
-pub fn recover_master_keys(phrase: &RecoveryPhrase) -> Result<(StealthSecretKey, MasterStealthAddress)> {
+pub fn recover_master_keys(
+    phrase: &RecoveryPhrase,
+) -> Result<(StealthSecretKey, MasterStealthAddress)> {
     recover_master_keys_with_params(phrase, ARGON2_T_COST, ARGON2_M_COST, ARGON2_P_COST)
 }
 
@@ -221,10 +223,7 @@ pub fn recover_master_keys_with_params(
 }
 
 /// Encrypt wallet secret keys with a recovery-derived key.
-pub fn encrypt_secrets(
-    secret: &StealthSecretKey,
-    enc_key: &[u8; 32],
-) -> Result<EncryptedSecrets> {
+pub fn encrypt_secrets(secret: &StealthSecretKey, enc_key: &[u8; 32]) -> Result<EncryptedSecrets> {
     let cipher = ChaCha20Poly1305::new(GenericArray::from_slice(enc_key));
 
     let scan_nonce_bytes = random_nonce();
@@ -272,7 +271,11 @@ pub fn decrypt_secrets(
 /// Derive a 32-byte key from a password and salt using lighter Argon2id.
 pub fn derive_key_from_password(password: &str, salt: &[u8; 16]) -> Result<[u8; 32]> {
     derive_key_from_password_with_params(
-        password, salt, PWD_ARGON2_T_COST, PWD_ARGON2_M_COST, PWD_ARGON2_P_COST,
+        password,
+        salt,
+        PWD_ARGON2_T_COST,
+        PWD_ARGON2_M_COST,
+        PWD_ARGON2_P_COST,
     )
 }
 
@@ -297,7 +300,11 @@ pub fn derive_key_from_password_with_params(
 /// Create a password cache by encrypting the raw_seed under a password.
 pub fn create_password_cache(raw_seed: &[u8; 64], password: &str) -> Result<PasswordCache> {
     create_password_cache_with_params(
-        raw_seed, password, PWD_ARGON2_T_COST, PWD_ARGON2_M_COST, PWD_ARGON2_P_COST,
+        raw_seed,
+        password,
+        PWD_ARGON2_T_COST,
+        PWD_ARGON2_M_COST,
+        PWD_ARGON2_P_COST,
     )
 }
 
@@ -312,7 +319,8 @@ pub fn create_password_cache_with_params(
     use rand::Rng;
     let mut salt = [0u8; 16];
     rand::thread_rng().fill(&mut salt);
-    let pwd_key = derive_key_from_password_with_params(password, &salt, t_cost, m_cost_kib, p_cost)?;
+    let pwd_key =
+        derive_key_from_password_with_params(password, &salt, t_cost, m_cost_kib, p_cost)?;
 
     let cipher = ChaCha20Poly1305::new(GenericArray::from_slice(&pwd_key));
     let nonce_bytes = random_nonce();
@@ -331,7 +339,11 @@ pub fn create_password_cache_with_params(
 /// Decrypt the raw_seed from a password cache.
 pub fn decrypt_password_cache(cache: &PasswordCache, password: &str) -> Result<[u8; 64]> {
     decrypt_password_cache_with_params(
-        cache, password, PWD_ARGON2_T_COST, PWD_ARGON2_M_COST, PWD_ARGON2_P_COST,
+        cache,
+        password,
+        PWD_ARGON2_T_COST,
+        PWD_ARGON2_M_COST,
+        PWD_ARGON2_P_COST,
     )
 }
 
@@ -343,7 +355,8 @@ pub fn decrypt_password_cache_with_params(
     m_cost_kib: u32,
     p_cost: u32,
 ) -> Result<[u8; 64]> {
-    let pwd_key = derive_key_from_password_with_params(password, &cache.salt, t_cost, m_cost_kib, p_cost)?;
+    let pwd_key =
+        derive_key_from_password_with_params(password, &cache.salt, t_cost, m_cost_kib, p_cost)?;
 
     let cipher = ChaCha20Poly1305::new(GenericArray::from_slice(&pwd_key));
     let nonce = GenericArray::from_slice(&cache.nonce);

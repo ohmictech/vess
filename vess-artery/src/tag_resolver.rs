@@ -18,8 +18,8 @@
 //! No single node—nor any minority coalition—can forge a tag association.
 
 use std::collections::HashMap;
-use vess_stealth::MasterStealthAddress;
 use vess_protocol::TagLookupResponse;
+use vess_stealth::MasterStealthAddress;
 
 /// Minimum number of distinct matching responses required to trust a
 /// tag → address association. Five nodes must independently agree.
@@ -36,13 +36,9 @@ pub enum TagResolution {
         registered_at: u64,
     },
     /// Not enough responses yet. Call [`TagResolver::add_response`] with more.
-    Pending {
-        responses_so_far: usize,
-    },
+    Pending { responses_so_far: usize },
     /// Multiple conflicting records exist — possible attack or race.
-    Conflict {
-        variants: usize,
-    },
+    Conflict { variants: usize },
     /// All responding nodes returned "not found".
     NotFound,
 }
@@ -106,15 +102,13 @@ impl TagResolver {
                 let key = ResponseKey::from_keys(&result.scan_ek, &result.spend_ek);
                 self.responses.insert(node_id, Some(key.clone()));
 
-                let entry = self.fingerprint_counts
-                    .entry(key.0)
-                    .or_insert_with(|| {
-                        let addr = MasterStealthAddress {
-                            scan_ek: result.scan_ek.clone(),
-                            spend_ek: result.spend_ek.clone(),
-                        };
-                        (addr, result.registered_at, 0)
-                    });
+                let entry = self.fingerprint_counts.entry(key.0).or_insert_with(|| {
+                    let addr = MasterStealthAddress {
+                        scan_ek: result.scan_ek.clone(),
+                        spend_ek: result.spend_ek.clone(),
+                    };
+                    (addr, result.registered_at, 0)
+                });
                 entry.2 += 1;
             }
         }
@@ -131,14 +125,18 @@ impl TagResolver {
     fn evaluate(&self) -> TagResolution {
         if self.fingerprint_counts.is_empty() {
             if self.responses.is_empty() {
-                return TagResolution::Pending { responses_so_far: 0 };
+                return TagResolution::Pending {
+                    responses_so_far: 0,
+                };
             }
             // All responses were "not found".
             return TagResolution::NotFound;
         }
 
         // Find the fingerprint with the most confirmations.
-        let best = self.fingerprint_counts.values()
+        let best = self
+            .fingerprint_counts
+            .values()
             .max_by_key(|(_, _, count)| *count)
             .unwrap();
 
@@ -207,7 +205,9 @@ mod tests {
         // 5th node tips quorum.
         let result = resolver.add_response([4u8; 32], &resp);
         match result {
-            TagResolution::Verified { confirming_nodes, .. } => {
+            TagResolution::Verified {
+                confirming_nodes, ..
+            } => {
                 assert_eq!(confirming_nodes, 5);
             }
             other => panic!("expected Verified, got {other:?}"),
@@ -224,7 +224,10 @@ mod tests {
             resolver.add_response([0x01; 32], &resp);
         }
         assert_eq!(resolver.response_count(), 1);
-        assert!(matches!(resolver.add_response([0x01; 32], &resp), TagResolution::Pending { .. }));
+        assert!(matches!(
+            resolver.add_response([0x01; 32], &resp),
+            TagResolution::Pending { .. }
+        ));
     }
 
     #[test]
@@ -271,7 +274,9 @@ mod tests {
 
         let result = resolver.add_response([0xFF; 32], &good);
         match result {
-            TagResolution::Verified { confirming_nodes, .. } => {
+            TagResolution::Verified {
+                confirming_nodes, ..
+            } => {
                 assert!(confirming_nodes >= 5);
             }
             other => panic!("expected Verified, got {other:?}"),

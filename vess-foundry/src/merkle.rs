@@ -77,12 +77,7 @@ impl MerkleTree {
 ///
 /// Given the leaf data, its index, the authentication path, and the expected
 /// root, returns true if the path is valid.
-pub fn verify_path(
-    leaf_data: &[u8],
-    index: usize,
-    path: &[[u8; 32]],
-    root: &[u8; 32],
-) -> bool {
+pub fn verify_path(leaf_data: &[u8], index: usize, path: &[[u8; 32]], root: &[u8; 32]) -> bool {
     let mut hash = hash_leaf(leaf_data);
     let mut pos = index;
     for sibling in path {

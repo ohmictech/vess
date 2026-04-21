@@ -3,15 +3,12 @@
 //! These tests exercise the full payment lifecycle:
 //! mint → stealth encrypt → send → receive → reforge → finalize.
 
-use vess_artery::{OwnershipRegistry, TagDht};
 use vess_artery::ownership_registry::OwnershipRecord;
-use vess_foundry::{Denomination, VessBill};
+use vess_artery::{OwnershipRegistry, TagDht};
 use vess_foundry::spend_auth::generate_spend_keypair;
+use vess_foundry::{Denomination, VessBill};
 use vess_kloak::billfold::BillFold;
-use vess_kloak::payment::{
-    prepare_payment,
-    try_receive_payment, PaymentTracker,
-};
+use vess_kloak::payment::{prepare_payment, try_receive_payment, PaymentTracker};
 use vess_kloak::persistence::WalletFile;
 use vess_kloak::recovery::{
     decrypt_secrets, derive_encryption_key_with_params, encrypt_secrets, RecoveryPhrase,
@@ -19,7 +16,7 @@ use vess_kloak::recovery::{
 use vess_kloak::selection::select_bills;
 use vess_protocol::PulseMessage;
 use vess_stealth::generate_master_keys;
-use vess_tag::{VessTag, validate_registration, TagRegistration};
+use vess_tag::{validate_registration, TagRegistration, VessTag};
 
 // blake3 used for computing tag hashes in tests.
 use blake3;
@@ -69,7 +66,13 @@ fn full_payment_lifecycle() {
         .iter()
         .map(|&i| sender_billfold.bills()[i].mint_id)
         .collect();
-    tracker.record_sent(payment_id, 10, mint_ids.clone(), [0u8; 32], std::collections::HashMap::new());
+    tracker.record_sent(
+        payment_id,
+        10,
+        mint_ids.clone(),
+        [0u8; 32],
+        std::collections::HashMap::new(),
+    );
 
     // 5. Recipient receives and decrypts.
     let payment = match msg {
@@ -103,8 +106,9 @@ fn full_payment_lifecycle() {
             digest: [0u8; 32],
             nonce: [0u8; 32],
             prev_claim_vk_hash: None,
-            claim_hash: None, chain_depth: 0,
-        encrypted_bill: vec![],
+            claim_hash: None,
+            chain_depth: 0,
+            encrypted_bill: vec![],
         };
         assert!(registry.register(record));
     }
@@ -134,9 +138,10 @@ fn ownership_registry_double_registration() {
         proof_hash: [0u8; 32],
         digest: [0u8; 32],
         nonce: [0u8; 32],
-            prev_claim_vk_hash: None,
-            claim_hash: None, chain_depth: 0,
-    encrypted_bill: vec![],
+        prev_claim_vk_hash: None,
+        claim_hash: None,
+        chain_depth: 0,
+        encrypted_bill: vec![],
     };
     let record2 = OwnershipRecord {
         mint_id: mint_id2,
@@ -148,9 +153,10 @@ fn ownership_registry_double_registration() {
         proof_hash: [0u8; 32],
         digest: [0u8; 32],
         nonce: [0u8; 32],
-            prev_claim_vk_hash: None,
-            claim_hash: None, chain_depth: 0,
-    encrypted_bill: vec![],
+        prev_claim_vk_hash: None,
+        claim_hash: None,
+        chain_depth: 0,
+        encrypted_bill: vec![],
     };
 
     assert!(registry.register(record1.clone()));
@@ -178,9 +184,10 @@ fn ownership_registry_consume_and_merkle() {
         proof_hash: [0u8; 32],
         digest: [0u8; 32],
         nonce: [0u8; 32],
-            prev_claim_vk_hash: None,
-            claim_hash: None, chain_depth: 0,
-    encrypted_bill: vec![],
+        prev_claim_vk_hash: None,
+        claim_hash: None,
+        chain_depth: 0,
+        encrypted_bill: vec![],
     };
     registry.register(record);
 
@@ -301,10 +308,7 @@ fn bill_selection_exact_match() {
 
 #[test]
 fn bill_selection_with_change() {
-    let bills = vec![
-        fresh_bill(Denomination::D20),
-        fresh_bill(Denomination::D5),
-    ];
+    let bills = vec![fresh_bill(Denomination::D20), fresh_bill(Denomination::D5)];
 
     let result = select_bills(&bills, 10).unwrap();
     assert!(result.total_selected >= 10);
@@ -317,18 +321,16 @@ fn bill_selection_with_change() {
 fn protocol_message_serialization() {
     use vess_protocol::Payment;
 
-    let messages = vec![
-        PulseMessage::Payment(Payment {
-            payment_id: [0xAA; 32],
-            stealth_payload: vec![1, 2, 3],
-            view_tag: 0x42,
-            stealth_id: [0xBB; 32],
-            created_at: 1000,
-            mint_ids: vec![],
-            denomination_values: vec![],
-            bill_count: 0,
-        }),
-    ];
+    let messages = vec![PulseMessage::Payment(Payment {
+        payment_id: [0xAA; 32],
+        stealth_payload: vec![1, 2, 3],
+        view_tag: 0x42,
+        stealth_id: [0xBB; 32],
+        created_at: 1000,
+        mint_ids: vec![],
+        denomination_values: vec![],
+        bill_count: 0,
+    })];
 
     for msg in &messages {
         let bytes = msg.to_bytes().unwrap();
@@ -485,8 +487,9 @@ fn ownership_registry_persistence_roundtrip() {
             digest: [0u8; 32],
             nonce: [0u8; 32],
             prev_claim_vk_hash: None,
-            claim_hash: None, chain_depth: 0,
-        encrypted_bill: vec![],
+            claim_hash: None,
+            chain_depth: 0,
+            encrypted_bill: vec![],
         };
         registry.register(record);
     }
@@ -525,8 +528,9 @@ fn ownership_registry_total_supply() {
             digest: [0u8; 32],
             nonce: [0u8; 32],
             prev_claim_vk_hash: None,
-            claim_hash: None, chain_depth: 0,
-        encrypted_bill: vec![],
+            claim_hash: None,
+            chain_depth: 0,
+            encrypted_bill: vec![],
         };
         registry.register(record);
     }
@@ -673,9 +677,10 @@ fn artery_snapshot_save_load() {
         proof_hash: [0u8; 32],
         digest: [0u8; 32],
         nonce: [0u8; 32],
-            prev_claim_vk_hash: None,
-            claim_hash: None, chain_depth: 0,
-    encrypted_bill: vec![],
+        prev_claim_vk_hash: None,
+        claim_hash: None,
+        chain_depth: 0,
+        encrypted_bill: vec![],
     };
     let record2 = OwnershipRecord {
         mint_id: rand::random(),
@@ -687,9 +692,10 @@ fn artery_snapshot_save_load() {
         proof_hash: [0u8; 32],
         digest: [0u8; 32],
         nonce: [0u8; 32],
-            prev_claim_vk_hash: None,
-            claim_hash: None, chain_depth: 0,
-    encrypted_bill: vec![],
+        prev_claim_vk_hash: None,
+        claim_hash: None,
+        chain_depth: 0,
+        encrypted_bill: vec![],
     };
 
     let snapshot = ArterySnapshot {
@@ -725,16 +731,31 @@ fn tag_pow_compute_and_verify() {
     let tag_hash = *blake3::hash(tag.as_str().as_bytes()).as_bytes();
     let (_secret, address) = generate_master_keys();
 
-    let (nonce, hash) = vess_tag::compute_tag_pow_test(&tag_hash, &address.scan_ek, &address.spend_ek).unwrap();
+    let (nonce, hash) =
+        vess_tag::compute_tag_pow_test(&tag_hash, &address.scan_ek, &address.spend_ek).unwrap();
     assert_eq!(hash.len(), 32);
 
-    let ok = vess_tag::verify_tag_pow_test(&tag_hash, &address.scan_ek, &address.spend_ek, &nonce, &hash).unwrap();
+    let ok = vess_tag::verify_tag_pow_test(
+        &tag_hash,
+        &address.scan_ek,
+        &address.spend_ek,
+        &nonce,
+        &hash,
+    )
+    .unwrap();
     assert!(ok);
 
     // Different tag → fails.
     let tag2 = VessTag::new("bob").unwrap();
     let tag2_hash = *blake3::hash(tag2.as_str().as_bytes()).as_bytes();
-    let bad = vess_tag::verify_tag_pow_test(&tag2_hash, &address.scan_ek, &address.spend_ek, &nonce, &hash).unwrap();
+    let bad = vess_tag::verify_tag_pow_test(
+        &tag2_hash,
+        &address.scan_ek,
+        &address.spend_ek,
+        &nonce,
+        &hash,
+    )
+    .unwrap();
     assert!(!bad);
 }
 
@@ -798,8 +819,7 @@ fn full_send_receive_attest_finalize() {
     let (recipient_secret, recipient_address) = generate_master_keys();
 
     // Send 25 Vess.
-    let (msg, payment_id, send_indices) =
-        prepare_payment(&sender, 25, &recipient_address).unwrap();
+    let (msg, payment_id, send_indices) = prepare_payment(&sender, 25, &recipient_address).unwrap();
 
     // Record mint_ids before removing.
     let sent_mint_ids: Vec<[u8; 32]> = send_indices
@@ -845,10 +865,14 @@ fn full_send_receive_attest_finalize() {
             digest: [0u8; 32],
             nonce: [0u8; 32],
             prev_claim_vk_hash: None,
-            claim_hash: None, chain_depth: 0,
-        encrypted_bill: vec![],
+            claim_hash: None,
+            chain_depth: 0,
+            encrypted_bill: vec![],
         };
-        assert!(registry.register(record.clone()), "fresh mint_ids should register");
+        assert!(
+            registry.register(record.clone()),
+            "fresh mint_ids should register"
+        );
     }
 
     // Try double-registration.
@@ -864,8 +888,9 @@ fn full_send_receive_attest_finalize() {
             digest: [0u8; 32],
             nonce: [0u8; 32],
             prev_claim_vk_hash: None,
-            claim_hash: None, chain_depth: 0,
-        encrypted_bill: vec![],
+            claim_hash: None,
+            chain_depth: 0,
+            encrypted_bill: vec![],
         };
         assert!(
             !registry.register(record),

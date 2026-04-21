@@ -66,8 +66,6 @@ pub enum PulseMessage {
     /// Deliver a limbo-held payment to the recipient who just came online.
     LimboDeliver(LimboDeliver),
 
-
-
     /// Replicate a tag record to DHT peers for redundancy.
     TagStore(TagStore),
 
@@ -114,7 +112,6 @@ pub enum PulseMessage {
 
     /// Response to a FindNode request: the K closest peers known.
     FindNodeResponse(FindNodeResponse),
-
 
     /// Attest that input bills have been consumed in a split/combine reforge.
     /// Artery nodes verify the owner's signature over each consumed mint_id
@@ -410,8 +407,6 @@ pub struct LimboDeliver {
     pub payment: Payment,
 }
 
-
-
 // ── Tag Replication ───────────────────────────────────────────────
 
 /// Replicate a tag record to peer DHT nodes for redundancy.
@@ -667,8 +662,6 @@ pub struct OwnershipFetchResponse {
     pub records: Vec<FetchedRecord>,
 }
 
-
-
 // ── Direct Peer-to-Peer Payment ──────────────────────────────────────
 
 /// Direct payment sent over a QUIC bi-stream between two wallets.
@@ -765,5 +758,4 @@ mod tests {
             _ => panic!("wrong variant"),
         }
     }
-
 }

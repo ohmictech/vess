@@ -18,7 +18,7 @@
 
 use anyhow::{anyhow, Result};
 use chacha20poly1305::{
-    aead::{Aead, KeyInit, generic_array::GenericArray},
+    aead::{generic_array::GenericArray, Aead, KeyInit},
     ChaCha20Poly1305,
 };
 use serde::{Deserialize, Serialize};
@@ -160,8 +160,8 @@ fn manifest_enc_key(spend_seed: &[u8; 32]) -> [u8; 32] {
 
 /// Encrypt a manifest (list of entries) for DHT storage.
 pub fn encrypt_manifest(spend_seed: &[u8; 32], entries: &[ManifestEntry]) -> Result<Vec<u8>> {
-    let plaintext = postcard::to_allocvec(entries)
-        .map_err(|e| anyhow!("manifest serialize: {e}"))?;
+    let plaintext =
+        postcard::to_allocvec(entries).map_err(|e| anyhow!("manifest serialize: {e}"))?;
     let key_bytes = manifest_enc_key(spend_seed);
     let key = GenericArray::from_slice(&key_bytes);
     let cipher = ChaCha20Poly1305::new(key);
@@ -191,8 +191,8 @@ pub fn decrypt_manifest(spend_seed: &[u8; 32], data: &[u8]) -> Result<Vec<Manife
     let plaintext = cipher
         .decrypt(nonce, ciphertext)
         .map_err(|_| anyhow!("manifest decrypt failed (wrong key or corrupted)"))?;
-    let entries: Vec<ManifestEntry> = postcard::from_bytes(&plaintext)
-        .map_err(|e| anyhow!("manifest deserialize: {e}"))?;
+    let entries: Vec<ManifestEntry> =
+        postcard::from_bytes(&plaintext).map_err(|e| anyhow!("manifest deserialize: {e}"))?;
     Ok(entries)
 }
 

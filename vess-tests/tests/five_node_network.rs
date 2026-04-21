@@ -22,20 +22,20 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use vess_artery::OwnershipRegistry;
 use vess_artery::ownership_registry::OwnershipRecord;
+use vess_artery::OwnershipRegistry;
 use vess_artery::TagDht;
 use vess_foundry::reforge::{reforge, ReforgeRequest};
 use vess_foundry::spend_auth;
 use vess_foundry::Denomination;
 use vess_kloak::billfold::{BillFold, SpendCredential};
 use vess_kloak::payment::{
-    claim_transfer_bills, prepare_payment_with_transfer,
-    try_decrypt_transfer_payload, DecryptedTransfer,
+    claim_transfer_bills, prepare_payment_with_transfer, try_decrypt_transfer_payload,
+    DecryptedTransfer,
 };
 use vess_protocol::{
-    OwnershipClaim, OwnershipGenesis, PulseMessage, RegistryQueryResponse,
-    ReforgeAttestation, TagLookupResponse, TagLookupResult, TagRegister,
+    OwnershipClaim, OwnershipGenesis, PulseMessage, ReforgeAttestation, RegistryQueryResponse,
+    TagLookupResponse, TagLookupResult, TagRegister,
 };
 use vess_stealth::{generate_master_keys, MasterStealthAddress};
 use vess_tag::TagRecord;
@@ -272,13 +272,7 @@ async fn transfer_and_claim(
 
     assert_eq!(
         transfer_payload.memo.as_deref(),
-        Some(
-            format!(
-                "{} -> {}: {} Vess",
-                sender.name, receiver.name, amount
-            )
-            .as_str()
-        ),
+        Some(format!("{} -> {}: {} Vess", sender.name, receiver.name, amount).as_str()),
     );
 
     let claim_result =
@@ -348,10 +342,7 @@ fn verify_total_supply(participants: &[&Participant], expected: u64) {
 
 /// Register all minted bills directly in the registry (skips STARK
 /// verification — that is covered in three_node_e2e).
-fn register_all_bills(
-    participants: &[&Participant],
-    registry: &Arc<Mutex<OwnershipRegistry>>,
-) {
+fn register_all_bills(participants: &[&Participant], registry: &Arc<Mutex<OwnershipRegistry>>) {
     let mut reg = registry.lock().unwrap();
     let now = now_unix();
     for p in participants {
@@ -405,48 +396,43 @@ async fn five_node_full_network() {
         let artery_node = artery_node.clone();
         async move {
             artery_node
-                .listen_messages_with_response(move |_peer, msg| {
-                    match msg {
-                        PulseMessage::OwnershipGenesis(og) => {
-                            if !handle_ownership_genesis_safe(&reg, &og) {
-                                *rejections.lock().unwrap() += 1;
-                                println!("    [ARTERY] Rejected bad OwnershipGenesis");
-                            }
-                            None
+                .listen_messages_with_response(move |_peer, msg| match msg {
+                    PulseMessage::OwnershipGenesis(og) => {
+                        if !handle_ownership_genesis_safe(&reg, &og) {
+                            *rejections.lock().unwrap() += 1;
+                            println!("    [ARTERY] Rejected bad OwnershipGenesis");
                         }
-                        PulseMessage::OwnershipClaim(ref oc) => {
-                            if !handle_ownership_claim_safe(&reg, oc) {
-                                *rejections.lock().unwrap() += 1;
-                                println!("    [ARTERY] Rejected bad OwnershipClaim");
-                            }
-                            None
+                        None
+                    }
+                    PulseMessage::OwnershipClaim(ref oc) => {
+                        if !handle_ownership_claim_safe(&reg, oc) {
+                            *rejections.lock().unwrap() += 1;
+                            println!("    [ARTERY] Rejected bad OwnershipClaim");
                         }
-                        PulseMessage::ReforgeAttestation(ref ra) => {
-                            if !handle_reforge_attestation_safe(&reg, ra) {
-                                *rejections.lock().unwrap() += 1;
-                                println!("    [ARTERY] Rejected bad ReforgeAttestation");
-                            }
-                            None
+                        None
+                    }
+                    PulseMessage::ReforgeAttestation(ref ra) => {
+                        if !handle_reforge_attestation_safe(&reg, ra) {
+                            *rejections.lock().unwrap() += 1;
+                            println!("    [ARTERY] Rejected bad ReforgeAttestation");
                         }
-                        PulseMessage::RegistryQuery(rq) => {
-                            let state = reg.lock().unwrap();
-                            let active = rq
-                                .mint_ids
-                                .iter()
-                                .map(|mid| state.is_active(mid))
-                                .collect();
-                            Some(PulseMessage::RegistryQueryResponse(
-                                RegistryQueryResponse { active },
-                            ))
-                        }
-                        PulseMessage::TagRegister(tr) => {
-                            handle_tag_register(&tags, tr);
-                            None
-                        }
-                        PulseMessage::TagLookup(tl) => {
-                            let dht = tags.lock().unwrap();
-                            let result = dht
-                                .lookup_by_hash(&tl.tag_hash)
+                        None
+                    }
+                    PulseMessage::RegistryQuery(rq) => {
+                        let state = reg.lock().unwrap();
+                        let active = rq.mint_ids.iter().map(|mid| state.is_active(mid)).collect();
+                        Some(PulseMessage::RegistryQueryResponse(RegistryQueryResponse {
+                            active,
+                        }))
+                    }
+                    PulseMessage::TagRegister(tr) => {
+                        handle_tag_register(&tags, tr);
+                        None
+                    }
+                    PulseMessage::TagLookup(tl) => {
+                        let dht = tags.lock().unwrap();
+                        let result =
+                            dht.lookup_by_hash(&tl.tag_hash)
                                 .map(|record| TagLookupResult {
                                     scan_ek: record.master_address.scan_ek.clone(),
                                     spend_ek: record.master_address.spend_ek.clone(),
@@ -456,15 +442,14 @@ async fn five_node_full_network() {
                                     registrant_vk: record.registrant_vk.clone(),
                                     signature: record.signature.clone(),
                                 });
-                            Some(PulseMessage::TagLookupResponse(TagLookupResponse {
-                                tag_hash: tl.tag_hash,
-                                nonce: tl.nonce,
-                                result,
-                            }))
-                        }
-                        PulseMessage::Payment(_) => None,
-                        _ => None,
+                        Some(PulseMessage::TagLookupResponse(TagLookupResponse {
+                            tag_hash: tl.tag_hash,
+                            nonce: tl.nonce,
+                            result,
+                        }))
                     }
+                    PulseMessage::Payment(_) => None,
+                    _ => None,
                 })
                 .await
                 .ok();
@@ -535,10 +520,7 @@ async fn five_node_full_network() {
     assert_eq!(diana.billfold.balance(), 3);
     assert_eq!(eve.billfold.balance(), 2);
 
-    register_all_bills(
-        &[&alice, &bob, &charlie, &diana, &eve],
-        &registry,
-    );
+    register_all_bills(&[&alice, &bob, &charlie, &diana, &eve], &registry);
     println!("All 20 bills registered in ownership registry.\n");
     verify_total_supply(&[&alice, &bob, &charlie, &diana, &eve], total_supply);
 
@@ -619,7 +601,9 @@ async fn five_node_full_network() {
 
         // Alice still owns her bill.
         let reg = registry.lock().unwrap();
-        let record = reg.get(&alice_bill.mint_id).expect("alice bill should exist");
+        let record = reg
+            .get(&alice_bill.mint_id)
+            .expect("alice bill should exist");
         let alice_cred = alice.credentials.get(&alice_bill.mint_id).unwrap();
         let alice_vk_hash = spend_auth::vk_hash(&alice_cred.spend_vk);
         assert_eq!(
@@ -1186,8 +1170,7 @@ fn handle_ownership_claim_safe(
     oc: &OwnershipClaim,
 ) -> bool {
     // Verify transfer signature.
-    let transfer_msg =
-        spend_auth::transfer_message(&oc.mint_id, &oc.stealth_id, oc.timestamp);
+    let transfer_msg = spend_auth::transfer_message(&oc.mint_id, &oc.stealth_id, oc.timestamp);
     match spend_auth::verify_spend(&oc.prev_owner_vk, &transfer_msg, &oc.transfer_sig) {
         Ok(true) => {}
         _ => return false,

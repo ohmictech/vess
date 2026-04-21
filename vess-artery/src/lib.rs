@@ -20,28 +20,28 @@
 //! └──────────┘            └──────────┘            └──────────┘
 //! ```
 
-pub mod ownership_registry;
+pub mod banishment;
+pub mod dns_seed;
 pub mod gossip;
+pub mod handshake;
+pub mod kademlia;
+pub mod limbo_buffer;
+pub mod node_runner;
+pub mod ownership_registry;
+pub mod persistence;
+pub mod reputation;
+pub mod rpc;
 pub mod tag_dht;
 pub mod tag_resolver;
-pub mod persistence;
-pub mod handshake;
-pub mod banishment;
-pub mod limbo_buffer;
-pub mod reputation;
-pub mod kademlia;
-pub mod node_runner;
-pub mod dns_seed;
-pub mod rpc;
 
-pub use ownership_registry::{OwnershipRegistry, dht_replication_factor};
-pub use limbo_buffer::LimboBuffer;
-pub use gossip::GossipConfig;
-pub use tag_dht::TagDht;
-pub use tag_resolver::{TagResolver, TagResolution, QUORUM_THRESHOLD};
-pub use persistence::{ArterySnapshot, NodeStorage};
-pub use handshake::{PeerRegistry, PeerState, PROTOCOL_VERSION_HASH, ALLOWED_VERSIONS};
-pub use handshake::{compute_handshake_pow, verify_handshake_pow};
-pub use handshake::{HANDSHAKE_POW_M_COST, HANDSHAKE_POW_T_COST, HANDSHAKE_POW_P_COST};
 pub use banishment::BanishmentManager;
+pub use gossip::GossipConfig;
+pub use handshake::{compute_handshake_pow, verify_handshake_pow};
+pub use handshake::{PeerRegistry, PeerState, ALLOWED_VERSIONS, PROTOCOL_VERSION_HASH};
+pub use handshake::{HANDSHAKE_POW_M_COST, HANDSHAKE_POW_P_COST, HANDSHAKE_POW_T_COST};
+pub use limbo_buffer::LimboBuffer;
+pub use ownership_registry::{dht_replication_factor, OwnershipRegistry};
+pub use persistence::{ArterySnapshot, NodeStorage};
 pub use reputation::ReputationTable;
+pub use tag_dht::TagDht;
+pub use tag_resolver::{TagResolution, TagResolver, QUORUM_THRESHOLD};

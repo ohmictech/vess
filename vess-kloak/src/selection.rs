@@ -71,11 +71,12 @@ pub fn select_bills_filtered(
         .filter(|&i| !reserved_set.contains(&bills[i].mint_id))
         .collect();
 
-    let total: u64 = available.iter().map(|&i| bills[i].denomination.value()).sum();
+    let total: u64 = available
+        .iter()
+        .map(|&i| bills[i].denomination.value())
+        .sum();
     if total < amount {
-        return Err(anyhow!(
-            "insufficient funds: need {amount}, have {total}"
-        ));
+        return Err(anyhow!("insufficient funds: need {amount}, have {total}"));
     }
 
     // Try randomized branch-and-bound first.
@@ -104,7 +105,10 @@ pub fn select_bills_filtered(
 
 /// Waste metric: change amount + per-bill overhead.
 fn waste(bills: &[VessBill], selected: &[usize], amount: u64) -> u64 {
-    let total: u64 = selected.iter().map(|&i| bills[i].denomination.value()).sum();
+    let total: u64 = selected
+        .iter()
+        .map(|&i| bills[i].denomination.value())
+        .sum();
     let change = total.saturating_sub(amount);
     change + selected.len() as u64 * BILL_COST
 }
@@ -117,11 +121,7 @@ fn waste(bills: &[VessBill], selected: &[usize], amount: u64) -> u64 {
 ///   solution's waste.
 /// - The remaining capacity (sum of unconsidered bills) can't reach the
 ///   target even if all are included.
-fn bnb_select(
-    bills: &[VessBill],
-    available: &[usize],
-    target: u64,
-) -> Option<Vec<usize>> {
+fn bnb_select(bills: &[VessBill], available: &[usize], target: u64) -> Option<Vec<usize>> {
     use rand::seq::SliceRandom;
 
     let mut rng = rand::thread_rng();
@@ -190,11 +190,7 @@ fn bnb_select(
 }
 
 /// Greedy largest-first selection with post-optimization.
-fn greedy_select(
-    bills: &[VessBill],
-    available: &[usize],
-    amount: u64,
-) -> Result<Vec<usize>> {
+fn greedy_select(bills: &[VessBill], available: &[usize], amount: u64) -> Result<Vec<usize>> {
     let mut indices: Vec<usize> = available.to_vec();
     indices.sort_by(|&a, &b| {
         bills[b]
@@ -323,12 +319,15 @@ mod tests {
         let sum: u64 = d.iter().map(|x| x.value()).sum();
         assert_eq!(sum, 37);
         // 37 = 20 + 10 + 5 + 2
-        assert_eq!(d, vec![
-            Denomination::D20,
-            Denomination::D10,
-            Denomination::D5,
-            Denomination::D2,
-        ]);
+        assert_eq!(
+            d,
+            vec![
+                Denomination::D20,
+                Denomination::D10,
+                Denomination::D5,
+                Denomination::D2,
+            ]
+        );
     }
 
     #[test]

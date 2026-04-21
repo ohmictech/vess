@@ -103,7 +103,9 @@ mod tests {
         let candidates = scheduler.scan(&bills);
         assert!(!candidates.is_empty());
         // Should find at least the D5 consolidation.
-        assert!(candidates.iter().any(|c| c.target_denomination == Denomination::D5));
+        assert!(candidates
+            .iter()
+            .any(|c| c.target_denomination == Denomination::D5));
     }
 
     #[test]
@@ -112,6 +114,8 @@ mod tests {
         let bills: Vec<VessBill> = (0..2).map(|_| make_bill(Denomination::D1)).collect();
 
         let candidates = scheduler.scan(&bills);
-        assert!(candidates.iter().any(|c| c.target_denomination == Denomination::D2));
+        assert!(candidates
+            .iter()
+            .any(|c| c.target_denomination == Denomination::D2));
     }
 }

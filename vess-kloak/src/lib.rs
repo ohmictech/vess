@@ -19,18 +19,18 @@
 //!   → Recipient claims via OwnershipClaim
 //! ```
 
-pub mod billfold;
-pub mod selection;
 pub mod auto_reforge;
-pub mod recovery;
-pub mod persistence;
+pub mod billfold;
 pub mod payment;
+pub mod persistence;
+pub mod recovery;
+pub mod selection;
 pub mod tag_cache;
 
-pub use billfold::BillFold;
-pub use selection::select_bills;
 pub use auto_reforge::ConsolidationScheduler;
-pub use recovery::{RecoveryPhrase, EncryptedSecrets};
+pub use billfold::BillFold;
+pub use payment::{cleanup_rejected_bills, extract_mint_ids_from_claims, PaymentTracker};
 pub use persistence::WalletFile;
-pub use payment::{PaymentTracker, cleanup_rejected_bills, extract_mint_ids_from_claims};
+pub use recovery::{EncryptedSecrets, RecoveryPhrase};
+pub use selection::select_bills;
 pub use tag_cache::TagCache;

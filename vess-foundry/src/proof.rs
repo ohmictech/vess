@@ -17,7 +17,7 @@ use blake3::Hasher;
 use serde::{Deserialize, Serialize};
 
 use crate::merkle::{self, MerkleTree};
-use crate::vm::{self, CacheLine, VmStep, VmTrace, EXTRA_READS, DISK_READ_INTERVAL};
+use crate::vm::{self, CacheLine, VmStep, VmTrace, DISK_READ_INTERVAL, EXTRA_READS};
 use crate::Denomination;
 
 /// Number of random queries the verifier checks.
@@ -300,18 +300,12 @@ pub fn generate_proof(
     let trace_tree = MerkleTree::build(&step_refs);
 
     // Build scratchpad Merkle tree (one leaf per cache line).
-    let pad_bytes: Vec<Vec<u8>> = scratchpad
-        .iter()
-        .map(|cl| line_to_bytes(&cl.0))
-        .collect();
+    let pad_bytes: Vec<Vec<u8>> = scratchpad.iter().map(|cl| line_to_bytes(&cl.0)).collect();
     let pad_refs: Vec<&[u8]> = pad_bytes.iter().map(|v| v.as_slice()).collect();
     let pad_tree = MerkleTree::build(&pad_refs);
 
     // Build disk dataset Merkle tree.
-    let disk_bytes: Vec<Vec<u8>> = disk_dataset
-        .iter()
-        .map(|cl| line_to_bytes(&cl.0))
-        .collect();
+    let disk_bytes: Vec<Vec<u8>> = disk_dataset.iter().map(|cl| line_to_bytes(&cl.0)).collect();
     let disk_refs: Vec<&[u8]> = disk_bytes.iter().map(|v| v.as_slice()).collect();
     let disk_tree = MerkleTree::build(&disk_refs);
 
@@ -320,7 +314,14 @@ pub fn generate_proof(
     let disk_root = disk_tree.root();
 
     // Derive query indices (Fiat-Shamir).
-    let query_indices = derive_query_indices(&trace_root, &scratchpad_root, &disk_root, nonce, &trace.digest, n_steps);
+    let query_indices = derive_query_indices(
+        &trace_root,
+        &scratchpad_root,
+        &disk_root,
+        nonce,
+        &trace.digest,
+        n_steps,
+    );
 
     // Open each query.
     let seed = crate::mint::derive_seed_pub(nonce, denom, owner_vk_hash);
@@ -505,8 +506,7 @@ pub fn verify_proof(proof: &VessProof, expected_digest: &[u8; 32]) -> Result<(),
         let mut working_regs = prev_regs;
         for k in 0..EXTRA_READS {
             let extra_reg = working_regs[((step_idx as usize) + k + 1) % NUM_REGS];
-            let expected_extra_addr =
-                (extra_reg.rotate_left((k as u32 + 1) * 7) as u32) & mask;
+            let expected_extra_addr = (extra_reg.rotate_left((k as u32 + 1) * 7) as u32) & mask;
             if current_step.extra_addrs[k] != expected_extra_addr {
                 return Err(VerifyError::TransitionMismatch(step_idx));
             }
@@ -521,8 +521,8 @@ pub fn verify_proof(proof: &VessProof, expected_digest: &[u8; 32]) -> Result<(),
             }
             // Apply the same register mutation the VM does.
             let dst = ((step_idx as usize) + k + 3) % NUM_REGS;
-            working_regs[dst] ^= query.extra_scratchpad_lines[k]
-                [(step_idx as usize + k) % LINE_U64S];
+            working_regs[dst] ^=
+                query.extra_scratchpad_lines[k][(step_idx as usize + k) % LINE_U64S];
             working_regs[dst] = working_regs[dst].rotate_right((11 + k as u32 * 3) & 63);
         }
 
@@ -621,8 +621,7 @@ impl AggregateProof {
         // All sub-proofs MUST deserialize — a malformed entry would let
         // an attacker manipulate the compound digest.
         for proof_bytes in &self.d1_proofs {
-            let p = deserialize_proof(proof_bytes)
-                .map_err(|_| VerifyError::DigestMismatch)?;
+            let p = deserialize_proof(proof_bytes).map_err(|_| VerifyError::DigestMismatch)?;
             h.update(&p.nonce);
         }
         Ok(*h.finalize().as_bytes())

@@ -12,15 +12,15 @@ use clap::{Parser, Subcommand};
 use serde_json::json;
 use tracing_subscriber::EnvFilter;
 
+use vess_kloak::billfold::SpendCredential;
+use vess_kloak::payment::build_genesis_messages;
 use vess_kloak::persistence::WalletFile;
 use vess_kloak::recovery::{
-    derive_raw_seed, encrypt_secrets, encryption_key_from_seed,
-    recover_master_keys, spend_seed_from_raw_seed, RecoveryPhrase,
+    derive_raw_seed, encrypt_secrets, encryption_key_from_seed, recover_master_keys,
+    spend_seed_from_raw_seed, RecoveryPhrase,
 };
 use vess_kloak::BillFold;
-use vess_kloak::payment::build_genesis_messages;
-use vess_kloak::billfold::SpendCredential;
-use vess_protocol::{PulseMessage, TagRegister, TagLookup};
+use vess_protocol::{PulseMessage, TagLookup, TagRegister};
 use vess_stealth::generate_master_keys_from_seed;
 use vess_tag::VessTag;
 use vess_vascular::VessNode;
@@ -189,17 +189,41 @@ async fn main() -> Result<()> {
         Command::Init { tag } => cmd_init(&cli, tag).await,
         Command::Recover { words, pin } => cmd_recover(&cli, words, pin).await,
         Command::Balance => cmd_balance(&cli).await,
-        Command::Notifications { follow, interval_ms, max } => {
-            cmd_notifications(&cli, *follow, *interval_ms, *max).await
-        }
-        Command::Send { amount, recipient, memo, node_direct } => {
-            cmd_send(&cli, *amount, recipient, memo.as_deref(), node_direct.as_deref()).await
+        Command::Notifications {
+            follow,
+            interval_ms,
+            max,
+        } => cmd_notifications(&cli, *follow, *interval_ms, *max).await,
+        Command::Send {
+            amount,
+            recipient,
+            memo,
+            node_direct,
+        } => {
+            cmd_send(
+                &cli,
+                *amount,
+                recipient,
+                memo.as_deref(),
+                node_direct.as_deref(),
+            )
+            .await
         }
         Command::Mint { finalize, status } => cmd_mint(&cli, *finalize, *status).await,
         Command::RegisterTag { tag } => cmd_register_tag(&cli, tag).await,
         Command::Pulse { node_id, message } => cmd_pulse(&cli, node_id, message).await,
         Command::Listen => cmd_listen(&cli).await,
-        Command::Node { k_neighbors, max_hops, state_dir, bootstrap, seed, no_seed, wallet, wallet_password, rpc_port } => {
+        Command::Node {
+            k_neighbors,
+            max_hops,
+            state_dir,
+            bootstrap,
+            seed,
+            no_seed,
+            wallet,
+            wallet_password,
+            rpc_port,
+        } => {
             let config = vess_artery::node_runner::NodeConfig {
                 k_neighbors: *k_neighbors,
                 max_hops: *max_hops,
@@ -251,9 +275,8 @@ fn derive_raw_seed_for_wallet(cli: &Cli) -> Result<[u8; 64]> {
             "set VESS_WALLET_PASSWORD or VESS_RECOVERY_PHRASE + VESS_RECOVERY_PIN env vars"
         )
     })?;
-    let pin = std::env::var("VESS_RECOVERY_PIN").map_err(|_| {
-        anyhow::anyhow!("set VESS_RECOVERY_PIN env var for this operation")
-    })?;
+    let pin = std::env::var("VESS_RECOVERY_PIN")
+        .map_err(|_| anyhow::anyhow!("set VESS_RECOVERY_PIN env var for this operation"))?;
     let phrase = RecoveryPhrase::from_input(&words, &pin)?;
     derive_raw_seed(&phrase)
 }
@@ -286,9 +309,8 @@ async fn rpc_call(port: u16, request: &serde_json::Value) -> Result<serde_json::
 /// Discover artery peers via DNS seeds. Used by init/recover when the
 /// local node is not yet running.
 async fn discover_peers() -> Result<Vec<iroh::EndpointId>> {
-    let seeds = vess_artery::dns_seed::resolve_seeds(
-        vess_artery::dns_seed::DEFAULT_SEED_DOMAIN,
-    ).await?;
+    let seeds =
+        vess_artery::dns_seed::resolve_seeds(vess_artery::dns_seed::DEFAULT_SEED_DOMAIN).await?;
     let mut peers = Vec::new();
     for s in &seeds {
         if let Ok(eid) = s.parse::<iroh::EndpointId>() {
@@ -296,9 +318,7 @@ async fn discover_peers() -> Result<Vec<iroh::EndpointId>> {
         }
     }
     if peers.is_empty() {
-        anyhow::bail!(
-            "no artery peers found via DNS seeds — check your internet connection"
-        );
+        anyhow::bail!("no artery peers found via DNS seeds — check your internet connection");
     }
     Ok(peers)
 }
@@ -331,7 +351,9 @@ async fn cmd_init(cli: &Cli, tag_str: &str) -> Result<()> {
         nonce: rand::random(),
     });
 
-    let resp = vess_node.send_message_with_response(target, &lookup).await?;
+    let resp = vess_node
+        .send_message_with_response(target, &lookup)
+        .await?;
 
     let is_taken = match &resp {
         Some(PulseMessage::TagLookupResponse(tlr)) => tlr.result.is_some(),
@@ -340,7 +362,10 @@ async fn cmd_init(cli: &Cli, tag_str: &str) -> Result<()> {
 
     if is_taken {
         vess_node.shutdown().await;
-        anyhow::bail!("tag {} is already claimed — wallet was NOT created", tag.display());
+        anyhow::bail!(
+            "tag {} is already claimed — wallet was NOT created",
+            tag.display()
+        );
     }
 
     println!("Tag {} is available!", tag.display());
@@ -403,7 +428,10 @@ async fn cmd_init(cli: &Cli, tag_str: &str) -> Result<()> {
         vess_node.shutdown().await;
 
         if cli.json {
-            println!("{}", json!({ "tag_registered": true, "tag": tag.display() }));
+            println!(
+                "{}",
+                json!({ "tag_registered": true, "tag": tag.display() })
+            );
         } else {
             println!("Tag {} registration sent.", tag.display());
         }
@@ -411,11 +439,14 @@ async fn cmd_init(cli: &Cli, tag_str: &str) -> Result<()> {
 
     if cli.json {
         wallet.save(&path)?;
-        println!("{}", json!({
-            "ok": true,
-            "recovery_phrase": phrase.display_phrase(),
-            "wallet_path": path.display().to_string(),
-        }));
+        println!(
+            "{}",
+            json!({
+                "ok": true,
+                "recovery_phrase": phrase.display_phrase(),
+                "wallet_path": path.display().to_string(),
+            })
+        );
     } else {
         println!("\n=== WRITE DOWN YOUR RECOVERY PHRASE ===\n");
         println!("  {}\n", phrase.display_phrase());
@@ -437,8 +468,7 @@ async fn cmd_init(cli: &Cli, tag_str: &str) -> Result<()> {
         let mut pin_input = String::new();
         io::stdin().read_line(&mut pin_input)?;
 
-        let words_match = words_input.split_whitespace().collect::<Vec<_>>()
-            == phrase.words;
+        let words_match = words_input.split_whitespace().collect::<Vec<_>>() == phrase.words;
         let pin_match = pin_input.trim() == phrase.pin;
 
         if !words_match || !pin_match {
@@ -448,7 +478,10 @@ async fn cmd_init(cli: &Cli, tag_str: &str) -> Result<()> {
         }
 
         wallet.save(&path)?;
-        println!("Recovery phrase verified. Wallet created at {}", path.display());
+        println!(
+            "Recovery phrase verified. Wallet created at {}",
+            path.display()
+        );
     }
 
     Ok(())
@@ -489,8 +522,9 @@ async fn cmd_recover(cli: &Cli, words: &str, pin: &str) -> Result<()> {
     let pe_msg = PulseMessage::PeerExchange(vess_protocol::PeerExchange {
         sender_id: vec![0u8; 32],
     });
-    if let Ok(Some(PulseMessage::PeerExchangeResponse(resp))) =
-        node.send_message_with_response(bootstrap_target, &pe_msg).await
+    if let Ok(Some(PulseMessage::PeerExchangeResponse(resp))) = node
+        .send_message_with_response(bootstrap_target, &pe_msg)
+        .await
     {
         for peer_bytes in &resp.peers {
             if let Ok(arr) = <[u8; 32]>::try_from(peer_bytes.as_slice()) {
@@ -523,7 +557,10 @@ async fn cmd_recover(cli: &Cli, words: &str, pin: &str) -> Result<()> {
                     Ok(entries) => {
                         manifest_entries = entries;
                         manifest_found = true;
-                        println!("  Manifest found with {} bill entries", manifest_entries.len());
+                        println!(
+                            "  Manifest found with {} bill entries",
+                            manifest_entries.len()
+                        );
                         break;
                     }
                     Err(e) => {
@@ -561,14 +598,22 @@ async fn cmd_recover(cli: &Cli, words: &str, pin: &str) -> Result<()> {
             }
             let rec = &fetched_records[i];
             if !rec.found {
-                println!("  [{}] mint_id {}: not found in registry", i, hex(&entry.mint_id[..4]));
+                println!(
+                    "  [{}] mint_id {}: not found in registry",
+                    i,
+                    hex(&entry.mint_id[..4])
+                );
                 continue;
             }
 
-            let denomination = match vess_foundry::Denomination::from_value(rec.denomination_value) {
+            let denomination = match vess_foundry::Denomination::from_value(rec.denomination_value)
+            {
                 Some(d) => d,
                 None => {
-                    println!("  [{i}] unknown denomination value: {}", rec.denomination_value);
+                    println!(
+                        "  [{i}] unknown denomination value: {}",
+                        rec.denomination_value
+                    );
                     continue;
                 }
             };
@@ -608,22 +653,19 @@ async fn cmd_recover(cli: &Cli, words: &str, pin: &str) -> Result<()> {
     wallet.save(&path)?;
 
     if cli.json {
-        println!("{}", json!({
-            "ok": true,
-            "wallet_path": path.display().to_string(),
-            "recovered_bills": recovered,
-            "balance": wallet.billfold.balance(),
-        }));
+        println!(
+            "{}",
+            json!({
+                "ok": true,
+                "wallet_path": path.display().to_string(),
+                "recovered_bills": recovered,
+                "balance": wallet.billfold.balance(),
+            })
+        );
     } else {
         println!("Wallet recovered successfully at {}", path.display());
-        println!(
-            "Scan key:  {} bytes",
-            secret.scan_dk.len()
-        );
-        println!(
-            "Spend key: {} bytes",
-            secret.spend_dk.len()
-        );
+        println!("Scan key:  {} bytes", secret.scan_dk.len());
+        println!("Spend key: {} bytes", secret.spend_dk.len());
         println!("Balance: {} Vess", wallet.billfold.balance());
     }
     Ok(())
@@ -650,16 +692,21 @@ async fn cmd_balance(cli: &Cli) -> Result<()> {
     let wallet = WalletFile::load(&path)?;
 
     if cli.json {
-        let breakdown: serde_json::Map<String, serde_json::Value> = wallet.billfold.denomination_breakdown()
+        let breakdown: serde_json::Map<String, serde_json::Value> = wallet
+            .billfold
+            .denomination_breakdown()
             .into_iter()
             .map(|(d, c)| (format!("{d}"), json!(c)))
             .collect();
-        println!("{}", json!({
-            "ok": true,
-            "balance": wallet.billfold.balance(),
-            "bills": wallet.billfold.count(),
-            "denominations": breakdown,
-        }));
+        println!(
+            "{}",
+            json!({
+                "ok": true,
+                "balance": wallet.billfold.balance(),
+                "bills": wallet.billfold.count(),
+                "denominations": breakdown,
+            })
+        );
     } else {
         println!("Balance: {} Vess", wallet.billfold.balance());
         println!("Bills:   {}", wallet.billfold.count());
@@ -679,18 +726,27 @@ async fn cmd_notifications(cli: &Cli, follow: bool, interval_ms: u64, max: usize
     let port = rpc_port(cli);
 
     loop {
-        let resp = rpc_call(port, &json!({
-            "method": "notifications",
-            "max": max,
-        }))
+        let resp = rpc_call(
+            port,
+            &json!({
+                "method": "notifications",
+                "max": max,
+            }),
+        )
         .await?;
 
-        let notifications = resp["notifications"].as_array().cloned().unwrap_or_default();
+        let notifications = resp["notifications"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
         let had_notifications = !notifications.is_empty();
 
         for note in &notifications {
             if cli.json {
-                println!("{}", json!({ "event": "notification", "notification": note }));
+                println!(
+                    "{}",
+                    json!({ "event": "notification", "notification": note })
+                );
             } else {
                 let kind = note["kind"].as_str().unwrap_or("notification");
                 let payment_id = note["payment_id"].as_str().unwrap_or("?");
@@ -710,22 +766,24 @@ async fn cmd_notifications(cli: &Cli, follow: bool, interval_ms: u64, max: usize
     }
 }
 
-async fn auto_watch_send_confirmation(
-    cli: &Cli,
-    payment_id: &str,
-    timeout_ms: u64,
-) -> Result<()> {
+async fn auto_watch_send_confirmation(cli: &Cli, payment_id: &str, timeout_ms: u64) -> Result<()> {
     let port = rpc_port(cli);
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
 
     while std::time::Instant::now() < deadline {
-        let resp = rpc_call(port, &json!({
-            "method": "notifications",
-            "max": 64,
-        }))
+        let resp = rpc_call(
+            port,
+            &json!({
+                "method": "notifications",
+                "max": 64,
+            }),
+        )
         .await?;
 
-        let notifications = resp["notifications"].as_array().cloned().unwrap_or_default();
+        let notifications = resp["notifications"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
         let mut confirmed = false;
 
         for note in &notifications {
@@ -735,7 +793,10 @@ async fn auto_watch_send_confirmation(
             }
 
             if cli.json {
-                println!("{}", json!({ "event": "notification", "notification": note }));
+                println!(
+                    "{}",
+                    json!({ "event": "notification", "notification": note })
+                );
             } else {
                 let kind = note["kind"].as_str().unwrap_or("notification");
                 let message = note["message"].as_str().unwrap_or("wallet event");
@@ -758,7 +819,13 @@ async fn auto_watch_send_confirmation(
     Ok(())
 }
 
-async fn cmd_send(cli: &Cli, amount: u64, recipient_id: &str, memo: Option<&str>, node_direct: Option<&str>) -> Result<()> {
+async fn cmd_send(
+    cli: &Cli,
+    amount: u64,
+    recipient_id: &str,
+    memo: Option<&str>,
+    node_direct: Option<&str>,
+) -> Result<()> {
     let port = rpc_port(cli);
     let mut req = if let Some(node_id) = node_direct {
         json!({
@@ -821,10 +888,14 @@ async fn cmd_mint(cli: &Cli, finalize_only: bool, status_only: bool) -> Result<(
 
     // ── Status mode ────────────────────────────────────────────────
     if status_only {
-        let state = vess_foundry::mint::MintSessionState::load_or_create(&session_path, owner_vk_hash);
+        let state =
+            vess_foundry::mint::MintSessionState::load_or_create(&session_path, owner_vk_hash);
         if state.solves.is_empty() {
             if cli.json {
-                println!("{}", json!({ "ok": true, "solves": 0, "vess": 0, "attempts": state.total_attempts }));
+                println!(
+                    "{}",
+                    json!({ "ok": true, "solves": 0, "vess": 0, "attempts": state.total_attempts })
+                );
             } else {
                 println!("No active mint session (0 solves).");
             }
@@ -833,18 +904,28 @@ async fn cmd_mint(cli: &Cli, finalize_only: bool, status_only: bool) -> Result<(
             let breakdown = vess_foundry::mint::optimal_breakdown(vess as u64);
             let bill_count = breakdown.len();
             if cli.json {
-                println!("{}", json!({
-                    "ok": true,
-                    "solves": vess,
-                    "vess": vess,
-                    "attempts": state.total_attempts,
-                    "bills_after_aggregation": bill_count,
-                }));
+                println!(
+                    "{}",
+                    json!({
+                        "ok": true,
+                        "solves": vess,
+                        "vess": vess,
+                        "attempts": state.total_attempts,
+                        "bills_after_aggregation": bill_count,
+                    })
+                );
             } else {
                 println!("Mint session: {} solves ({} vess)", vess, vess);
                 println!("Attempts:     {}", state.total_attempts);
-                println!("Aggregation:  {} bills ({})", bill_count,
-                    breakdown.iter().map(|d| format!("{d}")).collect::<Vec<_>>().join(" + "));
+                println!(
+                    "Aggregation:  {} bills ({})",
+                    bill_count,
+                    breakdown
+                        .iter()
+                        .map(|d| format!("{d}"))
+                        .collect::<Vec<_>>()
+                        .join(" + ")
+                );
             }
         }
         return Ok(());
@@ -866,11 +947,14 @@ async fn cmd_mint(cli: &Cli, finalize_only: bool, status_only: bool) -> Result<(
         let state = tokio::task::spawn_blocking(move || {
             vess_foundry::mint::mine_flow(&sp, &vk_hash, stop, |count, attempts| {
                 if json_mode {
-                    println!("{}", serde_json::json!({
-                        "event": "solve",
-                        "solves": count,
-                        "attempts": attempts,
-                    }));
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "event": "solve",
+                            "solves": count,
+                            "attempts": attempts,
+                        })
+                    );
                 } else {
                     println!("  Solve #{count} found! ({attempts} total attempts)");
                 }
@@ -886,7 +970,11 @@ async fn cmd_mint(cli: &Cli, finalize_only: bool, status_only: bool) -> Result<(
         }
 
         if !cli.json {
-            println!("\nMining stopped. {} solves ({} vess) accumulated.", state.solves.len(), state.solves.len());
+            println!(
+                "\nMining stopped. {} solves ({} vess) accumulated.",
+                state.solves.len(),
+                state.solves.len()
+            );
         }
     }
 
@@ -894,7 +982,10 @@ async fn cmd_mint(cli: &Cli, finalize_only: bool, status_only: bool) -> Result<(
     let state = vess_foundry::mint::MintSessionState::load_or_create(&session_path, owner_vk_hash);
     if state.solves.is_empty() {
         if cli.json {
-            println!("{}", json!({ "ok": false, "error": "no solves to finalize" }));
+            println!(
+                "{}",
+                json!({ "ok": false, "error": "no solves to finalize" })
+            );
         } else {
             println!("No solves to finalize.");
         }
@@ -908,11 +999,14 @@ async fn cmd_mint(cli: &Cli, finalize_only: bool, status_only: bool) -> Result<(
         &owner_vk_hash,
         Some(&|current, total| {
             if json_regen {
-                println!("{}", serde_json::json!({
-                    "event": "proof_regen",
-                    "current": current,
-                    "total": total,
-                }));
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "event": "proof_regen",
+                        "current": current,
+                        "total": total,
+                    })
+                );
             } else {
                 print!("\r  Regenerating proofs: {current}/{total}");
             }
@@ -923,7 +1017,11 @@ async fn cmd_mint(cli: &Cli, finalize_only: bool, status_only: bool) -> Result<(
     }
 
     if !cli.json {
-        println!("Aggregating {} solves into {} bill(s):", solve_count, bills.len());
+        println!(
+            "Aggregating {} solves into {} bill(s):",
+            solve_count,
+            bills.len()
+        );
         for (b, _) in &bills {
             println!("  {} (mint_id: {})", b.denomination, b.mint_id_hex());
         }
@@ -949,16 +1047,20 @@ async fn cmd_mint(cli: &Cli, finalize_only: bool, status_only: bool) -> Result<(
     let genesis_msgs = build_genesis_messages(&bills, &spend_vk);
     for gm in &genesis_msgs {
         if let PulseMessage::OwnershipGenesis(og) = gm {
-            rpc_call(port, &json!({
-                "method": "ownership_genesis",
-                "mint_id_hex": hex(&og.mint_id),
-                "chain_tip_hex": hex(&og.chain_tip),
-                "owner_vk_hash_hex": hex(&og.owner_vk_hash),
-                "owner_vk_hex": hex(&og.owner_vk),
-                "denomination_value": og.denomination_value,
-                "proof_hex": hex(&og.proof),
-                "digest_hex": hex(&og.digest),
-            })).await?;
+            rpc_call(
+                port,
+                &json!({
+                    "method": "ownership_genesis",
+                    "mint_id_hex": hex(&og.mint_id),
+                    "chain_tip_hex": hex(&og.chain_tip),
+                    "owner_vk_hash_hex": hex(&og.owner_vk_hash),
+                    "owner_vk_hex": hex(&og.owner_vk),
+                    "denomination_value": og.denomination_value,
+                    "proof_hex": hex(&og.proof),
+                    "digest_hex": hex(&og.digest),
+                }),
+            )
+            .await?;
         }
     }
 
@@ -976,13 +1078,18 @@ async fn cmd_mint(cli: &Cli, finalize_only: bool, status_only: bool) -> Result<(
             })
             .collect();
         let manifest_key = vess_foundry::seal::manifest_dht_key(&spend_seed);
-        let encrypted_manifest = vess_foundry::seal::encrypt_manifest(&spend_seed, &manifest_entries)?;
+        let encrypted_manifest =
+            vess_foundry::seal::encrypt_manifest(&spend_seed, &manifest_entries)?;
 
-        rpc_call(port, &json!({
-            "method": "manifest_store",
-            "dht_key_hex": hex(&manifest_key),
-            "encrypted_manifest_hex": hex(&encrypted_manifest),
-        })).await?;
+        rpc_call(
+            port,
+            &json!({
+                "method": "manifest_store",
+                "dht_key_hex": hex(&manifest_key),
+                "encrypted_manifest_hex": hex(&encrypted_manifest),
+            }),
+        )
+        .await?;
     }
 
     // Clean up session file after successful finalization.
@@ -991,12 +1098,15 @@ async fn cmd_mint(cli: &Cli, finalize_only: bool, status_only: bool) -> Result<(
     }
 
     if cli.json {
-        println!("{}", json!({
-            "ok": true,
-            "solves": solve_count,
-            "bills": bills.len(),
-            "balance": wallet.billfold.balance(),
-        }));
+        println!(
+            "{}",
+            json!({
+                "ok": true,
+                "solves": solve_count,
+                "bills": bills.len(),
+                "balance": wallet.billfold.balance(),
+            })
+        );
     } else {
         println!("Ownership genesis + manifest sent to artery node.");
         println!("Balance: {} Vess", wallet.billfold.balance());
@@ -1017,8 +1127,9 @@ async fn cmd_register_tag(cli: &Cli, tag_str: &str) -> Result<()> {
     let mut wallet = WalletFile::load(&path)?;
 
     // Derive enc_key — needed to encrypt the new tag signing key.
-    let password = std::env::var("VESS_WALLET_PASSWORD")
-        .map_err(|_| anyhow::anyhow!("VESS_WALLET_PASSWORD required for register-tag (encrypts tag signing key)"))?;
+    let password = std::env::var("VESS_WALLET_PASSWORD").map_err(|_| {
+        anyhow::anyhow!("VESS_WALLET_PASSWORD required for register-tag (encrypts tag signing key)")
+    })?;
     let raw_seed = wallet.unlock_with_password(&password)?;
     let enc_key = vess_kloak::recovery::encryption_key_from_seed(&raw_seed);
 
@@ -1063,20 +1174,27 @@ async fn cmd_register_tag(cli: &Cli, tag_str: &str) -> Result<()> {
 
     // Send registration via RPC to local artery node.
     let port = rpc_port(cli);
-    let resp = rpc_call(port, &json!({
-        "method": "tag_register",
-        "tag": tag.as_str(),
-        "scan_ek_hex": hex(&wallet.master_address.scan_ek),
-        "spend_ek_hex": hex(&wallet.master_address.spend_ek),
-        "pow_nonce_hex": hex(&pow_nonce),
-        "pow_hash_hex": hex(&pow_hash),
-        "timestamp": tmp_record.registered_at,
-        "registrant_vk_hex": hex(&registrant_vk),
-        "signature_hex": hex(&signature),
-    })).await?;
+    let resp = rpc_call(
+        port,
+        &json!({
+            "method": "tag_register",
+            "tag": tag.as_str(),
+            "scan_ek_hex": hex(&wallet.master_address.scan_ek),
+            "spend_ek_hex": hex(&wallet.master_address.spend_ek),
+            "pow_nonce_hex": hex(&pow_nonce),
+            "pow_hash_hex": hex(&pow_hash),
+            "timestamp": tmp_record.registered_at,
+            "registrant_vk_hex": hex(&registrant_vk),
+            "signature_hex": hex(&signature),
+        }),
+    )
+    .await?;
 
     if resp["ok"] != true {
-        anyhow::bail!("{}", resp["error"].as_str().unwrap_or("tag registration failed"));
+        anyhow::bail!(
+            "{}",
+            resp["error"].as_str().unwrap_or("tag registration failed")
+        );
     }
 
     if !cli.json {
@@ -1095,13 +1213,17 @@ async fn cmd_register_tag(cli: &Cli, tag_str: &str) -> Result<()> {
         };
         let confirm_sig = vess_foundry::spend_auth::sign_spend(&registrant_sk, &confirm_digest)?;
 
-        let confirm_resp = rpc_call(port, &json!({
-            "method": "tag_confirm",
-            "tag": tag.as_str(),
-            "mint_id_hex": hex(&mint_id),
-            "registrant_vk_hex": hex(&registrant_vk),
-            "signature_hex": hex(&confirm_sig),
-        })).await?;
+        let confirm_resp = rpc_call(
+            port,
+            &json!({
+                "method": "tag_confirm",
+                "tag": tag.as_str(),
+                "mint_id_hex": hex(&mint_id),
+                "registrant_vk_hex": hex(&registrant_vk),
+                "signature_hex": hex(&confirm_sig),
+            }),
+        )
+        .await?;
 
         if confirm_resp["ok"] == true {
             if !cli.json {
@@ -1110,7 +1232,10 @@ async fn cmd_register_tag(cli: &Cli, tag_str: &str) -> Result<()> {
             true
         } else {
             if !cli.json {
-                println!("Tag registered but hardening failed: {}", confirm_resp["error"].as_str().unwrap_or("unknown"));
+                println!(
+                    "Tag registered but hardening failed: {}",
+                    confirm_resp["error"].as_str().unwrap_or("unknown")
+                );
                 println!("You can harden later once you have bills in your wallet.");
             }
             false
@@ -1124,11 +1249,14 @@ async fn cmd_register_tag(cli: &Cli, tag_str: &str) -> Result<()> {
     };
 
     if cli.json {
-        println!("{}", json!({
-            "ok": true,
-            "tag": tag.display(),
-            "hardened": hardened,
-        }));
+        println!(
+            "{}",
+            json!({
+                "ok": true,
+                "tag": tag.display(),
+                "hardened": hardened,
+            })
+        );
     }
     Ok(())
 }
@@ -1159,7 +1287,10 @@ async fn cmd_listen(cli: &Cli) -> Result<()> {
     node.wait_online().await;
 
     if json_mode {
-        println!("{}", json!({ "event": "ready", "node_id": node.id().to_string() }));
+        println!(
+            "{}",
+            json!({ "event": "ready", "node_id": node.id().to_string() })
+        );
     } else {
         println!("Node ID:   {}", node.id());
         println!("Node Addr: {:?}", node.addr());
@@ -1169,7 +1300,10 @@ async fn cmd_listen(cli: &Cli) -> Result<()> {
     node.listen(move |peer, payload| {
         if json_mode {
             let msg = String::from_utf8_lossy(&payload);
-            println!("{}", serde_json::json!({ "event": "pulse", "peer": peer.to_string(), "payload": msg }));
+            println!(
+                "{}",
+                serde_json::json!({ "event": "pulse", "peer": peer.to_string(), "payload": msg })
+            );
         } else {
             let msg = String::from_utf8_lossy(&payload);
             println!("[{peer}] {msg}");
@@ -1191,7 +1325,9 @@ async fn cmd_set_password(cli: &Cli, password: String) -> Result<()> {
     wallet.set_password_cache(&raw_seed, &password)?;
     wallet.save(&path)?;
 
-    println!("Password set.  The node can now start with VESS_WALLET_PASSWORD or --wallet-password.");
+    println!(
+        "Password set.  The node can now start with VESS_WALLET_PASSWORD or --wallet-password."
+    );
     Ok(())
 }
 

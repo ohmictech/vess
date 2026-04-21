@@ -7,8 +7,8 @@
 use std::sync::{Arc, Mutex};
 use vess_foundry::{Denomination, VessBill};
 use vess_protocol::{
-    DirectPayment, DirectPaymentResponse, Payment, PulseMessage,
-    RegistryQuery, RegistryQueryResponse,
+    DirectPayment, DirectPaymentResponse, Payment, PulseMessage, RegistryQuery,
+    RegistryQueryResponse,
 };
 use vess_vascular::VessNode;
 
@@ -54,16 +54,14 @@ async fn two_nodes_exchange_ping_pong() {
         let node_b = node_b.clone();
         async move {
             node_b
-                .listen_messages_with_response(move |_peer, msg| {
-                    match msg {
-                        PulseMessage::RegistryQuery(rq) => {
-                            let active = rq.mint_ids.iter().map(|_| true).collect();
-                            Some(PulseMessage::RegistryQueryResponse(
-                                RegistryQueryResponse { active },
-                            ))
-                        }
-                        _ => None,
+                .listen_messages_with_response(move |_peer, msg| match msg {
+                    PulseMessage::RegistryQuery(rq) => {
+                        let active = rq.mint_ids.iter().map(|_| true).collect();
+                        Some(PulseMessage::RegistryQueryResponse(RegistryQueryResponse {
+                            active,
+                        }))
                     }
+                    _ => None,
                 })
                 .await
                 .ok();
@@ -75,9 +73,7 @@ async fn two_nodes_exchange_ping_pong() {
         mint_ids: vec![[0x01; 32], [0x02; 32]],
     });
 
-    let response = node_a
-        .send_message_with_response(addr_b, &query)
-        .await;
+    let response = node_a.send_message_with_response(addr_b, &query).await;
 
     match response {
         Err(e) => panic!("send_message_with_response failed: {e:#}"),
@@ -175,19 +171,15 @@ async fn direct_payment_request_response() {
         let node_b = node_b.clone();
         async move {
             node_b
-                .listen_messages_with_response(move |_peer, msg| {
-                    match msg {
-                        PulseMessage::DirectPayment(dp) => {
-                            Some(PulseMessage::DirectPaymentResponse(
-                                DirectPaymentResponse {
-                                    payment_id: dp.payment_id,
-                                    accepted: true,
-                                    reason: String::new(),
-                                },
-                            ))
-                        }
-                        _ => None,
+                .listen_messages_with_response(move |_peer, msg| match msg {
+                    PulseMessage::DirectPayment(dp) => {
+                        Some(PulseMessage::DirectPaymentResponse(DirectPaymentResponse {
+                            payment_id: dp.payment_id,
+                            accepted: true,
+                            reason: String::new(),
+                        }))
                     }
+                    _ => None,
                 })
                 .await
                 .ok();

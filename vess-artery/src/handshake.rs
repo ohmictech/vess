@@ -274,8 +274,11 @@ fn derive_pow_inputs(node_id: &[u8], nonce: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
 /// Returns the 32-byte Argon2id hash. This costs ~2-5 seconds + 256 MiB.
 pub fn compute_handshake_pow(node_id: &[u8], nonce: &[u8; 32]) -> Vec<u8> {
     compute_handshake_pow_with_params(
-        node_id, nonce,
-        HANDSHAKE_POW_T_COST, HANDSHAKE_POW_M_COST, HANDSHAKE_POW_P_COST,
+        node_id,
+        nonce,
+        HANDSHAKE_POW_T_COST,
+        HANDSHAKE_POW_M_COST,
+        HANDSHAKE_POW_P_COST,
     )
 }
 
@@ -292,7 +295,8 @@ pub fn compute_handshake_pow_with_params(
         .expect("valid argon2 params");
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     let mut output = vec![0u8; HANDSHAKE_POW_OUTPUT_LEN];
-    argon2.hash_password_into(&password, &salt, &mut output)
+    argon2
+        .hash_password_into(&password, &salt, &mut output)
         .expect("argon2 hash");
     output
 }
@@ -303,8 +307,12 @@ pub fn compute_handshake_pow_with_params(
 /// provided `pow_hash`. Returns `true` if valid.
 pub fn verify_handshake_pow(node_id: &[u8], nonce: &[u8; 32], pow_hash: &[u8]) -> bool {
     verify_handshake_pow_with_params(
-        node_id, nonce, pow_hash,
-        HANDSHAKE_POW_T_COST, HANDSHAKE_POW_M_COST, HANDSHAKE_POW_P_COST,
+        node_id,
+        nonce,
+        pow_hash,
+        HANDSHAKE_POW_T_COST,
+        HANDSHAKE_POW_M_COST,
+        HANDSHAKE_POW_P_COST,
     )
 }
 
@@ -491,13 +499,20 @@ mod tests {
         let node_id = b"test-node-id-1234567890";
         let nonce = [0xCC; 32];
         let hash = compute_handshake_pow_with_params(
-            node_id, &nonce,
-            HANDSHAKE_POW_T_COST_TEST, HANDSHAKE_POW_M_COST_TEST, HANDSHAKE_POW_P_COST,
+            node_id,
+            &nonce,
+            HANDSHAKE_POW_T_COST_TEST,
+            HANDSHAKE_POW_M_COST_TEST,
+            HANDSHAKE_POW_P_COST,
         );
         assert_eq!(hash.len(), HANDSHAKE_POW_OUTPUT_LEN);
         assert!(verify_handshake_pow_with_params(
-            node_id, &nonce, &hash,
-            HANDSHAKE_POW_T_COST_TEST, HANDSHAKE_POW_M_COST_TEST, HANDSHAKE_POW_P_COST,
+            node_id,
+            &nonce,
+            &hash,
+            HANDSHAKE_POW_T_COST_TEST,
+            HANDSHAKE_POW_M_COST_TEST,
+            HANDSHAKE_POW_P_COST,
         ));
     }
 
@@ -506,13 +521,20 @@ mod tests {
         let node_id = b"test-node-id-1234567890";
         let nonce = [0xDD; 32];
         let hash = compute_handshake_pow_with_params(
-            node_id, &nonce,
-            HANDSHAKE_POW_T_COST_TEST, HANDSHAKE_POW_M_COST_TEST, HANDSHAKE_POW_P_COST,
+            node_id,
+            &nonce,
+            HANDSHAKE_POW_T_COST_TEST,
+            HANDSHAKE_POW_M_COST_TEST,
+            HANDSHAKE_POW_P_COST,
         );
         let wrong_node = b"wrong-node-id-xxx";
         assert!(!verify_handshake_pow_with_params(
-            wrong_node, &nonce, &hash,
-            HANDSHAKE_POW_T_COST_TEST, HANDSHAKE_POW_M_COST_TEST, HANDSHAKE_POW_P_COST,
+            wrong_node,
+            &nonce,
+            &hash,
+            HANDSHAKE_POW_T_COST_TEST,
+            HANDSHAKE_POW_M_COST_TEST,
+            HANDSHAKE_POW_P_COST,
         ));
     }
 
@@ -521,13 +543,20 @@ mod tests {
         let node_id = b"test-node-id-1234567890";
         let nonce = [0xEE; 32];
         let hash = compute_handshake_pow_with_params(
-            node_id, &nonce,
-            HANDSHAKE_POW_T_COST_TEST, HANDSHAKE_POW_M_COST_TEST, HANDSHAKE_POW_P_COST,
+            node_id,
+            &nonce,
+            HANDSHAKE_POW_T_COST_TEST,
+            HANDSHAKE_POW_M_COST_TEST,
+            HANDSHAKE_POW_P_COST,
         );
         let wrong_nonce = [0xFF; 32];
         assert!(!verify_handshake_pow_with_params(
-            node_id, &wrong_nonce, &hash,
-            HANDSHAKE_POW_T_COST_TEST, HANDSHAKE_POW_M_COST_TEST, HANDSHAKE_POW_P_COST,
+            node_id,
+            &wrong_nonce,
+            &hash,
+            HANDSHAKE_POW_T_COST_TEST,
+            HANDSHAKE_POW_M_COST_TEST,
+            HANDSHAKE_POW_P_COST,
         ));
     }
 
@@ -536,8 +565,12 @@ mod tests {
         let node_id = b"test-node-id";
         let nonce = [0xAA; 32];
         assert!(!verify_handshake_pow_with_params(
-            node_id, &nonce, &[],
-            HANDSHAKE_POW_T_COST_TEST, HANDSHAKE_POW_M_COST_TEST, HANDSHAKE_POW_P_COST,
+            node_id,
+            &nonce,
+            &[],
+            HANDSHAKE_POW_T_COST_TEST,
+            HANDSHAKE_POW_M_COST_TEST,
+            HANDSHAKE_POW_P_COST,
         ));
     }
 

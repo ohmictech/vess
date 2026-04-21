@@ -147,11 +147,7 @@ pub fn reforge(request: ReforgeRequest) -> Result<ReforgeResult> {
 
     // Verify value conservation.
     let input_sum: u64 = request.inputs.iter().map(|b| b.denomination.value()).sum();
-    let output_sum: u64 = request
-        .output_denominations
-        .iter()
-        .map(|d| d.value())
-        .sum();
+    let output_sum: u64 = request.output_denominations.iter().map(|d| d.value()).sum();
 
     if input_sum != output_sum {
         return Err(anyhow!(
@@ -250,16 +246,19 @@ pub fn reforge(request: ReforgeRequest) -> Result<ReforgeResult> {
                 (mint_id, [0u8; 32])
             };
 
-            (VessBill {
-                denomination: denom,
-                digest,
-                created_at: now,
-                stealth_id: *stealth_id,
-                dht_index: 0, // Assigned by wallet when stored in DHT.
-                mint_id,
-                chain_tip,
-                chain_depth: 0,
-            }, proof_bytes)
+            (
+                VessBill {
+                    denomination: denom,
+                    digest,
+                    created_at: now,
+                    stealth_id: *stealth_id,
+                    dht_index: 0, // Assigned by wallet when stored in DHT.
+                    mint_id,
+                    chain_tip,
+                    chain_depth: 0,
+                },
+                proof_bytes,
+            )
         })
         .collect();
 
@@ -370,7 +369,11 @@ mod tests {
         .unwrap();
 
         assert_eq!(result.outputs.len(), 3);
-        let total: u64 = result.outputs.iter().map(|(b, _)| b.denomination.value()).sum();
+        let total: u64 = result
+            .outputs
+            .iter()
+            .map(|(b, _)| b.denomination.value())
+            .sum();
         assert_eq!(total, 20);
     }
 }

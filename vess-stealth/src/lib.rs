@@ -37,11 +37,11 @@
 use anyhow::{anyhow, Result};
 use blake3::Hasher;
 use chacha20poly1305::{
-    aead::{Aead, KeyInit, generic_array::GenericArray},
+    aead::{generic_array::GenericArray, Aead, KeyInit},
     ChaCha20Poly1305,
 };
-use ml_kem::{Encoded, EncodedSizeUser, KemCore, MlKem768};
 use ml_kem::kem::{Decapsulate, Encapsulate};
+use ml_kem::{Encoded, EncodedSizeUser, KemCore, MlKem768};
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 use serde::{Deserialize, Serialize};

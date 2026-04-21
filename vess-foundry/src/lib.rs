@@ -29,13 +29,13 @@
 //! - [`seal`] — Bill sealing/unsealing for DHT storage.
 //! - [`spend_auth`] — ML-DSA-65 spend authorization.
 
-pub mod vm;
 pub mod merkle;
-pub mod proof;
 pub mod mint;
+pub mod proof;
 pub mod reforge;
 pub mod seal;
 pub mod spend_auth;
+pub mod vm;
 
 use serde::{Deserialize, Serialize};
 

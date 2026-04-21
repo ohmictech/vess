@@ -21,10 +21,7 @@ fn collect_rs_files(dir: &Path, root: &Path, out: &mut Vec<(String, PathBuf)>) {
         return;
     }
 
-    let mut entries: Vec<_> = fs::read_dir(dir)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .collect();
+    let mut entries: Vec<_> = fs::read_dir(dir).unwrap().filter_map(|e| e.ok()).collect();
     entries.sort_by_key(|e| e.file_name());
 
     for entry in entries {
@@ -137,8 +134,10 @@ fn main() {
                 }
                 let mut bytes = [0u8; 32];
                 for (i, byte) in bytes.iter_mut().enumerate() {
-                    *byte = u8::from_str_radix(&trimmed[i * 2..i * 2 + 2], 16)
-                        .unwrap_or_else(|_| panic!("versions.txt: invalid hex at byte {i}: {trimmed}"));
+                    *byte =
+                        u8::from_str_radix(&trimmed[i * 2..i * 2 + 2], 16).unwrap_or_else(|_| {
+                            panic!("versions.txt: invalid hex at byte {i}: {trimmed}")
+                        });
                 }
                 // Skip if it matches the current build hash (already included).
                 if bytes == root {

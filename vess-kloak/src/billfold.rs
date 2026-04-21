@@ -59,11 +59,7 @@ impl BillFold {
     }
 
     /// Add a bill with its spend credentials in one call.
-    pub fn deposit_with_credentials(
-        &mut self,
-        bill: VessBill,
-        cred: SpendCredential,
-    ) -> bool {
+    pub fn deposit_with_credentials(&mut self, bill: VessBill, cred: SpendCredential) -> bool {
         let mint_id = bill.mint_id;
         if self.deposit(bill) {
             self.spend_credentials.insert(mint_id, cred);

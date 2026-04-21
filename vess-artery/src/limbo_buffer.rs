@@ -96,12 +96,15 @@ impl LimboBuffer {
         }
 
         *self.per_peer_count.entry(relay_peer).or_insert(0) += 1;
-        self.entries.entry(stealth_id).or_default().push(LimboEntry {
-            payment,
-            bill_ids,
-            entered_at,
-            relay_peer,
-        });
+        self.entries
+            .entry(stealth_id)
+            .or_default()
+            .push(LimboEntry {
+                payment,
+                bill_ids,
+                entered_at,
+                relay_peer,
+            });
         true
     }
 
@@ -210,7 +213,9 @@ impl LimboBuffer {
         let mut scored: Vec<([u8; 32], usize, u64)> = Vec::new();
         for (sid, entries) in &self.entries {
             for (i, e) in entries.iter().enumerate() {
-                let min_denom = e.payment.denomination_values
+                let min_denom = e
+                    .payment
+                    .denomination_values
                     .iter()
                     .copied()
                     .min()
@@ -326,7 +331,13 @@ mod tests {
 
         // Two payments for same recipient
         buf.hold(sid, test_payment(sid, &[bid1]), vec![bid1], 1000, PEER_A);
-        buf.hold(sid, test_payment(sid, &[bid2, bid3]), vec![bid2, bid3], 1001, PEER_A);
+        buf.hold(
+            sid,
+            test_payment(sid, &[bid2, bid3]),
+            vec![bid2, bid3],
+            1001,
+            PEER_A,
+        );
         assert_eq!(buf.total_entries(), 2);
 
         // Claim bid2 — removes the second entry
@@ -358,8 +369,20 @@ mod tests {
         let sid1 = [0xAA; 32];
         let sid2 = [0xBB; 32];
 
-        buf.hold(sid1, test_payment(sid1, &[[0x11; 32]]), vec![[0x11; 32]], 1000, PEER_A);
-        buf.hold(sid2, test_payment(sid2, &[[0x22; 32]]), vec![[0x22; 32]], 1001, PEER_B);
+        buf.hold(
+            sid1,
+            test_payment(sid1, &[[0x11; 32]]),
+            vec![[0x11; 32]],
+            1000,
+            PEER_A,
+        );
+        buf.hold(
+            sid2,
+            test_payment(sid2, &[[0x22; 32]]),
+            vec![[0x22; 32]],
+            1001,
+            PEER_B,
+        );
 
         let ids = buf.stealth_ids_with_payments();
         assert_eq!(ids.len(), 2);
@@ -369,7 +392,13 @@ mod tests {
     fn export_and_load() {
         let mut buf = LimboBuffer::new();
         let sid = [0xAA; 32];
-        buf.hold(sid, test_payment(sid, &[[0x11; 32]]), vec![[0x11; 32]], 1000, PEER_A);
+        buf.hold(
+            sid,
+            test_payment(sid, &[[0x11; 32]]),
+            vec![[0x11; 32]],
+            1000,
+            PEER_A,
+        );
 
         let exported = buf.export();
         let mut buf2 = LimboBuffer::new();
@@ -394,10 +423,22 @@ mod tests {
 
         // 201st from same peer must be rejected.
         let extra_bid = [0xFF; 32];
-        assert!(!buf.hold(sid, test_payment(sid, &[extra_bid]), vec![extra_bid], 1000, PEER_A));
+        assert!(!buf.hold(
+            sid,
+            test_payment(sid, &[extra_bid]),
+            vec![extra_bid],
+            1000,
+            PEER_A
+        ));
 
         // But a different peer can still add.
-        assert!(buf.hold(sid, test_payment(sid, &[extra_bid]), vec![extra_bid], 1000, PEER_B));
+        assert!(buf.hold(
+            sid,
+            test_payment(sid, &[extra_bid]),
+            vec![extra_bid],
+            1000,
+            PEER_B
+        ));
     }
 
     #[test]
@@ -432,7 +473,13 @@ mod tests {
         // Insert a high-denomination entry — triggers eviction.
         let high_bid = [0xEE; 32];
         let high_peer = [0xDD; 32];
-        assert!(buf.hold(sid, test_payment_denom(sid, &[high_bid], 1_000_000), vec![high_bid], 1000, high_peer));
+        assert!(buf.hold(
+            sid,
+            test_payment_denom(sid, &[high_bid], 1_000_000),
+            vec![high_bid],
+            1000,
+            high_peer
+        ));
 
         // Buffer should be below threshold after eviction.
         assert!(buf.total_entries() <= EVICTION_THRESHOLD);

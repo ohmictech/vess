@@ -120,7 +120,12 @@ impl OwnershipRegistry {
     ///
     /// Returns `true` if this node is among the `replication_factor`-closest
     /// to the `mint_id` by XOR distance.
-    pub fn should_store(&self, mint_id: &[u8; 32], peer_ids: &[[u8; 32]], replication_factor: usize) -> bool {
+    pub fn should_store(
+        &self,
+        mint_id: &[u8; 32],
+        peer_ids: &[[u8; 32]],
+        replication_factor: usize,
+    ) -> bool {
         let my_distance = xor_distance(&self.node_id, mint_id);
         let closer_count = peer_ids
             .iter()
@@ -212,10 +217,8 @@ impl OwnershipRegistry {
 
     /// Restore from a list of records (snapshot loading).
     pub fn from_records(node_id: [u8; 32], records: Vec<OwnershipRecord>) -> Self {
-        let map: HashMap<[u8; 32], OwnershipRecord> = records
-            .into_iter()
-            .map(|r| (r.mint_id, r))
-            .collect();
+        let map: HashMap<[u8; 32], OwnershipRecord> =
+            records.into_iter().map(|r| (r.mint_id, r)).collect();
         Self {
             node_id,
             records: map,

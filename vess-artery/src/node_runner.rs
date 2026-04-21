@@ -14,26 +14,23 @@ use anyhow::Result;
 use serde::Serialize;
 use tracing::{info, warn};
 
-use crate::{
-    OwnershipRegistry, TagDht, LimboBuffer,
-    BanishmentManager, PeerRegistry, PeerState, PROTOCOL_VERSION_HASH, ALLOWED_VERSIONS,
-    ReputationTable, dht_replication_factor,
+use crate::gossip::{
+    dynamic_fan_out, k_nearest, random_fan_out, GossipConfig, OWNERSHIP_FAN_OUT, RANDOM_FAN_OUT,
 };
-use crate::ownership_registry::OwnershipRecord;
-use crate::gossip::{GossipConfig, k_nearest, random_fan_out, dynamic_fan_out, RANDOM_FAN_OUT, OWNERSHIP_FAN_OUT};
 use crate::handshake::{compute_handshake_hmac, compute_handshake_pow, verify_handshake_pow};
-use crate::persistence::{ArterySnapshot, NodeStorage, hex_key, unhex_key};
-use crate::kademlia::{RoutingTable, RoutingPeer};
+use crate::kademlia::{RoutingPeer, RoutingTable};
+use crate::ownership_registry::OwnershipRecord;
+use crate::persistence::{hex_key, unhex_key, ArterySnapshot, NodeStorage};
+use crate::{
+    dht_replication_factor, BanishmentManager, LimboBuffer, OwnershipRegistry, PeerRegistry,
+    PeerState, ReputationTable, TagDht, ALLOWED_VERSIONS, PROTOCOL_VERSION_HASH,
+};
 
 use vess_protocol::{
-    PulseMessage, PeerExchange, PeerExchangeResponse,
-    MailboxCollectResponse, MailboxSweepResponse, TagLookupResponse, TagLookupResult,
-    HandshakeChallenge, HandshakeResponse,
-    RegistryQueryResponse, TagStore, TagConfirm,
-    OwnershipGenesis, OwnershipClaim, ReforgeAttestation,
-    ManifestRecoverResponse, FetchedRecord, OwnershipFetchResponse,
-    FindNodeResponse,
-
+    FetchedRecord, FindNodeResponse, HandshakeChallenge, HandshakeResponse, MailboxCollectResponse,
+    MailboxSweepResponse, ManifestRecoverResponse, OwnershipClaim, OwnershipFetchResponse,
+    OwnershipGenesis, PeerExchange, PeerExchangeResponse, PulseMessage, ReforgeAttestation,
+    RegistryQueryResponse, TagConfirm, TagLookupResponse, TagLookupResult, TagStore,
 };
 use vess_vascular::VessNode;
 
@@ -110,7 +107,9 @@ pub(crate) struct DuplicateTracker {
 
 impl DuplicateTracker {
     fn new() -> Self {
-        Self { table: HashMap::new() }
+        Self {
+            table: HashMap::new(),
+        }
     }
 
     /// Record a message from a peer and return whether the peer should
@@ -123,9 +122,7 @@ impl DuplicateTracker {
 
         let peer_entry = self.table.entry(*peer_id).or_default();
 
-        let (count, first_seen) = peer_entry
-            .entry(*payload_hash)
-            .or_insert((0, now));
+        let (count, first_seen) = peer_entry.entry(*payload_hash).or_insert((0, now));
 
         if now.saturating_sub(*first_seen) > DUPLICATE_WINDOW_SECS {
             // Window expired — reset.
@@ -318,9 +315,7 @@ impl ArteryState {
     pub(crate) fn push_notification(&mut self, notification: WalletNotification) {
         println!(
             "[wallet:{}] {} (payment_id: {})",
-            notification.kind,
-            notification.message,
-            notification.payment_id
+            notification.kind, notification.message, notification.payment_id
         );
         if self.notifications.len() >= MAX_WALLET_NOTIFICATIONS {
             self.notifications.pop_front();
@@ -456,10 +451,18 @@ impl ArteryState {
             tags,
             bills: BTreeMap::new(), // legacy — kept for deserialization compat
             mailbox: BTreeMap::new(),
-            known_peers: self.routing_table.all_peers().iter().map(|p| p.id_hash).collect(),
+            known_peers: self
+                .routing_table
+                .all_peers()
+                .iter()
+                .map(|p| p.id_hash)
+                .collect(),
             limbo_entries: {
                 let limbo_map = self.limbo_buffer.export();
-                limbo_map.into_iter().map(|(k, v)| (hex_key(&k), v)).collect()
+                limbo_map
+                    .into_iter()
+                    .map(|(k, v)| (hex_key(&k), v))
+                    .collect()
             },
             peer_reputations: self.reputation.export(),
             hardening_proofs: self.tag_dht.export_hardening_proofs(),
@@ -491,11 +494,11 @@ impl ArteryState {
             });
         }
 
-        let limbo_data: std::collections::HashMap<[u8; 32], Vec<crate::limbo_buffer::LimboEntry>> = snap
-            .limbo_entries
-            .into_iter()
-            .filter_map(|(k, v)| unhex_key(&k).ok().map(|key| (key, v)))
-            .collect();
+        let limbo_data: std::collections::HashMap<[u8; 32], Vec<crate::limbo_buffer::LimboEntry>> =
+            snap.limbo_entries
+                .into_iter()
+                .filter_map(|(k, v)| unhex_key(&k).ok().map(|key| (key, v)))
+                .collect();
         self.limbo_buffer.load(limbo_data);
 
         self.reputation.import(snap.peer_reputations);
@@ -506,7 +509,8 @@ impl ArteryState {
         self.registry = OwnershipRegistry::from_records(self.node_id, snap.ownership_records);
 
         // Restore manifest store.
-        self.manifest_store = snap.manifests
+        self.manifest_store = snap
+            .manifests
             .into_iter()
             .filter_map(|(k, v)| unhex_key(&k).ok().map(|key| (key, v)))
             .collect();
@@ -581,23 +585,23 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
 
     // ── Load embedded wallet (if configured) ────────────────────────
     let wallet_state = if let Some(ref wallet_path) = config.wallet_path {
-        use vess_kloak::WalletFile;
         use vess_kloak::recovery::encryption_key_from_seed;
+        use vess_kloak::WalletFile;
 
         let wallet = WalletFile::load(wallet_path)?;
 
         // Try password-based unlock first (fast ~1 s, 256 MiB), then
         // fall back to recovery phrase via env vars (slow ~10 s, 2 GiB).
-        let password = config.wallet_password.clone()
+        let password = config
+            .wallet_password
+            .clone()
             .or_else(|| std::env::var("VESS_WALLET_PASSWORD").ok());
 
         let raw_seed = if let Some(ref pwd) = password {
             wallet.unlock_with_password(pwd)?
         } else {
             // Legacy path: recovery phrase + PIN from env vars.
-            use vess_kloak::recovery::{
-                RecoveryPhrase, derive_raw_seed,
-            };
+            use vess_kloak::recovery::{derive_raw_seed, RecoveryPhrase};
             let phrase_words = std::env::var("VESS_RECOVERY_PHRASE").map_err(|_| {
                 anyhow::anyhow!(
                     "wallet unlock requires --wallet-password / VESS_WALLET_PASSWORD \
@@ -612,8 +616,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
         };
 
         // Derive stealth keys and encryption key from the raw seed.
-        let (stealth_secret, _address) =
-            vess_stealth::generate_master_keys_from_seed(&raw_seed);
+        let (stealth_secret, _address) = vess_stealth::generate_master_keys_from_seed(&raw_seed);
         let enc_key = encryption_key_from_seed(&raw_seed);
 
         // Load billfold and decrypt spend credentials into it.
@@ -683,7 +686,8 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
     // Unbounded mpsc channels decouple queue producers (handler) from
     // consumers (drain loops) so drain loops never contend on the main
     // state mutex for queue access.
-    let (manifest_tx, mut manifest_rx) = tokio::sync::mpsc::unbounded_channel::<vess_protocol::ManifestStore>();
+    let (manifest_tx, mut manifest_rx) =
+        tokio::sync::mpsc::unbounded_channel::<vess_protocol::ManifestStore>();
     let (tag_store_tx, mut tag_store_rx) = tokio::sync::mpsc::unbounded_channel::<TagStore>();
     let (tag_confirm_tx, mut tag_confirm_rx) = tokio::sync::mpsc::unbounded_channel::<TagConfirm>();
     let (og_tx, mut og_rx) = tokio::sync::mpsc::unbounded_channel::<OwnershipGenesis>();
@@ -753,7 +757,11 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     let _ = oc_tx.send(claim);
                 }
                 if received > 0 {
-                    info!(amount = received, bills = bill_count, "swept existing limbo into wallet");
+                    info!(
+                        amount = received,
+                        bills = bill_count,
+                        "swept existing limbo into wallet"
+                    );
                 }
             }
         }
@@ -783,7 +791,8 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
         };
         let rpc_node = node.clone();
         tokio::spawn(async move {
-            if let Err(e) = crate::rpc::run_rpc_server(port, rpc_state, rpc_senders, rpc_node).await {
+            if let Err(e) = crate::rpc::run_rpc_server(port, rpc_state, rpc_senders, rpc_node).await
+            {
                 warn!(error = %e, "RPC server exited with error");
             }
         });
@@ -834,7 +843,11 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 s.estimated_network_size = s.routing_table.estimated_network_size();
                 let n = s.estimated_network_size;
                 // k_neighbors scales logarithmically: max(6, ceil(log2(N)))
-                let log2_n = if n > 1 { (n as f64).log2().ceil() as usize } else { 1 };
+                let log2_n = if n > 1 {
+                    (n as f64).log2().ceil() as usize
+                } else {
+                    1
+                };
                 s.gossip_config.k_neighbors = log2_n.max(6);
                 // max_hops scales as ceil(log(N) / log(K)) — ensures every
                 // node is reachable in O(log N) steps.
@@ -854,8 +867,8 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 snap.banned_peers = flush_ban.all_banned();
                 snap
             };
-            let flush_storage = NodeStorage::open(&flush_storage_dir)
-                .expect("open state dir for flush");
+            let flush_storage =
+                NodeStorage::open(&flush_storage_dir).expect("open state dir for flush");
             if let Err(e) = flush_storage.save(&snap) {
                 warn!(error = %e, "failed to flush state to disk");
             } else {
@@ -930,10 +943,17 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     s.peer_registry.issue_challenge(peer_hash)
                 };
                 let challenge = PulseMessage::HandshakeChallenge(HandshakeChallenge { nonce });
-                match boot_node.send_message_with_response(target, &challenge).await {
+                match boot_node
+                    .send_message_with_response(target, &challenge)
+                    .await
+                {
                     Ok(Some(PulseMessage::HandshakeResponse(resp))) => {
                         let mut s = boot_state.lock().unwrap();
-                        if s.peer_registry.verify_response(&peer_hash, &resp.hmac, &ALLOWED_VERSIONS) {
+                        if s.peer_registry.verify_response(
+                            &peer_hash,
+                            &resp.hmac,
+                            &ALLOWED_VERSIONS,
+                        ) {
                             // Verify Argon2id PoW from the bootstrap peer.
                             if resp.pow_hash.is_empty()
                                 || !verify_handshake_pow(target.as_bytes(), &nonce, &resp.pow_hash)
@@ -1010,7 +1030,9 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
     tokio::spawn(async move {
         while let Some(first) = manifest_rx.recv().await {
             let mut manifests = vec![first];
-            while let Ok(item) = manifest_rx.try_recv() { manifests.push(item); }
+            while let Ok(item) = manifest_rx.try_recv() {
+                manifests.push(item);
+            }
 
             let (peer_hashes, routable_peers, age_factors, k, net_size, rep) = {
                 let s = manifest_drain_state.lock().unwrap();
@@ -1018,21 +1040,39 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs();
-                let (ph, rp, af) = s.routing_table.routable_peer_vecs(
-                    |id| s.peer_registry.state(id) == PeerState::Verified, now,
-                );
-                (ph, rp, af, s.gossip_config.k_neighbors, s.estimated_network_size, s.reputation.clone())
+                let (ph, rp, af) = s
+                    .routing_table
+                    .routable_peer_vecs(|id| s.peer_registry.state(id) == PeerState::Verified, now);
+                (
+                    ph,
+                    rp,
+                    af,
+                    s.gossip_config.k_neighbors,
+                    s.estimated_network_size,
+                    s.reputation.clone(),
+                )
             };
-            if routable_peers.is_empty() { continue; }
+            if routable_peers.is_empty() {
+                continue;
+            }
 
             let fan = dynamic_fan_out(net_size, RANDOM_FAN_OUT, RANDOM_FAN_OUT * 3);
             let mut per_peer: HashMap<usize, Vec<PulseMessage>> = HashMap::new();
             for ms in &manifests {
                 let indices = compute_gossip_targets(
-                    &ms.dht_key, &peer_hashes, &age_factors, k, &rep, fan, routable_peers.len(),
+                    &ms.dht_key,
+                    &peer_hashes,
+                    &age_factors,
+                    k,
+                    &rep,
+                    fan,
+                    routable_peers.len(),
                 );
                 for idx in indices {
-                    per_peer.entry(idx).or_default().push(PulseMessage::ManifestStore(ms.clone()));
+                    per_peer
+                        .entry(idx)
+                        .or_default()
+                        .push(PulseMessage::ManifestStore(ms.clone()));
                 }
             }
             batch_forward_to_peers(&manifest_drain_node, &routable_peers, per_peer).await;
@@ -1046,7 +1086,9 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
     tokio::spawn(async move {
         while let Some(first) = tag_store_rx.recv().await {
             let mut tags = vec![first];
-            while let Ok(item) = tag_store_rx.try_recv() { tags.push(item); }
+            while let Ok(item) = tag_store_rx.try_recv() {
+                tags.push(item);
+            }
 
             let (peer_hashes, routable_peers, age_factors, k, net_size, rep) = {
                 let s = tag_drain_state.lock().unwrap();
@@ -1054,22 +1096,40 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs();
-                let (ph, rp, af) = s.routing_table.routable_peer_vecs(
-                    |id| s.peer_registry.state(id) == PeerState::Verified, now,
-                );
-                (ph, rp, af, s.gossip_config.k_neighbors, s.estimated_network_size, s.reputation.clone())
+                let (ph, rp, af) = s
+                    .routing_table
+                    .routable_peer_vecs(|id| s.peer_registry.state(id) == PeerState::Verified, now);
+                (
+                    ph,
+                    rp,
+                    af,
+                    s.gossip_config.k_neighbors,
+                    s.estimated_network_size,
+                    s.reputation.clone(),
+                )
             };
-            if routable_peers.is_empty() { continue; }
+            if routable_peers.is_empty() {
+                continue;
+            }
 
             let fan = dynamic_fan_out(net_size, RANDOM_FAN_OUT, RANDOM_FAN_OUT * 3);
             let mut per_peer: HashMap<usize, Vec<PulseMessage>> = HashMap::new();
             for ts in &tags {
                 let dht_key = ts.tag_hash;
                 let indices = compute_gossip_targets(
-                    &dht_key, &peer_hashes, &age_factors, k, &rep, fan, routable_peers.len(),
+                    &dht_key,
+                    &peer_hashes,
+                    &age_factors,
+                    k,
+                    &rep,
+                    fan,
+                    routable_peers.len(),
                 );
                 for idx in indices {
-                    per_peer.entry(idx).or_default().push(PulseMessage::TagStore(ts.clone()));
+                    per_peer
+                        .entry(idx)
+                        .or_default()
+                        .push(PulseMessage::TagStore(ts.clone()));
                 }
             }
             batch_forward_to_peers(&tag_drain_node, &routable_peers, per_peer).await;
@@ -1083,7 +1143,9 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
     tokio::spawn(async move {
         while let Some(first) = tag_confirm_rx.recv().await {
             let mut confirms = vec![first];
-            while let Ok(item) = tag_confirm_rx.try_recv() { confirms.push(item); }
+            while let Ok(item) = tag_confirm_rx.try_recv() {
+                confirms.push(item);
+            }
 
             let (peer_hashes, routable_peers, age_factors, k, net_size, rep) = {
                 let s = confirm_drain_state.lock().unwrap();
@@ -1091,22 +1153,40 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs();
-                let (ph, rp, af) = s.routing_table.routable_peer_vecs(
-                    |id| s.peer_registry.state(id) == PeerState::Verified, now,
-                );
-                (ph, rp, af, s.gossip_config.k_neighbors, s.estimated_network_size, s.reputation.clone())
+                let (ph, rp, af) = s
+                    .routing_table
+                    .routable_peer_vecs(|id| s.peer_registry.state(id) == PeerState::Verified, now);
+                (
+                    ph,
+                    rp,
+                    af,
+                    s.gossip_config.k_neighbors,
+                    s.estimated_network_size,
+                    s.reputation.clone(),
+                )
             };
-            if routable_peers.is_empty() { continue; }
+            if routable_peers.is_empty() {
+                continue;
+            }
 
             let fan = dynamic_fan_out(net_size, RANDOM_FAN_OUT, RANDOM_FAN_OUT * 3);
             let mut per_peer: HashMap<usize, Vec<PulseMessage>> = HashMap::new();
             for tc in &confirms {
                 let dht_key = tc.tag_hash;
                 let indices = compute_gossip_targets(
-                    &dht_key, &peer_hashes, &age_factors, k, &rep, fan, routable_peers.len(),
+                    &dht_key,
+                    &peer_hashes,
+                    &age_factors,
+                    k,
+                    &rep,
+                    fan,
+                    routable_peers.len(),
                 );
                 for idx in indices {
-                    per_peer.entry(idx).or_default().push(PulseMessage::TagConfirm(tc.clone()));
+                    per_peer
+                        .entry(idx)
+                        .or_default()
+                        .push(PulseMessage::TagConfirm(tc.clone()));
                 }
             }
             batch_forward_to_peers(&confirm_drain_node, &routable_peers, per_peer).await;
@@ -1120,7 +1200,9 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
     tokio::spawn(async move {
         while let Some(first) = og_rx.recv().await {
             let mut items = vec![first];
-            while let Ok(item) = og_rx.try_recv() { items.push(item); }
+            while let Ok(item) = og_rx.try_recv() {
+                items.push(item);
+            }
 
             let (peer_hashes, routable_peers, age_factors, k, net_size, rep) = {
                 let s = og_drain_state.lock().unwrap();
@@ -1128,21 +1210,39 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs();
-                let (ph, rp, af) = s.routing_table.routable_peer_vecs(
-                    |id| s.peer_registry.state(id) == PeerState::Verified, now,
-                );
-                (ph, rp, af, s.gossip_config.k_neighbors, s.estimated_network_size, s.reputation.clone())
+                let (ph, rp, af) = s
+                    .routing_table
+                    .routable_peer_vecs(|id| s.peer_registry.state(id) == PeerState::Verified, now);
+                (
+                    ph,
+                    rp,
+                    af,
+                    s.gossip_config.k_neighbors,
+                    s.estimated_network_size,
+                    s.reputation.clone(),
+                )
             };
-            if routable_peers.is_empty() { continue; }
+            if routable_peers.is_empty() {
+                continue;
+            }
 
             let fan = dynamic_fan_out(net_size, OWNERSHIP_FAN_OUT, OWNERSHIP_FAN_OUT * 3);
             let mut per_peer: HashMap<usize, Vec<PulseMessage>> = HashMap::new();
             for og in &items {
                 let indices = compute_gossip_targets(
-                    &og.mint_id, &peer_hashes, &age_factors, k, &rep, fan, routable_peers.len(),
+                    &og.mint_id,
+                    &peer_hashes,
+                    &age_factors,
+                    k,
+                    &rep,
+                    fan,
+                    routable_peers.len(),
                 );
                 for idx in indices {
-                    per_peer.entry(idx).or_default().push(PulseMessage::OwnershipGenesis(og.clone()));
+                    per_peer
+                        .entry(idx)
+                        .or_default()
+                        .push(PulseMessage::OwnershipGenesis(og.clone()));
                 }
             }
             batch_forward_to_peers(&og_drain_node, &routable_peers, per_peer).await;
@@ -1156,7 +1256,9 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
     tokio::spawn(async move {
         while let Some(first) = oc_rx.recv().await {
             let mut items = vec![first];
-            while let Ok(item) = oc_rx.try_recv() { items.push(item); }
+            while let Ok(item) = oc_rx.try_recv() {
+                items.push(item);
+            }
 
             let (peer_hashes, routable_peers, age_factors, k, net_size, rep) = {
                 let s = oc_drain_state.lock().unwrap();
@@ -1164,21 +1266,39 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs();
-                let (ph, rp, af) = s.routing_table.routable_peer_vecs(
-                    |id| s.peer_registry.state(id) == PeerState::Verified, now,
-                );
-                (ph, rp, af, s.gossip_config.k_neighbors, s.estimated_network_size, s.reputation.clone())
+                let (ph, rp, af) = s
+                    .routing_table
+                    .routable_peer_vecs(|id| s.peer_registry.state(id) == PeerState::Verified, now);
+                (
+                    ph,
+                    rp,
+                    af,
+                    s.gossip_config.k_neighbors,
+                    s.estimated_network_size,
+                    s.reputation.clone(),
+                )
             };
-            if routable_peers.is_empty() { continue; }
+            if routable_peers.is_empty() {
+                continue;
+            }
 
             let fan = dynamic_fan_out(net_size, OWNERSHIP_FAN_OUT, OWNERSHIP_FAN_OUT * 3);
             let mut per_peer: HashMap<usize, Vec<PulseMessage>> = HashMap::new();
             for oc in &items {
                 let indices = compute_gossip_targets(
-                    &oc.mint_id, &peer_hashes, &age_factors, k, &rep, fan, routable_peers.len(),
+                    &oc.mint_id,
+                    &peer_hashes,
+                    &age_factors,
+                    k,
+                    &rep,
+                    fan,
+                    routable_peers.len(),
                 );
                 for idx in indices {
-                    per_peer.entry(idx).or_default().push(PulseMessage::OwnershipClaim(oc.clone()));
+                    per_peer
+                        .entry(idx)
+                        .or_default()
+                        .push(PulseMessage::OwnershipClaim(oc.clone()));
                 }
             }
             batch_forward_to_peers(&oc_drain_node, &routable_peers, per_peer).await;
@@ -1192,7 +1312,9 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
     tokio::spawn(async move {
         while let Some(first) = ra_rx.recv().await {
             let mut items = vec![first];
-            while let Ok(item) = ra_rx.try_recv() { items.push(item); }
+            while let Ok(item) = ra_rx.try_recv() {
+                items.push(item);
+            }
 
             let (peer_hashes, routable_peers, age_factors, k, net_size, rep) = {
                 let s = ra_drain_state.lock().unwrap();
@@ -1200,22 +1322,40 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs();
-                let (ph, rp, af) = s.routing_table.routable_peer_vecs(
-                    |id| s.peer_registry.state(id) == PeerState::Verified, now,
-                );
-                (ph, rp, af, s.gossip_config.k_neighbors, s.estimated_network_size, s.reputation.clone())
+                let (ph, rp, af) = s
+                    .routing_table
+                    .routable_peer_vecs(|id| s.peer_registry.state(id) == PeerState::Verified, now);
+                (
+                    ph,
+                    rp,
+                    af,
+                    s.gossip_config.k_neighbors,
+                    s.estimated_network_size,
+                    s.reputation.clone(),
+                )
             };
-            if routable_peers.is_empty() { continue; }
+            if routable_peers.is_empty() {
+                continue;
+            }
 
             let fan = dynamic_fan_out(net_size, RANDOM_FAN_OUT, RANDOM_FAN_OUT * 3);
             let mut per_peer: HashMap<usize, Vec<PulseMessage>> = HashMap::new();
             for ra in &items {
                 for cid in &ra.consumed_mint_ids {
                     let indices = compute_gossip_targets(
-                        cid, &peer_hashes, &age_factors, k, &rep, fan, routable_peers.len(),
+                        cid,
+                        &peer_hashes,
+                        &age_factors,
+                        k,
+                        &rep,
+                        fan,
+                        routable_peers.len(),
                     );
                     for idx in indices {
-                        per_peer.entry(idx).or_default().push(PulseMessage::ReforgeAttestation(ra.clone()));
+                        per_peer
+                            .entry(idx)
+                            .or_default()
+                            .push(PulseMessage::ReforgeAttestation(ra.clone()));
                     }
                 }
             }
@@ -1233,7 +1373,9 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
     tokio::spawn(async move {
         while let Some(first) = pay_rx.recv().await {
             let mut items = vec![first];
-            while let Ok(item) = pay_rx.try_recv() { items.push(item); }
+            while let Ok(item) = pay_rx.try_recv() {
+                items.push(item);
+            }
 
             let (peer_hashes, routable_peers, age_factors, k, net_size, rep) = {
                 let s = pay_drain_state.lock().unwrap();
@@ -1241,21 +1383,39 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs();
-                let (ph, rp, af) = s.routing_table.routable_peer_vecs(
-                    |id| s.peer_registry.state(id) == PeerState::Verified, now,
-                );
-                (ph, rp, af, s.gossip_config.k_neighbors, s.estimated_network_size, s.reputation.clone())
+                let (ph, rp, af) = s
+                    .routing_table
+                    .routable_peer_vecs(|id| s.peer_registry.state(id) == PeerState::Verified, now);
+                (
+                    ph,
+                    rp,
+                    af,
+                    s.gossip_config.k_neighbors,
+                    s.estimated_network_size,
+                    s.reputation.clone(),
+                )
             };
-            if routable_peers.is_empty() { continue; }
+            if routable_peers.is_empty() {
+                continue;
+            }
 
             let fan = dynamic_fan_out(net_size, RANDOM_FAN_OUT, RANDOM_FAN_OUT * 3);
             let mut per_peer: HashMap<usize, Vec<PulseMessage>> = HashMap::new();
             for p in &items {
                 let indices = compute_gossip_targets(
-                    &p.stealth_id, &peer_hashes, &age_factors, k, &rep, fan, routable_peers.len(),
+                    &p.stealth_id,
+                    &peer_hashes,
+                    &age_factors,
+                    k,
+                    &rep,
+                    fan,
+                    routable_peers.len(),
                 );
                 for idx in indices {
-                    per_peer.entry(idx).or_default().push(PulseMessage::Payment(p.clone()));
+                    per_peer
+                        .entry(idx)
+                        .or_default()
+                        .push(PulseMessage::Payment(p.clone()));
                 }
             }
             batch_forward_to_peers(&pay_drain_node, &routable_peers, per_peer).await;
@@ -1279,7 +1439,8 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
             if routable_count < 3 {
                 let peers_to_ask: Vec<Vec<u8>> = {
                     let s = pex_state.lock().unwrap();
-                    s.routing_table.routable_peers(|_| true)
+                    s.routing_table
+                        .routable_peers(|_| true)
                         .into_iter()
                         .take(3)
                         .map(|p| p.id_bytes)
@@ -1298,29 +1459,31 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     let msg = PulseMessage::PeerExchange(PeerExchange {
                         sender_id: pex_node.id().as_bytes().to_vec(),
                     });
-                    if let Ok(Some(PulseMessage::PeerExchangeResponse(resp))) = pex_node.send_message_with_response(target, &msg).await {
-                            let mut s = pex_state.lock().unwrap();
-                            let now = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs();
-                            for new_peer_bytes in &resp.peers {
-                                let hash: [u8; 32] = *blake3::hash(new_peer_bytes).as_bytes();
-                                if hash == s.node_id {
-                                    continue;
-                                }
-                                if !s.routing_table.contains(&hash) {
-                                    s.routing_table.insert(RoutingPeer {
-                                        id_hash: hash,
-                                        id_bytes: new_peer_bytes.clone(),
-                                        last_seen: now,
-                                        first_seen: now,
-                                    });
-                                    if let Ok(arr) = <[u8; 32]>::try_from(new_peer_bytes.as_slice()) {
-                                        s.handshake_queue.push(arr);
-                                    }
+                    if let Ok(Some(PulseMessage::PeerExchangeResponse(resp))) =
+                        pex_node.send_message_with_response(target, &msg).await
+                    {
+                        let mut s = pex_state.lock().unwrap();
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        for new_peer_bytes in &resp.peers {
+                            let hash: [u8; 32] = *blake3::hash(new_peer_bytes).as_bytes();
+                            if hash == s.node_id {
+                                continue;
+                            }
+                            if !s.routing_table.contains(&hash) {
+                                s.routing_table.insert(RoutingPeer {
+                                    id_hash: hash,
+                                    id_bytes: new_peer_bytes.clone(),
+                                    last_seen: now,
+                                    first_seen: now,
+                                });
+                                if let Ok(arr) = <[u8; 32]>::try_from(new_peer_bytes.as_slice()) {
+                                    s.handshake_queue.push(arr);
                                 }
                             }
+                        }
                     }
                 }
             }
@@ -1364,9 +1527,13 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 };
 
                 let challenge = PulseMessage::HandshakeChallenge(HandshakeChallenge { nonce });
-                if let Ok(Some(PulseMessage::HandshakeResponse(resp))) = hs_node.send_message_with_response(target, &challenge).await {
+                if let Ok(Some(PulseMessage::HandshakeResponse(resp))) =
+                    hs_node.send_message_with_response(target, &challenge).await
+                {
                     let mut s = hs_state.lock().unwrap();
-                    if s.peer_registry.verify_response(&peer_hash, &resp.hmac, &ALLOWED_VERSIONS) {
+                    if s.peer_registry
+                        .verify_response(&peer_hash, &resp.hmac, &ALLOWED_VERSIONS)
+                    {
                         // Verify Argon2id PoW from the peer.
                         if resp.pow_hash.is_empty()
                             || !verify_handshake_pow(&id_bytes, &nonce, &resp.pow_hash)
@@ -1403,9 +1570,8 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
 
             let stale_peers: Vec<[u8; 32]> = {
                 let s = reverify_state.lock().unwrap();
-                s.peer_registry.peers_due_for_reverification(
-                    crate::handshake::REVERIFICATION_INTERVAL,
-                )
+                s.peer_registry
+                    .peers_due_for_reverification(crate::handshake::REVERIFICATION_INTERVAL)
             };
 
             for peer_hash in stale_peers {
@@ -1434,10 +1600,17 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 };
 
                 let challenge = PulseMessage::HandshakeChallenge(HandshakeChallenge { nonce });
-                match reverify_node.send_message_with_response(target, &challenge).await {
+                match reverify_node
+                    .send_message_with_response(target, &challenge)
+                    .await
+                {
                     Ok(Some(PulseMessage::HandshakeResponse(resp))) => {
                         let mut s = reverify_state.lock().unwrap();
-                        if s.peer_registry.verify_response(&peer_hash, &resp.hmac, &ALLOWED_VERSIONS) {
+                        if s.peer_registry.verify_response(
+                            &peer_hash,
+                            &resp.hmac,
+                            &ALLOWED_VERSIONS,
+                        ) {
                             if resp.pow_hash.is_empty()
                                 || !verify_handshake_pow(&id_bytes, &nonce, &resp.pow_hash)
                             {
@@ -1498,18 +1671,24 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
 
             let notify_msgs: Vec<(Vec<Vec<u8>>, vess_protocol::PulseMessage)> = {
                 let s = limbo_state.lock().unwrap();
-                let routable: Vec<Vec<u8>> = s.routing_table.routable_peers(
-                    |id| s.peer_registry.state(id) == PeerState::Verified,
-                ).into_iter().map(|p| p.id_bytes).collect();
+                let routable: Vec<Vec<u8>> = s
+                    .routing_table
+                    .routable_peers(|id| s.peer_registry.state(id) == PeerState::Verified)
+                    .into_iter()
+                    .map(|p| p.id_bytes)
+                    .collect();
 
-                deliveries.iter().map(|(sid, payments)| {
-                    let msg = PulseMessage::LimboNotify(vess_protocol::LimboNotify {
-                        stealth_id: *sid,
-                        count: payments.len() as u32,
-                        custodian_id: s.node_id,
-                    });
-                    (routable.clone(), msg)
-                }).collect()
+                deliveries
+                    .iter()
+                    .map(|(sid, payments)| {
+                        let msg = PulseMessage::LimboNotify(vess_protocol::LimboNotify {
+                            stealth_id: *sid,
+                            count: payments.len() as u32,
+                            custodian_id: s.node_id,
+                        });
+                        (routable.clone(), msg)
+                    })
+                    .collect()
             };
 
             for (peers, msg) in notify_msgs {

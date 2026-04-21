@@ -7,9 +7,9 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use iroh::endpoint::{Connection, ConnectionState, Incoming, presets};
-use iroh::{Endpoint, EndpointAddr, EndpointId};
 use iroh::address_lookup::mdns::MdnsAddressLookup;
+use iroh::endpoint::{presets, Connection, ConnectionState, Incoming};
+use iroh::{Endpoint, EndpointAddr, EndpointId};
 use tracing::{info, warn};
 use vess_protocol::PulseMessage;
 
@@ -65,11 +65,7 @@ impl VessNode {
     }
 
     /// Sends a binary Pulse to a remote peer. Ignores any response.
-    pub async fn send_pulse(
-        &self,
-        target: impl Into<EndpointAddr>,
-        payload: &[u8],
-    ) -> Result<()> {
+    pub async fn send_pulse(&self, target: impl Into<EndpointAddr>, payload: &[u8]) -> Result<()> {
         self.send_pulse_with_response(target, payload).await?;
         Ok(())
     }
@@ -151,11 +147,7 @@ impl VessNode {
         info!("listening for pulses");
 
         loop {
-            let incoming = self
-                .endpoint
-                .accept()
-                .await
-                .context("endpoint closed")?;
+            let incoming = self.endpoint.accept().await.context("endpoint closed")?;
 
             let h = handler.clone();
             tokio::spawn(async move {
@@ -196,8 +188,8 @@ impl VessNode {
         if response.is_empty() {
             return Ok(None);
         }
-        let resp_msg = PulseMessage::from_bytes(&response)
-            .context("deserialize response PulseMessage")?;
+        let resp_msg =
+            PulseMessage::from_bytes(&response).context("deserialize response PulseMessage")?;
         Ok(Some(resp_msg))
     }
 
@@ -244,12 +236,12 @@ impl VessNode {
         &self,
         on_message: impl Fn(EndpointId, PulseMessage) + Send + Sync + 'static,
     ) -> Result<()> {
-        self.listen(move |peer, payload| {
-            match PulseMessage::from_bytes(&payload) {
+        self.listen(
+            move |peer, payload| match PulseMessage::from_bytes(&payload) {
                 Ok(msg) => on_message(peer, msg),
                 Err(e) => warn!(%peer, error = %e, "invalid pulse message"),
-            }
-        })
+            },
+        )
         .await
     }
 
@@ -261,8 +253,8 @@ impl VessNode {
         &self,
         on_message: impl Fn(EndpointId, PulseMessage) -> Option<PulseMessage> + Send + Sync + 'static,
     ) -> Result<()> {
-        self.listen_with_response(move |peer, payload| {
-            match PulseMessage::from_bytes(&payload) {
+        self.listen_with_response(
+            move |peer, payload| match PulseMessage::from_bytes(&payload) {
                 Ok(msg) => match on_message(peer, msg) {
                     Some(resp) => resp.to_bytes().unwrap_or_default(),
                     None => Vec::new(),
@@ -271,8 +263,8 @@ impl VessNode {
                     warn!(%peer, error = %e, "invalid pulse message");
                     Vec::new()
                 }
-            }
-        })
+            },
+        )
         .await
     }
 }
@@ -287,10 +279,7 @@ impl VessNode {
 ///   Request:  `[u32 BE payload_len][payload bytes]`
 ///   Response: `[u32 BE response_len][response bytes]`
 ///   (response_len = 0 means acknowledged, no data)
-async fn write_pulse<S: ConnectionState>(
-    conn: &Connection<S>,
-    payload: &[u8],
-) -> Result<Vec<u8>> {
+async fn write_pulse<S: ConnectionState>(conn: &Connection<S>, payload: &[u8]) -> Result<Vec<u8>> {
     let (mut tx, mut rx) = conn.open_bi().await.context("open bi stream")?;
 
     // Length-prefixed framing: [u32 BE length][payload]
@@ -368,11 +357,7 @@ async fn handle_incoming(
     // Wait for the remote to signal it has finished reading by closing
     // its side. Without this, dropping `conn` sends CONNECTION_CLOSE
     // which can preempt in-flight stream data on the wire.
-    let _ = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        conn.closed(),
-    )
-    .await;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), conn.closed()).await;
 
     Ok(())
 }

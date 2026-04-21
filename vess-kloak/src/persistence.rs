@@ -28,7 +28,10 @@ pub struct EncryptedBlob {
 impl EncryptedBlob {
     /// Encrypt arbitrary bytes under a 32-byte key.
     pub fn encrypt(plaintext: &[u8], enc_key: &[u8; 32]) -> Result<Self> {
-        use chacha20poly1305::{aead::{Aead, KeyInit, generic_array::GenericArray}, ChaCha20Poly1305};
+        use chacha20poly1305::{
+            aead::{generic_array::GenericArray, Aead, KeyInit},
+            ChaCha20Poly1305,
+        };
         use rand::RngCore;
 
         let cipher = ChaCha20Poly1305::new(GenericArray::from_slice(enc_key));
@@ -36,20 +39,28 @@ impl EncryptedBlob {
         rand::thread_rng().fill_bytes(&mut nonce_bytes);
         let nonce = GenericArray::from_slice(&nonce_bytes);
 
-        let ciphertext = cipher.encrypt(nonce, plaintext)
+        let ciphertext = cipher
+            .encrypt(nonce, plaintext)
             .map_err(|e| anyhow::anyhow!("encryption failed: {e}"))?;
 
-        Ok(Self { ciphertext, nonce: nonce_bytes })
+        Ok(Self {
+            ciphertext,
+            nonce: nonce_bytes,
+        })
     }
 
     /// Decrypt to raw bytes.
     pub fn decrypt(&self, enc_key: &[u8; 32]) -> Result<Vec<u8>> {
-        use chacha20poly1305::{aead::{Aead, KeyInit, generic_array::GenericArray}, ChaCha20Poly1305};
+        use chacha20poly1305::{
+            aead::{generic_array::GenericArray, Aead, KeyInit},
+            ChaCha20Poly1305,
+        };
 
         let cipher = ChaCha20Poly1305::new(GenericArray::from_slice(enc_key));
         let nonce = GenericArray::from_slice(&self.nonce);
 
-        cipher.decrypt(nonce, self.ciphertext.as_slice())
+        cipher
+            .decrypt(nonce, self.ciphertext.as_slice())
             .map_err(|e| anyhow::anyhow!("decryption failed (wrong key?): {e}"))
     }
 }
@@ -111,7 +122,10 @@ pub struct EncryptedSpendSeed {
 impl EncryptedSpendSeed {
     /// Encrypt a spend seed with the given 32-byte key.
     pub fn encrypt(spend_seed: &[u8; 32], enc_key: &[u8; 32]) -> Result<Self> {
-        use chacha20poly1305::{aead::{Aead, KeyInit, generic_array::GenericArray}, ChaCha20Poly1305};
+        use chacha20poly1305::{
+            aead::{generic_array::GenericArray, Aead, KeyInit},
+            ChaCha20Poly1305,
+        };
         use rand::RngCore;
 
         let cipher = ChaCha20Poly1305::new(GenericArray::from_slice(enc_key));
@@ -119,23 +133,32 @@ impl EncryptedSpendSeed {
         rand::thread_rng().fill_bytes(&mut nonce_bytes);
         let nonce = GenericArray::from_slice(&nonce_bytes);
 
-        let ciphertext = cipher.encrypt(nonce, spend_seed.as_slice())
+        let ciphertext = cipher
+            .encrypt(nonce, spend_seed.as_slice())
             .map_err(|e| anyhow::anyhow!("spend seed encryption failed: {e}"))?;
 
-        Ok(Self { ciphertext, nonce: nonce_bytes })
+        Ok(Self {
+            ciphertext,
+            nonce: nonce_bytes,
+        })
     }
 
     /// Decrypt the spend seed with the given 32-byte key.
     pub fn decrypt(&self, enc_key: &[u8; 32]) -> Result<[u8; 32]> {
-        use chacha20poly1305::{aead::{Aead, KeyInit, generic_array::GenericArray}, ChaCha20Poly1305};
+        use chacha20poly1305::{
+            aead::{generic_array::GenericArray, Aead, KeyInit},
+            ChaCha20Poly1305,
+        };
 
         let cipher = ChaCha20Poly1305::new(GenericArray::from_slice(enc_key));
         let nonce = GenericArray::from_slice(&self.nonce);
 
-        let plaintext = cipher.decrypt(nonce, self.ciphertext.as_slice())
+        let plaintext = cipher
+            .decrypt(nonce, self.ciphertext.as_slice())
             .map_err(|e| anyhow::anyhow!("spend seed decryption failed (wrong key?): {e}"))?;
 
-        let seed: [u8; 32] = plaintext.try_into()
+        let seed: [u8; 32] = plaintext
+            .try_into()
             .map_err(|_| anyhow::anyhow!("decrypted spend seed has wrong length"))?;
         Ok(seed)
     }
@@ -195,14 +218,17 @@ impl WalletFile {
     // ── Spend credential encryption ─────────────────────────────
 
     /// Encrypt the billfold's spend credentials and store in the wallet.
-    pub fn encrypt_spend_credentials(&mut self, billfold: &BillFold, enc_key: &[u8; 32]) -> Result<()> {
+    pub fn encrypt_spend_credentials(
+        &mut self,
+        billfold: &BillFold,
+        enc_key: &[u8; 32],
+    ) -> Result<()> {
         let creds = billfold.export_credentials();
         if creds.is_empty() {
             self.encrypted_spend_credentials = None;
             return Ok(());
         }
-        let json = serde_json::to_vec(creds)
-            .context("serialize spend credentials")?;
+        let json = serde_json::to_vec(creds).context("serialize spend credentials")?;
         self.encrypted_spend_credentials = Some(EncryptedBlob::encrypt(&json, enc_key)?);
         Ok(())
     }
@@ -211,7 +237,11 @@ impl WalletFile {
     ///
     /// Handles migration: if the billfold already has legacy plaintext
     /// credentials (from an old wallet), those are preserved.
-    pub fn decrypt_spend_credentials_into(&self, billfold: &mut BillFold, enc_key: &[u8; 32]) -> Result<()> {
+    pub fn decrypt_spend_credentials_into(
+        &self,
+        billfold: &mut BillFold,
+        enc_key: &[u8; 32],
+    ) -> Result<()> {
         if let Some(ref blob) = self.encrypted_spend_credentials {
             let json = blob.decrypt(enc_key)?;
             let creds: std::collections::HashMap<[u8; 32], crate::billfold::SpendCredential> =
@@ -269,11 +299,9 @@ impl WalletFile {
         m_cost_kib: u32,
         p_cost: u32,
     ) -> Result<()> {
-        self.password_cache = Some(
-            crate::recovery::create_password_cache_with_params(
-                raw_seed, password, t_cost, m_cost_kib, p_cost,
-            )?
-        );
+        self.password_cache = Some(crate::recovery::create_password_cache_with_params(
+            raw_seed, password, t_cost, m_cost_kib, p_cost,
+        )?);
         Ok(())
     }
 
@@ -299,8 +327,7 @@ impl WalletFile {
                 .with_context(|| format!("create wallet directory: {}", parent.display()))?;
         }
 
-        let json = serde_json::to_string_pretty(self)
-            .context("serialize wallet")?;
+        let json = serde_json::to_string_pretty(self).context("serialize wallet")?;
 
         std::fs::write(path, json.as_bytes())
             .with_context(|| format!("write wallet file: {}", path.display()))?;
@@ -319,11 +346,10 @@ impl WalletFile {
 
     /// Load wallet from a JSON file.
     pub fn load(path: &Path) -> Result<Self> {
-        let data = std::fs::read(path)
-            .with_context(|| format!("read wallet file: {}", path.display()))?;
+        let data =
+            std::fs::read(path).with_context(|| format!("read wallet file: {}", path.display()))?;
 
-        let wallet: WalletFile = serde_json::from_slice(&data)
-            .context("deserialize wallet")?;
+        let wallet: WalletFile = serde_json::from_slice(&data).context("deserialize wallet")?;
 
         if wallet.version > Self::CURRENT_VERSION {
             anyhow::bail!(
@@ -372,7 +398,8 @@ mod tests {
         let enc_key = derive_encryption_key_with_params(&phrase, 1, 64, 1).unwrap();
         let encrypted = encrypt_secrets(&secret, &enc_key).unwrap();
 
-        let wallet = WalletFile::new(address, encrypted, BillFold::new(), [0u8; 32], &enc_key).unwrap();
+        let wallet =
+            WalletFile::new(address, encrypted, BillFold::new(), [0u8; 32], &enc_key).unwrap();
 
         let dir = std::env::temp_dir().join("vess-test-persistence");
         let path = dir.join("wallet.json");
@@ -394,7 +421,8 @@ mod tests {
         let enc_key = derive_encryption_key_with_params(&phrase, 1, 64, 1).unwrap();
         let encrypted = encrypt_secrets(&secret, &enc_key).unwrap();
 
-        let wallet = WalletFile::new(address, encrypted, BillFold::new(), [0u8; 32], &enc_key).unwrap();
+        let wallet =
+            WalletFile::new(address, encrypted, BillFold::new(), [0u8; 32], &enc_key).unwrap();
 
         let dir = std::env::temp_dir().join("vess-test-backup");
         let backup_path = dir.join("backup.json");

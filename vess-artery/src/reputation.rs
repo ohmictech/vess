@@ -134,11 +134,11 @@ impl ReputationTable {
             return;
         }
         // Find the peer with the worst score.
-        if let Some((&worst_id, _)) = self
-            .peers
-            .iter()
-            .min_by(|(_, a), (_, b)| a.score().partial_cmp(&b.score()).unwrap_or(std::cmp::Ordering::Equal))
-        {
+        if let Some((&worst_id, _)) = self.peers.iter().min_by(|(_, a), (_, b)| {
+            a.score()
+                .partial_cmp(&b.score())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }) {
             self.peers.remove(&worst_id);
         }
     }
@@ -199,10 +199,7 @@ impl ReputationTable {
             .iter()
             .enumerate()
             .map(|(i, id)| {
-                let rep_score = self
-                    .peers
-                    .get(id)
-                    .map_or(0.5, |r| r.score());
+                let rep_score = self.peers.get(id).map_or(0.5, |r| r.score());
                 let age_f = age_factors.get(i).copied().unwrap_or(1.0);
                 (i, rep_score * age_f)
             })

@@ -48,11 +48,7 @@ pub fn compare_distance(d1: &[u8; 32], d2: &[u8; 32]) -> std::cmp::Ordering {
 /// Select the K nearest peers from a list, measured by XOR distance to a target.
 ///
 /// Returns indices into `peer_ids` sorted by ascending distance.
-pub fn k_nearest(
-    target: &[u8; 32],
-    peer_ids: &[[u8; 32]],
-    k: usize,
-) -> Vec<usize> {
+pub fn k_nearest(target: &[u8; 32], peer_ids: &[[u8; 32]], k: usize) -> Vec<usize> {
     let mut indexed: Vec<(usize, [u8; 32])> = peer_ids
         .iter()
         .enumerate()
@@ -94,15 +90,9 @@ pub fn dynamic_fan_out(estimated_network_size: usize, base: usize, max_fan: usiz
 /// Select R random peer indices that are NOT in the `exclude` set.
 ///
 /// Uses Fisher-Yates partial shuffle for O(R) performance.
-pub fn random_fan_out(
-    total_peers: usize,
-    exclude: &[usize],
-    r: usize,
-) -> Vec<usize> {
+pub fn random_fan_out(total_peers: usize, exclude: &[usize], r: usize) -> Vec<usize> {
     use rand::seq::SliceRandom;
-    let candidates: Vec<usize> = (0..total_peers)
-        .filter(|i| !exclude.contains(i))
-        .collect();
+    let candidates: Vec<usize> = (0..total_peers).filter(|i| !exclude.contains(i)).collect();
     if candidates.is_empty() {
         return Vec::new();
     }
@@ -180,7 +170,9 @@ impl PeerRateLimiter {
             // New peer — enforce global cap.
             if self.counters.len() >= self.max_peers {
                 // Evict oldest entries (peers with oldest window_start).
-                let oldest = self.counters.iter()
+                let oldest = self
+                    .counters
+                    .iter()
                     .min_by_key(|(_, (_, ws))| *ws)
                     .map(|(k, _)| *k);
                 if let Some(k) = oldest {

@@ -191,10 +191,7 @@ impl TagDht {
     /// Check if a tag is hardened.
     pub fn is_hardened(&self, tag_str: &str) -> bool {
         let key = *blake3::hash(tag_str.as_bytes()).as_bytes();
-        self.records
-            .get(&key)
-            .and_then(|r| r.hardened_at)
-            .is_some()
+        self.records.get(&key).and_then(|r| r.hardened_at).is_some()
     }
 
     /// Purge unhardened tags whose registration has expired.
@@ -370,7 +367,7 @@ mod tests {
         let pruned = dht.purge_unhardened(now);
         assert_eq!(pruned, 1);
         assert!(dht.lookup("alice").is_none()); // pruned
-        assert!(dht.lookup("bob").is_some());   // hardened, kept
+        assert!(dht.lookup("bob").is_some()); // hardened, kept
         assert!(dht.lookup("charlie").is_some()); // too recent to prune
     }
 
