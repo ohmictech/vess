@@ -1,6 +1,6 @@
 # Vess Protocol
 
-Post-quantum digital cash. No blockchain. Deterministic finality in under one second. Unlimited throughput. Zero fees.
+Post-quantum digital cash. No blockchain. Deterministic finality in under one second. Unlimited throughput. Zero fees. Full nodes on smartphones.
 
 Bills are minted via proof-of-work, owned via hash chains, and transferred through a peer-to-peer mesh. Payments settle the moment the recipient claims the bill — no block confirmations, no epochs, no probabilistic waiting. Throughput has no protocol ceiling because there is no shared ledger to bottleneck: every payment is an independent message between two peers. All cryptography is post-quantum. There is no consensus mechanism because there is nothing to reach consensus about.
 
@@ -30,7 +30,23 @@ Vess picks it up.
 
 **Scales without the baggage.** DHT replication with k=20 means the early network (5–25 nodes) behaves like full consensus — every node sees everything. As the network grows, it naturally transitions to efficient sharded replication. No "bootstrap mode," no fragile early phase, no 500 GB initial sync.
 
-**Anyone with a phone can participate.** The 1 GiB scratchpad fits comfortably on any smartphone made in the last five years, and the 8 GiB disk dataset fits on a cheap microSD card or internal storage. You won't get rich mining on a phone — maybe a few cents a day. But that's the point. In economies where a dollar is a meal, the ability to create money from a device you already own, with no bank account, no KYC, no intermediary taking a cut, is the difference between participating in the financial system and being locked out of it entirely. Bitcoin mining requires a warehouse. Ethereum staking requires capital. Vess requires a phone and electricity.
+**Anyone with a phone can participate — as a full node.** Every other cryptocurrency requires you to trust someone else's server on a mobile device. Bitcoin's full node needs 600 GB. Ethereum's needs 1 TB+. "Light" clients skip verification entirely and rely on trusted third parties. Vess is the first cryptocurrency protocol where a phone running the native app is a genuine full node: it routes payments, verifies transfers it relays, holds DHT shards, participates in ownership resolution, and can mine — all in a ~60 MB background process with no chain to sync and no history to download. The foreground service survives Android battery optimization; the 1 GiB scratchpad fits on any phone made after 2019; the 8 GiB disk dataset fits on internal storage or a microSD card. In economies where a dollar is a meal, the ability to create money from a device you already own, with no bank account, no KYC, no intermediary taking a cut, is the difference between participating in the financial system and being locked out of it entirely. Bitcoin mining requires a warehouse. Ethereum staking requires 32 ETH. Vess requires a phone and electricity.
+
+---
+
+## Protocol Firsts
+
+These are properties that, to the best of our knowledge, no other cryptocurrency protocol achieves simultaneously.
+
+**First full-node protocol that runs natively on a smartphone.** Other mobile crypto apps are either light clients (trusting a third-party server), custodial wallets (trusting a company), or thin wrappers around a remote RPC. A Vess phone node has no chain to sync, bounded fixed memory, and participates in payment routing, ownership verification, and DHT replication at full protocol depth — not observer mode.
+
+**First post-quantum digital cash protocol.** Every cryptographic primitive is post-quantum from genesis: ML-KEM-768 (key exchange / stealth addressing), ML-DSA-65 (ownership signatures), Blake3 (hashing), Argon2id (key derivation). No elliptic curve cryptography appears anywhere in the codebase. Most "post-quantum roadmap" projects still rely on ECDSA today.
+
+**First digital cash system with deterministic sub-second finality and no global state.** Bitcoin finalizes probabilistically in ~60 minutes. Ethereum in ~12 seconds (with checkpoints). Monero in ~2 minutes. All of them require global ledger agreement. Vess payments finalize the instant the recipient broadcasts an ownership claim — typically under one second on a live network — and no global state is required because there is no shared ledger to agree on.
+
+**First memory-hard + bandwidth-hard + storage-hard proof-of-work.** Most memory-hard PoW (Ethash, RandomX) uses one or two resistance layers. Vess uses three simultaneously: a 1 GiB RAM scratchpad, 4× memory bus saturation per VM step, and an 8 GiB per-identity NVMe dataset. The combination means no single hardware optimization (faster DRAM, wider memory bus, denser storage) breaks the balance — all three must be provisioned at commodity scale.
+
+**No fees, ever.** There is no fee market. There is no miner extractable value. There are no gas costs. Payments are free to route because relay nodes are compensated by the ability to participate in the network, not by skimming from transactions. This is only possible because there is no shared ledger creating economic scarcity of block space.
 
 ---
 
