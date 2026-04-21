@@ -131,9 +131,8 @@ pub enum PulseMessage {
 ///
 /// The stealth payload carries all bill data encrypted to the recipient.
 /// Relay metadata is intentionally minimal to prevent passive traffic
-/// analysis — `mint_ids` and `denomination_values` are **deprecated**
-/// (privacy leak) and should be left empty.  Use `bill_count` for
-/// relay-side accounting without revealing bill identities.
+/// analysis. Use `bill_count` for relay-side accounting without revealing
+/// bill identities.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Payment {
     /// Unique payment ID for tracking in-flight state.
@@ -147,15 +146,6 @@ pub struct Payment {
     pub stealth_id: [u8; 32],
     /// Unix timestamp when payment was created.
     pub created_at: u64,
-    /// **Deprecated — privacy leak.**  Cleartext bill identifiers allow
-    /// relay nodes to track bill movements across transfers.  Leave empty;
-    /// relay nodes should use `bill_count` and `payment_id` instead.
-    #[serde(default)]
-    pub mint_ids: Vec<[u8; 32]>,
-    /// **Deprecated — privacy leak.**  Cleartext denomination values
-    /// expose exact payment amounts to every relay.  Leave empty.
-    #[serde(default)]
-    pub denomination_values: Vec<u64>,
     /// Number of bills in this payment (relay-safe metadata).
     ///
     /// Relays use this for lightweight accounting and rate limiting
@@ -729,8 +719,6 @@ mod tests {
             view_tag: 0x42,
             stealth_id: [0xBB; 32],
             created_at: 1000,
-            mint_ids: vec![[0x11; 32]],
-            denomination_values: vec![10],
             bill_count: 1,
         });
         let bytes = msg.to_bytes().unwrap();

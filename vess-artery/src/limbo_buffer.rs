@@ -200,32 +200,25 @@ impl LimboBuffer {
         self.rebuild_peer_counts();
     }
 
-    /// Evict the lowest-denomination entries until total entries drop
-    /// below `EVICTION_THRESHOLD`. Protects high-value payments at the
-    /// expense of dust-sized ones during a DoS flood.
+    /// Evict the oldest entries until total entries drop below
+    /// `EVICTION_THRESHOLD`. Oldest-first protects recently-arrived
+    /// payments during a relay flood.
     fn evict_lowest_denomination(&mut self) {
         let target = EVICTION_THRESHOLD * 9 / 10; // evict down to ~90% of threshold
         if self.total_entries() <= target {
             return;
         }
 
-        // Collect (stealth_id, vec_index, min_denom) for every entry.
+        // Collect (stealth_id, vec_index, entered_at) for every entry.
         let mut scored: Vec<([u8; 32], usize, u64)> = Vec::new();
         for (sid, entries) in &self.entries {
             for (i, e) in entries.iter().enumerate() {
-                let min_denom = e
-                    .payment
-                    .denomination_values
-                    .iter()
-                    .copied()
-                    .min()
-                    .unwrap_or(0);
-                scored.push((*sid, i, min_denom));
+                scored.push((*sid, i, e.entered_at));
             }
         }
 
-        // Sort ascending by denomination — evict cheapest first.
-        scored.sort_by_key(|&(_, _, d)| d);
+        // Sort ascending by age — evict oldest first.
+        scored.sort_by_key(|&(_, _, t)| t);
 
         let to_evict = self.total_entries() - target;
         let evict_set: Vec<([u8; 32], usize)> = scored
@@ -291,15 +284,13 @@ mod tests {
         test_payment_denom(stealth_id, bill_ids, 10)
     }
 
-    fn test_payment_denom(stealth_id: [u8; 32], bill_ids: &[[u8; 32]], denom: u64) -> Payment {
+    fn test_payment_denom(stealth_id: [u8; 32], bill_ids: &[[u8; 32]], _denom: u64) -> Payment {
         Payment {
             payment_id: rand::random(),
             stealth_payload: vec![1, 2, 3],
             view_tag: 0x42,
             stealth_id,
             created_at: 1000,
-            mint_ids: bill_ids.to_vec(),
-            denomination_values: vec![denom; bill_ids.len()],
             bill_count: bill_ids.len() as u8,
         }
     }

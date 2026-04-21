@@ -309,13 +309,18 @@ pub(crate) struct ArteryState {
     pub(crate) outbound_payments: HashMap<[u8; 32], OutboundPaymentRecord>,
     /// Reverse index from mint_id to outbound payment_id for fast finalization.
     pub(crate) outbound_by_mint_id: HashMap<[u8; 32], [u8; 32]>,
+    /// Shared banishment manager — included in snapshots so the ban list
+    /// survives node restarts.
+    pub(crate) banishment: Arc<BanishmentManager>,
 }
 
 impl ArteryState {
     pub(crate) fn push_notification(&mut self, notification: WalletNotification) {
-        println!(
-            "[wallet:{}] {} (payment_id: {})",
-            notification.kind, notification.message, notification.payment_id
+        info!(
+            kind = %notification.kind,
+            payment_id = %notification.payment_id,
+            "{}",
+            notification.message
         );
         if self.notifications.len() >= MAX_WALLET_NOTIFICATIONS {
             self.notifications.pop_front();
@@ -457,6 +462,15 @@ impl ArteryState {
                 .iter()
                 .map(|p| p.id_hash)
                 .collect(),
+            peer_endpoints: {
+                let mut map = std::collections::BTreeMap::new();
+                for p in self.routing_table.all_peers() {
+                    if !p.id_bytes.is_empty() {
+                        map.insert(hex_key(&p.id_hash), p.id_bytes.clone());
+                    }
+                }
+                map
+            },
             limbo_entries: {
                 let limbo_map = self.limbo_buffer.export();
                 limbo_map
@@ -466,7 +480,7 @@ impl ArteryState {
             },
             peer_reputations: self.reputation.export(),
             hardening_proofs: self.tag_dht.export_hardening_proofs(),
-            banned_peers: Vec::new(),
+            banned_peers: self.banishment.all_banned(),
             ownership_records: self.registry.all_records(),
             manifests,
         }
@@ -486,9 +500,14 @@ impl ArteryState {
 
         self.routing_table = RoutingTable::new(self.node_id);
         for h in snap.known_peers {
+            let id_bytes = snap
+                .peer_endpoints
+                .get(&hex_key(&h))
+                .cloned()
+                .unwrap_or_default();
             self.routing_table.insert(RoutingPeer {
                 id_hash: h,
-                id_bytes: Vec::new(),
+                id_bytes,
                 last_seen: 0,
                 first_seen: 0,
             });
@@ -649,6 +668,8 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
         max_hops: config.max_hops,
     };
 
+    let banishment = Arc::new(BanishmentManager::new());
+
     let state = Arc::new(Mutex::new(ArteryState {
         registry: OwnershipRegistry::new(node_id_bytes),
         tag_dht: TagDht::new(node_id_bytes, config.k_neighbors),
@@ -678,9 +699,8 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
         notifications: VecDeque::new(),
         outbound_payments: HashMap::new(),
         outbound_by_mint_id: HashMap::new(),
+        banishment: banishment.clone(),
     }));
-
-    let banishment = Arc::new(BanishmentManager::new());
 
     // ── Gossip drain channels ───────────────────────────────────────
     // Unbounded mpsc channels decouple queue producers (handler) from
@@ -801,7 +821,6 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
 
     // ── Periodic state flush (every 60 seconds) ─────────────────────
     let flush_state = state.clone();
-    let flush_ban = banishment.clone();
     let flush_storage_dir = config.state_dir.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -863,9 +882,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
             }
             let snap = {
                 let s = flush_state.lock().unwrap();
-                let mut snap = s.snapshot();
-                snap.banned_peers = flush_ban.all_banned();
-                snap
+                s.snapshot()
             };
             let flush_storage =
                 NodeStorage::open(&flush_storage_dir).expect("open state dir for flush");
@@ -2077,40 +2094,6 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     return None;
                 }
 
-                // Backwards-compatible metadata validation: if the sender
-                // populated cleartext mint_ids/denomination_values (legacy),
-                // validate them.  Modern senders leave these empty for
-                // privacy — relay nodes use payment_id for dedup instead.
-                if !p.mint_ids.is_empty() {
-                    // Check ownership registry — all mint_ids must be active.
-                    for mint_id in &p.mint_ids {
-                        if !state.registry.is_active(mint_id) {
-                            warn!("payment rejected: mint_id not active in registry");
-                            return None;
-                        }
-                    }
-
-                    // Validate denomination_values array length matches mint_ids.
-                    if p.denomination_values.len() != p.mint_ids.len()
-                    {
-                        warn!("payment rejected: array length mismatch (mints={}, denoms={}) — banishing peer",
-                            p.mint_ids.len(), p.denomination_values.len());
-                        state.peer_registry.mark_banished(peer_id);
-                        ban_ref.banish(peer_id);
-                        return None;
-                    }
-
-                    // Reject payments whose mint_ids overlap with existing limbo
-                    // entries. A bill that is already in-flight (held in limbo)
-                    // cannot be spent again until the first payment clears.
-                    for mid in &p.mint_ids {
-                        if state.limbo_mint_ids.contains(mid) {
-                            warn!("payment rejected: mint_id already in limbo");
-                            return None;
-                        }
-                    }
-                }
-
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -2120,7 +2103,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     .unwrap_or_default()
                     .as_millis() as u64;
 
-                let mint_ids = p.mint_ids.clone();
+                let mint_ids: Vec<[u8; 32]> = Vec::new();
                 let stealth_id = p.stealth_id;
                 let relay_copy = p.clone();
                 let payment_id = p.payment_id;
@@ -2282,25 +2265,9 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     return None;
                 }
 
-                for mint_id in &p.mint_ids {
-                    if !state.registry.is_active(mint_id) {
-                        warn!("limbo deliver rejected: mint_id not active");
-                        return None;
-                    }
-                }
-
-                if !p.mint_ids.is_empty() && p.denomination_values.len() != p.mint_ids.len()
-                {
-                    warn!("limbo deliver rejected: array length mismatch — banishing peer");
-                    state.peer_registry.mark_banished(peer_id);
-                    ban_ref.banish(peer_id);
-                    return None;
-                }
-
                 // Registry-only model: no inline STARK verification.
-                // Allow overlapping mint_ids (same reasoning as Payment handler).
 
-                let mint_ids = p.mint_ids.clone();
+                let mint_ids: Vec<[u8; 32]> = Vec::new();
                 let stealth_id = p.stealth_id;
                 let payment_id = p.payment_id;
                 let now = std::time::SystemTime::now()
@@ -3104,8 +3071,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
     // Save state on shutdown.
     {
         let s = state.lock().unwrap();
-        let mut snap = s.snapshot();
-        snap.banned_peers = banishment.all_banned();
+        let snap = s.snapshot();
         storage.save(&snap)?;
         info!("state saved to disk on shutdown");
 

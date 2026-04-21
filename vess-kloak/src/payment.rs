@@ -176,8 +176,6 @@ pub fn prepare_payment(
         view_tag: stealth.view_tag,
         stealth_id: stealth.stealth_id,
         created_at: now_unix(),
-        mint_ids: Vec::new(),
-        denomination_values: Vec::new(),
         bill_count,
     });
 
@@ -254,8 +252,6 @@ pub fn prepare_payment_with_transfer(
         view_tag: stealth.view_tag,
         stealth_id: stealth.stealth_id,
         created_at: timestamp,
-        mint_ids: Vec::new(),
-        denomination_values: Vec::new(),
         bill_count,
     });
 
@@ -314,8 +310,6 @@ pub fn prepare_payment_from_bills(
         view_tag: stealth.view_tag,
         stealth_id: stealth.stealth_id,
         created_at: timestamp,
-        mint_ids: Vec::new(),
-        denomination_values: Vec::new(),
         bill_count,
     });
 

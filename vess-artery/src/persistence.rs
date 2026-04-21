@@ -31,6 +31,11 @@ pub struct ArterySnapshot {
     pub mailbox: BTreeMap<String, Vec<serde_json::Value>>,
     /// Known peer node IDs.
     pub known_peers: Vec<[u8; 32]>,
+    /// Raw endpoint bytes for known peers, keyed by hex-encoded id_hash.
+    /// Allows the node to immediately reconnect to peers after a restart
+    /// rather than waiting for them to reannounce.
+    #[serde(default)]
+    pub peer_endpoints: BTreeMap<String, Vec<u8>>,
     /// Limbo buffer entries keyed by hex-encoded stealth ID.
     #[serde(default)]
     pub limbo_entries: BTreeMap<String, Vec<LimboEntry>>,
@@ -59,6 +64,7 @@ impl ArterySnapshot {
             bills: BTreeMap::new(),
             mailbox: BTreeMap::new(),
             known_peers: Vec::new(),
+            peer_endpoints: BTreeMap::new(),
             limbo_entries: BTreeMap::new(),
             peer_reputations: Vec::new(),
             hardening_proofs: Vec::new(),
