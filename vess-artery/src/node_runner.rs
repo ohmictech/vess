@@ -5,10 +5,13 @@
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
+use serde::Serialize;
 use tracing::{info, warn};
 
 use crate::{
@@ -37,6 +40,30 @@ use vess_vascular::VessNode;
 use vess_kloak::billfold::SpendCredential;
 use vess_kloak::payment::receive_and_claim;
 use vess_stealth::StealthSecretKey;
+
+const MAX_WALLET_NOTIFICATIONS: usize = 256;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WalletNotification {
+    pub kind: String,
+    pub created_at: u64,
+    pub payment_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub amount: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bill_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub counterparty: Option<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct OutboundPaymentRecord {
+    pub(crate) payment_id: [u8; 32],
+    pub(crate) amount: u64,
+    pub(crate) recipient: String,
+    pub(crate) pending_mint_ids: HashSet<[u8; 32]>,
+}
 
 /// Maximum age (in seconds) for timestamps on incoming messages.
 /// Messages older than this are rejected as stale / potential replays.
@@ -279,9 +306,120 @@ pub(crate) struct ArteryState {
     /// Wallet file path (set from config even when wallet is locked).
     /// Used by the RPC `wallet_unlock` endpoint to load the file.
     pub(crate) wallet_path: Option<PathBuf>,
+    /// Wallet-local notification queue for CLI and wallet layers.
+    pub(crate) notifications: VecDeque<WalletNotification>,
+    /// Outbound payments waiting for recipient claim confirmation.
+    pub(crate) outbound_payments: HashMap<[u8; 32], OutboundPaymentRecord>,
+    /// Reverse index from mint_id to outbound payment_id for fast finalization.
+    pub(crate) outbound_by_mint_id: HashMap<[u8; 32], [u8; 32]>,
 }
 
 impl ArteryState {
+    pub(crate) fn push_notification(&mut self, notification: WalletNotification) {
+        println!(
+            "[wallet:{}] {} (payment_id: {})",
+            notification.kind,
+            notification.message,
+            notification.payment_id
+        );
+        if self.notifications.len() >= MAX_WALLET_NOTIFICATIONS {
+            self.notifications.pop_front();
+        }
+        self.notifications.push_back(notification);
+    }
+
+    pub(crate) fn take_notifications(&mut self, max: usize) -> Vec<WalletNotification> {
+        let count = max.max(1).min(self.notifications.len());
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            if let Some(note) = self.notifications.pop_front() {
+                out.push(note);
+            }
+        }
+        out
+    }
+
+    pub(crate) fn record_outbound_payment(
+        &mut self,
+        payment_id: [u8; 32],
+        amount: u64,
+        recipient: String,
+        mint_ids: &[[u8; 32]],
+    ) {
+        let pending_mint_ids: HashSet<[u8; 32]> = mint_ids.iter().copied().collect();
+        for mint_id in &pending_mint_ids {
+            self.outbound_by_mint_id.insert(*mint_id, payment_id);
+        }
+        self.outbound_payments.insert(
+            payment_id,
+            OutboundPaymentRecord {
+                payment_id,
+                amount,
+                recipient,
+                pending_mint_ids,
+            },
+        );
+    }
+
+    fn now_unix() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+    pub(crate) fn finalize_outbound_mint_if_complete(&mut self, mint_id: &[u8; 32]) {
+        let Some(payment_id) = self.outbound_by_mint_id.remove(mint_id) else {
+            return;
+        };
+
+        let mut completed = None;
+        if let Some(record) = self.outbound_payments.get_mut(&payment_id) {
+            record.pending_mint_ids.remove(mint_id);
+            if record.pending_mint_ids.is_empty() {
+                completed = Some((record.payment_id, record.amount, record.recipient.clone()));
+            }
+        }
+
+        if let Some((payment_id, amount, recipient)) = completed {
+            self.outbound_payments.remove(&payment_id);
+            self.push_notification(WalletNotification {
+                kind: "payment_sent_confirmed".to_string(),
+                created_at: Self::now_unix(),
+                payment_id: hex_key(&payment_id),
+                amount: Some(amount),
+                bill_count: None,
+                counterparty: Some(recipient.clone()),
+                message: format!("Payment to {recipient} confirmed by recipient claim."),
+            });
+        }
+    }
+
+    pub(crate) fn release_outbound_mints(&mut self, mint_ids: &[[u8; 32]]) {
+        let mut affected_payment_ids = HashSet::new();
+        for mint_id in mint_ids {
+            if let Some(payment_id) = self.outbound_by_mint_id.remove(mint_id) {
+                affected_payment_ids.insert(payment_id);
+            }
+        }
+
+        for payment_id in affected_payment_ids {
+            if let Some(record) = self.outbound_payments.remove(&payment_id) {
+                self.push_notification(WalletNotification {
+                    kind: "payment_sent_released".to_string(),
+                    created_at: Self::now_unix(),
+                    payment_id: hex_key(&payment_id),
+                    amount: Some(record.amount),
+                    bill_count: Some(record.pending_mint_ids.len()),
+                    counterparty: Some(record.recipient.clone()),
+                    message: format!(
+                        "Pending payment to {} expired and its reserved bills were released.",
+                        record.recipient
+                    ),
+                });
+            }
+        }
+    }
+
     /// Persist the in-memory wallet billfold to disk immediately.
     /// Spend credentials are encrypted before writing.
     /// No-op if no wallet is loaded.
@@ -534,6 +672,9 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
         payment_latency: PaymentLatencyTracker::new(1000),
         wallet: wallet_state,
         wallet_path: config.wallet_path.clone(),
+        notifications: VecDeque::new(),
+        outbound_payments: HashMap::new(),
+        outbound_by_mint_id: HashMap::new(),
     }));
 
     let banishment = Arc::new(BanishmentManager::new());
@@ -675,6 +816,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 if let Some(ref mut ws) = s.wallet {
                     let released = ws.billfold.release_expired(3600, now);
                     if !released.is_empty() {
+                        s.release_outbound_mints(&released);
                         info!(count = released.len(), "released expired bill reservations");
                     }
                 }
@@ -1850,6 +1992,15 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                                 }
                             }
                             info!(amount = total, "auto-received payment into wallet");
+                            state.push_notification(WalletNotification {
+                                kind: "payment_received".to_string(),
+                                created_at: now,
+                                payment_id: hex_key(&payment_id),
+                                amount: Some(total),
+                                bill_count: Some(pending_oc.len()),
+                                counterparty: None,
+                                message: format!("Received {total} Vess and claimed ownership."),
+                            });
                             for oc in pending_oc { let _ = h_oc_tx.send(oc); }
                             // Persist wallet immediately after receiving bills.
                             state.flush_wallet();
@@ -2589,6 +2740,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                                     info!("bill permanently withdrawn after claim: {:?}", &oc.mint_id[..4]);
                                 }
                             }
+                            state.finalize_outbound_mint_if_complete(&oc.mint_id);
                         } else if oc.chain_depth == rec.chain_depth {
                             // Same depth — check if this is a competing claim
                             // for the same transfer slot.

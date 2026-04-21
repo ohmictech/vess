@@ -71,6 +71,10 @@ pub const DEFAULT_RPC_PORT: u16 = 9400;
 pub enum RpcRequest {
     Balance,
     NodeInfo,
+    Notifications {
+        #[serde(default)]
+        max: Option<usize>,
+    },
     TagLookup { tag: String },
     Send { amount: u64, recipient: String, #[serde(default)] memo: Option<String> },
     SendDirect { amount: u64, recipient: String, node_id: String, #[serde(default)] memo: Option<String> },
@@ -159,6 +163,9 @@ pub enum RpcData {
         amount: u64,
         remaining_balance: u64,
     },
+    Notifications {
+        notifications: Vec<crate::node_runner::WalletNotification>,
+    },
     WalletStatus {
         locked: bool,
         has_password: bool,
@@ -237,6 +244,7 @@ async fn handle_request(line: &str, state: &Arc<Mutex<ArteryState>>, senders: &Q
     match req {
         RpcRequest::Balance => handle_balance(state),
         RpcRequest::NodeInfo => handle_node_info(state),
+        RpcRequest::Notifications { max } => handle_notifications(state, max.unwrap_or(64)),
         RpcRequest::TagLookup { tag } => handle_tag_lookup(state, &tag),
         RpcRequest::Send { amount, recipient, memo } => handle_send(state, amount, &recipient, memo, senders),
         RpcRequest::SendDirect { amount, recipient, node_id, memo } => handle_send_direct(state, amount, &recipient, &node_id, memo, senders, node).await,
@@ -279,6 +287,13 @@ fn handle_node_info(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
         tag_count: s.tag_dht.record_count(),
         registry_count: s.registry.len(),
         limbo_count: s.limbo_mint_ids.len(),
+    })
+}
+
+fn handle_notifications(state: &Arc<Mutex<ArteryState>>, max: usize) -> RpcResponse {
+    let mut s = state.lock().unwrap();
+    RpcResponse::ok(RpcData::Notifications {
+        notifications: s.take_notifications(max),
     })
 }
 
@@ -363,7 +378,7 @@ fn handle_send(
         Err(e) => return RpcResponse::err(format!("bill selection failed: {e}")),
     };
 
-    let (msg, payment_id, _sent_mints) = if selection.change > 0 {
+    let (msg, payment_id, sent_mints) = if selection.change > 0 {
         // === CHANGE PATH: reforge ===
         let input_bills: Vec<vess_foundry::VessBill> = selection
             .send_indices
@@ -552,6 +567,20 @@ fn handle_send(
     if let PulseMessage::Payment(ref payment) = msg {
         let _ = senders.pay_tx.send(payment.clone());
     }
+
+    s.record_outbound_payment(payment_id, amount, recipient_tag.to_string(), &sent_mints);
+    s.push_notification(crate::node_runner::WalletNotification {
+        kind: "payment_sent".to_string(),
+        created_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        payment_id: hex_key(&payment_id),
+        amount: Some(amount),
+        bill_count: Some(sent_mints.len()),
+        counterparty: Some(recipient_tag.to_string()),
+        message: format!("Payment to {recipient_tag} queued for delivery."),
+    });
 
     // Persist wallet immediately so bill withdrawals/reservations survive a crash.
     s.flush_wallet();
@@ -831,6 +860,18 @@ async fn handle_send_direct(
                 let remaining = s.wallet.as_ref()
                     .map(|w| w.billfold.available_balance())
                     .unwrap_or(0);
+                s.push_notification(crate::node_runner::WalletNotification {
+                    kind: "payment_sent_confirmed".to_string(),
+                    created_at: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                    payment_id: hex_key(&payment_id),
+                    amount: Some(amount),
+                    bill_count: Some(sent_mints.len()),
+                    counterparty: Some(recipient_tag.to_string()),
+                    message: format!("Direct payment to {recipient_tag} was accepted by the recipient."),
+                });
                 RpcResponse::ok(RpcData::Send {
                     payment_id: hex_key(&payment_id),
                     amount,

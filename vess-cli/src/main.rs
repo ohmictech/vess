@@ -68,6 +68,19 @@ enum Command {
     /// Show wallet balance and denomination breakdown.
     Balance,
 
+    /// Show sender/receiver wallet notifications from the local node.
+    Notifications {
+        /// Keep polling and print events as they arrive.
+        #[arg(long)]
+        follow: bool,
+        /// Poll interval in milliseconds when following.
+        #[arg(long, default_value = "1000")]
+        interval_ms: u64,
+        /// Maximum queued notifications to fetch per poll.
+        #[arg(long, default_value = "64")]
+        max: usize,
+    },
+
     /// Send Vess to a recipient (by +tag or stealth address).
     Send {
         /// Amount to send.
@@ -176,6 +189,9 @@ async fn main() -> Result<()> {
         Command::Init { tag } => cmd_init(&cli, tag).await,
         Command::Recover { words, pin } => cmd_recover(&cli, words, pin).await,
         Command::Balance => cmd_balance(&cli).await,
+        Command::Notifications { follow, interval_ms, max } => {
+            cmd_notifications(&cli, *follow, *interval_ms, *max).await
+        }
         Command::Send { amount, recipient, memo, node_direct } => {
             cmd_send(&cli, *amount, recipient, memo.as_deref(), node_direct.as_deref()).await
         }
@@ -659,6 +675,89 @@ async fn cmd_balance(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
+async fn cmd_notifications(cli: &Cli, follow: bool, interval_ms: u64, max: usize) -> Result<()> {
+    let port = rpc_port(cli);
+
+    loop {
+        let resp = rpc_call(port, &json!({
+            "method": "notifications",
+            "max": max,
+        }))
+        .await?;
+
+        let notifications = resp["notifications"].as_array().cloned().unwrap_or_default();
+        let had_notifications = !notifications.is_empty();
+
+        for note in &notifications {
+            if cli.json {
+                println!("{}", json!({ "event": "notification", "notification": note }));
+            } else {
+                let kind = note["kind"].as_str().unwrap_or("notification");
+                let payment_id = note["payment_id"].as_str().unwrap_or("?");
+                let message = note["message"].as_str().unwrap_or("wallet event");
+                println!("[{kind}] {message} (payment_id: {payment_id})");
+            }
+        }
+
+        if !follow {
+            if !had_notifications && !cli.json {
+                println!("No notifications.");
+            }
+            return Ok(());
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(interval_ms.max(100))).await;
+    }
+}
+
+async fn auto_watch_send_confirmation(
+    cli: &Cli,
+    payment_id: &str,
+    timeout_ms: u64,
+) -> Result<()> {
+    let port = rpc_port(cli);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+
+    while std::time::Instant::now() < deadline {
+        let resp = rpc_call(port, &json!({
+            "method": "notifications",
+            "max": 64,
+        }))
+        .await?;
+
+        let notifications = resp["notifications"].as_array().cloned().unwrap_or_default();
+        let mut confirmed = false;
+
+        for note in &notifications {
+            let note_payment_id = note["payment_id"].as_str().unwrap_or("");
+            if note_payment_id != payment_id {
+                continue;
+            }
+
+            if cli.json {
+                println!("{}", json!({ "event": "notification", "notification": note }));
+            } else {
+                let kind = note["kind"].as_str().unwrap_or("notification");
+                let message = note["message"].as_str().unwrap_or("wallet event");
+                println!("[{kind}] {message}");
+            }
+
+            let kind = note["kind"].as_str().unwrap_or("");
+            if kind == "payment_sent_confirmed" || kind == "payment_sent_released" {
+                confirmed = true;
+            }
+        }
+
+        if confirmed {
+            break;
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    Ok(())
+}
+
 async fn cmd_send(cli: &Cli, amount: u64, recipient_id: &str, memo: Option<&str>, node_direct: Option<&str>) -> Result<()> {
     let port = rpc_port(cli);
     let mut req = if let Some(node_id) = node_direct {
@@ -680,6 +779,7 @@ async fn cmd_send(cli: &Cli, amount: u64, recipient_id: &str, memo: Option<&str>
     }
     let resp = rpc_call(port, &req).await?;
     if resp["ok"] == true {
+        let payment_id = resp["payment_id"].as_str().unwrap_or("?").to_string();
         if cli.json {
             println!("{resp}");
         } else {
@@ -688,10 +788,16 @@ async fn cmd_send(cli: &Cli, amount: u64, recipient_id: &str, memo: Option<&str>
             } else {
                 println!("Payment sent!");
             }
-            println!("Payment ID: {}", resp["payment_id"].as_str().unwrap_or("?"));
+            println!("Payment ID: {}", payment_id);
             println!("Amount:     {} Vess", resp["amount"]);
             println!("Balance:    {} Vess", resp["remaining_balance"]);
         }
+
+        // Automatic confirmation watch: no extra command needed.
+        // For relay sends, this catches the eventual recipient claim event.
+        // For direct sends, the accepted response is immediate but we still
+        // drain any matching queued notification for consistency.
+        auto_watch_send_confirmation(cli, &payment_id, 15_000).await?;
     } else {
         anyhow::bail!("{}", resp["error"].as_str().unwrap_or("unknown error"));
     }
