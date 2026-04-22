@@ -844,6 +844,26 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 if evicted > 0 {
                     info!(count = evicted, "evicted expired limbo buffer entries");
                 }
+                // Clean up limbo_mint_ids for payments whose TTL has expired.
+                // limbo_entry_times stores insertion-ms; TTL is 3600 s = 3_600_000 ms.
+                let ttl_ms: u64 = 3_600_000;
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                let stale: Vec<[u8; 32]> = s
+                    .limbo_entry_times
+                    .iter()
+                    .filter(|(_, &t)| now_ms.saturating_sub(t) > ttl_ms)
+                    .map(|(&mid, _)| mid)
+                    .collect();
+                for mid in &stale {
+                    s.limbo_mint_ids.remove(mid);
+                    s.limbo_entry_times.remove(mid);
+                }
+                if !stale.is_empty() {
+                    info!(count = stale.len(), "evicted expired limbo_mint_ids entries");
+                }
                 // Release bill reservations older than the limbo TTL (3600 s).
                 if let Some(ref mut ws) = s.wallet {
                     let released = ws.billfold.release_expired(3600, now);
@@ -2540,10 +2560,22 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     }
                 }
 
-                // 4. Check that the mint_id is active in the registry.
+                // 4. Check that the mint_id is active in the registry AND that
+                //    the registrant_vk is the current owner of that bill.
+                //    Without the ownership check, anyone can harden any tag
+                //    using an arbitrary active bill observed from the network.
                 if !state.registry.is_active(&tc.mint_id) {
                     warn!("TagConfirm: mint_id not active in registry");
                     return None;
+                }
+                if let Some(rec) = state.registry.get(&tc.mint_id) {
+                    let confirmor_vk_hash = vess_foundry::spend_auth::vk_hash(&tc.registrant_vk);
+                    if rec.current_owner_vk_hash != confirmor_vk_hash {
+                        warn!("TagConfirm: registrant_vk is not the current bill owner — banishing peer");
+                        state.peer_registry.mark_banished(peer_id);
+                        ban_ref.banish(peer_id);
+                        return None;
+                    }
                 }
 
                 // 5. Harden the tag.
@@ -2568,6 +2600,24 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
 
             PulseMessage::OwnershipGenesis(og) => {
                 info!(%peer, "ownership genesis for mint_id {:?}", &og.mint_id[..4]);
+
+                // 0a. Reject oversized proofs before any deserialization attempt.
+                //     Prevents OOM DoS via crafted multi-GB proof fields.
+                const MAX_PROOF_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
+                if og.proof.len() > MAX_PROOF_BYTES {
+                    warn!("ownership genesis: proof exceeds size limit ({} bytes) — banishing peer", og.proof.len());
+                    state.peer_registry.mark_banished(peer_id);
+                    ban_ref.banish(peer_id);
+                    return None;
+                }
+
+                // 0b. Reject genesis for a bill that was already consumed via reforge.
+                //     Without this check, a replayed OwnershipGenesis for a spent bill
+                //     would re-register it as active, polluting the registry.
+                if state.registry.was_consumed(&og.mint_id).is_some() {
+                    warn!("ownership genesis: mint_id {:?} is already consumed (tombstone exists) — ignoring", &og.mint_id[..4]);
+                    return None;
+                }
 
                 // 1. Check if already registered (idempotent).
                 if state.registry.is_active(&og.mint_id) {
@@ -2718,6 +2768,11 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     // 5. All input bills must be consumed (not active in registry).
                     //    If inputs are still active, the ReforgeAttestation hasn't
                     //    propagated yet — drop and let gossip retry (don't banish).
+                    //
+                    //    SECURITY: inputs must also have a tombstone (was_consumed)
+                    //    to prove they were legitimately minted and then consumed.
+                    //    An input that is neither active NOR tombstoned was never a
+                    //    real bill — accepting it would allow value inflation.
                     for input_mint_id in &rp.input_mint_ids {
                         if state.registry.is_active(input_mint_id) {
                             warn!(
@@ -2725,6 +2780,18 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                                  dropping (ReforgeAttestation may not have arrived yet)",
                                 &input_mint_id[..4]
                             );
+                            return None;
+                        }
+                        // Anti-inflation: reject if no tombstone exists for this input.
+                        // A missing tombstone means the input was never a valid bill.
+                        if state.registry.was_consumed(input_mint_id).is_none() {
+                            warn!(
+                                "ownership genesis: reforge input {:?} has no tombstone — \
+                                 inflation attack rejected — banishing peer",
+                                &input_mint_id[..4]
+                            );
+                            state.peer_registry.mark_banished(peer_id);
+                            ban_ref.banish(peer_id);
                             return None;
                         }
                     }

@@ -373,7 +373,9 @@ fn handle_balance(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
     let s = state.lock().unwrap();
     match &s.wallet {
         Some(ws) => RpcResponse::ok(RpcData::Balance {
-            balance: ws.billfold.balance(),
+            // Use available_balance so reserved (in-flight) bills are not shown
+            // as spendable. Total balance = available + reserved.
+            balance: ws.billfold.available_balance(),
             bill_count: ws.billfold.bills().len(),
         }),
         None => RpcResponse::err("wallet not loaded"),

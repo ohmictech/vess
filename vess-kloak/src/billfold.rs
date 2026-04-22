@@ -123,9 +123,9 @@ impl BillFold {
         counts.into_iter().collect()
     }
 
-    /// Whether the billfold has enough total value to cover an amount.
+    /// Whether the billfold has enough available (non-reserved) value to cover an amount.
     pub fn can_afford(&self, amount: u64) -> bool {
-        self.balance() >= amount
+        self.available_balance() >= amount
     }
 
     // ── Reservation (limbo / in-flight) ──────────────────────────
