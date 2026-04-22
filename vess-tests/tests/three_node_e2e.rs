@@ -220,6 +220,7 @@ async fn three_node_mint_send_claim() {
         digest: bill.digest,
         hops_remaining: 3,
         chain_depth: 0,
+        output_index: 0,
     });
 
     client_a

@@ -27,15 +27,15 @@
 use crate::{Denomination, VessBill};
 use anyhow::{anyhow, Result};
 use blake3::Hasher;
-use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
 /// A compound proof for split/combine reforges.
 ///
-/// Records the input bill digests and denominations so verifiers can
-/// confirm value conservation. Individual STARK proofs are already
-/// verified at bill genesis and stored in the ownership registry —
-/// they don't need to be re-bundled here.
+/// Records the input bill digests and denominations AND the committed output
+/// denominations so verifiers can confirm value conservation and prevent
+/// denomination inflation. Individual STARK proofs are already verified at
+/// bill genesis and stored in the ownership registry — they don't need to
+/// be re-bundled here.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReforgeProof {
     /// Mint IDs of the consumed input bills (for registry lookup).
@@ -44,28 +44,43 @@ pub struct ReforgeProof {
     pub input_digests: Vec<[u8; 32]>,
     /// Denomination for each consumed input bill.
     pub input_denominations: Vec<Denomination>,
+    /// Claimed output denominations — must sum to ∑ input denominations.
+    /// Committed here so verifiers can check each output against this list.
+    pub output_denominations: Vec<Denomination>,
 }
 
-/// Verify a compound reforge proof for a claimed output denomination.
+/// Verify a compound reforge proof.
 ///
 /// Checks:
-/// 1. The proof digest matches the expected digest.
-/// 2. The sum of input denominations is returned for the caller to
-///    verify value conservation across all outputs.
+/// 1. Array lengths are consistent.
+/// 2. The compound digest matches the serialized proof.
+/// 3. ∑ input denominations == ∑ output denominations (value conservation).
+/// 4. The claimed output denomination at `output_index` matches `expected_denomination`.
 ///
-/// Individual STARK proofs were already verified at genesis — the
-/// relay can confirm inputs are active via `registry.is_active()`.
+/// Individual STARK proofs were already verified at genesis — the relay
+/// confirms inputs are consumed via `registry.is_active()`.
 pub fn verify_reforge_proof(
     reforge_proof: &ReforgeProof,
     expected_digest: &[u8; 32],
-) -> Result<u64> {
+    output_index: usize,
+    expected_denomination: u64,
+) -> Result<()> {
     if reforge_proof.input_mint_ids.len() != reforge_proof.input_digests.len()
         || reforge_proof.input_mint_ids.len() != reforge_proof.input_denominations.len()
     {
         anyhow::bail!("reforge proof: array length mismatch");
     }
+    if reforge_proof.output_denominations.is_empty() {
+        anyhow::bail!("reforge proof: no output denominations");
+    }
+    if output_index >= reforge_proof.output_denominations.len() {
+        anyhow::bail!(
+            "reforge proof: output_index {output_index} out of bounds (len={})",
+            reforge_proof.output_denominations.len()
+        );
+    }
 
-    // Verify that the compound digest matches the serialized proof.
+    // Verify compound digest.
     let re_serialized = postcard::to_allocvec(reforge_proof)
         .map_err(|e| anyhow!("re-serialize reforge proof: {e}"))?;
     let mut h = Hasher::new();
@@ -76,14 +91,37 @@ pub fn verify_reforge_proof(
         anyhow::bail!("reforge proof digest mismatch");
     }
 
-    // Sum the input denominations — caller checks conservation.
-    let input_sum: u64 = reforge_proof
-        .input_denominations
-        .iter()
-        .map(|d| d.value())
-        .sum();
+    // Verify value conservation.
+    let input_sum: u64 = reforge_proof.input_denominations.iter().map(|d| d.value()).sum();
+    let output_sum: u64 = reforge_proof.output_denominations.iter().map(|d| d.value()).sum();
+    if input_sum != output_sum {
+        anyhow::bail!("reforge proof: value not conserved (in={input_sum}, out={output_sum})");
+    }
 
-    Ok(input_sum)
+    // Verify the claimed denomination for this specific output.
+    if reforge_proof.output_denominations[output_index].value() != expected_denomination {
+        anyhow::bail!(
+            "reforge proof: denomination mismatch at index {output_index}: \
+             proof says {}, genesis claims {expected_denomination}",
+            reforge_proof.output_denominations[output_index].value()
+        );
+    }
+
+    Ok(())
+}
+
+/// Derive the deterministic mint_id for a split/combine reforge output.
+///
+/// `reforge_mint_id = Blake3("vess-reforge-mint-id-v0" || compound_digest || output_index_le)`
+///
+/// Deterministic from the compound_digest (which commits to all input bills)
+/// so verifiers can re-derive it without a random nonce.
+pub fn reforge_mint_id(compound_digest: &[u8; 32], output_index: usize) -> [u8; 32] {
+    let mut h = Hasher::new();
+    h.update(b"vess-reforge-mint-id-v0");
+    h.update(compound_digest);
+    h.update(&(output_index as u32).to_le_bytes());
+    *h.finalize().as_bytes()
 }
 
 /// Serialize a ReforgeProof to bytes using postcard.
@@ -117,6 +155,9 @@ pub struct ReforgeResult {
     /// Mint IDs of the consumed input bills. These MUST be deleted from
     /// the ownership registry to prevent double-spending the inputs.
     pub consumed_mint_ids: Vec<[u8; 32]>,
+    /// Compound proof digest for split/combine reforges; `None` for 1:1 transfers.
+    /// Callers use this to build `OwnershipGenesis` without re-hashing.
+    pub compound_digest: Option<[u8; 32]>,
 }
 
 /// Execute a reforge operation.
@@ -160,8 +201,6 @@ pub fn reforge(request: ReforgeRequest) -> Result<ReforgeResult> {
         .unwrap_or_default()
         .as_secs();
 
-    let mut rng = rand::thread_rng();
-
     // Collect consumed mint_ids from inputs.
     let consumed_mint_ids: Vec<[u8; 32]> = request.inputs.iter().map(|b| b.mint_id).collect();
 
@@ -176,12 +215,14 @@ pub fn reforge(request: ReforgeRequest) -> Result<ReforgeResult> {
             .all(|(inp, &out_d)| inp.denomination == out_d);
 
     // For split/combine, bundle ALL input proofs + digests + denominations
-    // into a compound proof so verifiers can confirm value conservation.
+    // AND the committed output denominations into a compound proof so
+    // verifiers can confirm value conservation and prevent inflation.
     let compound_proof: Option<Vec<u8>> = if !is_one_to_one {
         let rp = ReforgeProof {
             input_mint_ids: request.inputs.iter().map(|b| b.mint_id).collect(),
             input_digests: request.inputs.iter().map(|b| b.digest).collect(),
             input_denominations: request.inputs.iter().map(|b| b.denomination).collect(),
+            output_denominations: request.output_denominations.clone(),
         };
         Some(postcard::to_allocvec(&rp).expect("reforge proof serialization should not fail"))
     } else {
@@ -202,10 +243,6 @@ pub fn reforge(request: ReforgeRequest) -> Result<ReforgeResult> {
         .zip(request.output_stealth_ids.iter())
         .enumerate()
         .map(|(i, (&denom, stealth_id))| {
-            // Fresh nonce for each output.
-            let mut nonce = [0u8; 32];
-            rng.fill_bytes(&mut nonce);
-
             // Proof bytes: carry forward from input or use compound.
             let proof_bytes = if is_one_to_one {
                 // 1:1 — inherit the ORIGINAL STARK proof unchanged.
@@ -231,15 +268,9 @@ pub fn reforge(request: ReforgeRequest) -> Result<ReforgeResult> {
             let (mint_id, chain_tip) = if is_one_to_one {
                 (request.inputs[i].mint_id, request.inputs[i].chain_tip)
             } else {
-                // New mint_id for split/combine outputs.
-                let mint_id = {
-                    let mut h = Hasher::new();
-                    h.update(b"vess-reforge-mint-id-v0");
-                    h.update(&compound_digest.unwrap());
-                    h.update(&(i as u32).to_le_bytes());
-                    h.update(&nonce);
-                    *h.finalize().as_bytes()
-                };
+                // New mint_id for split/combine outputs — deterministic from
+                // compound_digest so verifiers can re-derive without a random nonce.
+                let mint_id = reforge_mint_id(&compound_digest.unwrap(), i);
                 // chain_tip will be set when registered via OwnershipGenesis.
                 // Use zeroed placeholder — the wallet must call genesis_chain_tip()
                 // before registering.
@@ -265,6 +296,7 @@ pub fn reforge(request: ReforgeRequest) -> Result<ReforgeResult> {
     Ok(ReforgeResult {
         outputs,
         consumed_mint_ids,
+        compound_digest,
     })
 }
 

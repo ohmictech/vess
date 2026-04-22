@@ -558,6 +558,7 @@ async fn five_node_full_network() {
             digest: [0xAA; 32],
             hops_remaining: 3,
             chain_depth: 0,
+            output_index: 0,
         });
         evil_node
             .send_message(artery_addr.clone(), &fake_genesis)
@@ -665,6 +666,7 @@ async fn five_node_full_network() {
             digest: [0xEE; 32],
             hops_remaining: 3,
             chain_depth: 0,
+            output_index: 0,
         });
         evil_node
             .send_message(artery_addr.clone(), &inflated)
@@ -697,6 +699,7 @@ async fn five_node_full_network() {
             digest: alice_bill.digest,
             hops_remaining: 3,
             chain_depth: 0,
+            output_index: 0,
         });
         evil_node
             .send_message(artery_addr.clone(), &replay)

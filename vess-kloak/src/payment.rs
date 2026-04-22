@@ -632,6 +632,7 @@ pub fn build_genesis_messages(bills: &[(VessBill, Vec<u8>)], owner_vk: &[u8]) ->
                 digest: bill.digest,
                 hops_remaining: 6,
                 chain_depth: 0,
+                output_index: 0,
             })
         })
         .collect()

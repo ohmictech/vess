@@ -749,12 +749,14 @@ async fn handle_send(
         }
 
         // OwnershipGenesis for each change bill (registers them in the DHT).
-        for (bill, proof_bytes) in &change_bills {
+        for (j, (bill, proof_bytes)) in change_bills.iter().enumerate() {
             if let Some(cred) = reforged_creds.get(&bill.mint_id) {
                 let owner_vk_hash = vess_foundry::spend_auth::vk_hash(&cred.spend_vk);
+                // Compute correct genesis chain_tip (reforge outputs have [0;32] placeholder).
+                let chain_tip = vess_foundry::genesis_chain_tip(&bill.mint_id, &owner_vk_hash);
                 let _ = senders.og_tx.send(vess_protocol::OwnershipGenesis {
                     mint_id: bill.mint_id,
-                    chain_tip: bill.chain_tip,
+                    chain_tip,
                     owner_vk_hash,
                     owner_vk: cred.spend_vk.clone(),
                     denomination_value: bill.denomination.value(),
@@ -762,6 +764,7 @@ async fn handle_send(
                     digest: bill.digest,
                     hops_remaining: 6,
                     chain_depth: 0,
+                    output_index: (send_count + j) as u32,
                 });
             }
         }
@@ -771,9 +774,10 @@ async fn handle_send(
             if let Some(cred) = reforged_creds.get(&bill.mint_id) {
                 let proof_bytes = result.outputs[i].1.clone();
                 let owner_vk_hash = vess_foundry::spend_auth::vk_hash(&cred.spend_vk);
+                let chain_tip = vess_foundry::genesis_chain_tip(&bill.mint_id, &owner_vk_hash);
                 let _ = senders.og_tx.send(vess_protocol::OwnershipGenesis {
                     mint_id: bill.mint_id,
-                    chain_tip: bill.chain_tip,
+                    chain_tip,
                     owner_vk_hash,
                     owner_vk: cred.spend_vk.clone(),
                     denomination_value: bill.denomination.value(),
@@ -781,6 +785,7 @@ async fn handle_send(
                     digest: bill.digest,
                     hops_remaining: 6,
                     chain_depth: 0,
+                    output_index: i as u32,
                 });
             }
         }
@@ -1035,19 +1040,21 @@ async fn handle_send_direct(
                 });
             }
 
-            for (bill, _) in &change_bills {
+            for (j, (bill, proof_bytes)) in change_bills.iter().enumerate() {
                 if let Some(cred) = reforged_creds.get(&bill.mint_id) {
                     let owner_vk_hash = vess_foundry::spend_auth::vk_hash(&cred.spend_vk);
+                    let chain_tip = vess_foundry::genesis_chain_tip(&bill.mint_id, &owner_vk_hash);
                     let _ = senders.og_tx.send(vess_protocol::OwnershipGenesis {
                         mint_id: bill.mint_id,
-                        chain_tip: bill.chain_tip,
+                        chain_tip,
                         owner_vk_hash,
                         owner_vk: cred.spend_vk.clone(),
                         denomination_value: bill.denomination.value(),
-                        proof: Vec::new(),
+                        proof: proof_bytes.clone(),
                         digest: bill.digest,
                         hops_remaining: 6,
                         chain_depth: 0,
+                        output_index: (send_count + j) as u32,
                     });
                 }
             }
@@ -1056,9 +1063,10 @@ async fn handle_send_direct(
                 if let Some(cred) = reforged_creds.get(&bill.mint_id) {
                     let proof_bytes = result.outputs[i].1.clone();
                     let owner_vk_hash = vess_foundry::spend_auth::vk_hash(&cred.spend_vk);
+                    let chain_tip = vess_foundry::genesis_chain_tip(&bill.mint_id, &owner_vk_hash);
                     let _ = senders.og_tx.send(vess_protocol::OwnershipGenesis {
                         mint_id: bill.mint_id,
-                        chain_tip: bill.chain_tip,
+                        chain_tip,
                         owner_vk_hash,
                         owner_vk: cred.spend_vk.clone(),
                         denomination_value: bill.denomination.value(),
@@ -1066,6 +1074,7 @@ async fn handle_send_direct(
                         digest: bill.digest,
                         hops_remaining: 6,
                         chain_depth: 0,
+                        output_index: i as u32,
                     });
                 }
             }
@@ -1542,6 +1551,7 @@ fn handle_ownership_genesis(
         digest,
         hops_remaining: 6,
         chain_depth: 0,
+        output_index: 0,
     });
 
     RpcResponse::ok(RpcData::Empty {})

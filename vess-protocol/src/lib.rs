@@ -482,6 +482,11 @@ pub struct OwnershipGenesis {
     /// Chain depth at genesis is always 0.
     #[serde(default)]
     pub chain_depth: u64,
+    /// Output index within a split/combine reforge (0-based).
+    /// Set to 0 for regular minted bills. Used by verifiers to derive
+    /// and confirm the `mint_id` of a reforge output without a random nonce.
+    #[serde(default)]
+    pub output_index: u32,
 }
 
 /// Claim ownership of a bill after receiving a transfer.

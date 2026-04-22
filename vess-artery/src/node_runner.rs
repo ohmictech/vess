@@ -2579,10 +2579,14 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     return None;
                 }
 
-                // 2. Verify proof — supports both single STARK and aggregate proofs.
+                // 2. Verify proof — supports STARK, aggregate, and reforge proofs.
                 //    Single STARK: D1 bills or 1:1 reforges (postcard VessProof).
                 //    Aggregate: D2+ bills from flow-based minting (postcard AggregateProof).
+                //    ReforgeProof: split/combine outputs.
                 let proof_nonce: [u8; 32];
+                // Set to true when the ReforgeProof branch already verified mint_id
+                // (uses different derivation formula from minted bills).
+                let mut mint_id_pre_verified = false;
                 if let Ok(iop_proof) = vess_foundry::proof::deserialize_proof(&og.proof) {
                     // ── Single STARK path ──
                     if let Err(e) = vess_foundry::proof::verify_proof(&iop_proof, &og.digest) {
@@ -2654,6 +2658,80 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     // Sampled aggregate nonce = nonce_tree_root (deterministic
                     // from proof, no need for all N individual nonces).
                     proof_nonce = sap.nonce_tree_root;
+                } else if let Ok(rp) = vess_foundry::reforge::deserialize_reforge_proof(&og.proof) {
+                    // ── Reforge output genesis (split / combine) ──────────────────
+                    //
+                    // The proof is a `ReforgeProof` committed to:
+                    //   • all input mint_ids + digests + denominations
+                    //   • all output denominations
+                    // making it impossible to inflate the denomination of any output.
+
+                    // 1. Re-derive compound_digest and verify the committed proof.
+                    let re_serialized = vess_foundry::reforge::serialize_reforge_proof(&rp);
+                    let compound_digest: [u8; 32] = {
+                        let mut h = blake3::Hasher::new();
+                        h.update(b"vess-reforge-digest-v0");
+                        h.update(&re_serialized);
+                        *h.finalize().as_bytes()
+                    };
+                    if compound_digest != og.digest {
+                        warn!("ownership genesis: reforge compound_digest mismatch — banishing peer");
+                        state.peer_registry.mark_banished(peer_id);
+                        ban_ref.banish(peer_id);
+                        return None;
+                    }
+
+                    // 2. Value conservation check.
+                    let input_sum: u64 = rp.input_denominations.iter().map(|d| d.value()).sum();
+                    let output_sum: u64 = rp.output_denominations.iter().map(|d| d.value()).sum();
+                    if input_sum != output_sum {
+                        warn!("ownership genesis: reforge value not conserved (in={input_sum}, out={output_sum}) — banishing peer");
+                        state.peer_registry.mark_banished(peer_id);
+                        ban_ref.banish(peer_id);
+                        return None;
+                    }
+
+                    // 3. Verify the claimed denomination for this specific output index.
+                    let output_index = og.output_index as usize;
+                    if output_index >= rp.output_denominations.len() {
+                        warn!("ownership genesis: output_index {output_index} out of bounds — banishing peer");
+                        state.peer_registry.mark_banished(peer_id);
+                        ban_ref.banish(peer_id);
+                        return None;
+                    }
+                    if rp.output_denominations[output_index].value() != og.denomination_value {
+                        warn!("ownership genesis: reforge denomination mismatch at index {output_index} — banishing peer");
+                        state.peer_registry.mark_banished(peer_id);
+                        ban_ref.banish(peer_id);
+                        return None;
+                    }
+
+                    // 4. Derive and verify mint_id deterministically.
+                    let expected_mint_id = vess_foundry::reforge::reforge_mint_id(&compound_digest, output_index);
+                    if expected_mint_id != og.mint_id {
+                        warn!("ownership genesis: reforge mint_id derivation mismatch — banishing peer");
+                        state.peer_registry.mark_banished(peer_id);
+                        ban_ref.banish(peer_id);
+                        return None;
+                    }
+
+                    // 5. All input bills must be consumed (not active in registry).
+                    //    If inputs are still active, the ReforgeAttestation hasn't
+                    //    propagated yet — drop and let gossip retry (don't banish).
+                    for input_mint_id in &rp.input_mint_ids {
+                        if state.registry.is_active(input_mint_id) {
+                            warn!(
+                                "ownership genesis: reforge input {:?} still active — \
+                                 dropping (ReforgeAttestation may not have arrived yet)",
+                                &input_mint_id[..4]
+                            );
+                            return None;
+                        }
+                    }
+
+                    // Use compound_digest as the stored proof_nonce (identifies reforge in registry).
+                    proof_nonce = compound_digest;
+                    mint_id_pre_verified = true; // Already checked above via reforge_mint_id.
                 } else {
                     warn!("ownership genesis: malformed proof (neither STARK nor aggregate) — banishing peer");
                     state.peer_registry.mark_banished(peer_id);
@@ -2670,13 +2748,15 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     return None;
                 }
 
-                // 4. Verify mint_id derivation.
-                let expected_mint_id = vess_foundry::derive_mint_id(&og.digest, &proof_nonce);
-                if expected_mint_id != og.mint_id {
-                    warn!("ownership genesis: mint_id derivation mismatch — banishing peer");
-                    state.peer_registry.mark_banished(peer_id);
-                    ban_ref.banish(peer_id);
-                    return None;
+                // 4. Verify mint_id derivation (skipped for reforge outputs — already verified above).
+                if !mint_id_pre_verified {
+                    let expected_mint_id = vess_foundry::derive_mint_id(&og.digest, &proof_nonce);
+                    if expected_mint_id != og.mint_id {
+                        warn!("ownership genesis: mint_id derivation mismatch — banishing peer");
+                        state.peer_registry.mark_banished(peer_id);
+                        ban_ref.banish(peer_id);
+                        return None;
+                    }
                 }
 
                 // 5. Verify genesis chain_tip.
