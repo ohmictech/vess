@@ -18,6 +18,7 @@ use tracing::{info, warn};
 
 use vess_foundry::reforge::{reforge, ReforgeRequest};
 use vess_foundry::spend_auth::generate_spend_keypair;
+use vess_kloak::auto_reforge::ConsolidationScheduler;
 use vess_kloak::billfold::SpendCredential;
 use vess_kloak::payment::{prepare_payment_from_bills, prepare_payment_with_transfer};
 use vess_kloak::selection::{decompose_amount, select_bills_filtered};
@@ -564,6 +565,165 @@ async fn handle_tag_lookup(
     }
 }
 
+/// Opportunistic consolidation: while spend keys are already unlocked for a
+/// payment, reforge small bills into larger denominations in the background.
+///
+/// Scans bills that are NOT being sent (`excluded`) and NOT already reserved,
+/// finds groups whose combined value equals a valid denomination, and reforges
+/// up to 2 groups (highest combined value first). Each consolidation is
+/// completely independent of the payment — failures are silently skipped.
+fn fire_opportunistic_consolidations(
+    s: &mut ArteryState,
+    cred_map: &HashMap<[u8; 32], SpendCredential>,
+    excluded: &[[u8; 32]],
+    senders: &QueueSenders,
+) {
+    let ws = match s.wallet.as_ref() {
+        Some(w) => w,
+        None => return,
+    };
+
+    // Bills eligible for consolidation: not being sent, not reserved, have known creds.
+    let excluded_set: std::collections::HashSet<[u8; 32]> = excluded.iter().copied().collect();
+    let available: Vec<vess_foundry::VessBill> = ws
+        .billfold
+        .bills()
+        .iter()
+        .filter(|b| {
+            !excluded_set.contains(&b.mint_id)
+                && !ws.billfold.is_reserved(&b.mint_id)
+                && cred_map.contains_key(&b.mint_id)
+        })
+        .cloned()
+        .collect();
+
+    if available.len() < 2 {
+        return;
+    }
+
+    let mut candidates = ConsolidationScheduler::new().scan(&available);
+    if candidates.is_empty() {
+        return;
+    }
+
+    // Largest target denomination first, cap at 2 to avoid network noise.
+    candidates
+        .sort_by(|a, b| b.target_denomination.value().cmp(&a.target_denomination.value()));
+    candidates.truncate(2);
+
+    for candidate in candidates {
+        let input_bills: Vec<vess_foundry::VessBill> =
+            candidate.indices.iter().map(|&i| available[i].clone()).collect();
+
+        if input_bills.iter().any(|b| !cred_map.contains_key(&b.mint_id)) {
+            continue;
+        }
+
+        let output_stealth_id = input_bills[0].stealth_id;
+        let result = match reforge(ReforgeRequest {
+            inputs: input_bills.clone(),
+            output_denominations: vec![candidate.target_denomination],
+            output_stealth_ids: vec![output_stealth_id],
+        }) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("opportunistic consolidation: reforge error: {e}");
+                continue;
+            }
+        };
+
+        let (new_bill, proof_bytes) = result.outputs[0].clone();
+        let (new_vk, new_sk) = generate_spend_keypair();
+        let new_cred = SpendCredential { spend_vk: new_vk, spend_sk: new_sk };
+
+        // Build and sign ReforgeAttestation.
+        let mut sorted_consumed = result.consumed_mint_ids.clone();
+        sorted_consumed.sort();
+        let reforge_id = {
+            let mut h = blake3::Hasher::new();
+            h.update(b"vess-reforge-id-v0");
+            for mid in &sorted_consumed {
+                h.update(mid);
+            }
+            *h.finalize().as_bytes()
+        };
+
+        let mut consume_sigs = Vec::<Vec<u8>>::new();
+        let mut owner_vk_for_ra = Vec::<u8>::new();
+        let mut sig_ok = true;
+        for mid in &result.consumed_mint_ids {
+            if let Some(cred) = cred_map.get(mid) {
+                let digest = {
+                    let mut h = blake3::Hasher::new();
+                    h.update(b"vess-reforge-consume-v0");
+                    h.update(mid);
+                    h.update(&reforge_id);
+                    *h.finalize().as_bytes()
+                };
+                match vess_foundry::spend_auth::sign_spend(&cred.spend_sk, &digest) {
+                    Ok(sig) => {
+                        consume_sigs.push(sig);
+                        if owner_vk_for_ra.is_empty() {
+                            owner_vk_for_ra = cred.spend_vk.clone();
+                        }
+                    }
+                    Err(e) => {
+                        warn!("opportunistic consolidation: sign error: {e}");
+                        sig_ok = false;
+                        break;
+                    }
+                }
+            } else {
+                sig_ok = false;
+                break;
+            }
+        }
+        if !sig_ok || consume_sigs.len() != result.consumed_mint_ids.len() {
+            warn!("opportunistic consolidation: incomplete signatures — skipping");
+            continue;
+        }
+
+        let _ = senders.ra_tx.send(vess_protocol::ReforgeAttestation {
+            consumed_mint_ids: result.consumed_mint_ids.clone(),
+            owner_vk: owner_vk_for_ra,
+            consume_sigs,
+            reforge_id,
+            output_mint_ids: vec![new_bill.mint_id],
+            hops_remaining: 6,
+        });
+
+        let owner_vk_hash = vess_foundry::spend_auth::vk_hash(&new_cred.spend_vk);
+        let chain_tip = vess_foundry::genesis_chain_tip(&new_bill.mint_id, &owner_vk_hash);
+        let _ = senders.og_tx.send(vess_protocol::OwnershipGenesis {
+            mint_id: new_bill.mint_id,
+            chain_tip,
+            owner_vk_hash,
+            owner_vk: new_cred.spend_vk.clone(),
+            denomination_value: new_bill.denomination.value(),
+            proof: proof_bytes,
+            digest: new_bill.digest,
+            hops_remaining: 6,
+            chain_depth: 0,
+            output_index: 0,
+        });
+
+        // Update billfold atomically.
+        let ws_mut = s.wallet.as_mut().unwrap();
+        for mid in &result.consumed_mint_ids {
+            ws_mut.billfold.withdraw(mid);
+        }
+        ws_mut.billfold.deposit_with_credentials(new_bill.clone(), new_cred);
+
+        info!(
+            "opportunistic consolidation: {}×{} → {} (mint_id {:?})",
+            input_bills.len(),
+            input_bills[0].denomination.value(),
+            new_bill.denomination.value(),
+            &new_bill.mint_id[..4],
+        );
+    }
+}
+
 async fn handle_send(
     state: &Arc<Mutex<ArteryState>>,
     node: &VessNode,
@@ -843,6 +1003,9 @@ async fn handle_send(
         message: format!("Payment to {recipient_tag} queued for delivery."),
     });
 
+    // Opportunistically consolidate other bills while keys are unlocked.
+    fire_opportunistic_consolidations(&mut s, &cred_map, &sent_mints, senders);
+
     // Persist wallet immediately so bill withdrawals/reservations survive a crash.
     s.flush_wallet();
 
@@ -1085,6 +1248,8 @@ async fn handle_send_direct(
                 }
             }
 
+            // Consolidate other bills while spend keys are unlocked.
+            fire_opportunistic_consolidations(&mut s, &cred_map, &sent_mints, senders);
             s.flush_wallet();
             (msg, pid, sent_mints)
         } else {
@@ -1111,6 +1276,8 @@ async fn handle_send_direct(
                 .unwrap_or_default()
                 .as_secs();
             ws_mut.billfold.reserve(&mint_ids, now);
+            // Consolidate other bills while spend keys are unlocked.
+            fire_opportunistic_consolidations(&mut s, &cred_map, &mint_ids, senders);
             s.flush_wallet();
 
             (msg, pid, mint_ids)
