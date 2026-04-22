@@ -707,6 +707,7 @@ fn artery_snapshot_save_load() {
         banned_peers: vec![[0xBB; 32]],
         ownership_records: vec![record1, record2],
         manifests: std::collections::BTreeMap::new(),
+        peer_endpoints: std::collections::BTreeMap::new(),
     };
 
     storage.save(&snapshot).unwrap();

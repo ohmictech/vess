@@ -120,15 +120,12 @@ async fn payment_message_survives_wire_roundtrip() {
     });
 
     // Build a Payment message with realistic fields.
-    let bill = fresh_bill(Denomination::D10);
     let payment = PulseMessage::Payment(Payment {
         payment_id: rand::random(),
         stealth_payload: vec![0xAB; 256],
         view_tag: 0x42,
         stealth_id: rand::random(),
         created_at: now_unix(),
-        mint_ids: vec![bill.mint_id],
-        denomination_values: vec![bill.denomination.value()],
         bill_count: 1,
     });
 
@@ -142,9 +139,7 @@ async fn payment_message_survives_wire_roundtrip() {
 
     match &msgs[0] {
         PulseMessage::Payment(p) => {
-            assert_eq!(p.mint_ids.len(), 1);
-            assert_eq!(p.mint_ids[0], bill.mint_id);
-            assert_eq!(p.denomination_values[0], 10);
+            assert_eq!(p.bill_count, 1);
             assert_eq!(p.view_tag, 0x42);
         }
         other => panic!("expected Payment, got: {other:?}"),
@@ -265,15 +260,12 @@ async fn three_node_relay() {
     });
 
     // A sends a Payment to B.
-    let bill = fresh_bill(Denomination::D10);
     let payment_msg = PulseMessage::Payment(Payment {
         payment_id: rand::random(),
         stealth_payload: vec![0xAB; 64],
         view_tag: 0x11,
         stealth_id: rand::random(),
         created_at: now_unix(),
-        mint_ids: vec![bill.mint_id],
-        denomination_values: vec![10],
         bill_count: 1,
     });
 
@@ -289,7 +281,7 @@ async fn three_node_relay() {
     assert_eq!(msgs.len(), 1);
     match &msgs[0] {
         PulseMessage::Payment(p) => {
-            assert_eq!(p.denomination_values[0], 10);
+            assert_eq!(p.bill_count, 1);
         }
         other => panic!("expected Payment at C, got: {other:?}"),
     }
