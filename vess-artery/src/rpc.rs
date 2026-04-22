@@ -21,14 +21,16 @@ use vess_foundry::spend_auth::generate_spend_keypair;
 use vess_kloak::billfold::SpendCredential;
 use vess_kloak::payment::{prepare_payment_from_bills, prepare_payment_with_transfer};
 use vess_kloak::selection::{decompose_amount, select_bills_filtered};
-use vess_protocol::{ManifestStore, PulseMessage, TagStore};
+use vess_protocol::{ManifestStore, PulseMessage, TagLookup, TagStore};
 use vess_stealth::MasterStealthAddress;
 use vess_tag::{TagRecord, VessTag};
 use vess_vascular::VessNode;
 
+use crate::gossip::k_nearest;
 use crate::node_runner::ArteryState;
 use crate::node_runner::WalletState;
 use crate::persistence::hex_key;
+use crate::tag_resolver::{TagResolution, TagResolver};
 
 /// Channel senders for gossip queues (shared with drain loops via mpsc).
 #[derive(Clone)]
@@ -277,12 +279,12 @@ async fn handle_request(
         RpcRequest::Balance => handle_balance(state),
         RpcRequest::NodeInfo => handle_node_info(state),
         RpcRequest::Notifications { max } => handle_notifications(state, max.unwrap_or(64)),
-        RpcRequest::TagLookup { tag } => handle_tag_lookup(state, &tag),
+        RpcRequest::TagLookup { tag } => handle_tag_lookup(state, node, &tag).await,
         RpcRequest::Send {
             amount,
             recipient,
             memo,
-        } => handle_send(state, amount, &recipient, memo, senders),
+        } => handle_send(state, node, amount, &recipient, memo, senders).await,
         RpcRequest::SendDirect {
             amount,
             recipient,
@@ -399,41 +401,159 @@ fn handle_notifications(state: &Arc<Mutex<ArteryState>>, max: usize) -> RpcRespo
     })
 }
 
-fn handle_tag_lookup(state: &Arc<Mutex<ArteryState>>, tag: &str) -> RpcResponse {
-    let tag_str = tag.strip_prefix('+').unwrap_or(tag);
-    let mut s = state.lock().unwrap();
+/// Number of peers to query for a DHT tag lookup when the local shard
+/// has no record.  We fan out to up to this many peers and run
+/// `TagResolver` quorum verification over the responses.
+const TAG_LOOKUP_FAN_OUT: usize = 9;
 
-    // ── Check local tag cache first ─────────────────────────────────
+/// Timeout (milliseconds) for a single peer's `TagLookup` response.
+const TAG_LOOKUP_TIMEOUT_MS: u64 = 4_000;
+
+/// Active DHT tag resolution.
+///
+/// Priority order:
+/// 1. Local tag cache (fastest — no I/O).
+/// 2. Local DHT shard (in-memory, no network).
+/// 3. Fan out `TagLookup` pulses to the K-nearest routable peers and
+///    verify the result with `TagResolver` (quorum ≥ 5 matching nodes).
+///
+/// Returns `Some(address)` when verified, `None` if the tag is unknown
+/// across the network.
+async fn resolve_tag(
+    state: &Arc<Mutex<ArteryState>>,
+    node: &VessNode,
+    tag_str: &str,
+) -> Option<MasterStealthAddress> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    if let Some(cached) = s.tag_cache.get(tag_str, now) {
-        return RpcResponse::ok(RpcData::TagLookup {
-            found: true,
-            tag: tag_str.to_owned(),
-            scan_ek: Some(to_hex(&cached.scan_ek)),
-            spend_ek: Some(to_hex(&cached.spend_ek)),
-            hardened: None,
-        });
+
+    // ── 1. Local cache ───────────────────────────────────────────────
+    {
+        let mut s = state.lock().unwrap();
+        if let Some(cached) = s.tag_cache.get(tag_str, now) {
+            return Some(MasterStealthAddress {
+                scan_ek: cached.scan_ek,
+                spend_ek: cached.spend_ek,
+            });
+        }
     }
 
-    // ── Fall back to the local DHT shard ────────────────────────────
-    match s.tag_dht.lookup(tag_str) {
-        Some(record) => {
-            let scan_ek = record.master_address.scan_ek.clone();
-            let spend_ek = record.master_address.spend_ek.clone();
-            let hardened = record.hardened_at.is_some();
-            // Persist into local cache so future lookups are instant.
-            s.tag_cache.insert(tag_str, scan_ek.clone(), spend_ek.clone(), now);
-            RpcResponse::ok(RpcData::TagLookup {
-                found: true,
-                tag: tag_str.to_owned(),
-                scan_ek: Some(to_hex(&scan_ek)),
-                spend_ek: Some(to_hex(&spend_ek)),
-                hardened: Some(hardened),
-            })
+    // ── 2. Local DHT shard ──────────────────────────────────────────
+    {
+        let mut s = state.lock().unwrap();
+        if let Some(record) = s.tag_dht.lookup(tag_str) {
+            let addr = MasterStealthAddress {
+                scan_ek: record.master_address.scan_ek.clone(),
+                spend_ek: record.master_address.spend_ek.clone(),
+            };
+            s.tag_cache.insert(tag_str, addr.scan_ek.clone(), addr.spend_ek.clone(), now);
+            return Some(addr);
         }
+    }
+
+    // ── 3. Active DHT query ─────────────────────────────────────────
+    // Select peers closest to the tag's DHT key.
+    let tag_hash: [u8; 32] = *blake3::hash(tag_str.as_bytes()).as_bytes();
+    let nonce: [u8; 16] = rand::random();
+
+    let targets: Vec<(iroh::EndpointId, [u8; 32])> = {
+        let s = state.lock().unwrap();
+        let peers = s.routing_table.routable_peers(|_| true);
+        if peers.is_empty() {
+            return None;
+        }
+        let peer_hashes: Vec<[u8; 32]> = peers.iter().map(|p| p.id_hash).collect();
+        let nearest_indices = k_nearest(&tag_hash, &peer_hashes, TAG_LOOKUP_FAN_OUT);
+        nearest_indices
+            .into_iter()
+            .filter_map(|i| {
+                let p = &peers[i];
+                let arr: [u8; 32] = p.id_bytes.as_slice().try_into().ok()?;
+                let eid = iroh::EndpointId::from_bytes(&arr).ok()?;
+                Some((eid, p.id_hash))
+            })
+            .collect()
+    };
+
+    if targets.is_empty() {
+        return None;
+    }
+
+    // Send `TagLookup` concurrently to all selected peers.
+    let lookup_msg = PulseMessage::TagLookup(TagLookup {
+        tag_hash,
+        nonce,
+    });
+
+    let mut tasks = Vec::with_capacity(targets.len());
+    for (eid, id_hash) in targets {
+        let n = node.clone();
+        let msg = lookup_msg.clone();
+        tasks.push(tokio::spawn(async move {
+            let resp = tokio::time::timeout(
+                std::time::Duration::from_millis(TAG_LOOKUP_TIMEOUT_MS),
+                n.send_message_with_response(eid, &msg),
+            )
+            .await;
+            (id_hash, resp)
+        }));
+    }
+
+    let results = futures::future::join_all(tasks).await;
+
+    // Collect responses and run quorum verification.
+    let mut resolver = TagResolver::new();
+    for join_result in results {
+        let Ok((id_hash, timeout_result)) = join_result else {
+            continue;
+        };
+        let Ok(Ok(Some(PulseMessage::TagLookupResponse(tlr)))) = timeout_result else {
+            continue;
+        };
+        // Ignore responses with wrong nonce (could be stale).
+        if tlr.nonce != nonce {
+            continue;
+        }
+        match resolver.add_response(id_hash, &tlr) {
+            TagResolution::Verified { address, .. } => {
+                // Quorum reached — cache and return.
+                let mut s = state.lock().unwrap();
+                s.tag_cache.insert(
+                    tag_str,
+                    address.scan_ek.clone(),
+                    address.spend_ek.clone(),
+                    now,
+                );
+                return Some(address);
+            }
+            TagResolution::Conflict { .. } => {
+                warn!(tag = tag_str, "tag lookup: conflicting records from network");
+                return None;
+            }
+            _ => {} // Pending or NotFound — keep collecting
+        }
+    }
+
+    None
+}
+
+async fn handle_tag_lookup(
+    state: &Arc<Mutex<ArteryState>>,
+    node: &VessNode,
+    tag: &str,
+) -> RpcResponse {
+    let tag_str = tag.strip_prefix('+').unwrap_or(tag);
+
+    match resolve_tag(state, node, tag_str).await {
+        Some(addr) => RpcResponse::ok(RpcData::TagLookup {
+            found: true,
+            tag: tag_str.to_owned(),
+            scan_ek: Some(to_hex(&addr.scan_ek)),
+            spend_ek: Some(to_hex(&addr.spend_ek)),
+            hardened: None,
+        }),
         None => RpcResponse::ok(RpcData::TagLookup {
             found: false,
             tag: tag_str.to_owned(),
@@ -444,8 +564,9 @@ fn handle_tag_lookup(state: &Arc<Mutex<ArteryState>>, tag: &str) -> RpcResponse 
     }
 }
 
-fn handle_send(
+async fn handle_send(
     state: &Arc<Mutex<ArteryState>>,
+    node: &VessNode,
     amount: u64,
     recipient_tag: &str,
     memo: Option<String>,
@@ -453,39 +574,20 @@ fn handle_send(
 ) -> RpcResponse {
     let tag_str = recipient_tag.strip_prefix('+').unwrap_or(recipient_tag);
 
+    // ── Resolve tag (cache → local DHT → active DHT query) ──────────
+    // Done outside the mutex so the async network query doesn't block
+    // the state lock.
+    let recipient_address = match resolve_tag(state, node, tag_str).await {
+        Some(addr) => addr,
+        None => return RpcResponse::err(format!("tag +{tag_str} not found")),
+    };
+
     let mut s = state.lock().unwrap();
 
     // ── Require wallet ──────────────────────────────────────────────
     if s.wallet.is_none() {
         return RpcResponse::err("wallet not loaded");
     }
-
-    // ── Resolve tag ─────────────────────────────────────────────────
-    let recipient_address = match s.tag_cache.get(tag_str, std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs(),
-    ) {
-        Some(cached) => MasterStealthAddress {
-            scan_ek: cached.scan_ek,
-            spend_ek: cached.spend_ek,
-        },
-        None => match s.tag_dht.lookup(tag_str) {
-            Some(record) => {
-                let addr = MasterStealthAddress {
-                    scan_ek: record.master_address.scan_ek.clone(),
-                    spend_ek: record.master_address.spend_ek.clone(),
-                };
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                s.tag_cache.insert(tag_str, addr.scan_ek.clone(), addr.spend_ek.clone(), now);
-                addr
-            }
-            None => return RpcResponse::err(format!("tag +{tag_str} not found")),
-        },
-    };
 
     // ── Build credential map ────────────────────────────────────────
     let ws = s.wallet.as_ref().unwrap();
@@ -769,39 +871,20 @@ async fn handle_send_direct(
         Err(_) => return RpcResponse::err("invalid node_id: expected hex-encoded endpoint ID"),
     };
 
+    let tag_str = recipient_tag.strip_prefix('+').unwrap_or(recipient_tag);
+
+    // ── Resolve tag (cache → local DHT → active DHT query) ──────────
+    let recipient_address = match resolve_tag(state, node, tag_str).await {
+        Some(addr) => addr,
+        None => return RpcResponse::err(format!("tag +{tag_str} not found")),
+    };
+
     let (msg, payment_id, sent_mints) = {
-        let tag_str = recipient_tag.strip_prefix('+').unwrap_or(recipient_tag);
         let mut s = state.lock().unwrap();
 
         if s.wallet.is_none() {
             return RpcResponse::err("wallet not loaded");
         }
-
-        let recipient_address = match s.tag_cache.get(tag_str, std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs(),
-        ) {
-            Some(cached) => MasterStealthAddress {
-                scan_ek: cached.scan_ek,
-                spend_ek: cached.spend_ek,
-            },
-            None => match s.tag_dht.lookup(tag_str) {
-                Some(record) => {
-                    let addr = MasterStealthAddress {
-                        scan_ek: record.master_address.scan_ek.clone(),
-                        spend_ek: record.master_address.spend_ek.clone(),
-                    };
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    s.tag_cache.insert(tag_str, addr.scan_ek.clone(), addr.spend_ek.clone(), now);
-                    addr
-                }
-                None => return RpcResponse::err(format!("tag +{tag_str} not found")),
-            },
-        };
 
         let ws = s.wallet.as_ref().unwrap();
         let cred_map: HashMap<[u8; 32], SpendCredential> = ws

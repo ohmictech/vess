@@ -4206,6 +4206,7 @@ dependencies = [
  "blake3",
  "cuckoofilter",
  "dirs-next",
+ "futures",
  "hickory-resolver 0.26.0",
  "iroh",
  "rand 0.8.5",
