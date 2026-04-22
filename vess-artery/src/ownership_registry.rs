@@ -123,6 +123,16 @@ pub struct ConsumedRecord {
     pub output_mint_ids: Vec<[u8; 32]>,
     /// Unix timestamp when the consumption was recorded.
     pub consumed_at: u64,
+    /// True denomination value of the consumed bill (u64 coins).
+    /// Stored so ReforgeProof input_denominations can be verified
+    /// against the original registry record, preventing value inflation.
+    #[serde(default)]
+    pub denomination_value: u64,
+    /// Original digest of the consumed bill (Blake3 hash of the proof).
+    /// Stored so ReforgeProof input_digests can be verified against the
+    /// actual registry record, preventing digest substitution attacks.
+    #[serde(default)]
+    pub digest: [u8; 32],
 }
 
 impl OwnershipRegistry {
@@ -215,9 +225,16 @@ impl OwnershipRegistry {
         consumed_at: u64,
     ) -> Option<OwnershipRecord> {
         let removed = self.consume(mint_id);
+        // Capture the true denomination and digest from the live record
+        // so ReforgeProof validation can verify the attacker-supplied
+        // input_denominations / input_digests against ground truth.
+        let (denomination_value, digest) = removed
+            .as_ref()
+            .map(|r| (r.denomination_value, r.digest))
+            .unwrap_or((0, [0u8; 32]));
         self.consumed.insert(
             *mint_id,
-            ConsumedRecord { reforge_id, output_mint_ids, consumed_at },
+            ConsumedRecord { reforge_id, output_mint_ids, consumed_at, denomination_value, digest },
         );
         removed
     }
@@ -267,6 +284,11 @@ impl OwnershipRegistry {
         self.records.values().cloned().collect()
     }
 
+    /// Get all consumed tombstones for serialization/snapshot.
+    pub fn all_consumed(&self) -> HashMap<[u8; 32], ConsumedRecord> {
+        self.consumed.clone()
+    }
+
     /// Restore from a list of records (snapshot loading).
     pub fn from_records(node_id: [u8; 32], records: Vec<OwnershipRecord>) -> Self {
         let map: HashMap<[u8; 32], OwnershipRecord> =
@@ -275,6 +297,22 @@ impl OwnershipRegistry {
             node_id,
             records: map,
             consumed: HashMap::new(),
+            merkle_root: None,
+        }
+    }
+
+    /// Restore from records + consumed tombstones (full snapshot loading).
+    pub fn from_records_with_tombstones(
+        node_id: [u8; 32],
+        records: Vec<OwnershipRecord>,
+        consumed: HashMap<[u8; 32], ConsumedRecord>,
+    ) -> Self {
+        let map: HashMap<[u8; 32], OwnershipRecord> =
+            records.into_iter().map(|r| (r.mint_id, r)).collect();
+        Self {
+            node_id,
+            records: map,
+            consumed,
             merkle_root: None,
         }
     }

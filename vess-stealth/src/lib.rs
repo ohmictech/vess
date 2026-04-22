@@ -284,7 +284,7 @@ pub fn scan_view_tag(secret: &StealthSecretKey, ct_scan: &[u8], view_tag: u8) ->
 pub fn open_stealth_payload(
     secret: &StealthSecretKey,
     payload: &StealthPayload,
-) -> Result<(Vec<u8>, [u8; 32])> {
+) -> Result<(Vec<u8>, [u8; 32], [u8; 32])> {
     let scan_dk = vec_to_dk(&secret.scan_dk)?;
     let spend_dk = vec_to_dk(&secret.spend_dk)?;
     let ct_scan = vec_to_ct(&payload.ct_scan)?;
@@ -314,7 +314,11 @@ pub fn open_stealth_payload(
         .decrypt(nonce, payload.ciphertext.as_ref())
         .map_err(|e| anyhow!("AEAD decrypt: {e}"))?;
 
-    Ok((plaintext, payload.stealth_id))
+    // Derive a separate recovery key so callers can encrypt bill-recovery
+    // blobs that only the recipient (who can re-run KEM decapsulation) can read.
+    let recovery_key = derive_recovery_key(ss_scan_bytes);
+
+    Ok((plaintext, payload.stealth_id, recovery_key))
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────
@@ -335,6 +339,16 @@ fn derive_aead_key(ss_scan: &[u8]) -> [u8; 32] {
     let mut h = Hasher::new();
     h.update(ss_scan);
     h.update(b"vess-aead-v0");
+    *h.finalize().as_bytes()
+}
+
+/// Derive a per-payment key for encrypting the claim recovery blob
+/// (`encrypted_bill` in `OwnershipClaim`).  Uses a separate domain from
+/// the payload AEAD key so the two purposes never share key material.
+fn derive_recovery_key(ss_scan: &[u8]) -> [u8; 32] {
+    let mut h = Hasher::new();
+    h.update(ss_scan);
+    h.update(b"vess-recovery-v0");
     *h.finalize().as_bytes()
 }
 
@@ -364,7 +378,7 @@ mod tests {
         assert!(scan_view_tag(&secret, &payload.ct_scan, payload.view_tag).unwrap());
 
         // Full open should succeed.
-        let (decrypted, stealth_id) = open_stealth_payload(&secret, &payload).unwrap();
+        let (decrypted, stealth_id, _rk) = open_stealth_payload(&secret, &payload).unwrap();
         assert_eq!(decrypted, plaintext);
         assert_eq!(stealth_id, payload.stealth_id);
     }
@@ -433,7 +447,7 @@ mod tests {
 
         assert!(scan_view_tag(&secret, &payload.ct_scan, payload.view_tag).unwrap());
 
-        let (decrypted, sid) = open_stealth_payload(&secret, &payload).unwrap();
+        let (decrypted, sid, _rk) = open_stealth_payload(&secret, &payload).unwrap();
         assert_eq!(decrypted, plaintext);
         assert_eq!(sid, payload.stealth_id);
     }

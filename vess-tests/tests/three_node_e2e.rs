@@ -297,16 +297,16 @@ async fn three_node_mint_send_claim() {
         .expect("decrypt should not error")
         .expect("should decrypt (view tag match)");
 
-    let (transfer_payload, stealth_id) = match decrypted {
-        DecryptedTransfer::WithAuth(tp, sid) => (tp, sid),
+    let (transfer_payload, stealth_id, recovery_key) = match decrypted {
+        DecryptedTransfer::WithAuth(tp, sid, rk) => (tp, sid, rk),
     };
 
     assert_eq!(transfer_payload.bills.len(), 1);
     assert_eq!(transfer_payload.bills[0].mint_id, mint_id);
 
-    // ── 9. Bob claims the transfer ──────────────────────────────────
+    // ── 9. Bob claims the transfer ──────────────────────────────────────────────
     let claim_result =
-        claim_transfer_bills(transfer_payload, stealth_id).expect("claim transfer bills");
+        claim_transfer_bills(transfer_payload, stealth_id, Some(recovery_key)).expect("claim transfer bills");
 
     assert_eq!(claim_result.claimed.len(), 1);
     assert_eq!(claim_result.ownership_claims.len(), 1);
@@ -416,11 +416,11 @@ async fn three_node_mint_send_claim() {
         .expect("decrypt should not error")
         .expect("should decrypt (view tag match)");
 
-    let (tp2, sid2) = match decrypted_2 {
-        DecryptedTransfer::WithAuth(tp, sid) => (tp, sid),
+    let (tp2, sid2, rk2) = match decrypted_2 {
+        DecryptedTransfer::WithAuth(tp, sid, rk) => (tp, sid, rk),
     };
 
-    let claim_result_2 = claim_transfer_bills(tp2, sid2).expect("claim transfer bills (Charlie)");
+    let claim_result_2 = claim_transfer_bills(tp2, sid2, Some(rk2)).expect("claim transfer bills (Charlie)");
 
     for cb in &claim_result_2.claimed {
         charlie.billfold.deposit_with_credentials(

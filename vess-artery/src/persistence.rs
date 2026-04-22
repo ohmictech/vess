@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use vess_tag::TagRecord;
 
 use crate::limbo_buffer::LimboEntry;
-use crate::ownership_registry::OwnershipRecord;
+use crate::ownership_registry::{ConsumedRecord, OwnershipRecord};
 use crate::reputation::PeerReputation;
 
 /// Serializable snapshot of all artery state for disk persistence.
@@ -53,9 +53,19 @@ pub struct ArterySnapshot {
     /// Ownership registry records.
     #[serde(default)]
     pub ownership_records: Vec<OwnershipRecord>,
+    /// Consumed bill tombstones (keyed by hex-encoded mint_id).
+    /// Persisting these across restarts prevents post-restart double-spend
+    /// by maintaining the tombstone guard for all previously consumed bills.
+    #[serde(default)]
+    pub consumed_records: BTreeMap<String, ConsumedRecord>,
     /// Encrypted wallet manifests keyed by hex-encoded DHT key.
     #[serde(default)]
     pub manifests: BTreeMap<String, Vec<u8>>,
+    /// Payment IDs that are currently held in limbo (waiting for claim or expiry).
+    /// Persisting these prevents re-processing a payment whose stealth payload was
+    /// put into limbo but whose limbo record was never cleaned up after a restart.
+    #[serde(default)]
+    pub limbo_payment_ids: Vec<[u8; 32]>,
 }
 
 impl ArterySnapshot {
@@ -72,7 +82,9 @@ impl ArterySnapshot {
             hardening_proofs: Vec::new(),
             banned_peers: Vec::new(),
             ownership_records: Vec::new(),
+            consumed_records: BTreeMap::new(),
             manifests: BTreeMap::new(),
+            limbo_payment_ids: Vec::new(),
         }
     }
 }

@@ -302,13 +302,40 @@ fn derive_raw_seed_for_wallet(cli: &Cli) -> Result<[u8; 64]> {
     derive_raw_seed(&phrase)
 }
 
+/// Read the per-startup RPC session token from the state directory.
+///
+/// The token is generated fresh each time the node starts and written to
+/// `{state_dir}/rpc-token` (mode 600 on Unix). The CLI must send it as
+/// the first line on every new connection.
+fn read_rpc_token(state_dir: &std::path::Path) -> Result<String> {
+    let token_path = state_dir.join("rpc-token");
+    let token = std::fs::read_to_string(&token_path).map_err(|e| {
+        anyhow::anyhow!(
+            "cannot read RPC token from {}: {} — is the node running?",
+            token_path.display(),
+            e
+        )
+    })?;
+    Ok(token.trim().to_string())
+}
+
 /// Send a JSON-RPC request to the node's local RPC server and return the
 /// parsed response.  The caller is responsible for constructing the request
 /// object (must be a single JSON line).
 async fn rpc_call(port: u16, request: &serde_json::Value) -> Result<serde_json::Value> {
+    let state_dir = vess_artery::persistence::NodeStorage::default_dir()?;
+    rpc_call_with_dir(port, &state_dir, request).await
+}
+
+async fn rpc_call_with_dir(
+    port: u16,
+    state_dir: &std::path::Path,
+    request: &serde_json::Value,
+) -> Result<serde_json::Value> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::TcpStream;
 
+    let token = read_rpc_token(state_dir)?;
     let addr = format!("127.0.0.1:{port}");
     let stream = TcpStream::connect(&addr).await.map_err(|e| {
         anyhow::anyhow!("cannot connect to node RPC at {addr}: {e} — is the node running with --rpc-port {port}?")
@@ -317,6 +344,11 @@ async fn rpc_call(port: u16, request: &serde_json::Value) -> Result<serde_json::
     let (reader, mut writer) = stream.into_split();
     let mut line_buf = String::new();
     let mut buf_reader = BufReader::new(reader);
+
+    // H2: Send auth token as first line before any command.
+    let mut token_bytes = token.into_bytes();
+    token_bytes.push(b'\n');
+    writer.write_all(&token_bytes).await?;
 
     let mut req_bytes = serde_json::to_vec(request)?;
     req_bytes.push(b'\n');

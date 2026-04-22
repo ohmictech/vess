@@ -706,8 +706,10 @@ fn artery_snapshot_save_load() {
         hardening_proofs: vec![],
         banned_peers: vec![[0xBB; 32]],
         ownership_records: vec![record1, record2],
+        consumed_records: std::collections::BTreeMap::new(),
         manifests: std::collections::BTreeMap::new(),
         peer_endpoints: std::collections::BTreeMap::new(),
+        limbo_payment_ids: vec![],
     };
 
     storage.save(&snapshot).unwrap();

@@ -219,8 +219,13 @@ impl RpcResponse {
 // ── Server ──────────────────────────────────────────────────────────
 
 /// Spawn the RPC listener. Returns when the node shuts down.
+///
+/// `token` is a per-startup secret written to `{state_dir}/rpc-token` (mode 600
+/// on Unix) and must be sent as the very first line on every new connection.
+/// Connections that fail the token check are silently closed.
 pub(crate) async fn run_rpc_server(
     port: u16,
+    token: String,
     state: Arc<Mutex<ArteryState>>,
     senders: QueueSenders,
     node: VessNode,
@@ -237,14 +242,25 @@ pub(crate) async fn run_rpc_server(
                 continue;
             }
         };
-        info!(%peer_addr, "RPC client connected");
 
         let st = state.clone();
         let snd = senders.clone();
         let nd = node.clone();
+        let tok = token.clone();
         tokio::spawn(async move {
             let (reader, mut writer) = stream.into_split();
             let mut lines = BufReader::new(reader).lines();
+
+            // H2: First line must be the session token.
+            // Reject silently to avoid oracle behaviour.
+            match lines.next_line().await {
+                Ok(Some(first)) if first.trim() == tok => {}
+                _ => {
+                    warn!(%peer_addr, "RPC client rejected: bad or missing auth token");
+                    return;
+                }
+            }
+            info!(%peer_addr, "RPC client authenticated");
 
             while let Ok(Some(line)) = lines.next_line().await {
                 let resp = handle_request(&line, &st, &snd, &nd).await;
@@ -621,7 +637,14 @@ fn fire_opportunistic_consolidations(
             continue;
         }
 
-        let output_stealth_id = input_bills[0].stealth_id;
+        // M6: Generate a fresh random stealth_id for the consolidated output
+        // rather than reusing the input bill's stealth_id.
+        let output_stealth_id = {
+            use rand::Rng;
+            let mut id = [0u8; 32];
+            rand::thread_rng().fill(&mut id);
+            id
+        };
         let result = match reforge(ReforgeRequest {
             inputs: input_bills.clone(),
             output_denominations: vec![candidate.target_denomination],
@@ -798,10 +821,20 @@ async fn handle_send(
         let mut all_denoms = send_denoms.clone();
         all_denoms.extend(&selection.change_denominations);
 
-        let stealth_ids: Vec<[u8; 32]> = all_denoms
-            .iter()
-            .map(|_| input_bills[0].stealth_id)
-            .collect();
+        // M6: Generate a fresh random stealth_id per output bill.
+        // Reusing input_bills[0].stealth_id would link outputs to the consumed
+        // bill, leaking the reforge graph to any observer of the billfold.
+        let stealth_ids: Vec<[u8; 32]> = {
+            use rand::Rng;
+            let mut rng = rand::thread_rng();
+            (0..all_denoms.len())
+                .map(|_| {
+                    let mut id = [0u8; 32];
+                    rng.fill(&mut id);
+                    id
+                })
+                .collect()
+        };
 
         let result = match reforge(ReforgeRequest {
             inputs: input_bills,
@@ -1103,10 +1136,18 @@ async fn handle_send_direct(
             let mut all_denoms = send_denoms.clone();
             all_denoms.extend(&selection.change_denominations);
 
-            let stealth_ids: Vec<[u8; 32]> = all_denoms
-                .iter()
-                .map(|_| input_bills[0].stealth_id)
-                .collect();
+            // M6: Generate fresh random stealth_ids per output (same fix as handle_send).
+            let stealth_ids: Vec<[u8; 32]> = {
+                use rand::Rng;
+                let mut rng = rand::thread_rng();
+                (0..all_denoms.len())
+                    .map(|_| {
+                        let mut id = [0u8; 32];
+                        rng.fill(&mut id);
+                        id
+                    })
+                    .collect()
+            };
 
             let result = match reforge(ReforgeRequest {
                 inputs: input_bills,

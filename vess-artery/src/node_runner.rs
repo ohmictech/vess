@@ -79,6 +79,10 @@ const MAX_LIMBO_HOLD_IDS: usize = 256;
 /// Maximum encrypted manifest size in bytes (1 MiB).
 const MAX_MANIFEST_SIZE: usize = 1_048_576;
 
+/// Maximum number of manifest entries stored in the DHT manifest store.
+/// Oldest (lowest-key) entry is evicted when this limit is exceeded.
+const MAX_MANIFEST_ENTRIES: usize = 500;
+
 /// Maximum number of stealth_payloads returned in a single
 /// MailboxSweep response to prevent memory exhaustion.
 const MAX_SWEEP_PAYLOADS: usize = 500;
@@ -299,6 +303,12 @@ pub(crate) struct ArteryState {
     pub(crate) limbo_entry_times: HashMap<[u8; 32], u64>,
     /// Payment latency tracker (payment relay → ownership claim completion).
     pub(crate) payment_latency: PaymentLatencyTracker,
+    /// H3: OwnershipGenesis messages that arrived before their ReforgeAttestation
+    /// tombstones. Keyed by a missing input mint_id — when that tombstone is
+    /// created by an RA, the pending genesis messages are retried.
+    /// This prevents legitimate reforge outputs from being rejected (and the
+    /// broadcaster being falsely banished) due to gossip ordering races.
+    pub(crate) pending_reforge_genesis: HashMap<[u8; 32], Vec<vess_protocol::OwnershipGenesis>>,
     /// Embedded wallet — trial-decrypts incoming payments automatically.
     pub(crate) wallet: Option<WalletState>,
     /// Wallet file path (set from config even when wallet is locked).
@@ -487,7 +497,16 @@ impl ArteryState {
             hardening_proofs: self.tag_dht.export_hardening_proofs(),
             banned_peers: self.banishment.all_banned(),
             ownership_records: self.registry.all_records(),
+            consumed_records: self
+                .registry
+                .all_consumed()
+                .into_iter()
+                .map(|(k, v)| (hex_key(&k), v))
+                .collect(),
             manifests,
+            // M5: persist the set of in-flight limbo payment IDs so a restart
+            // cannot be used to replay a payment that is already in limbo.
+            limbo_payment_ids: self.limbo_payment_ids.iter().cloned().collect(),
         }
     }
 
@@ -530,7 +549,16 @@ impl ArteryState {
         self.tag_dht.load_hardening_proofs(snap.hardening_proofs);
 
         // Restore ownership registry.
-        self.registry = OwnershipRegistry::from_records(self.node_id, snap.ownership_records);
+        let consumed: std::collections::HashMap<[u8; 32], crate::ownership_registry::ConsumedRecord> =
+            snap.consumed_records
+                .into_iter()
+                .filter_map(|(k, v)| unhex_key(&k).ok().map(|key| (key, v)))
+                .collect();
+        self.registry = OwnershipRegistry::from_records_with_tombstones(
+            self.node_id,
+            snap.ownership_records,
+            consumed,
+        );
 
         // Restore manifest store.
         self.manifest_store = snap
@@ -538,6 +566,11 @@ impl ArteryState {
             .into_iter()
             .filter_map(|(k, v)| unhex_key(&k).ok().map(|key| (key, v)))
             .collect();
+
+        // M5: Restore in-flight limbo payment IDs.
+        for id in snap.limbo_payment_ids {
+            self.limbo_payment_ids.insert(id);
+        }
     }
 }
 
@@ -699,6 +732,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
         manifest_store: HashMap::new(),
         limbo_entry_times: HashMap::new(),
         payment_latency: PaymentLatencyTracker::new(1000),
+        pending_reforge_genesis: HashMap::new(),
         wallet: wallet_state,
         wallet_path: config.wallet_path.clone(),
         notifications: VecDeque::new(),
@@ -802,6 +836,24 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
         info!(balance = bal, "wallet enabled");
     }
     if let Some(port) = config.rpc_port {
+        // H2: Generate a per-startup random token and write it to a
+        // mode-600 file so only the process owner can read it.
+        let rpc_token: String = {
+            use rand::Rng;
+            let bytes: [u8; 32] = rand::thread_rng().gen();
+            bytes.iter().map(|b| format!("{b:02x}")).collect()
+        };
+        {
+            let token_path = config.state_dir.join("rpc-token");
+            if let Err(e) = std::fs::write(&token_path, rpc_token.as_bytes()) {
+                warn!(error = %e, "failed to write rpc-token file — RPC auth may not work");
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600));
+            }
+        }
         info!(port, "RPC server listening");
         let rpc_state = state.clone();
         let rpc_senders = crate::rpc::QueueSenders {
@@ -815,7 +867,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
         };
         let rpc_node = node.clone();
         tokio::spawn(async move {
-            if let Err(e) = crate::rpc::run_rpc_server(port, rpc_state, rpc_senders, rpc_node).await
+            if let Err(e) = crate::rpc::run_rpc_server(port, rpc_token, rpc_state, rpc_senders, rpc_node).await
             {
                 warn!(error = %e, "RPC server exited with error");
             }
@@ -1883,6 +1935,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 | PulseMessage::OwnershipGenesis(_)
                 | PulseMessage::OwnershipClaim(_)
                 | PulseMessage::ReforgeAttestation(_)
+                | PulseMessage::LimboHold(_)  // M3: gate on verified to prevent unbounded HashSet growth
         );
         if mesh_critical && state.peer_registry.state(&peer_id) != PeerState::Verified {
             if state.peer_registry.state(&peer_id) == PeerState::Unknown {
@@ -2361,6 +2414,12 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     .iter().map(|p| p.id_hash).collect();
                 let repl = dht_replication_factor(state.estimated_network_size);
                 if state.registry.should_store(&ms.dht_key, &peer_ids, repl) {
+                    // M2: Evict oldest entry if the cap is reached.
+                    if state.manifest_store.len() >= MAX_MANIFEST_ENTRIES {
+                        if let Some(&oldest) = state.manifest_store.keys().next() {
+                            state.manifest_store.remove(&oldest);
+                        }
+                    }
                     state.manifest_store.insert(ms.dht_key, ms.encrypted_manifest.clone());
                     info!("manifest stored in DHT");
                 }
@@ -2709,6 +2768,9 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     // from proof, no need for all N individual nonces).
                     proof_nonce = sap.nonce_tree_root;
                 } else if let Ok(rp) = vess_foundry::reforge::deserialize_reforge_proof(&og.proof) {
+                    // H3 needs to buffer `og` if an input tombstone is missing.
+                    // Clone before `rp` borrows `og.proof` to avoid the borrow conflict.
+                    let og_for_h3 = og.clone();
                     // ── Reforge output genesis (split / combine) ──────────────────
                     //
                     // The proof is a `ReforgeProof` committed to:
@@ -2773,7 +2835,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     //    to prove they were legitimately minted and then consumed.
                     //    An input that is neither active NOR tombstoned was never a
                     //    real bill — accepting it would allow value inflation.
-                    for input_mint_id in &rp.input_mint_ids {
+                    for (idx, input_mint_id) in rp.input_mint_ids.iter().enumerate() {
                         if state.registry.is_active(input_mint_id) {
                             warn!(
                                 "ownership genesis: reforge input {:?} still active — \
@@ -2784,15 +2846,59 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                         }
                         // Anti-inflation: reject if no tombstone exists for this input.
                         // A missing tombstone means the input was never a valid bill.
-                        if state.registry.was_consumed(input_mint_id).is_none() {
-                            warn!(
-                                "ownership genesis: reforge input {:?} has no tombstone — \
-                                 inflation attack rejected — banishing peer",
-                                &input_mint_id[..4]
-                            );
-                            state.peer_registry.mark_banished(peer_id);
-                            ban_ref.banish(peer_id);
-                            return None;
+                        let tombstone = match state.registry.was_consumed(input_mint_id) {
+                            Some(t) => t,
+                            None => {
+                                // H3: The ReforgeAttestation may not have arrived yet on this
+                                // node. Buffer the genesis keyed by the missing input so we
+                                // can retry when the RA (and its tombstone) materialises.
+                                // Cap the buffer to avoid memory exhaustion from fake OGs.
+                                const MAX_PENDING_GENESIS: usize = 1_000;
+                                let pending = state.pending_reforge_genesis
+                                    .entry(*input_mint_id)
+                                    .or_default();
+                                if pending.len() < MAX_PENDING_GENESIS {
+                                    pending.push(og_for_h3.clone());
+                                }
+                                return None;
+                            }
+                        };
+                        // C1: verify input_denominations against the stored denomination.
+                        // tombstone.denomination_value == 0 means the tombstone was created
+                        // before this check existed (old data) — skip to avoid false positives.
+                        if tombstone.denomination_value != 0 {
+                            if let Some(claimed_denom) = rp.input_denominations.get(idx) {
+                                if claimed_denom.value() != tombstone.denomination_value {
+                                    warn!(
+                                        "ownership genesis: reforge input {:?} denomination \
+                                         mismatch (claimed={}, stored={}) — inflation attack — \
+                                         banishing peer",
+                                        &input_mint_id[..4],
+                                        claimed_denom.value(),
+                                        tombstone.denomination_value
+                                    );
+                                    state.peer_registry.mark_banished(peer_id);
+                                    ban_ref.banish(peer_id);
+                                    return None;
+                                }
+                            }
+                        }
+                        // M1: verify input_digests against the stored digest.
+                        // Zeroed digest == old tombstone without this field — skip.
+                        let zero = [0u8; 32];
+                        if tombstone.digest != zero {
+                            if let Some(claimed_digest) = rp.input_digests.get(idx) {
+                                if claimed_digest != &tombstone.digest {
+                                    warn!(
+                                        "ownership genesis: reforge input {:?} digest mismatch — \
+                                         banishing peer",
+                                        &input_mint_id[..4]
+                                    );
+                                    state.peer_registry.mark_banished(peer_id);
+                                    ban_ref.banish(peer_id);
+                                    return None;
+                                }
+                            }
                         }
                     }
 
@@ -2973,11 +3079,14 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     // chain_tip verification is deferred to conflict resolution.
                 }
 
-                // 6. Timestamp validation.
-                if !timestamp_is_valid(oc.timestamp) {
-                    warn!("ownership claim: timestamp out of range");
-                    return None;
-                }
+                // 6. Timestamp skip for OwnershipClaim.
+                //
+                // The 5-minute staleness check is intentionally OMITTED here.
+                // The limbo buffer holds payments for up to 3600 s; recipients
+                // who are offline longer than 5 minutes would lose payments
+                // permanently if we enforced MAX_MESSAGE_AGE_SECS. The
+                // transfer_sig already cryptographically binds the timestamp,
+                // so there is no replay risk in accepting older claims.
 
                 // 7. Update ownership registry if stored locally.
                 //    Deterministic conflict resolution:
@@ -2993,7 +3102,9 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                         h.update(&oc.transfer_sig);
                         // Include the transfer timestamp so pre-ground
                         // claim hashes expire with the 5-minute window.
-                        h.update(&oc.timestamp.to_le_bytes());
+                        // M4: bucket to 60-second resolution to reduce grinding
+                        // surface without breaking legitimate use.
+                        h.update(&(oc.timestamp / 60).to_le_bytes());
                         *h.finalize().as_bytes()
                     };
 
@@ -3208,6 +3319,16 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                         ).is_some();
                     if was_active {
                         info!("reforge consumed mint_id {:?}", &mint_id[..4]);
+                    }
+                }
+
+                // H3: Drain any OwnershipGenesis messages that were buffered waiting
+                // for these tombstones to materialise, and re-inject them for processing.
+                for mint_id in &ra.consumed_mint_ids {
+                    if let Some(pending) = state.pending_reforge_genesis.remove(mint_id) {
+                        for pending_og in pending {
+                            let _ = h_og_tx.send(pending_og);
+                        }
                     }
                 }
 

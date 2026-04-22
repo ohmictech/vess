@@ -266,8 +266,8 @@ async fn transfer_and_claim(
         .expect("decrypt error")
         .expect("view tag mismatch");
 
-    let (transfer_payload, stealth_id) = match decrypted {
-        DecryptedTransfer::WithAuth(tp, sid) => (tp, sid),
+    let (transfer_payload, stealth_id, recovery_key) = match decrypted {
+        DecryptedTransfer::WithAuth(tp, sid, rk) => (tp, sid, rk),
     };
 
     assert_eq!(
@@ -276,7 +276,7 @@ async fn transfer_and_claim(
     );
 
     let claim_result =
-        claim_transfer_bills(transfer_payload, stealth_id).expect("claim transfer bills");
+        claim_transfer_bills(transfer_payload, stealth_id, Some(recovery_key)).expect("claim transfer bills");
 
     let num_bills = claim_result.claimed.len();
 

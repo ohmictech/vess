@@ -416,7 +416,7 @@ pub fn receive_direct_payment(dp: &vess_protocol::DirectPayment) -> Result<Trans
     // time. No inline proof verification needed.
 
     // Delegate to the existing claim logic (verifies transfer sigs + generates new keypairs).
-    claim_transfer_bills(payload, dp.recipient_stealth_id)
+    claim_transfer_bills(payload, dp.recipient_stealth_id, None)
 }
 
 // ── Recipient-side operations ────────────────────────────────────────
@@ -447,7 +447,7 @@ pub fn try_decrypt_stealth_payload(
     }
 
     // Full decrypt.
-    let (plaintext, _stealth_id) = open_stealth_payload(secret, &stealth)?;
+    let (plaintext, _stealth_id, _recovery_key) = open_stealth_payload(secret, &stealth)?;
 
     let bills: Vec<VessBill> =
         postcard::from_bytes(&plaintext).map_err(|e| anyhow!("deserialize bills: {e}"))?;
@@ -471,18 +471,18 @@ pub fn try_decrypt_transfer_payload(
         return Ok(None);
     }
 
-    let (plaintext, stealth_id) = open_stealth_payload(secret, &stealth)?;
+    let (plaintext, stealth_id, recovery_key) = open_stealth_payload(secret, &stealth)?;
 
     let tp = postcard::from_bytes::<TransferPayload>(&plaintext)
         .map_err(|e| anyhow!("stealth payload decrypted but not a valid TransferPayload: {e}"))?;
-    Ok(Some(DecryptedTransfer::WithAuth(tp, stealth_id)))
+    Ok(Some(DecryptedTransfer::WithAuth(tp, stealth_id, recovery_key)))
 }
 
 /// Result of decrypting a stealth payload.
 #[derive(Debug, Clone)]
 pub enum DecryptedTransfer {
     /// Transfer with authorization signatures and ownership chain data.
-    WithAuth(TransferPayload, [u8; 32]),
+    WithAuth(TransferPayload, [u8; 32], [u8; 32]),
 }
 
 /// Claimed bill output: bill + spend keypair.
@@ -519,6 +519,7 @@ pub struct TransferClaimResult {
 pub fn claim_transfer_bills(
     payload: TransferPayload,
     stealth_id: [u8; 32],
+    recovery_key: Option<[u8; 32]>,
 ) -> Result<TransferClaimResult> {
     if payload.bills.len() != payload.sender_vks.len()
         || payload.bills.len() != payload.transfer_sigs.len()
@@ -556,25 +557,39 @@ pub fn claim_transfer_bills(
 
         // 4. Build OwnershipClaim message.
         //    chain_depth = bill's current depth + 1 (this is one more transfer).
-        //    encrypted_bill = postcard(bill) encrypted with Blake3(stealth_id || mint_id)
-        //    so artery nodes can store it for DHT recovery but can't read it.
         let new_depth = bill.chain_depth + 1;
+        //    encrypted_bill = AEAD-encrypted postcard(bill) using ChaCha20Poly1305 with
+        //    the per-payment KEM recovery key (derived from DKSAP scan shared secret).
+        //    Only the recipient can re-derive this key — it is NOT in the claim message.
+        //    Falls back to an empty blob when no recovery key is available (e.g. direct payment).
         let encrypted_bill = {
-            use blake3::Hasher;
-            let mut kh = Hasher::new();
-            kh.update(&stealth_id);
-            kh.update(&bill.mint_id);
-            kh.update(b"vess-claim-bill-v0");
-            let key = kh.finalize();
-            let bill_bytes = postcard::to_allocvec(&bill).unwrap_or_default();
-            // Simple XOR-mask for lightweight confidentiality — the true
-            // security comes from DKSAP (only recipient knows stealth_id
-            // secret key). The mask prevents casual inspection by DHT nodes.
-            let mut out = bill_bytes;
-            for (i, b) in out.iter_mut().enumerate() {
-                *b ^= key.as_bytes()[i % 32];
+            match recovery_key {
+                Some(key) => {
+                    use chacha20poly1305::{ChaCha20Poly1305, KeyInit, aead::Aead};
+                    // Derive a per-bill nonce from the key + mint_id so each bill
+                    // within a multi-bill transfer has a unique nonce.
+                    let nonce_bytes = {
+                        let mut h = blake3::Hasher::new();
+                        h.update(&key);
+                        h.update(&bill.mint_id);
+                        h.update(b"vess-claim-nonce-v1");
+                        let hash = h.finalize();
+                        let mut n = [0u8; 12];
+                        n.copy_from_slice(&hash.as_bytes()[..12]);
+                        n
+                    };
+                    let bill_bytes = postcard::to_allocvec(&bill).unwrap_or_default();
+                    let cipher = ChaCha20Poly1305::new((&key).into());
+                    let nonce = chacha20poly1305::Nonce::from_slice(&nonce_bytes);
+                    cipher.encrypt(nonce, bill_bytes.as_ref())
+                        .unwrap_or_default()
+                }
+                None => {
+                    // No KEM secret available (direct payment / test path).
+                    // The recipient already holds the bill; an empty blob is safe.
+                    vec![]
+                }
             }
-            out
         };
         let claim = PulseMessage::OwnershipClaim(vess_protocol::OwnershipClaim {
             mint_id: bill.mint_id,
@@ -652,8 +667,8 @@ pub fn receive_and_claim(
     stealth_payload: &[u8],
 ) -> Result<Option<TransferClaimResult>> {
     match try_decrypt_transfer_payload(secret, stealth_payload)? {
-        Some(DecryptedTransfer::WithAuth(tp, stealth_id)) => {
-            let result = claim_transfer_bills(tp, stealth_id)?;
+        Some(DecryptedTransfer::WithAuth(tp, stealth_id, recovery_key)) => {
+            let result = claim_transfer_bills(tp, stealth_id, Some(recovery_key))?;
             Ok(Some(result))
         }
         None => Ok(None),
