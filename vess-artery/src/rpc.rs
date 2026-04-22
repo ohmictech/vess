@@ -739,11 +739,14 @@ async fn handle_send(
             }
         }
         if consume_sigs.len() == result.consumed_mint_ids.len() {
+            let output_mint_ids: Vec<[u8; 32]> =
+                result.outputs.iter().map(|(b, _)| b.mint_id).collect();
             let _ = senders.ra_tx.send(vess_protocol::ReforgeAttestation {
                 consumed_mint_ids: result.consumed_mint_ids,
                 owner_vk: owner_vk_for_ra,
                 consume_sigs,
                 reforge_id,
+                output_mint_ids,
                 hops_remaining: 6,
             });
         }
@@ -1031,11 +1034,14 @@ async fn handle_send_direct(
                 }
             }
             if consume_sigs.len() == result.consumed_mint_ids.len() {
+                let output_mint_ids: Vec<[u8; 32]> =
+                    result.outputs.iter().map(|(b, _)| b.mint_id).collect();
                 let _ = senders.ra_tx.send(vess_protocol::ReforgeAttestation {
                     consumed_mint_ids: result.consumed_mint_ids,
                     owner_vk: owner_vk_for_ra,
                     consume_sigs,
                     reforge_id,
+                    output_mint_ids,
                     hops_remaining: 6,
                 });
             }

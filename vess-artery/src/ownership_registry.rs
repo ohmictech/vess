@@ -101,8 +101,28 @@ pub struct OwnershipRegistry {
     node_id: [u8; 32],
     /// Active ownership records keyed by mint_id.
     records: HashMap<[u8; 32], OwnershipRecord>,
+    /// Reforge tombstones: consumed mint_ids → where the value went.
+    ///
+    /// When a bill is consumed in a split/combine, its old mint_id is
+    /// deleted from `records` and a `ConsumedRecord` is inserted here.
+    /// This lets nodes:
+    ///   1. Reject `OwnershipClaim` messages for consumed bills.
+    ///   2. Answer "where did this bill go?" for wallet recovery.
+    consumed: HashMap<[u8; 32], ConsumedRecord>,
     /// Cached Merkle root (invalidated on mutation).
     merkle_root: Option<[u8; 32]>,
+}
+
+/// Tombstone for a bill that was consumed in a split/combine reforge.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConsumedRecord {
+    /// Reforge event ID (links this tombstone to the attestation).
+    pub reforge_id: [u8; 32],
+    /// Mint IDs of the new bills produced by this reforge.
+    /// Wallets use this to locate the new consolidated/split bills.
+    pub output_mint_ids: Vec<[u8; 32]>,
+    /// Unix timestamp when the consumption was recorded.
+    pub consumed_at: u64,
 }
 
 impl OwnershipRegistry {
@@ -111,6 +131,7 @@ impl OwnershipRegistry {
         Self {
             node_id,
             records: HashMap::new(),
+            consumed: HashMap::new(),
             merkle_root: None,
         }
     }
@@ -175,6 +196,37 @@ impl OwnershipRegistry {
         removed
     }
 
+    /// Consume a bill and atomically record a reforge tombstone.
+    ///
+    /// Preferred over bare `consume()` during reforge processing.
+    /// Nodes that later receive an `OwnershipClaim` for this `mint_id`
+    /// can check `was_consumed()` and reject it immediately.
+    /// Wallets can follow `ConsumedRecord::output_mint_ids` to find the
+    /// new bills produced by the reforge.
+    ///
+    /// The tombstone is stored even when this node doesn't hold the live
+    /// record (common for bills held in other DHT shards — receipt of the
+    /// `ReforgeAttestation` is still enough to create the tombstone).
+    pub fn mark_consumed(
+        &mut self,
+        mint_id: &[u8; 32],
+        reforge_id: [u8; 32],
+        output_mint_ids: Vec<[u8; 32]>,
+        consumed_at: u64,
+    ) -> Option<OwnershipRecord> {
+        let removed = self.consume(mint_id);
+        self.consumed.insert(
+            *mint_id,
+            ConsumedRecord { reforge_id, output_mint_ids, consumed_at },
+        );
+        removed
+    }
+
+    /// Return the tombstone for a consumed bill, if one exists.
+    pub fn was_consumed(&self, mint_id: &[u8; 32]) -> Option<&ConsumedRecord> {
+        self.consumed.get(mint_id)
+    }
+
     /// Number of active mint_ids in the registry.
     pub fn len(&self) -> usize {
         self.records.len()
@@ -222,6 +274,7 @@ impl OwnershipRegistry {
         Self {
             node_id,
             records: map,
+            consumed: HashMap::new(),
             merkle_root: None,
         }
     }

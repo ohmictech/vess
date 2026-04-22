@@ -549,6 +549,13 @@ pub struct ReforgeAttestation {
     /// Deterministic reforge identity: ties the consumption to a specific
     /// reforge event. `Blake3("vess-reforge-id-v0" || sorted consumed_mint_ids)`.
     pub reforge_id: [u8; 32],
+    /// Mint IDs of the new output bills created by this reforge.
+    ///
+    /// Included so nodes that held records for the consumed bills can store
+    /// tombstones pointing to the new bills, enabling wallets to trace funds
+    /// through split/combine operations.
+    #[serde(default)]
+    pub output_mint_ids: Vec<[u8; 32]>,
     /// Remaining gossip hops (decremented at each relay, stops at 0).
     pub hops_remaining: u8,
 }

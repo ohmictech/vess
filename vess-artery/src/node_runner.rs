@@ -2808,6 +2808,24 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
             PulseMessage::OwnershipClaim(oc) => {
                 info!(%peer, "ownership claim for mint_id {:?}", &oc.mint_id[..4]);
 
+                // 0. Reforge-wins rule (highest priority):
+                //    If this bill was consumed by a valid split/combine, no
+                //    subsequent OwnershipClaim is valid — the value literally
+                //    no longer exists at this mint_id.
+                //
+                //    We don't banish the peer because they may not have
+                //    received the ReforgeAttestation yet.
+                if let Some(tombstone) = state.registry.was_consumed(&oc.mint_id) {
+                    warn!(
+                        "ownership claim rejected: mint_id {:?} was consumed via \
+                         reforge {:?} (outputs: {})",
+                        &oc.mint_id[..4],
+                        &tombstone.reforge_id[..4],
+                        tombstone.output_mint_ids.len(),
+                    );
+                    return None;
+                }
+
                 // 1. Look up existing ownership record.
                 // If we don't have this mint_id locally (it lives on another
                 // DHT node), we still validate and forward.
@@ -3103,9 +3121,25 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     }
                 }
 
-                // 4. Consume (delete) all input mint_ids from the registry.
+                // 4. Consume (delete) all input mint_ids and store tombstones.
+                //
+                // The tombstone maps old mint_id → reforge_id + output_mint_ids,
+                // so that:
+                //   a. Future OwnershipClaims for these bills are rejected (reforge-wins rule).
+                //   b. Wallets can trace where the value went after a split/combine.
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
                 for mint_id in &ra.consumed_mint_ids {
-                    if let Some(_removed) = state.registry.consume(mint_id) {
+                    let was_active =
+                        state.registry.mark_consumed(
+                            mint_id,
+                            ra.reforge_id,
+                            ra.output_mint_ids.clone(),
+                            now,
+                        ).is_some();
+                    if was_active {
                         info!("reforge consumed mint_id {:?}", &mint_id[..4]);
                     }
                 }

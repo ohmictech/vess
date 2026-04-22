@@ -636,6 +636,7 @@ async fn five_node_full_network() {
             owner_vk: evil_vk,
             consume_sigs: vec![vec![0u8; 128]],
             reforge_id,
+            output_mint_ids: vec![],
             hops_remaining: 3,
         });
         evil_node
