@@ -128,6 +128,12 @@ pub enum RpcRequest {
         dht_key_hex: String,
         encrypted_manifest_hex: String,
     },
+    TagCacheList,
+    TagCacheClear {
+        /// Tag to remove (e.g. "alice" or "+alice"). Omit to clear all.
+        #[serde(default)]
+        tag: Option<String>,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -187,6 +193,9 @@ pub enum RpcData {
     WalletStatus {
         locked: bool,
         has_password: bool,
+    },
+    TagCacheList {
+        entries: Vec<crate::tag_cache::TagCacheEntryView>,
     },
     Empty {},
 }
@@ -350,6 +359,8 @@ async fn handle_request(
             &encrypted_manifest_hex,
             &senders.manifest_tx,
         ),
+        RpcRequest::TagCacheList => handle_tag_cache_list(state),
+        RpcRequest::TagCacheClear { tag } => handle_tag_cache_clear(state, tag.as_deref()),
     }
 }
 
@@ -390,15 +401,39 @@ fn handle_notifications(state: &Arc<Mutex<ArteryState>>, max: usize) -> RpcRespo
 
 fn handle_tag_lookup(state: &Arc<Mutex<ArteryState>>, tag: &str) -> RpcResponse {
     let tag_str = tag.strip_prefix('+').unwrap_or(tag);
-    let s = state.lock().unwrap();
-    match s.tag_dht.lookup(tag_str) {
-        Some(record) => RpcResponse::ok(RpcData::TagLookup {
+    let mut s = state.lock().unwrap();
+
+    // ── Check local tag cache first ─────────────────────────────────
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if let Some(cached) = s.tag_cache.get(tag_str, now) {
+        return RpcResponse::ok(RpcData::TagLookup {
             found: true,
             tag: tag_str.to_owned(),
-            scan_ek: Some(to_hex(&record.master_address.scan_ek)),
-            spend_ek: Some(to_hex(&record.master_address.spend_ek)),
-            hardened: Some(record.hardened_at.is_some()),
-        }),
+            scan_ek: Some(to_hex(&cached.scan_ek)),
+            spend_ek: Some(to_hex(&cached.spend_ek)),
+            hardened: None,
+        });
+    }
+
+    // ── Fall back to the local DHT shard ────────────────────────────
+    match s.tag_dht.lookup(tag_str) {
+        Some(record) => {
+            let scan_ek = record.master_address.scan_ek.clone();
+            let spend_ek = record.master_address.spend_ek.clone();
+            let hardened = record.hardened_at.is_some();
+            // Persist into local cache so future lookups are instant.
+            s.tag_cache.insert(tag_str, scan_ek.clone(), spend_ek.clone(), now);
+            RpcResponse::ok(RpcData::TagLookup {
+                found: true,
+                tag: tag_str.to_owned(),
+                scan_ek: Some(to_hex(&scan_ek)),
+                spend_ek: Some(to_hex(&spend_ek)),
+                hardened: Some(hardened),
+            })
+        }
         None => RpcResponse::ok(RpcData::TagLookup {
             found: false,
             tag: tag_str.to_owned(),
@@ -426,12 +461,30 @@ fn handle_send(
     }
 
     // ── Resolve tag ─────────────────────────────────────────────────
-    let recipient_address = match s.tag_dht.lookup(tag_str) {
-        Some(record) => MasterStealthAddress {
-            scan_ek: record.master_address.scan_ek.clone(),
-            spend_ek: record.master_address.spend_ek.clone(),
+    let recipient_address = match s.tag_cache.get(tag_str, std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs(),
+    ) {
+        Some(cached) => MasterStealthAddress {
+            scan_ek: cached.scan_ek,
+            spend_ek: cached.spend_ek,
         },
-        None => return RpcResponse::err(format!("tag +{tag_str} not found")),
+        None => match s.tag_dht.lookup(tag_str) {
+            Some(record) => {
+                let addr = MasterStealthAddress {
+                    scan_ek: record.master_address.scan_ek.clone(),
+                    spend_ek: record.master_address.spend_ek.clone(),
+                };
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                s.tag_cache.insert(tag_str, addr.scan_ek.clone(), addr.spend_ek.clone(), now);
+                addr
+            }
+            None => return RpcResponse::err(format!("tag +{tag_str} not found")),
+        },
     };
 
     // ── Build credential map ────────────────────────────────────────
@@ -724,12 +777,30 @@ async fn handle_send_direct(
             return RpcResponse::err("wallet not loaded");
         }
 
-        let recipient_address = match s.tag_dht.lookup(tag_str) {
-            Some(record) => MasterStealthAddress {
-                scan_ek: record.master_address.scan_ek.clone(),
-                spend_ek: record.master_address.spend_ek.clone(),
+        let recipient_address = match s.tag_cache.get(tag_str, std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        ) {
+            Some(cached) => MasterStealthAddress {
+                scan_ek: cached.scan_ek,
+                spend_ek: cached.spend_ek,
             },
-            None => return RpcResponse::err(format!("tag +{tag_str} not found")),
+            None => match s.tag_dht.lookup(tag_str) {
+                Some(record) => {
+                    let addr = MasterStealthAddress {
+                        scan_ek: record.master_address.scan_ek.clone(),
+                        spend_ek: record.master_address.spend_ek.clone(),
+                    };
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    s.tag_cache.insert(tag_str, addr.scan_ek.clone(), addr.spend_ek.clone(), now);
+                    addr
+                }
+                None => return RpcResponse::err(format!("tag +{tag_str} not found")),
+            },
         };
 
         let ws = s.wallet.as_ref().unwrap();
@@ -1422,3 +1493,32 @@ fn handle_manifest_store(
 
     RpcResponse::ok(RpcData::Empty {})
 }
+
+// ── Tag cache handlers ───────────────────────────────────────────────
+
+fn handle_tag_cache_list(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
+    let s = state.lock().unwrap();
+    RpcResponse::ok(RpcData::TagCacheList {
+        entries: s.tag_cache.to_views(),
+    })
+}
+
+fn handle_tag_cache_clear(state: &Arc<Mutex<ArteryState>>, tag: Option<&str>) -> RpcResponse {
+    let mut s = state.lock().unwrap();
+    match tag {
+        Some(t) => {
+            let tag_str = t.strip_prefix('+').unwrap_or(t);
+            let removed = s.tag_cache.remove(tag_str);
+            if removed {
+                RpcResponse::ok(RpcData::Empty {})
+            } else {
+                RpcResponse::err(format!("tag +{tag_str} not in cache"))
+            }
+        }
+        None => {
+            s.tag_cache.clear_all();
+            RpcResponse::ok(RpcData::Empty {})
+        }
+    }
+}
+

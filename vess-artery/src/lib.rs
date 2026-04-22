@@ -31,6 +31,7 @@ pub mod ownership_registry;
 pub mod persistence;
 pub mod reputation;
 pub mod rpc;
+pub mod tag_cache;
 pub mod tag_dht;
 pub mod tag_resolver;
 

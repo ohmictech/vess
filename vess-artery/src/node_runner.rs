@@ -313,6 +313,10 @@ pub(crate) struct ArteryState {
     /// Shared banishment manager — included in snapshots so the ban list
     /// survives node restarts.
     pub(crate) banishment: Arc<BanishmentManager>,
+    /// Persistent local VessTag address book.
+    /// Caches every verified tag → stealth address the wallet has sent to,
+    /// so repeat payments skip the DHT entirely.
+    pub(crate) tag_cache: crate::tag_cache::TagCache,
 }
 
 impl ArteryState {
@@ -701,6 +705,9 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
         outbound_payments: HashMap::new(),
         outbound_by_mint_id: HashMap::new(),
         banishment: banishment.clone(),
+        tag_cache: crate::tag_cache::TagCache::load_or_create(
+            config.state_dir.join("tag_cache.json"),
+        ),
     }));
 
     // ── Gossip drain channels ───────────────────────────────────────

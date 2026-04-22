@@ -167,6 +167,23 @@ enum Command {
         #[arg(long)]
         password: String,
     },
+
+    /// Manage the local VessTag address book (persistent tag → stealth address cache).
+    #[command(subcommand)]
+    TagCache(TagCacheCmd),
+}
+
+/// Subcommands for `vess tag-cache`.
+#[derive(Subcommand)]
+enum TagCacheCmd {
+    /// List all cached VessTag entries, most-recently-used first.
+    List,
+    /// Remove a specific tag from the cache (forces re-lookup next send).
+    Clear {
+        /// Tag to remove, e.g. "alice" or "+alice".
+        /// Omit to clear the entire cache.
+        tag: Option<String>,
+    },
 }
 
 fn wallet_path(cli: &Cli) -> Result<PathBuf> {
@@ -248,6 +265,10 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::SetPassword { password } => cmd_set_password(&cli, password.clone()).await,
+        Command::TagCache(sub) => match sub {
+            TagCacheCmd::List => cmd_tag_cache_list(&cli).await,
+            TagCacheCmd::Clear { tag } => cmd_tag_cache_clear(&cli, tag.as_deref()).await,
+        },
     }
 }
 
@@ -1328,6 +1349,52 @@ async fn cmd_set_password(cli: &Cli, password: String) -> Result<()> {
     println!(
         "Password set.  The node can now start with VESS_WALLET_PASSWORD or --wallet-password."
     );
+    Ok(())
+}
+
+async fn cmd_tag_cache_list(cli: &Cli) -> Result<()> {
+    let port = rpc_port(cli);
+    let resp = rpc_call(port, &serde_json::json!({ "method": "tag_cache_list" })).await?;
+    if resp["ok"] != true {
+        anyhow::bail!("{}", resp["error"].as_str().unwrap_or("unknown error"));
+    }
+    let entries = resp["entries"].as_array().cloned().unwrap_or_default();
+    if cli.json {
+        println!("{resp}");
+    } else if entries.is_empty() {
+        println!("Tag cache is empty.");
+    } else {
+        println!("{:<20} {:<12} {}", "TAG", "LAST USED", "VERIFIED AT");
+        println!("{}", "-".repeat(60));
+        for e in &entries {
+            let tag = e["tag"].as_str().unwrap_or("?");
+            let last_used = e["last_used"].as_u64().unwrap_or(0);
+            let verified_at = e["verified_at"].as_u64().unwrap_or(0);
+            println!("+{tag:<19} {last_used:<12} {verified_at}");
+        }
+        println!("\n{} cached tag(s)", entries.len());
+    }
+    Ok(())
+}
+
+async fn cmd_tag_cache_clear(cli: &Cli, tag: Option<&str>) -> Result<()> {
+    let port = rpc_port(cli);
+    let req = match tag {
+        Some(t) => serde_json::json!({ "method": "tag_cache_clear", "tag": t }),
+        None => serde_json::json!({ "method": "tag_cache_clear" }),
+    };
+    let resp = rpc_call(port, &req).await?;
+    if resp["ok"] != true {
+        anyhow::bail!("{}", resp["error"].as_str().unwrap_or("unknown error"));
+    }
+    if cli.json {
+        println!("{resp}");
+    } else {
+        match tag {
+            Some(t) => println!("Removed +{} from tag cache.", t.strip_prefix('+').unwrap_or(t)),
+            None => println!("Tag cache cleared."),
+        }
+    }
     Ok(())
 }
 
