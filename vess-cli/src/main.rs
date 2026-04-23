@@ -123,6 +123,19 @@ enum Command {
     /// Listen for raw incoming Pulses (low-level).
     Listen,
 
+    /// Start the Vess node as an always-on background service.
+    ///
+    /// On first run, guides you through wallet creation or recovery
+    /// and sets a quick-unlock password. On subsequent runs, prompts
+    /// for the password and re-starts the background node.
+    Start,
+
+    /// Stop the background Vess node that was started with `vess start`.
+    Stop,
+
+    /// Show whether the background node is running and a wallet summary.
+    Status,
+
     /// Run as a full artery node (network participant).
     Node {
         /// Number of gossip neighbors (K).
@@ -230,6 +243,9 @@ async fn main() -> Result<()> {
         Command::RegisterTag { tag } => cmd_register_tag(&cli, tag).await,
         Command::Pulse { node_id, message } => cmd_pulse(&cli, node_id, message).await,
         Command::Listen => cmd_listen(&cli).await,
+        Command::Start => cmd_start(&cli).await,
+        Command::Stop => cmd_stop().await,
+        Command::Status => cmd_status(&cli).await,
         Command::Node {
             k_neighbors,
             max_hops,
@@ -1441,4 +1457,578 @@ fn now_unix() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+// ── Background-service helpers ────────────────────────────────────────
+
+/// ~/.vess/ directory (wallet + PID + log live here).
+fn vess_data_dir() -> Result<PathBuf> {
+    #[cfg(windows)]
+    let home = std::env::var_os("USERPROFILE").map(PathBuf::from);
+    #[cfg(not(windows))]
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let h = home.ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
+    Ok(h.join(".vess"))
+}
+
+fn node_pid_path() -> Result<PathBuf> {
+    Ok(vess_data_dir()?.join("node.pid"))
+}
+
+fn node_log_path() -> Result<PathBuf> {
+    Ok(vess_data_dir()?.join("node.log"))
+}
+
+fn read_node_pid() -> Option<u32> {
+    node_pid_path()
+        .ok()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| s.trim().parse().ok())
+}
+
+fn write_node_pid(pid: u32) -> Result<()> {
+    let path = node_pid_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, pid.to_string())?;
+    Ok(())
+}
+
+fn clear_node_pid() {
+    if let Ok(p) = node_pid_path() {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+/// Check if a process with the given PID is still alive.
+fn is_pid_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+    #[cfg(windows)]
+    {
+        let out = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+            .output();
+        match out {
+            Ok(o) => String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()),
+            Err(_) => false,
+        }
+    }
+}
+
+/// Send SIGTERM (Unix) or taskkill (Windows) to a process.
+fn kill_pid(pid: u32) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let status = std::process::Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status()?;
+        if !status.success() {
+            anyhow::bail!("kill returned non-zero for PID {pid}");
+        }
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/F"])
+            .status()?;
+        Ok(())
+    }
+}
+
+/// Print a prompt and read a line from stdin.
+fn prompt(msg: &str) -> Result<String> {
+    use std::io::{self, Write};
+    print!("{msg}");
+    io::stdout().flush()?;
+    let mut s = String::new();
+    io::stdin().read_line(&mut s)?;
+    Ok(s.trim().to_string())
+}
+
+/// Read a password from the terminal without echoing it.
+fn prompt_password(msg: &str) -> Result<String> {
+    rpassword::prompt_password(msg).map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+// ── `vess start` ─────────────────────────────────────────────────────
+
+async fn cmd_start(cli: &Cli) -> Result<()> {
+    let port = rpc_port(cli);
+    let wallet_file = wallet_path(cli)?;
+
+    // 1. Bail early if a node process is already running.
+    if let Some(pid) = read_node_pid() {
+        if is_pid_alive(pid) {
+            println!("Vess node is already running (PID {pid}).");
+            println!("  Balance: run `vess balance`");
+            println!("  Stop:    run `vess stop`");
+            return Ok(());
+        }
+        // Stale PID file from a previous crash — clean it up.
+        clear_node_pid();
+    }
+
+    // 2. First-run wizard (creates wallet + sets password) or prompt for
+    //    the password on an already-initialised wallet.
+    let password: String = if !wallet_file.exists() {
+        first_run_wizard(&wallet_file).await?
+    } else {
+        // Use env var if already set (e.g. CI / scripted installs).
+        if let Ok(pwd) = std::env::var("VESS_WALLET_PASSWORD") {
+            let wf = WalletFile::load(&wallet_file)?;
+            wf.unlock_with_password(&pwd)
+                .map_err(|_| anyhow::anyhow!("VESS_WALLET_PASSWORD env var contains an incorrect password"))?;
+            pwd
+        } else {
+            let wf = WalletFile::load(&wallet_file)?;
+            if wf.password_cache.is_none() {
+                // Wallet exists but has never had a password set.
+                println!("Your wallet doesn't have a quick-unlock password yet.");
+                println!("This is required to restart the background service without entering");
+                println!("your recovery phrase each time.\n");
+                setup_new_password(&wallet_file, &derive_raw_seed_for_wallet(cli)?)?
+            } else {
+                let pwd = prompt_password("Enter wallet password: ")?;
+                wf.unlock_with_password(&pwd)
+                    .map_err(|_| anyhow::anyhow!("incorrect password"))?;
+                pwd
+            }
+        }
+    };
+
+    // 3. Spawn the artery node as a detached background process.
+    let log_path = node_log_path()?;
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
+    let log_file2 = log_file.try_clone()?;
+
+    let exe = std::env::current_exe()
+        .map_err(|e| anyhow::anyhow!("cannot find own executable: {e}"))?;
+    let wallet_str = wallet_file.display().to_string();
+    let port_str = port.to_string();
+
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.args(["node", "--wallet", &wallet_str, "--rpc-port", &port_str]);
+    // Pass password via env var — safer than CLI args (not visible in `ps`).
+    cmd.env("VESS_WALLET_PASSWORD", &password);
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(log_file);
+    cmd.stderr(log_file2);
+
+    // On Windows, detach from the console entirely.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW);
+    }
+
+    let child = cmd
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("failed to launch node process: {e}"))?;
+    let pid = child.id();
+    write_node_pid(pid)?;
+
+    println!("\nVess node started!");
+    println!("  PID:     {pid}");
+    println!("  Log:     {}", log_path.display());
+    println!("  Balance: run `vess balance`  (takes a few seconds to connect)");
+    println!("  Stop:    run `vess stop`");
+    Ok(())
+}
+
+/// Prompt for and confirm a new password, set it on the wallet, save.
+/// Returns the chosen password.
+fn setup_new_password(wallet_path: &PathBuf, raw_seed: &[u8; 64]) -> Result<String> {
+    println!("Set a quick-unlock password for the background service.");
+    println!("(Your recovery phrase is the fallback if you forget it.)\n");
+    let password = loop {
+        let pwd = prompt_password("  New password:     ")?;
+        if pwd.is_empty() {
+            println!("  Password cannot be empty.");
+            continue;
+        }
+        let pwd2 = prompt_password("  Confirm password: ")?;
+        if pwd != pwd2 {
+            println!("  Passwords don't match. Try again.\n");
+            continue;
+        }
+        break pwd;
+    };
+    let mut wf = WalletFile::load(wallet_path)?;
+    wf.set_password_cache(raw_seed, &password)?;
+    wf.save(wallet_path)?;
+    println!("  Password set ✓\n");
+    Ok(password)
+}
+
+/// Interactive first-run wizard: creates or recovers a wallet, sets an
+/// unlock password, and returns that password so the caller can pass it
+/// to the background node process.
+async fn first_run_wizard(wallet_path: &PathBuf) -> Result<String> {
+    println!();
+    println!("  ╔══════════════════════════════════════╗");
+    println!("  ║  Welcome to Vess — first-time setup  ║");
+    println!("  ╚══════════════════════════════════════╝");
+    println!();
+    println!("  [1] Create a new wallet");
+    println!("  [2] Recover an existing wallet from recovery phrase");
+    println!();
+
+    let choice = prompt("Your choice [1/2]: ")?;
+
+    let raw_seed: [u8; 64] = match choice.trim() {
+        "2" => wizard_recover(wallet_path).await?,
+        _ => wizard_new(wallet_path).await?,
+    };
+
+    // Now set a quick-unlock password (raw_seed still in scope — no re-prompt).
+    println!();
+    println!("Set a quick-unlock password for the background service.");
+    println!("(Your recovery phrase is the fallback if you ever forget it.)\n");
+    let password = loop {
+        let pwd = prompt_password("  New password:     ")?;
+        if pwd.is_empty() {
+            println!("  Password cannot be empty.");
+            continue;
+        }
+        let pwd2 = prompt_password("  Confirm password: ")?;
+        if pwd != pwd2 {
+            println!("  Passwords don't match. Try again.\n");
+            continue;
+        }
+        break pwd;
+    };
+
+    let mut wf = WalletFile::load(wallet_path)?;
+    wf.set_password_cache(&raw_seed, &password)?;
+    wf.save(wallet_path)?;
+    println!("  Password set ✓\n");
+    Ok(password)
+}
+
+/// Wizard sub-flow: create a brand new wallet. Returns the raw_seed so the
+/// caller can set up a password without asking for the phrase again.
+async fn wizard_new(wallet_path: &PathBuf) -> Result<[u8; 64]> {
+    println!();
+    println!("── New Wallet Setup ─────────────────────────────────────");
+
+    let tag_str = loop {
+        let t = prompt("Choose a +tag for your wallet (e.g. alice): ")?;
+        let t = t.trim_start_matches('+').trim().to_string();
+        if t.is_empty() {
+            println!("Tag cannot be empty.");
+            continue;
+        }
+        break t;
+    };
+
+    // Check tag availability before doing the expensive PoW.
+    println!("Checking if +{tag_str} is available…");
+    let peers = discover_peers().await?;
+    let target = peers[0];
+    let vess_node = VessNode::spawn().await?;
+    vess_node.wait_online().await;
+
+    let lookup = PulseMessage::TagLookup(TagLookup {
+        tag_hash: *blake3::hash(tag_str.as_bytes()).as_bytes(),
+        nonce: rand::random(),
+    });
+    let resp = vess_node.send_message_with_response(target, &lookup).await?;
+    if matches!(&resp, Some(PulseMessage::TagLookupResponse(tlr)) if tlr.result.is_some()) {
+        vess_node.shutdown().await;
+        anyhow::bail!("+{tag_str} is already taken. Run `vess start` again and pick another tag.");
+    }
+    println!("+{tag_str} is available!");
+
+    // Derive keys.
+    let phrase = RecoveryPhrase::generate();
+    let raw_seed = derive_raw_seed(&phrase)?;
+    let (secret, address) = generate_master_keys_from_seed(&raw_seed);
+    let enc_key = encryption_key_from_seed(&raw_seed);
+    let spend_seed = spend_seed_from_raw_seed(&raw_seed);
+    let encrypted = encrypt_secrets(&secret, &enc_key)?;
+    let mut wallet = WalletFile::new(address, encrypted, BillFold::new(), spend_seed, &enc_key)?;
+
+    // Compute tag PoW and register.
+    println!("\nComputing proof-of-work for tag registration (~10 s, 2 GiB RAM)…");
+    let tag_hash = *blake3::hash(tag_str.as_bytes()).as_bytes();
+    let (pow_nonce, pow_hash) = vess_tag::compute_tag_pow(
+        &tag_hash,
+        &wallet.master_address.scan_ek,
+        &wallet.master_address.spend_ek,
+    )?;
+    let (registrant_vk, registrant_sk) = vess_foundry::spend_auth::generate_spend_keypair();
+    wallet.tag_registrant_vk = registrant_vk.clone();
+    wallet.set_encrypted_tag_sk(&registrant_sk, &enc_key)?;
+
+    let tmp_record = vess_tag::TagRecord {
+        tag_hash,
+        master_address: vess_stealth::MasterStealthAddress {
+            scan_ek: wallet.master_address.scan_ek.clone(),
+            spend_ek: wallet.master_address.spend_ek.clone(),
+        },
+        pow_nonce,
+        pow_hash: pow_hash.clone(),
+        registered_at: now_unix(),
+        registrant_vk: registrant_vk.clone(),
+        signature: Vec::new(),
+        hardened_at: None,
+    };
+    let digest = tmp_record.digest();
+    let signature = vess_foundry::spend_auth::sign_spend(&registrant_sk, &digest)?;
+    let msg = PulseMessage::TagRegister(TagRegister {
+        tag_hash,
+        scan_ek: wallet.master_address.scan_ek.clone(),
+        spend_ek: wallet.master_address.spend_ek.clone(),
+        pow_nonce,
+        pow_hash,
+        timestamp: tmp_record.registered_at,
+        registrant_vk,
+        signature,
+    });
+    vess_node.send_message(target, &msg).await?;
+    vess_node.shutdown().await;
+    println!("+{tag_str} registered!");
+
+    // Display recovery phrase and require confirmation before saving.
+    println!();
+    println!("  ╔═══════════════════════════════════════════════════════════════╗");
+    println!("  ║  YOUR RECOVERY PHRASE — WRITE THIS DOWN NOW!                 ║");
+    println!("  ╠═══════════════════════════════════════════════════════════════╣");
+    println!("  ║  {}  ║", phrase.display_phrase());
+    println!("  ╚═══════════════════════════════════════════════════════════════╝");
+    println!();
+    println!("  This is the ONLY way to recover your wallet if you lose your password.");
+    println!("  Store it offline — paper, not a screenshot.\n");
+
+    loop {
+        let words_in = prompt("  Re-enter your 5 words to confirm you saved them: ")?;
+        let pin_in = prompt("  Re-enter your PIN: ")?;
+        let words_ok = words_in.split_whitespace().collect::<Vec<_>>() == phrase.words;
+        let pin_ok = pin_in.trim() == phrase.pin;
+        if words_ok && pin_ok {
+            println!("  Recovery phrase confirmed ✓\n");
+            break;
+        }
+        println!("  That doesn't match. Please try again.\n");
+    }
+
+    wallet.save(wallet_path)?;
+    Ok(raw_seed)
+}
+
+/// Wizard sub-flow: recover wallet from recovery phrase + PIN.
+/// Returns the raw_seed so the caller can set up a password without
+/// asking for the phrase a second time.
+async fn wizard_recover(wallet_path: &PathBuf) -> Result<[u8; 64]> {
+    println!();
+    println!("── Wallet Recovery ─────────────────────────────────────");
+
+    let words = prompt("Enter your 5 recovery words (space-separated): ")?;
+    let pin = prompt("Enter your 5-digit PIN: ")?;
+    let phrase = RecoveryPhrase::from_input(&words, &pin)?;
+
+    let (secret, address) = recover_master_keys(&phrase)?;
+    let raw_seed = derive_raw_seed(&phrase)?;
+    let enc_key = encryption_key_from_seed(&raw_seed);
+    let spend_seed = spend_seed_from_raw_seed(&raw_seed);
+    let encrypted = encrypt_secrets(&secret, &enc_key)?;
+
+    let mut billfold = if wallet_path.exists() {
+        WalletFile::load(wallet_path)?.billfold
+    } else {
+        BillFold::new()
+    };
+
+    println!("\nConnecting to the network to recover your bills…");
+    let node = VessNode::spawn().await?;
+    node.wait_online().await;
+
+    let peers = discover_peers().await?;
+    let bootstrap_target = peers[0];
+    let mut targets: Vec<iroh::EndpointId> = vec![bootstrap_target];
+
+    let pe_msg = PulseMessage::PeerExchange(vess_protocol::PeerExchange {
+        sender_id: vec![0u8; 32],
+    });
+    if let Ok(Some(PulseMessage::PeerExchangeResponse(resp))) =
+        node.send_message_with_response(bootstrap_target, &pe_msg).await
+    {
+        for pb in &resp.peers {
+            if let Ok(arr) = <[u8; 32]>::try_from(pb.as_slice()) {
+                if let Ok(eid) = iroh::EndpointId::from_bytes(&arr) {
+                    if !targets.contains(&eid) {
+                        targets.push(eid);
+                    }
+                }
+            }
+        }
+    }
+    println!("  Using {} peer(s) for manifest fetch", targets.len());
+
+    let manifest_key = vess_foundry::seal::manifest_dht_key(&spend_seed);
+    let manifest_req = PulseMessage::ManifestRecover(vess_protocol::ManifestRecover {
+        dht_key: manifest_key,
+    });
+
+    let mut manifest_entries = Vec::new();
+    let mut manifest_found = false;
+    for &peer in &targets {
+        if let Ok(Some(PulseMessage::ManifestRecoverResponse(mrr))) =
+            node.send_message_with_response(peer, &manifest_req).await
+        {
+            if mrr.found {
+                if let Ok(entries) =
+                    vess_foundry::seal::decrypt_manifest(&spend_seed, &mrr.encrypted_manifest)
+                {
+                    manifest_entries = entries;
+                    manifest_found = true;
+                    println!("  Manifest found: {} bill entries", manifest_entries.len());
+                    break;
+                }
+            }
+        }
+    }
+
+    let mut max_dht_index = 0u64;
+    if manifest_found && !manifest_entries.is_empty() {
+        let mint_ids: Vec<[u8; 32]> = manifest_entries.iter().map(|e| e.mint_id).collect();
+        let fetch_req =
+            PulseMessage::OwnershipFetch(vess_protocol::OwnershipFetch { mint_ids });
+        let mut fetched = Vec::new();
+        for &peer in &targets {
+            if let Ok(Some(PulseMessage::OwnershipFetchResponse(ofr))) =
+                node.send_message_with_response(peer, &fetch_req).await
+            {
+                fetched = ofr.records;
+                break;
+            }
+        }
+        for (i, entry) in manifest_entries.iter().enumerate() {
+            if i >= fetched.len() {
+                break;
+            }
+            let rec = &fetched[i];
+            if !rec.found {
+                continue;
+            }
+            if let Some(denomination) =
+                vess_foundry::Denomination::from_value(rec.denomination_value)
+            {
+                let bill = vess_foundry::VessBill {
+                    denomination,
+                    digest: rec.digest,
+                    created_at: 0,
+                    stealth_id: [0u8; 32],
+                    dht_index: entry.dht_index,
+                    mint_id: entry.mint_id,
+                    chain_tip: rec.chain_tip,
+                    chain_depth: 0,
+                };
+                billfold.deposit(bill);
+                if entry.dht_index >= max_dht_index {
+                    max_dht_index = entry.dht_index + 1;
+                }
+            }
+        }
+        println!(
+            "  Recovered {} bill(s). Balance: {} Vess",
+            billfold.count(),
+            billfold.balance()
+        );
+    } else {
+        println!("  No manifest found. Wallet created with empty balance.");
+        println!("  (Bills in-flight will be delivered once the node is running.)");
+    }
+
+    node.shutdown().await;
+
+    let mut wallet = WalletFile::new(address, encrypted, billfold, spend_seed, &enc_key)?;
+    wallet.next_dht_index = max_dht_index;
+    wallet.save(wallet_path)?;
+    println!("  Wallet saved ✓\n");
+    Ok(raw_seed)
+}
+
+// ── `vess stop` ──────────────────────────────────────────────────────
+async fn cmd_stop() -> Result<()> {
+    match read_node_pid() {
+        None => {
+            println!("No background Vess node is running (no PID file found).");
+        }
+        Some(pid) => {
+            if !is_pid_alive(pid) {
+                println!("Process {pid} is no longer running (stale PID file removed).");
+                clear_node_pid();
+            } else {
+                kill_pid(pid)?;
+                clear_node_pid();
+                println!("Vess node (PID {pid}) stopped.");
+            }
+        }
+    }
+    Ok(())
+}
+
+// ── `vess status` ────────────────────────────────────────────────────
+
+async fn cmd_status(cli: &Cli) -> Result<()> {
+    let port = rpc_port(cli);
+
+    let running = match read_node_pid() {
+        None => false,
+        Some(pid) => {
+            if is_pid_alive(pid) {
+                println!("Status:  RUNNING  (PID {pid})");
+                true
+            } else {
+                println!("Status:  NOT RUNNING  (stale PID file removed)");
+                clear_node_pid();
+                false
+            }
+        }
+    };
+
+    if !running {
+        println!("Run `vess start` to start the node.");
+        return Ok(());
+    }
+
+    // Try RPC for live stats.
+    if let Ok(resp) = rpc_call(port, &json!({"method": "balance"})).await {
+        if resp["ok"] == true {
+            println!("Balance: {} Vess  ({} bills)", resp["balance"], resp["bill_count"]);
+        }
+    }
+
+    if let Ok(resp) = rpc_call(port, &json!({"method": "node_info"})).await {
+        if resp["ok"] == true {
+            println!("Peers:   {}", resp["verified_peer_count"]);
+            println!("Node ID: {}", resp["node_id"].as_str().unwrap_or("?"));
+        }
+    }
+
+    println!();
+    println!("  `vess balance`       — check balance");
+    println!("  `vess send <n> <+tag>` — send Vess");
+    println!("  `vess stop`          — stop the node");
+    Ok(())
 }
