@@ -366,6 +366,9 @@ pub(crate) struct WalletState {
     pub(crate) wallet_path: PathBuf,
     /// Encryption key for spend credentials and tag keys on disk.
     pub(crate) enc_key: [u8; 32],
+    /// Mailbox shard key derived from our spend encapsulation key.
+    /// Used for targeted [`MailboxSweep`] and automatic forwarding subscription.
+    pub(crate) mailbox_key: [u8; 32],
 }
 
 /// Shared artery node state behind a mutex.
@@ -798,7 +801,8 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
         };
 
         // Derive stealth keys and encryption key from the raw seed.
-        let (stealth_secret, _address) = vess_stealth::generate_master_keys_from_seed(&raw_seed);
+        let (stealth_secret, address) = vess_stealth::generate_master_keys_from_seed(&raw_seed);
+        let mailbox_key = vess_kloak::derive_mailbox_key(&address.spend_ek);
         let enc_key = encryption_key_from_seed(&raw_seed);
 
         // Load billfold and decrypt spend credentials into it.
@@ -813,6 +817,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
             billfold,
             wallet_path: wallet_path.clone(),
             enc_key,
+            mailbox_key,
         })
     } else {
         None
@@ -2028,6 +2033,81 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     if let Err(e) = limbo_node.send_message(target, &msg).await {
                         warn!("limbo notify failed: {e}");
                     }
+                }
+            }
+        }
+    });
+
+    // ── Auto mailbox-forward subscription ──────────────────────────
+    //
+    // When a wallet is loaded, register with the K nearest verified peers
+    // for our `mailbox_key` so they push matching payments via LimboDeliver.
+    // Runs every 30 minutes, which is half the maximum TTL (3600 s), so the
+    // subscription stays continuously active without waiting for expiry.
+    // The first attempt is delayed by 15 s to allow bootstrap peers to connect.
+    let fwd_sub_node = node.clone();
+    let fwd_sub_state = state.clone();
+    tokio::spawn(async move {
+        // Give bootstrap / handshake tasks a head-start before we register.
+        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1_800));
+        loop {
+            interval.tick().await;
+
+            // Snapshot mailbox_key and nearest verified peers under the lock.
+            let (mailbox_key, nearest_peers) = {
+                let s = fwd_sub_state.lock().unwrap();
+                let mk = match s.wallet.as_ref().map(|w| w.mailbox_key) {
+                    Some(k) => k,
+                    None => continue, // no wallet — nothing to subscribe for
+                };
+                let peers = s
+                    .routing_table
+                    .closest_peers(&mk, s.gossip_config.k_neighbors)
+                    .into_iter()
+                    .filter(|p| s.peer_registry.state(&p.id_hash) == PeerState::Verified)
+                    .map(|p| p.id_bytes)
+                    .collect::<Vec<_>>();
+                (mk, peers)
+            };
+
+            if nearest_peers.is_empty() {
+                continue; // no verified peers yet — will retry in 30 min
+            }
+
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+
+            for peer_bytes in &nearest_peers {
+                let arr: [u8; 32] = match peer_bytes.as_slice().try_into() {
+                    Ok(a) => a,
+                    Err(_) => continue,
+                };
+                let target = match iroh::EndpointId::from_bytes(&arr) {
+                    Ok(id) => id,
+                    Err(_) => continue,
+                };
+                let nonce: [u8; 16] = {
+                    use rand::Rng;
+                    rand::thread_rng().gen()
+                };
+                let msg = PulseMessage::MailboxForwardRegister(vess_protocol::MailboxForwardRegister {
+                    mailbox_key,
+                    timestamp: now,
+                    ttl_secs: MAX_FORWARD_TTL_SECS as u32,
+                    nonce,
+                });
+                match fwd_sub_node.send_message_with_response(target, &msg).await {
+                    Ok(Some(PulseMessage::MailboxForwardAck(ack))) => {
+                        if ack.accepted {
+                            info!(queued = ack.queued_forwarded, "mailbox forward subscription accepted");
+                        } else {
+                            info!("mailbox forward subscription rejected by peer");
+                        }
+                    }
+                    _ => {} // unreachable or unexpected — silently skip
                 }
             }
         }

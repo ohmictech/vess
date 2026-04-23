@@ -1442,8 +1442,9 @@ fn handle_wallet_unlock(
     };
 
     // Derive stealth keys and encryption key from raw_seed.
-    let (stealth_secret, _address) = vess_stealth::generate_master_keys_from_seed(&raw_seed);
+    let (stealth_secret, address) = vess_stealth::generate_master_keys_from_seed(&raw_seed);
     let enc_key = vess_kloak::recovery::encryption_key_from_seed(&raw_seed);
+    let mailbox_key = vess_kloak::derive_mailbox_key(&address.spend_ek);
 
     // Load billfold and decrypt spend credentials into it.
     let mut billfold = wallet.billfold.clone();
@@ -1458,6 +1459,7 @@ fn handle_wallet_unlock(
         billfold,
         wallet_path: wallet_path.clone(),
         enc_key,
+        mailbox_key,
     });
 
     // Sweep existing limbo entries through the newly unlocked wallet.
