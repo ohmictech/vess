@@ -170,6 +170,25 @@ impl LimboBuffer {
         payloads
     }
 
+    /// Collect up to `max` full [`Payment`] objects whose `mailbox_key` matches `key`.
+    ///
+    /// Used on [`MailboxForwardRegister`] to immediately deliver any already-waiting
+    /// payments to the newly-subscribed node.
+    pub fn payments_by_mailbox_key(&self, key: &[u8; 32], max: usize) -> Vec<vess_protocol::Payment> {
+        let mut out = Vec::with_capacity(max.min(128));
+        'outer: for entries in self.entries.values() {
+            for entry in entries {
+                if entry.mailbox_key.as_ref() == Some(key) {
+                    out.push(entry.payment.clone());
+                    if out.len() >= max {
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// Collect up to `max` stealth_payloads whose mailbox_key matches `key`.
     ///
     /// Used by the targeted [`MailboxSweep`] path.  Recipients that set a

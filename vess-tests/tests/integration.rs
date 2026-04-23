@@ -463,6 +463,47 @@ fn mailbox_collect_round_trip() {
     }
 }
 
+#[test]
+fn mailbox_forward_register_round_trip() {
+    use vess_protocol::{MailboxForwardAck, MailboxForwardRegister};
+
+    let register = PulseMessage::MailboxForwardRegister(MailboxForwardRegister {
+        mailbox_key: [0xAB; 32],
+        timestamp: 1_700_000_000,
+        ttl_secs: 1800,
+        nonce: [0x12; 16],
+    });
+
+    let bytes = register.to_bytes().unwrap();
+    let decoded = PulseMessage::from_bytes(&bytes).unwrap();
+    match decoded {
+        PulseMessage::MailboxForwardRegister(mfr) => {
+            assert_eq!(mfr.mailbox_key, [0xAB; 32]);
+            assert_eq!(mfr.timestamp, 1_700_000_000);
+            assert_eq!(mfr.ttl_secs, 1800);
+            assert_eq!(mfr.nonce, [0x12; 16]);
+        }
+        _ => panic!("expected MailboxForwardRegister"),
+    }
+
+    let ack = PulseMessage::MailboxForwardAck(MailboxForwardAck {
+        nonce: [0x12; 16],
+        accepted: true,
+        queued_forwarded: 3,
+    });
+
+    let bytes = ack.to_bytes().unwrap();
+    let decoded = PulseMessage::from_bytes(&bytes).unwrap();
+    match decoded {
+        PulseMessage::MailboxForwardAck(ack) => {
+            assert_eq!(ack.nonce, [0x12; 16]);
+            assert!(ack.accepted);
+            assert_eq!(ack.queued_forwarded, 3);
+        }
+        _ => panic!("expected MailboxForwardAck"),
+    }
+}
+
 // ── OwnershipRegistry persistence ─────────────────────────────────────
 
 #[test]

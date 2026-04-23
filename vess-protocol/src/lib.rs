@@ -78,6 +78,12 @@ pub enum PulseMessage {
     /// Response to a mailbox sweep.
     MailboxSweepResponse(MailboxSweepResponse),
 
+    /// Ask a shard custodian to push incoming payments to this node.
+    MailboxForwardRegister(MailboxForwardRegister),
+
+    /// Acknowledgement to a [`MailboxForwardRegister`] request.
+    MailboxForwardAck(MailboxForwardAck),
+
     /// Claim ownership of a bill after receiving a transfer.
     OwnershipClaim(OwnershipClaim),
 
@@ -279,6 +285,51 @@ pub struct MailboxSweepResponse {
     pub nonce: [u8; 16],
     /// All stealth_payloads currently in limbo (opaque AEAD blobs).
     pub payloads: Vec<Vec<u8>>,
+}
+
+// ── Mailbox Forward Subscription ─────────────────────────────────────
+
+/// Ask a shard custodian to push any incoming payments matching
+/// `mailbox_key` to this node via [`LimboDeliver`].
+///
+/// The subscribing peer is identified by its transport-layer endpoint ID
+/// (i.e. whoever sent this message).  A new registration for the same
+/// key replaces any prior subscription (last-writer wins).
+///
+/// Subscriptions expire after `ttl_secs` seconds (capped server-side at
+/// 3 600 s / 1 h).  Nodes should re-register before expiry.
+///
+/// On acceptance the custodian immediately forwards any already-waiting
+/// payments for the key, so the subscriber does not need a separate sweep.
+///
+/// **Privacy:** the custodian learns which node subscribes to this hash,
+/// but payment content remains end-to-end encrypted regardless.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MailboxForwardRegister {
+    /// Mailbox shard key to subscribe to
+    /// (`BLAKE3("vess-mailbox-v1" || spend_ek)`).
+    pub mailbox_key: [u8; 32],
+    /// Unix timestamp at creation time (stale requests are rejected).
+    pub timestamp: u64,
+    /// Requested subscription lifetime in seconds.
+    /// Capped server-side at 3 600 s.
+    pub ttl_secs: u32,
+    /// Anti-replay nonce, echoed in the acknowledgement.
+    pub nonce: [u8; 16],
+}
+
+/// Acknowledgement from a custodian that processed a
+/// [`MailboxForwardRegister`] request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MailboxForwardAck {
+    /// Echoed nonce from the corresponding [`MailboxForwardRegister`].
+    pub nonce: [u8; 16],
+    /// `true` when the subscription was stored; `false` when rejected
+    /// (rate-limited, stale timestamp, etc.).
+    pub accepted: bool,
+    /// Number of already-waiting payments forwarded immediately on
+    /// registration via [`LimboDeliver`].
+    pub queued_forwarded: u32,
 }
 
 // ── Registry Query ───────────────────────────────────────────────────

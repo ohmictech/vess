@@ -28,9 +28,10 @@ use crate::{
 
 use vess_protocol::{
     FetchedRecord, FindNodeResponse, HandshakeChallenge, HandshakeResponse, MailboxCollectResponse,
-    MailboxSweepResponse, ManifestRecoverResponse, OwnershipClaim, OwnershipFetchResponse,
-    OwnershipGenesis, PeerExchange, PeerExchangeResponse, PulseMessage, ReforgeAttestation,
-    RegistryQueryResponse, TagConfirm, TagLookupResponse, TagLookupResult, TagStore,
+    MailboxForwardAck, MailboxSweepResponse, ManifestRecoverResponse, OwnershipClaim,
+    OwnershipFetchResponse, OwnershipGenesis, PeerExchange, PeerExchangeResponse, PulseMessage,
+    ReforgeAttestation, RegistryQueryResponse, TagConfirm, TagLookupResponse, TagLookupResult,
+    TagStore,
 };
 use vess_vascular::VessNode;
 
@@ -52,6 +53,18 @@ pub struct WalletNotification {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub counterparty: Option<String>,
     pub message: String,
+}
+
+/// Active push-forwarding subscription for a mailbox shard key.
+///
+/// When a shard custodian holds this record it will attempt a [`LimboDeliver`]
+/// to `target_id_bytes` for every payment whose `mailbox_key` matches.
+#[derive(Debug, Clone)]
+pub(crate) struct ForwardRecord {
+    /// Raw 32-byte `EndpointId` of the subscribing node.
+    pub(crate) target_id_bytes: Vec<u8>,
+    /// Unix timestamp when the subscription expires.
+    pub(crate) expires_at: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -86,6 +99,13 @@ const MAX_MANIFEST_ENTRIES: usize = 500;
 /// Maximum number of stealth_payloads returned in a single
 /// MailboxSweep response to prevent memory exhaustion.
 const MAX_SWEEP_PAYLOADS: usize = 500;
+
+/// Maximum TTL accepted for a [`MailboxForwardRegister`] subscription (1 hour).
+const MAX_FORWARD_TTL_SECS: u64 = 3_600;
+
+/// Freshness window for [`MailboxForwardRegister`] timestamps: requests older
+/// than this many seconds are rejected as stale / replayed.
+const FORWARD_TIMESTAMP_TOLERANCE_SECS: u64 = 120;
 
 /// Number of duplicate messages from a single peer within a window
 /// before the peer is banished for duplicate flooding.
@@ -409,6 +429,11 @@ pub(crate) struct ArteryState {
     /// Caches every verified tag → stealth address the wallet has sent to,
     /// so repeat payments skip the DHT entirely.
     pub(crate) tag_cache: crate::tag_cache::TagCache,
+    /// Active push-forwarding subscriptions: mailbox_key → record of the
+    /// subscribing node and subscription expiry time.
+    pub(crate) mailbox_fwd: HashMap<[u8; 32], ForwardRecord>,
+    /// Rate limiter for [`MailboxForwardRegister`] requests.
+    pub(crate) mailbox_fwd_limiter: crate::gossip::PeerRateLimiter,
 }
 
 impl ArteryState {
@@ -842,6 +867,9 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
         tag_cache: crate::tag_cache::TagCache::load_or_create(
             config.state_dir.join("tag_cache.json"),
         ),
+        mailbox_fwd: HashMap::new(),
+        // MailboxForwardRegister: 5 registrations per 60-second window per peer.
+        mailbox_fwd_limiter: crate::gossip::PeerRateLimiter::new(5, 60),
     }));
 
     // ── Gossip drain channels ───────────────────────────────────────
@@ -856,6 +884,10 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
     let (oc_tx, mut oc_rx) = tokio::sync::mpsc::unbounded_channel::<OwnershipClaim>();
     let (ra_tx, mut ra_rx) = tokio::sync::mpsc::unbounded_channel::<ReforgeAttestation>();
     let (pay_tx, mut pay_rx) = tokio::sync::mpsc::unbounded_channel::<vess_protocol::Payment>();
+    // Forward channel: (target EndpointId bytes, Payment to deliver).
+    // The drain task below sends a LimboDeliver to subscribed nodes.
+    let (fwd_tx, mut fwd_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(Vec<u8>, vess_protocol::Payment)>();
 
     // Restore persisted state.
     {
@@ -1032,6 +1064,13 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 let pruned_tags = s.tag_dht.purge_unhardened(now);
                 if pruned_tags > 0 {
                     info!(count = pruned_tags, "pruned unhardened tags");
+                }
+                // Evict expired mailbox forwarding subscriptions.
+                let before_fwd = s.mailbox_fwd.len();
+                s.mailbox_fwd.retain(|_, r| r.expires_at > now);
+                let evicted_fwd = before_fwd - s.mailbox_fwd.len();
+                if evicted_fwd > 0 {
+                    info!(count = evicted_fwd, "evicted expired mailbox forward subscriptions");
                 }
                 // C1: Evict pending-reforge-genesis entries older than the TTL.
                 // Without this, keys created by fake attestations linger forever.
@@ -1686,6 +1725,28 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
         }
     });
 
+    // ── Mailbox forward delivery drain task ─────────────────────────
+    // Sends a LimboDeliver to each subscribed node when a matching
+    // payment arrives so recipients get push notification rather than
+    // having to poll.
+    let fwd_drain_node = node.clone();
+    tokio::spawn(async move {
+        while let Some((target_bytes, payment)) = fwd_rx.recv().await {
+            let arr: [u8; 32] = match target_bytes.as_slice().try_into() {
+                Ok(a) => a,
+                Err(_) => continue,
+            };
+            let target = match iroh::EndpointId::from_bytes(&arr) {
+                Ok(id) => id,
+                Err(_) => continue,
+            };
+            let msg = PulseMessage::LimboDeliver(vess_protocol::LimboDeliver { payment });
+            if let Err(e) = fwd_drain_node.send_message(target, &msg).await {
+                warn!(error = %e, "mailbox forward delivery failed");
+            }
+        }
+    });
+
     // ── Periodic peer exchange ──────────────────────────────────────
     let pex_node = node.clone();
     let pex_state = state.clone();
@@ -1988,6 +2049,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
     let h_oc_tx = oc_tx.clone();
     let h_ra_tx = ra_tx.clone();
     let h_pay_tx = pay_tx.clone();
+    let h_fwd_tx = fwd_tx.clone();
     node.listen_messages_with_response(move |peer, msg| {
         let peer_hash: [u8; 32] = *blake3::hash(peer.as_bytes()).as_bytes();
         if ban_ref.is_banished(&peer_hash) {
@@ -2165,6 +2227,53 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 Some(PulseMessage::MailboxSweepResponse(MailboxSweepResponse {
                     nonce: ms.nonce,
                     payloads,
+                }))
+            }
+
+            PulseMessage::MailboxForwardRegister(mfr) => {
+                // Rate-limit to prevent subscription flooding.
+                if !state.mailbox_fwd_limiter.allow(&peer_id) {
+                    warn!(%peer, "mailbox forward register rate-limited");
+                    return Some(PulseMessage::MailboxForwardAck(MailboxForwardAck {
+                        nonce: mfr.nonce,
+                        accepted: false,
+                        queued_forwarded: 0,
+                    }));
+                }
+
+                // Reject stale or future-shifted timestamps to block replays.
+                let now = ArteryState::now_unix();
+                let age = now.saturating_sub(mfr.timestamp);
+                let skew = mfr.timestamp.saturating_sub(now);
+                if age > FORWARD_TIMESTAMP_TOLERANCE_SECS || skew > MAX_FUTURE_SKEW_SECS {
+                    warn!(%peer, age, "mailbox forward register rejected: stale/future timestamp");
+                    return Some(PulseMessage::MailboxForwardAck(MailboxForwardAck {
+                        nonce: mfr.nonce,
+                        accepted: false,
+                        queued_forwarded: 0,
+                    }));
+                }
+
+                let ttl = (mfr.ttl_secs as u64).min(MAX_FORWARD_TTL_SECS);
+                let expires_at = now + ttl;
+                state.mailbox_fwd.insert(mfr.mailbox_key, ForwardRecord {
+                    target_id_bytes: peer.as_bytes().to_vec(),
+                    expires_at,
+                });
+
+                // Immediately push any already-waiting payments for this key.
+                let waiting = state.limbo_buffer.payments_by_mailbox_key(&mfr.mailbox_key, MAX_SWEEP_PAYLOADS);
+                let queued_forwarded = waiting.len() as u32;
+                let target_bytes = peer.as_bytes().to_vec();
+                for payment in waiting {
+                    let _ = h_fwd_tx.send((target_bytes.clone(), payment));
+                }
+
+                info!(%peer, key = ?&mfr.mailbox_key[..4], ttl, queued = queued_forwarded, "mailbox forward subscription registered");
+                Some(PulseMessage::MailboxForwardAck(MailboxForwardAck {
+                    nonce: mfr.nonce,
+                    accepted: true,
+                    queued_forwarded,
                 }))
             }
 
@@ -2363,7 +2472,16 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
 
                 // Forward to K-nearest by stealth_id so multiple relay
                 // nodes hold the payment (prevents single-node censorship).
-                let _ = h_pay_tx.send(relay_copy);
+                let _ = h_pay_tx.send(relay_copy.clone());
+
+                // Push to any active forwarding subscriber for this mailbox_key.
+                if let Some(ref key) = mailbox_key {
+                    if let Some(record) = state.mailbox_fwd.get(key) {
+                        if record.expires_at > now {
+                            let _ = h_fwd_tx.send((record.target_id_bytes.clone(), relay_copy));
+                        }
+                    }
+                }
 
                 // ── Auto-receive: trial-decrypt if wallet is loaded ─────
                 // Clone the payload out first to avoid overlapping borrows.
@@ -2524,14 +2642,24 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     .unwrap_or_default()
                     .as_secs();
                 let mailbox_key = p.mailbox_key;
+                let deliver_payment = ld.payment;
 
-                if !state.limbo_buffer.hold(stealth_id, ld.payment, Vec::new(), now, peer_id, mailbox_key) {
+                if !state.limbo_buffer.hold(stealth_id, deliver_payment.clone(), Vec::new(), now, peer_id, mailbox_key) {
                     warn!(%peer, "limbo deliver rejected: buffer at capacity");
                     return None;
                 }
 
                 // Track AFTER successful hold.
                 state.limbo_payment_ids.insert(payment_id);
+
+                // Push to any active forwarding subscriber for this mailbox_key.
+                if let Some(ref key) = mailbox_key {
+                    if let Some(record) = state.mailbox_fwd.get(key) {
+                        if record.expires_at > now {
+                            let _ = h_fwd_tx.send((record.target_id_bytes.clone(), deliver_payment.clone()));
+                        }
+                    }
+                }
 
                 // Auto-receive trial-decrypt for LimboDeliver too.
                 let maybe_payload = state.limbo_buffer.peek(&stealth_id)
