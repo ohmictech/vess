@@ -127,6 +127,7 @@ async fn payment_message_survives_wire_roundtrip() {
         stealth_id: rand::random(),
         created_at: now_unix(),
         bill_count: 1,
+        mailbox_key: None,
     });
 
     node_a.send_message(addr_b, &payment).await.unwrap();
@@ -267,6 +268,7 @@ async fn three_node_relay() {
         stealth_id: rand::random(),
         created_at: now_unix(),
         bill_count: 1,
+        mailbox_key: None,
     });
 
     node_a.send_message(addr_b, &payment_msg).await.unwrap();

@@ -152,6 +152,20 @@ pub struct Payment {
     /// without learning which specific bills are being transferred.
     #[serde(default)]
     pub bill_count: u8,
+
+    /// Optional DHT routing key for mailbox sharding.
+    ///
+    /// Derived by the sender as `BLAKE3("vess-mailbox-v1" || spend_ek_bytes)`
+    /// from the recipient's public spend encapsulation key.  When present,
+    /// relay nodes store this payment in limbo tagged with this key, and
+    /// the recipient issues a targeted [`MailboxSweep`] with the matching
+    /// key to retrieve only their own payments — no trial-decryption of
+    /// unrelated payloads.
+    ///
+    /// Both sender and recipient derive the same key from the same public
+    /// spend_ek, so no additional out-of-band communication is needed.
+    #[serde(default)]
+    pub mailbox_key: Option<[u8; 32]>,
 }
 
 // ── Tag Operations ───────────────────────────────────────────────────
@@ -248,6 +262,14 @@ pub struct MailboxCollectResponse {
 pub struct MailboxSweep {
     /// Random nonce to prevent response replay.
     pub nonce: [u8; 16],
+
+    /// Optional mailbox key filter (see [`Payment::mailbox_key`]).
+    ///
+    /// When present the relay returns only limbo payloads whose
+    /// stored `mailbox_key` matches.  When absent the relay returns
+    /// ALL payloads (legacy behaviour, backwards compatible).
+    #[serde(default)]
+    pub mailbox_key: Option<[u8; 32]>,
 }
 
 /// Response to a [`MailboxSweep`].
@@ -732,6 +754,7 @@ mod tests {
             stealth_id: [0xBB; 32],
             created_at: 1000,
             bill_count: 1,
+            mailbox_key: None,
         });
         let bytes = msg.to_bytes().unwrap();
         let decoded = PulseMessage::from_bytes(&bytes).unwrap();

@@ -328,6 +328,7 @@ fn protocol_message_serialization() {
         stealth_id: [0xBB; 32],
         created_at: 1000,
         bill_count: 0,
+        mailbox_key: None,
     })];
 
     for msg in &messages {

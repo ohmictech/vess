@@ -29,7 +29,7 @@ pub mod tag_cache;
 
 pub use auto_reforge::ConsolidationScheduler;
 pub use billfold::BillFold;
-pub use payment::{cleanup_rejected_bills, extract_mint_ids_from_claims, PaymentTracker};
+pub use payment::{cleanup_rejected_bills, derive_mailbox_key, extract_mint_ids_from_claims, PaymentTracker};
 pub use persistence::WalletFile;
 pub use recovery::{EncryptedSecrets, RecoveryPhrase};
 pub use selection::select_bills;

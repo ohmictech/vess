@@ -1664,7 +1664,9 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     Err(e) => { warn!(error = %e, "serialize Payment failed"); continue; }
                 };
                 let indices = compute_gossip_targets_scored(
-                    &p.stealth_id,
+                    // Route by mailbox_key when present — puts payment into the
+                    // recipient's DHT shard rather than broadcasting by stealth_id.
+                    p.mailbox_key.as_ref().unwrap_or(&p.stealth_id),
                     &peer_hashes,
                     &peer_scores,
                     &age_factors,
@@ -2152,8 +2154,14 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
 
                 // M4: Collect stealth_payloads in a single pass via sweep_payloads(),
                 // avoiding the O(n) two-level iteration over all stealth IDs.
-                let payloads = state.limbo_buffer.sweep_payloads(MAX_SWEEP_PAYLOADS);
-                info!(%peer, count = payloads.len(), "mailbox sweep");
+                // When the sweep carries a mailbox_key, return only matching payloads
+                // (targeted sweep) — eliminates trial-decrypt of unrelated payments.
+                let payloads = if let Some(ref key) = ms.mailbox_key {
+                    state.limbo_buffer.sweep_by_mailbox_key(key, MAX_SWEEP_PAYLOADS)
+                } else {
+                    state.limbo_buffer.sweep_payloads(MAX_SWEEP_PAYLOADS)
+                };
+                info!(%peer, count = payloads.len(), mailbox_key = ms.mailbox_key.is_some(), "mailbox sweep");
                 Some(PulseMessage::MailboxSweepResponse(MailboxSweepResponse {
                     nonce: ms.nonce,
                     payloads,
@@ -2342,8 +2350,9 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 let stealth_id = p.stealth_id;
                 let relay_copy = p.clone();
                 let payment_id = p.payment_id;
+                let mailbox_key = p.mailbox_key;
 
-                if !state.limbo_buffer.hold(stealth_id, p, Vec::new(), now, peer_id) {
+                if !state.limbo_buffer.hold(stealth_id, p, Vec::new(), now, peer_id, mailbox_key) {
                     warn!(%peer, "payment rejected: limbo buffer at capacity or peer quota exceeded");
                     return None;
                 }
@@ -2514,8 +2523,9 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs();
+                let mailbox_key = p.mailbox_key;
 
-                if !state.limbo_buffer.hold(stealth_id, ld.payment, Vec::new(), now, peer_id) {
+                if !state.limbo_buffer.hold(stealth_id, ld.payment, Vec::new(), now, peer_id, mailbox_key) {
                     warn!(%peer, "limbo deliver rejected: buffer at capacity");
                     return None;
                 }

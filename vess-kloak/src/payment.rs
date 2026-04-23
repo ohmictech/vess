@@ -140,6 +140,32 @@ impl PaymentTracker {
     }
 }
 
+// ── Mailbox shard key derivation ────────────────────────────────────
+
+/// Derive the deterministic mailbox routing key from a recipient's
+/// spend encapsulation key.
+///
+/// Both the **sender** (who has the recipient's public `spend_ek`) and the
+/// **recipient** (who generates it from their own key) derive the same key
+/// independently — no extra out-of-band communication is needed.
+///
+/// The key is used in two ways:
+/// 1. The sender attaches it to the [`Payment`] so relay nodes store the
+///    payment under the correct shard (via [`LimboEntry::mailbox_key`]).
+/// 2. The recipient sends a targeted [`MailboxSweep`] with this key so
+///    each relay returns only their own payloads — eliminating
+///    trial-decryption of every stranger's payment.
+///
+/// Relay routing uses the key instead of `stealth_id` so multiple relay
+/// nodes in the K-nearest neighbourhood of the key all hold the payment,
+/// matching the cluster the recipient will sweep.
+pub fn derive_mailbox_key(spend_ek: &[u8]) -> [u8; 32] {
+    let mut h = Hasher::new();
+    h.update(b"vess-mailbox-v1");
+    h.update(spend_ek);
+    *h.finalize().as_bytes()
+}
+
 // ── Sender-side operations ───────────────────────────────────────────
 
 /// Prepare a payment: select bills, build stealth payload, produce wire message.
@@ -177,6 +203,7 @@ pub fn prepare_payment(
         stealth_id: stealth.stealth_id,
         created_at: now_unix(),
         bill_count,
+        mailbox_key: Some(derive_mailbox_key(&recipient.spend_ek)),
     });
 
     Ok((msg, payment_id, selection.send_indices))
@@ -253,6 +280,7 @@ pub fn prepare_payment_with_transfer(
         stealth_id: stealth.stealth_id,
         created_at: timestamp,
         bill_count,
+        mailbox_key: Some(derive_mailbox_key(&recipient.spend_ek)),
     });
 
     Ok((msg, payment_id, selection.send_indices))
@@ -311,6 +339,7 @@ pub fn prepare_payment_from_bills(
         stealth_id: stealth.stealth_id,
         created_at: timestamp,
         bill_count,
+        mailbox_key: Some(derive_mailbox_key(&recipient.spend_ek)),
     });
 
     Ok((msg, payment_id))

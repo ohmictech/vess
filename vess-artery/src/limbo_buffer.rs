@@ -44,6 +44,10 @@ pub struct LimboEntry {
     /// Used for per-peer quota enforcement.
     #[serde(default)]
     pub relay_peer: [u8; 32],
+    /// Mailbox shard key (see [`Payment::mailbox_key`]).
+    /// When present, MailboxSweep with a matching key returns only this entry.
+    #[serde(default)]
+    pub mailbox_key: Option<[u8; 32]>,
 }
 
 /// Limbo buffer keyed by stealth_id.
@@ -79,6 +83,7 @@ impl LimboBuffer {
         bill_ids: Vec<[u8; 32]>,
         entered_at: u64,
         relay_peer: [u8; 32],
+        mailbox_key: Option<[u8; 32]>,
     ) -> bool {
         // Per-peer quota check (Fix 3A).
         let peer_count = self.per_peer_count.get(&relay_peer).copied().unwrap_or(0);
@@ -104,6 +109,7 @@ impl LimboBuffer {
                 bill_ids,
                 entered_at,
                 relay_peer,
+                mailbox_key,
             });
         true
     }
@@ -158,6 +164,26 @@ impl LimboBuffer {
                 payloads.push(entry.payment.stealth_payload.clone());
                 if payloads.len() >= max {
                     break 'outer;
+                }
+            }
+        }
+        payloads
+    }
+
+    /// Collect up to `max` stealth_payloads whose mailbox_key matches `key`.
+    ///
+    /// Used by the targeted [`MailboxSweep`] path.  Recipients that set a
+    /// `mailbox_key` when sending only ever retrieve their own payments —
+    /// no trial-decryption of unrelated payloads needed.
+    pub fn sweep_by_mailbox_key(&self, key: &[u8; 32], max: usize) -> Vec<Vec<u8>> {
+        let mut payloads = Vec::with_capacity(max.min(128));
+        'outer: for entries in self.entries.values() {
+            for entry in entries {
+                if entry.mailbox_key.as_ref() == Some(key) {
+                    payloads.push(entry.payment.stealth_payload.clone());
+                    if payloads.len() >= max {
+                        break 'outer;
+                    }
                 }
             }
         }
@@ -310,6 +336,7 @@ mod tests {
             stealth_id,
             created_at: 1000,
             bill_count: bill_ids.len() as u8,
+            mailbox_key: None,
         }
     }
 
@@ -320,7 +347,7 @@ mod tests {
         let bids = vec![[0x11; 32], [0x22; 32]];
         let payment = test_payment(sid, &bids);
 
-        assert!(buf.hold(sid, payment, bids.clone(), 1000, PEER_A));
+        assert!(buf.hold(sid, payment, bids.clone(), 1000, PEER_A, None));
         assert_eq!(buf.total_entries(), 1);
         assert_eq!(buf.recipient_count(), 1);
 
@@ -339,13 +366,14 @@ mod tests {
         let bid3 = [0x33; 32];
 
         // Two payments for same recipient
-        buf.hold(sid, test_payment(sid, &[bid1]), vec![bid1], 1000, PEER_A);
+        buf.hold(sid, test_payment(sid, &[bid1]), vec![bid1], 1000, PEER_A, None);
         buf.hold(
             sid,
             test_payment(sid, &[bid2, bid3]),
             vec![bid2, bid3],
             1001,
             PEER_A,
+            None,
         );
         assert_eq!(buf.total_entries(), 2);
 
@@ -362,7 +390,7 @@ mod tests {
         let sid = [0xAA; 32];
         let bid = [0x11; 32];
 
-        buf.hold(sid, test_payment(sid, &[bid]), vec![bid], 1000, PEER_A);
+        buf.hold(sid, test_payment(sid, &[bid]), vec![bid], 1000, PEER_A, None);
         assert_eq!(buf.total_entries(), 1);
 
         // Recipient claims — removes the entry
@@ -384,6 +412,7 @@ mod tests {
             vec![[0x11; 32]],
             1000,
             PEER_A,
+            None,
         );
         buf.hold(
             sid2,
@@ -391,6 +420,7 @@ mod tests {
             vec![[0x22; 32]],
             1001,
             PEER_B,
+            None,
         );
 
         let ids = buf.stealth_ids_with_payments();
@@ -407,6 +437,7 @@ mod tests {
             vec![[0x11; 32]],
             1000,
             PEER_A,
+            None,
         );
 
         let exported = buf.export();
@@ -426,7 +457,7 @@ mod tests {
                 b[0..2].copy_from_slice(&(i as u16).to_le_bytes());
                 b
             };
-            assert!(buf.hold(sid, test_payment(sid, &[bid]), vec![bid], 1000, PEER_A));
+            assert!(buf.hold(sid, test_payment(sid, &[bid]), vec![bid], 1000, PEER_A, None));
         }
         assert_eq!(buf.total_entries(), MAX_ENTRIES_PER_PEER);
 
@@ -437,7 +468,8 @@ mod tests {
             test_payment(sid, &[extra_bid]),
             vec![extra_bid],
             1000,
-            PEER_A
+            PEER_A,
+            None,
         ));
 
         // But a different peer can still add.
@@ -446,7 +478,8 @@ mod tests {
             test_payment(sid, &[extra_bid]),
             vec![extra_bid],
             1000,
-            PEER_B
+            PEER_B,
+            None,
         ));
     }
 
@@ -473,6 +506,7 @@ mod tests {
                 bill_ids: vec![bid],
                 entered_at: 1000,
                 relay_peer: peer,
+                mailbox_key: None,
             });
             *buf.per_peer_count.entry(peer).or_insert(0) += 1;
         }
@@ -487,7 +521,8 @@ mod tests {
             test_payment_denom(sid, &[high_bid], 1_000_000),
             vec![high_bid],
             1000,
-            high_peer
+            high_peer,
+            None,
         ));
 
         // Buffer should be below threshold after eviction.
