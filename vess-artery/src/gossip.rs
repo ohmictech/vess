@@ -177,6 +177,9 @@ impl PeerRateLimiter {
                     .map(|(k, _)| *k);
                 if let Some(k) = oldest {
                     self.counters.remove(&k);
+                    // H3: also evict the strikes entry for the evicted peer so the
+                    // strikes map doesn't grow without bound via Sybil churn.
+                    self.strikes.remove(&k);
                 }
             }
             self.counters.insert(*peer_id, (1, now));

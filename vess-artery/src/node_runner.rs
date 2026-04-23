@@ -94,6 +94,17 @@ const DUPLICATE_FLOOD_THRESHOLD: u32 = 50;
 /// Window (in seconds) for counting per-peer duplicate messages.
 const DUPLICATE_WINDOW_SECS: u64 = 60;
 
+/// C1: Maximum total OwnershipGenesis entries buffered across all pending-reforge
+/// keys.  Each entry can be up to 4 MiB, so 5 000 × 4 MiB = 20 GiB worst-case
+/// without a global cap.  The 5 000-entry limit keeps worst-case at ~20 GiB
+/// while still handling legitimate reforge bursts.
+const MAX_PENDING_GENESIS_TOTAL: usize = 5_000;
+
+/// C1: TTL for pending-reforge-genesis entries (5 minutes).  An attestation
+/// that takes longer than this almost certainly lost in the network; retaining
+/// the genesis messages beyond this point won't help.
+const PENDING_GENESIS_TTL_SECS: u64 = 300;
+
 // Flat peer list removed — replaced by Kademlia routing table
 // (kademlia.rs). Sybil protection is now handled by per-bucket K=20
 // caps and handshake PoW. The routing table stores only infrastructure
@@ -126,6 +137,13 @@ impl DuplicateTracker {
 
         let peer_entry = self.table.entry(*peer_id).or_default();
 
+        // M2: Shrink the inner map by dropping expired window entries before
+        // inserting.  Without this, every fake hash from a long-lived peer
+        // accumulates forever inside the inner HashMap.
+        peer_entry.retain(|_, (_, first_seen)| {
+            now.saturating_sub(*first_seen) <= DUPLICATE_WINDOW_SECS
+        });
+
         let (count, first_seen) = peer_entry.entry(*payload_hash).or_insert((0, now));
 
         if now.saturating_sub(*first_seen) > DUPLICATE_WINDOW_SECS {
@@ -147,6 +165,67 @@ impl DuplicateTracker {
     fn evict(&mut self, peer_id: &[u8; 32]) {
         self.table.remove(peer_id);
     }
+}
+
+/// Compute a compact deduplication key for a [`PulseMessage`].
+///
+/// For messages that carry large proof fields — most notably [`OwnershipGenesis`]
+/// with its 4 MiB STARK proof — hashing the full serialization on every
+/// relay hop wastes significant CPU.  Instead we hash only the fields that
+/// uniquely identify the semantic event so duplicate detection stays cheap.
+///
+/// For messages without an obvious unique key we fall back to hashing the
+/// full serialization; those messages are small in practice.
+fn message_dedup_key(msg: &PulseMessage) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    match msg {
+        PulseMessage::Payment(p) => {
+            h.update(b"Payment");
+            h.update(&p.payment_id);
+        }
+        PulseMessage::OwnershipGenesis(og) => {
+            // H1: hash only mint_id — avoids re-serializing the 4 MiB proof.
+            h.update(b"OwnershipGenesis");
+            h.update(&og.mint_id);
+        }
+        PulseMessage::OwnershipClaim(oc) => {
+            h.update(b"OwnershipClaim");
+            h.update(&oc.mint_id);
+            h.update(&oc.new_owner_vk_hash);
+        }
+        PulseMessage::ReforgeAttestation(ra) => {
+            h.update(b"ReforgeAttestation");
+            h.update(&ra.reforge_id);
+        }
+        PulseMessage::TagRegister(tr) => {
+            h.update(b"TagRegister");
+            h.update(&tr.tag_hash);
+            h.update(&tr.pow_nonce);
+        }
+        PulseMessage::TagStore(ts) => {
+            h.update(b"TagStore");
+            h.update(&ts.tag_hash);
+        }
+        PulseMessage::TagConfirm(tc) => {
+            h.update(b"TagConfirm");
+            h.update(&tc.tag_hash);
+            h.update(&tc.mint_id);
+        }
+        PulseMessage::ManifestStore(ms) => {
+            h.update(b"ManifestStore");
+            h.update(&ms.dht_key);
+        }
+        PulseMessage::LimboHold(lh) => {
+            h.update(b"LimboHold");
+            h.update(&lh.stealth_id);
+            h.update(&lh.entered_at.to_le_bytes());
+        }
+        _ => {
+            // All other message types are small; full serialization is fine.
+            h.update(&msg.to_bytes().unwrap_or_default());
+        }
+    }
+    *h.finalize().as_bytes()
 }
 
 /// Check if a timestamp is within the acceptable window.
@@ -297,7 +376,8 @@ pub(crate) struct ArteryState {
     /// Payment IDs already in limbo (prevents exact duplicate buffering).
     pub(crate) limbo_payment_ids: std::collections::HashSet<[u8; 32]>,
     /// Encrypted wallet manifests keyed by DHT key.
-    pub(crate) manifest_store: HashMap<[u8; 32], Vec<u8>>,
+    /// Value is `(encrypted_manifest, inserted_at_unix_secs)` for oldest-first eviction.
+    pub(crate) manifest_store: HashMap<[u8; 32], (Vec<u8>, u64)>,
     /// Unix-millis timestamp when each bill entered limbo (keyed by mint_id,
     /// populated at auto-receive time for end-to-end latency tracking).
     pub(crate) limbo_entry_times: HashMap<[u8; 32], u64>,
@@ -308,7 +388,9 @@ pub(crate) struct ArteryState {
     /// created by an RA, the pending genesis messages are retried.
     /// This prevents legitimate reforge outputs from being rejected (and the
     /// broadcaster being falsely banished) due to gossip ordering races.
-    pub(crate) pending_reforge_genesis: HashMap<[u8; 32], Vec<vess_protocol::OwnershipGenesis>>,
+    /// Value is `(OwnershipGenesis, buffered_at_unix_secs)` for TTL eviction.
+    /// C1: Enforced global cap + per-key cap to prevent memory exhaustion.
+    pub(crate) pending_reforge_genesis: HashMap<[u8; 32], Vec<(vess_protocol::OwnershipGenesis, u64)>>,
     /// Embedded wallet — trial-decrypts incoming payments automatically.
     pub(crate) wallet: Option<WalletState>,
     /// Wallet file path (set from config even when wallet is locked).
@@ -464,7 +546,7 @@ impl ArteryState {
         let manifests: BTreeMap<String, Vec<u8>> = self
             .manifest_store
             .iter()
-            .map(|(k, v)| (hex_key(k), v.clone()))
+            .map(|(k, (v, _))| (hex_key(k), v.clone()))
             .collect();
 
         ArterySnapshot {
@@ -560,11 +642,12 @@ impl ArteryState {
             consumed,
         );
 
-        // Restore manifest store.
+        // Restore manifest store, assigning insertion time 0 for entries loaded
+        // from a snapshot (they sort before any new arrivals for eviction purposes).
         self.manifest_store = snap
             .manifests
             .into_iter()
-            .filter_map(|(k, v)| unhex_key(&k).ok().map(|key| (key, v)))
+            .filter_map(|(k, v)| unhex_key(&k).ok().map(|key| (key, (v, 0u64))))
             .collect();
 
         // M5: Restore in-flight limbo payment IDs.
@@ -933,6 +1016,32 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 if pruned_tags > 0 {
                     info!(count = pruned_tags, "pruned unhardened tags");
                 }
+                // C1: Evict pending-reforge-genesis entries older than the TTL.
+                // Without this, keys created by fake attestations linger forever.
+                {
+                    let mut evicted_keys = 0usize;
+                    let mut evicted_entries = 0usize;
+                    s.pending_reforge_genesis.retain(|_, entries| {
+                        let before = entries.len();
+                        entries.retain(|(_, buffered_at)| {
+                            now.saturating_sub(*buffered_at) < PENDING_GENESIS_TTL_SECS
+                        });
+                        evicted_entries += before - entries.len();
+                        if entries.is_empty() {
+                            evicted_keys += 1;
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                    if evicted_entries > 0 {
+                        info!(
+                            keys = evicted_keys,
+                            entries = evicted_entries,
+                            "evicted expired pending-reforge-genesis entries"
+                        );
+                    }
+                }
                 // Re-estimate network size from routing table and scale
                 // gossip parameters dynamically.
                 s.estimated_network_size = s.routing_table.estimated_network_size();
@@ -969,8 +1078,10 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
             }
             // Flush embedded wallet billfold to disk.
             {
-                let s = flush_state.lock().unwrap();
+                let mut s = flush_state.lock().unwrap();
                 s.flush_wallet();
+                // M1: Flush tag cache if any get() hits marked it dirty.
+                s.tag_cache.flush_if_dirty();
             }
         }
     });
@@ -1909,9 +2020,8 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
         }
 
         // ── Per-peer duplicate flood detection ─────────────────────
-        let payload_hash: [u8; 32] = *blake3::hash(
-            &msg.to_bytes().unwrap_or_default()
-        ).as_bytes();
+        // H1: Hash only identifying fields (not the full 4 MiB proof body).
+        let payload_hash: [u8; 32] = message_dedup_key(&msg);
         if let Some(dup_count) = state.duplicate_tracker.record(&peer_id, &payload_hash) {
             warn!(%peer, dup_count, "duplicate flood detected — banishing peer locally");
             state.peer_registry.mark_banished(peer_id);
@@ -1983,17 +2093,9 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     }));
                 }
 
-                // Collect stealth_payloads across every stealth_id in limbo,
-                // capped to prevent memory-exhaustion from a bloated limbo.
-                let mut payloads = Vec::new();
-                'sweep: for sid in state.limbo_buffer.stealth_ids_with_payments() {
-                    for entry in state.limbo_buffer.peek(&sid) {
-                        payloads.push(entry.payment.stealth_payload.clone());
-                        if payloads.len() >= MAX_SWEEP_PAYLOADS {
-                            break 'sweep;
-                        }
-                    }
-                }
+                // M4: Collect stealth_payloads in a single pass via sweep_payloads(),
+                // avoiding the O(n) two-level iteration over all stealth IDs.
+                let payloads = state.limbo_buffer.sweep_payloads(MAX_SWEEP_PAYLOADS);
                 info!(%peer, count = payloads.len(), "mailbox sweep");
                 Some(PulseMessage::MailboxSweepResponse(MailboxSweepResponse {
                     nonce: ms.nonce,
@@ -2414,13 +2516,19 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     .iter().map(|p| p.id_hash).collect();
                 let repl = dht_replication_factor(state.estimated_network_size);
                 if state.registry.should_store(&ms.dht_key, &peer_ids, repl) {
-                    // M2: Evict oldest entry if the cap is reached.
+                    // M3: Evict the entry with the oldest insertion timestamp so
+                    // long-held manifests are dropped first (not an arbitrary key).
                     if state.manifest_store.len() >= MAX_MANIFEST_ENTRIES {
-                        if let Some(&oldest) = state.manifest_store.keys().next() {
-                            state.manifest_store.remove(&oldest);
+                        if let Some(&oldest_key) = state
+                            .manifest_store
+                            .iter()
+                            .min_by_key(|(_, (_, ts))| ts)
+                            .map(|(k, _)| k)
+                        {
+                            state.manifest_store.remove(&oldest_key);
                         }
                     }
-                    state.manifest_store.insert(ms.dht_key, ms.encrypted_manifest.clone());
+                    state.manifest_store.insert(ms.dht_key, (ms.encrypted_manifest.clone(), now_ts));
                     info!("manifest stored in DHT");
                 }
                 if ms.hops_remaining > 0 {
@@ -2432,7 +2540,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
             }
 
             PulseMessage::ManifestRecover(mr) => {
-                if let Some(data) = state.manifest_store.get(&mr.dht_key) {
+                if let Some((data, _)) = state.manifest_store.get(&mr.dht_key) {
                     info!("ManifestRecover: returning manifest");
                     Some(PulseMessage::ManifestRecoverResponse(ManifestRecoverResponse {
                         dht_key: mr.dht_key,
@@ -2769,8 +2877,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     proof_nonce = sap.nonce_tree_root;
                 } else if let Ok(rp) = vess_foundry::reforge::deserialize_reforge_proof(&og.proof) {
                     // H3 needs to buffer `og` if an input tombstone is missing.
-                    // Clone before `rp` borrows `og.proof` to avoid the borrow conflict.
-                    let og_for_h3 = og.clone();
+                    // ReforgeProof owns all its data so no borrow conflict with `og`.
                     // ── Reforge output genesis (split / combine) ──────────────────
                     //
                     // The proof is a `ReforgeProof` committed to:
@@ -2852,13 +2959,21 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                                 // H3: The ReforgeAttestation may not have arrived yet on this
                                 // node. Buffer the genesis keyed by the missing input so we
                                 // can retry when the RA (and its tombstone) materialises.
-                                // Cap the buffer to avoid memory exhaustion from fake OGs.
-                                const MAX_PENDING_GENESIS: usize = 1_000;
-                                let pending = state.pending_reforge_genesis
-                                    .entry(*input_mint_id)
-                                    .or_default();
-                                if pending.len() < MAX_PENDING_GENESIS {
-                                    pending.push(og_for_h3.clone());
+                                // C1: Guard both per-key cap and global total to prevent
+                                // an attacker from exhausting memory with fake input keys.
+                                const MAX_PENDING_GENESIS_PER_KEY: usize = 200;
+                                let global_total: usize = state
+                                    .pending_reforge_genesis
+                                    .values()
+                                    .map(|v| v.len())
+                                    .sum();
+                                if global_total < MAX_PENDING_GENESIS_TOTAL {
+                                    let pending = state.pending_reforge_genesis
+                                        .entry(*input_mint_id)
+                                        .or_default();
+                                    if pending.len() < MAX_PENDING_GENESIS_PER_KEY {
+                                        pending.push((og.clone(), now_ts));
+                                    }
                                 }
                                 return None;
                             }
@@ -3326,7 +3441,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 // for these tombstones to materialise, and re-inject them for processing.
                 for mint_id in &ra.consumed_mint_ids {
                     if let Some(pending) = state.pending_reforge_genesis.remove(mint_id) {
-                        for pending_og in pending {
+                        for (pending_og, _buffered_at) in pending {
                             let _ = h_og_tx.send(pending_og);
                         }
                     }

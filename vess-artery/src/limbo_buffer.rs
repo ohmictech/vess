@@ -146,6 +146,24 @@ impl LimboBuffer {
         self.entries.keys().copied().collect()
     }
 
+    /// M4: Collect up to `max` stealth_payloads for a MailboxSweep response.
+    ///
+    /// Iterates the inner entry structure once rather than building an
+    /// intermediate `Vec<stealth_id>` and then doing a second lookup per id,
+    /// halving allocations and avoiding the two-level iteration at the call site.
+    pub fn sweep_payloads(&self, max: usize) -> Vec<Vec<u8>> {
+        let mut payloads = Vec::with_capacity(max.min(self.total_entries()));
+        'outer: for entries in self.entries.values() {
+            for entry in entries {
+                payloads.push(entry.payment.stealth_payload.clone());
+                if payloads.len() >= max {
+                    break 'outer;
+                }
+            }
+        }
+        payloads
+    }
+
     /// Peek at entries for a stealth_id without draining.
     pub fn peek(&self, stealth_id: &[u8; 32]) -> &[LimboEntry] {
         self.entries

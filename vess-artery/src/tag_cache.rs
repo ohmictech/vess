@@ -14,6 +14,11 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
+/// Maximum number of entries kept in the tag cache.
+/// When this limit is reached, the least-recently-used entry is evicted
+/// before inserting the new one.
+const MAX_TAG_CACHE_ENTRIES: usize = 10_000;
+
 /// A single cached tag entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedTag {
@@ -29,6 +34,8 @@ pub struct CachedTag {
 pub struct TagCache {
     entries: HashMap<String, CachedTag>,
     path: PathBuf,
+    /// True when in-memory entries have been modified since the last save.
+    dirty: bool,
 }
 
 impl TagCache {
@@ -49,21 +56,35 @@ impl TagCache {
         } else {
             HashMap::new()
         };
-        Self { entries, path }
+        Self { entries, path, dirty: false }
     }
 
-    /// Look up a tag.  Updates `last_used` and saves on hit.
+    /// Look up a tag.  Updates `last_used` and marks the cache dirty.
+    /// Disk flush is deferred to the periodic task via `flush_if_dirty()`.
     pub fn get(&mut self, tag_str: &str, now: u64) -> Option<CachedTag> {
         let entry = self.entries.get_mut(tag_str)?;
         entry.last_used = now;
         let cloned = entry.clone();
-        // Best-effort save; ignore errors (non-fatal cache update).
-        let _ = self.save();
+        // M1: Do NOT call self.save() here — save() is a blocking syscall and
+        // this method is called on every cache hit inside the state mutex.
+        // The dirty flag ensures the next periodic flush writes the update.
+        self.dirty = true;
         Some(cloned)
     }
 
     /// Insert or overwrite a tag entry and persist to disk.
     pub fn insert(&mut self, tag_str: &str, scan_ek: Vec<u8>, spend_ek: Vec<u8>, now: u64) {
+        // L2: Evict the least-recently-used entry when at capacity.
+        if !self.entries.contains_key(tag_str) && self.entries.len() >= MAX_TAG_CACHE_ENTRIES {
+            if let Some(lru_key) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, v)| v.last_used)
+                .map(|(k, _)| k.clone())
+            {
+                self.entries.remove(&lru_key);
+            }
+        }
         self.entries.insert(
             tag_str.to_owned(),
             CachedTag {
@@ -73,8 +94,11 @@ impl TagCache {
                 last_used: now,
             },
         );
+        self.dirty = true;
         if let Err(e) = self.save() {
             warn!(error = %e, "failed to persist tag cache");
+        } else {
+            self.dirty = false;
         }
     }
 
@@ -82,8 +106,11 @@ impl TagCache {
     pub fn remove(&mut self, tag_str: &str) -> bool {
         let removed = self.entries.remove(tag_str).is_some();
         if removed {
+            self.dirty = true;
             if let Err(e) = self.save() {
                 warn!(error = %e, "failed to persist tag cache after remove");
+            } else {
+                self.dirty = false;
             }
         }
         removed
@@ -92,8 +119,24 @@ impl TagCache {
     /// Clear the entire cache.
     pub fn clear_all(&mut self) {
         self.entries.clear();
+        self.dirty = true;
         if let Err(e) = self.save() {
             warn!(error = %e, "failed to persist tag cache after clear");
+        } else {
+            self.dirty = false;
+        }
+    }
+
+    /// M1: Write the cache to disk only when entries have changed.
+    /// Called from the periodic flush task instead of on every `get()` hit.
+    pub fn flush_if_dirty(&mut self) {
+        if !self.dirty {
+            return;
+        }
+        if let Err(e) = self.save() {
+            warn!(error = %e, "failed to flush tag cache");
+        } else {
+            self.dirty = false;
         }
     }
 

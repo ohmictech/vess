@@ -1790,8 +1790,12 @@ fn handle_manifest_store(
 
     let mut s = state.lock().unwrap();
 
-    // Store locally.
-    s.manifest_store.insert(dht_key, encrypted_manifest.clone());
+    // Store locally (record current time for oldest-first eviction).
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    s.manifest_store.insert(dht_key, (encrypted_manifest.clone(), now));
 
     // Queue for gossip.
     let _ = manifest_tx.send(ManifestStore {
