@@ -659,22 +659,33 @@ impl ArteryState {
 
 // ── Gossip drain helpers ────────────────────────────────────────────
 
-/// Compute target peer indices for a given DHT key using K-nearest
-/// selection, reputation-weighted ranking, and random fan-out.
-fn compute_gossip_targets(
+/// E2: Lightweight variant of `compute_gossip_targets` that reads peer
+/// reputation from a pre-computed `peer_hash -> score` slice aligned to
+/// `peer_hashes`.  The caller snapshots scores once per drain cycle
+/// (~8 bytes × routable-peer-count) instead of cloning the full
+/// [`ReputationTable`] (~200 bytes × tracked-peer-count, up to ~10 MiB).
+fn compute_gossip_targets_scored(
     key: &[u8; 32],
     peer_hashes: &[[u8; 32]],
+    peer_scores: &[f64],
     age_factors: &[f64],
     k: usize,
-    rep: &ReputationTable,
     fan: usize,
     total_peers: usize,
 ) -> Vec<usize> {
     let nearest = k_nearest(key, peer_hashes, k);
-    let candidate_hashes: Vec<[u8; 32]> = nearest.iter().map(|&i| peer_hashes[i]).collect();
-    let candidate_ages: Vec<f64> = nearest.iter().map(|&i| age_factors[i]).collect();
-    let ranked = rep.select_best_with_age(&candidate_hashes, k, &candidate_ages);
-    let mut indices: Vec<usize> = ranked.iter().map(|&ri| nearest[ri]).collect();
+    // Rank the k-nearest candidates by score × age.
+    let mut ranked: Vec<(usize, f64)> = nearest
+        .iter()
+        .enumerate()
+        .map(|(ci, &pi)| {
+            let score = peer_scores.get(pi).copied().unwrap_or(0.5);
+            let age = age_factors.get(pi).copied().unwrap_or(1.0);
+            (ci, score * age)
+        })
+        .collect();
+    ranked.sort_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    let mut indices: Vec<usize> = ranked.into_iter().take(k).map(|(ci, _)| nearest[ci]).collect();
     let extra = random_fan_out(total_peers, &indices, fan);
     for ei in extra {
         if !indices.contains(&ei) {
@@ -686,14 +697,20 @@ fn compute_gossip_targets(
 
 /// Batch-send grouped messages to peers over single QUIC connections.
 /// Sends to all target peers concurrently via tokio::spawn.
-async fn batch_forward_to_peers(
+///
+/// E1: Batch-send **pre-serialized** payloads to peers over single QUIC
+/// connections.  The caller serializes each logical message once and shares
+/// the byte buffer via `Arc<Vec<u8>>` across all target peers — eliminating
+/// the `PulseMessage::clone()` + re-`to_bytes()` multiplication that the
+/// `PulseMessage`-based path incurs per target.
+async fn batch_forward_bytes_to_peers(
     node: &VessNode,
     routable_peers: &[Vec<u8>],
-    per_peer: HashMap<usize, Vec<PulseMessage>>,
+    per_peer: HashMap<usize, Vec<Arc<Vec<u8>>>>,
 ) {
     let mut tasks = Vec::with_capacity(per_peer.len());
-    for (idx, msgs) in per_peer {
-        if idx >= routable_peers.len() || msgs.is_empty() {
+    for (idx, payloads) in per_peer {
+        if idx >= routable_peers.len() || payloads.is_empty() {
             continue;
         }
         let arr: [u8; 32] = match routable_peers[idx].as_slice().try_into() {
@@ -706,8 +723,8 @@ async fn batch_forward_to_peers(
         };
         let peer_node = node.clone();
         tasks.push(tokio::spawn(async move {
-            if let Err(e) = peer_node.send_messages_to_peer(target, &msgs).await {
-                warn!("batch forward to peer failed: {e}");
+            if let Err(e) = peer_node.send_raw_pulses_to_peer(target, &payloads).await {
+                warn!("batch forward (raw) to peer failed: {e}");
             }
         }));
     }
@@ -1238,7 +1255,9 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 manifests.push(item);
             }
 
-            let (peer_hashes, routable_peers, age_factors, k, net_size, rep) = {
+            // E2: snapshot only the scores we need (one f64 per routable peer)
+            // instead of cloning the full ReputationTable.
+            let (peer_hashes, routable_peers, age_factors, peer_scores, k, net_size) = {
                 let s = manifest_drain_state.lock().unwrap();
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -1247,13 +1266,14 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 let (ph, rp, af) = s
                     .routing_table
                     .routable_peer_vecs(|id| s.peer_registry.state(id) == PeerState::Verified, now);
+                let scores = s.reputation.snapshot_scores_for(&ph);
                 (
                     ph,
                     rp,
                     af,
+                    scores,
                     s.gossip_config.k_neighbors,
                     s.estimated_network_size,
-                    s.reputation.clone(),
                 )
             };
             if routable_peers.is_empty() {
@@ -1261,14 +1281,19 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
             }
 
             let fan = dynamic_fan_out(net_size, RANDOM_FAN_OUT, RANDOM_FAN_OUT * 3);
-            let mut per_peer: HashMap<usize, Vec<PulseMessage>> = HashMap::new();
+            // E1: serialize each logical message once; share via Arc across targets.
+            let mut per_peer: HashMap<usize, Vec<Arc<Vec<u8>>>> = HashMap::new();
             for ms in &manifests {
-                let indices = compute_gossip_targets(
+                let bytes = match PulseMessage::ManifestStore(ms.clone()).to_bytes() {
+                    Ok(b) => Arc::new(b),
+                    Err(e) => { warn!(error = %e, "serialize ManifestStore failed"); continue; }
+                };
+                let indices = compute_gossip_targets_scored(
                     &ms.dht_key,
                     &peer_hashes,
+                    &peer_scores,
                     &age_factors,
                     k,
-                    &rep,
                     fan,
                     routable_peers.len(),
                 );
@@ -1276,10 +1301,10 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     per_peer
                         .entry(idx)
                         .or_default()
-                        .push(PulseMessage::ManifestStore(ms.clone()));
+                        .push(Arc::clone(&bytes));
                 }
             }
-            batch_forward_to_peers(&manifest_drain_node, &routable_peers, per_peer).await;
+            batch_forward_bytes_to_peers(&manifest_drain_node, &routable_peers, per_peer).await;
             info!(count = manifests.len(), "manifest store batch forwarded");
         }
     });
@@ -1294,7 +1319,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 tags.push(item);
             }
 
-            let (peer_hashes, routable_peers, age_factors, k, net_size, rep) = {
+            let (peer_hashes, routable_peers, age_factors, peer_scores, k, net_size) = {
                 let s = tag_drain_state.lock().unwrap();
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -1303,13 +1328,14 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 let (ph, rp, af) = s
                     .routing_table
                     .routable_peer_vecs(|id| s.peer_registry.state(id) == PeerState::Verified, now);
+                let scores = s.reputation.snapshot_scores_for(&ph);
                 (
                     ph,
                     rp,
                     af,
+                    scores,
                     s.gossip_config.k_neighbors,
                     s.estimated_network_size,
-                    s.reputation.clone(),
                 )
             };
             if routable_peers.is_empty() {
@@ -1317,15 +1343,19 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
             }
 
             let fan = dynamic_fan_out(net_size, RANDOM_FAN_OUT, RANDOM_FAN_OUT * 3);
-            let mut per_peer: HashMap<usize, Vec<PulseMessage>> = HashMap::new();
+            let mut per_peer: HashMap<usize, Vec<Arc<Vec<u8>>>> = HashMap::new();
             for ts in &tags {
                 let dht_key = ts.tag_hash;
-                let indices = compute_gossip_targets(
+                let bytes = match PulseMessage::TagStore(ts.clone()).to_bytes() {
+                    Ok(b) => Arc::new(b),
+                    Err(e) => { warn!(error = %e, "serialize TagStore failed"); continue; }
+                };
+                let indices = compute_gossip_targets_scored(
                     &dht_key,
                     &peer_hashes,
+                    &peer_scores,
                     &age_factors,
                     k,
-                    &rep,
                     fan,
                     routable_peers.len(),
                 );
@@ -1333,10 +1363,10 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     per_peer
                         .entry(idx)
                         .or_default()
-                        .push(PulseMessage::TagStore(ts.clone()));
+                        .push(Arc::clone(&bytes));
                 }
             }
-            batch_forward_to_peers(&tag_drain_node, &routable_peers, per_peer).await;
+            batch_forward_bytes_to_peers(&tag_drain_node, &routable_peers, per_peer).await;
             info!(count = tags.len(), "tag store batch forwarded");
         }
     });
@@ -1351,7 +1381,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 confirms.push(item);
             }
 
-            let (peer_hashes, routable_peers, age_factors, k, net_size, rep) = {
+            let (peer_hashes, routable_peers, age_factors, peer_scores, k, net_size) = {
                 let s = confirm_drain_state.lock().unwrap();
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -1360,13 +1390,14 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 let (ph, rp, af) = s
                     .routing_table
                     .routable_peer_vecs(|id| s.peer_registry.state(id) == PeerState::Verified, now);
+                let scores = s.reputation.snapshot_scores_for(&ph);
                 (
                     ph,
                     rp,
                     af,
+                    scores,
                     s.gossip_config.k_neighbors,
                     s.estimated_network_size,
-                    s.reputation.clone(),
                 )
             };
             if routable_peers.is_empty() {
@@ -1374,15 +1405,19 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
             }
 
             let fan = dynamic_fan_out(net_size, RANDOM_FAN_OUT, RANDOM_FAN_OUT * 3);
-            let mut per_peer: HashMap<usize, Vec<PulseMessage>> = HashMap::new();
+            let mut per_peer: HashMap<usize, Vec<Arc<Vec<u8>>>> = HashMap::new();
             for tc in &confirms {
                 let dht_key = tc.tag_hash;
-                let indices = compute_gossip_targets(
+                let bytes = match PulseMessage::TagConfirm(tc.clone()).to_bytes() {
+                    Ok(b) => Arc::new(b),
+                    Err(e) => { warn!(error = %e, "serialize TagConfirm failed"); continue; }
+                };
+                let indices = compute_gossip_targets_scored(
                     &dht_key,
                     &peer_hashes,
+                    &peer_scores,
                     &age_factors,
                     k,
-                    &rep,
                     fan,
                     routable_peers.len(),
                 );
@@ -1390,10 +1425,10 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     per_peer
                         .entry(idx)
                         .or_default()
-                        .push(PulseMessage::TagConfirm(tc.clone()));
+                        .push(Arc::clone(&bytes));
                 }
             }
-            batch_forward_to_peers(&confirm_drain_node, &routable_peers, per_peer).await;
+            batch_forward_bytes_to_peers(&confirm_drain_node, &routable_peers, per_peer).await;
             info!(count = confirms.len(), "tag confirm batch forwarded");
         }
     });
@@ -1408,7 +1443,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 items.push(item);
             }
 
-            let (peer_hashes, routable_peers, age_factors, k, net_size, rep) = {
+            let (peer_hashes, routable_peers, age_factors, peer_scores, k, net_size) = {
                 let s = og_drain_state.lock().unwrap();
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -1417,13 +1452,14 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 let (ph, rp, af) = s
                     .routing_table
                     .routable_peer_vecs(|id| s.peer_registry.state(id) == PeerState::Verified, now);
+                let scores = s.reputation.snapshot_scores_for(&ph);
                 (
                     ph,
                     rp,
                     af,
+                    scores,
                     s.gossip_config.k_neighbors,
                     s.estimated_network_size,
-                    s.reputation.clone(),
                 )
             };
             if routable_peers.is_empty() {
@@ -1431,14 +1467,20 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
             }
 
             let fan = dynamic_fan_out(net_size, OWNERSHIP_FAN_OUT, OWNERSHIP_FAN_OUT * 3);
-            let mut per_peer: HashMap<usize, Vec<PulseMessage>> = HashMap::new();
+            let mut per_peer: HashMap<usize, Vec<Arc<Vec<u8>>>> = HashMap::new();
             for og in &items {
-                let indices = compute_gossip_targets(
+                // OwnershipGenesis proofs can be 4 MiB — the Arc avoids that
+                // clone multiplying by fan-out targets (E1).
+                let bytes = match PulseMessage::OwnershipGenesis(og.clone()).to_bytes() {
+                    Ok(b) => Arc::new(b),
+                    Err(e) => { warn!(error = %e, "serialize OwnershipGenesis failed"); continue; }
+                };
+                let indices = compute_gossip_targets_scored(
                     &og.mint_id,
                     &peer_hashes,
+                    &peer_scores,
                     &age_factors,
                     k,
-                    &rep,
                     fan,
                     routable_peers.len(),
                 );
@@ -1446,10 +1488,10 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     per_peer
                         .entry(idx)
                         .or_default()
-                        .push(PulseMessage::OwnershipGenesis(og.clone()));
+                        .push(Arc::clone(&bytes));
                 }
             }
-            batch_forward_to_peers(&og_drain_node, &routable_peers, per_peer).await;
+            batch_forward_bytes_to_peers(&og_drain_node, &routable_peers, per_peer).await;
             info!(count = items.len(), "ownership genesis batch forwarded");
         }
     });
@@ -1464,7 +1506,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 items.push(item);
             }
 
-            let (peer_hashes, routable_peers, age_factors, k, net_size, rep) = {
+            let (peer_hashes, routable_peers, age_factors, peer_scores, k, net_size) = {
                 let s = oc_drain_state.lock().unwrap();
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -1473,13 +1515,14 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 let (ph, rp, af) = s
                     .routing_table
                     .routable_peer_vecs(|id| s.peer_registry.state(id) == PeerState::Verified, now);
+                let scores = s.reputation.snapshot_scores_for(&ph);
                 (
                     ph,
                     rp,
                     af,
+                    scores,
                     s.gossip_config.k_neighbors,
                     s.estimated_network_size,
-                    s.reputation.clone(),
                 )
             };
             if routable_peers.is_empty() {
@@ -1487,14 +1530,18 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
             }
 
             let fan = dynamic_fan_out(net_size, OWNERSHIP_FAN_OUT, OWNERSHIP_FAN_OUT * 3);
-            let mut per_peer: HashMap<usize, Vec<PulseMessage>> = HashMap::new();
+            let mut per_peer: HashMap<usize, Vec<Arc<Vec<u8>>>> = HashMap::new();
             for oc in &items {
-                let indices = compute_gossip_targets(
+                let bytes = match PulseMessage::OwnershipClaim(oc.clone()).to_bytes() {
+                    Ok(b) => Arc::new(b),
+                    Err(e) => { warn!(error = %e, "serialize OwnershipClaim failed"); continue; }
+                };
+                let indices = compute_gossip_targets_scored(
                     &oc.mint_id,
                     &peer_hashes,
+                    &peer_scores,
                     &age_factors,
                     k,
-                    &rep,
                     fan,
                     routable_peers.len(),
                 );
@@ -1502,10 +1549,10 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     per_peer
                         .entry(idx)
                         .or_default()
-                        .push(PulseMessage::OwnershipClaim(oc.clone()));
+                        .push(Arc::clone(&bytes));
                 }
             }
-            batch_forward_to_peers(&oc_drain_node, &routable_peers, per_peer).await;
+            batch_forward_bytes_to_peers(&oc_drain_node, &routable_peers, per_peer).await;
             info!(count = items.len(), "ownership claim batch forwarded");
         }
     });
@@ -1520,7 +1567,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 items.push(item);
             }
 
-            let (peer_hashes, routable_peers, age_factors, k, net_size, rep) = {
+            let (peer_hashes, routable_peers, age_factors, peer_scores, k, net_size) = {
                 let s = ra_drain_state.lock().unwrap();
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -1529,13 +1576,14 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 let (ph, rp, af) = s
                     .routing_table
                     .routable_peer_vecs(|id| s.peer_registry.state(id) == PeerState::Verified, now);
+                let scores = s.reputation.snapshot_scores_for(&ph);
                 (
                     ph,
                     rp,
                     af,
+                    scores,
                     s.gossip_config.k_neighbors,
                     s.estimated_network_size,
-                    s.reputation.clone(),
                 )
             };
             if routable_peers.is_empty() {
@@ -1543,15 +1591,19 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
             }
 
             let fan = dynamic_fan_out(net_size, RANDOM_FAN_OUT, RANDOM_FAN_OUT * 3);
-            let mut per_peer: HashMap<usize, Vec<PulseMessage>> = HashMap::new();
+            let mut per_peer: HashMap<usize, Vec<Arc<Vec<u8>>>> = HashMap::new();
             for ra in &items {
+                let bytes = match PulseMessage::ReforgeAttestation(ra.clone()).to_bytes() {
+                    Ok(b) => Arc::new(b),
+                    Err(e) => { warn!(error = %e, "serialize ReforgeAttestation failed"); continue; }
+                };
                 for cid in &ra.consumed_mint_ids {
-                    let indices = compute_gossip_targets(
+                    let indices = compute_gossip_targets_scored(
                         cid,
                         &peer_hashes,
+                        &peer_scores,
                         &age_factors,
                         k,
-                        &rep,
                         fan,
                         routable_peers.len(),
                     );
@@ -1559,11 +1611,11 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                         per_peer
                             .entry(idx)
                             .or_default()
-                            .push(PulseMessage::ReforgeAttestation(ra.clone()));
+                            .push(Arc::clone(&bytes));
                     }
                 }
             }
-            batch_forward_to_peers(&ra_drain_node, &routable_peers, per_peer).await;
+            batch_forward_bytes_to_peers(&ra_drain_node, &routable_peers, per_peer).await;
             info!(count = items.len(), "reforge attestation batch forwarded");
         }
     });
@@ -1581,7 +1633,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 items.push(item);
             }
 
-            let (peer_hashes, routable_peers, age_factors, k, net_size, rep) = {
+            let (peer_hashes, routable_peers, age_factors, peer_scores, k, net_size) = {
                 let s = pay_drain_state.lock().unwrap();
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -1590,13 +1642,14 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 let (ph, rp, af) = s
                     .routing_table
                     .routable_peer_vecs(|id| s.peer_registry.state(id) == PeerState::Verified, now);
+                let scores = s.reputation.snapshot_scores_for(&ph);
                 (
                     ph,
                     rp,
                     af,
+                    scores,
                     s.gossip_config.k_neighbors,
                     s.estimated_network_size,
-                    s.reputation.clone(),
                 )
             };
             if routable_peers.is_empty() {
@@ -1604,14 +1657,18 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
             }
 
             let fan = dynamic_fan_out(net_size, RANDOM_FAN_OUT, RANDOM_FAN_OUT * 3);
-            let mut per_peer: HashMap<usize, Vec<PulseMessage>> = HashMap::new();
+            let mut per_peer: HashMap<usize, Vec<Arc<Vec<u8>>>> = HashMap::new();
             for p in &items {
-                let indices = compute_gossip_targets(
+                let bytes = match PulseMessage::Payment(p.clone()).to_bytes() {
+                    Ok(b) => Arc::new(b),
+                    Err(e) => { warn!(error = %e, "serialize Payment failed"); continue; }
+                };
+                let indices = compute_gossip_targets_scored(
                     &p.stealth_id,
                     &peer_hashes,
+                    &peer_scores,
                     &age_factors,
                     k,
-                    &rep,
                     fan,
                     routable_peers.len(),
                 );
@@ -1619,10 +1676,10 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     per_peer
                         .entry(idx)
                         .or_default()
-                        .push(PulseMessage::Payment(p.clone()));
+                        .push(Arc::clone(&bytes));
                 }
             }
-            batch_forward_to_peers(&pay_drain_node, &routable_peers, per_peer).await;
+            batch_forward_bytes_to_peers(&pay_drain_node, &routable_peers, per_peer).await;
             info!(count = items.len(), "payment relay batch forwarded");
         }
     });
@@ -2345,8 +2402,11 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                                 message: format!("Received {total} Vess and claimed ownership."),
                             });
                             for oc in pending_oc { let _ = h_oc_tx.send(oc); }
-                            // Persist wallet immediately after receiving bills.
-                            state.flush_wallet();
+                            // Wallet is persisted by the periodic flush task
+                            // (every 60s); avoid blocking disk I/O in the
+                            // payment-receive hot path. At worst a crash
+                            // within the flush window replays the OC from the
+                            // gossip log on restart.
 
                             // Return acknowledgment so direct senders get
                             // instant confirmation. Relay nodes use fire-and-
@@ -3213,6 +3273,14 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                         let mut h = blake3::Hasher::new();
                         h.update(b"vess-claim-hash-v1");
                         h.update(&oc.mint_id);
+                        // L1: bind the previous owner vk_hash so an attacker
+                        // cannot grind claim_hashes across different candidate
+                        // predecessors for the same (mint_id, timestamp-bucket)
+                        // — any change to prev_owner_vk produces a different
+                        // claim_hash, and transfer_sig already authenticates
+                        // prev_owner_vk. Defense-in-depth alongside the
+                        // prev_claim_vk_hash gate.
+                        h.update(&vess_foundry::spend_auth::vk_hash(&oc.prev_owner_vk));
                         h.update(&oc.new_owner_vk_hash);
                         h.update(&oc.transfer_sig);
                         // Include the transfer timestamp so pre-ground

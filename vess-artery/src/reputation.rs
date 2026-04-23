@@ -226,6 +226,17 @@ impl ReputationTable {
         self.peers.is_empty()
     }
 
+    /// Return a Vec of reputation scores parallel to `peers`, using 0.5 for
+    /// peers not tracked in the table.  This is the data that gossip drain
+    /// tasks actually consume; snapshotting only the scores lets them avoid
+    /// cloning the full `ReputationTable` on every drain iteration (E2).
+    pub fn snapshot_scores_for(&self, peers: &[[u8; 32]]) -> Vec<f64> {
+        peers
+            .iter()
+            .map(|id| self.peers.get(id).map_or(0.5, |r| r.score()))
+            .collect()
+    }
+
     /// Export all records for persistence.
     pub fn export(&self) -> Vec<([u8; 32], PeerReputation)> {
         self.peers.iter().map(|(&k, v)| (k, v.clone())).collect()

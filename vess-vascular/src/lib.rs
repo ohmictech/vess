@@ -228,6 +228,35 @@ impl VessNode {
         Ok(())
     }
 
+    /// Send multiple pre-serialized pulse payloads to the same peer over a
+    /// single QUIC connection.
+    ///
+    /// Equivalent to [`send_messages_to_peer`] but takes already-serialized
+    /// bytes, which lets the caller serialize each logical message once and
+    /// share the byte buffer (via [`Arc`]) across many target peers without
+    /// re-serializing per destination.
+    pub async fn send_raw_pulses_to_peer(
+        &self,
+        target: impl Into<EndpointAddr>,
+        payloads: &[Arc<Vec<u8>>],
+    ) -> Result<()> {
+        if payloads.is_empty() {
+            return Ok(());
+        }
+        let conn = self
+            .endpoint
+            .connect(target, VESS_ALPN)
+            .await
+            .context("connect to peer for raw batch send")?;
+
+        for bytes in payloads {
+            if let Err(e) = write_pulse(&conn, bytes.as_slice()).await {
+                warn!(error = %e, "raw batch send: message failed, continuing");
+            }
+        }
+        Ok(())
+    }
+
     /// Listen for incoming [`PulseMessage`]s (fire-and-forget).
     ///
     /// Deserializes each raw pulse into a typed message before invoking
