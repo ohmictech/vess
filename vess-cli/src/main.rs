@@ -43,7 +43,7 @@ struct Cli {
     rpc: Option<u16>,
 
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -216,20 +216,21 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match &cli.command {
-        Command::Init { tag } => cmd_init(&cli, tag).await,
-        Command::Recover { words, pin } => cmd_recover(&cli, words, pin).await,
-        Command::Balance => cmd_balance(&cli).await,
-        Command::Notifications {
+        None => cmd_interactive(&cli).await,
+        Some(Command::Init { tag }) => cmd_init(&cli, tag).await,
+        Some(Command::Recover { words, pin }) => cmd_recover(&cli, words, pin).await,
+        Some(Command::Balance) => cmd_balance(&cli).await,
+        Some(Command::Notifications {
             follow,
             interval_ms,
             max,
-        } => cmd_notifications(&cli, *follow, *interval_ms, *max).await,
-        Command::Send {
+        }) => cmd_notifications(&cli, *follow, *interval_ms, *max).await,
+        Some(Command::Send {
             amount,
             recipient,
             memo,
             node_direct,
-        } => {
+        }) => {
             cmd_send(
                 &cli,
                 *amount,
@@ -239,14 +240,14 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        Command::Mint { finalize, status } => cmd_mint(&cli, *finalize, *status).await,
-        Command::RegisterTag { tag } => cmd_register_tag(&cli, tag).await,
-        Command::Pulse { node_id, message } => cmd_pulse(&cli, node_id, message).await,
-        Command::Listen => cmd_listen(&cli).await,
-        Command::Start => cmd_start(&cli).await,
-        Command::Stop => cmd_stop().await,
-        Command::Status => cmd_status(&cli).await,
-        Command::Node {
+        Some(Command::Mint { finalize, status }) => cmd_mint(&cli, *finalize, *status).await,
+        Some(Command::RegisterTag { tag }) => cmd_register_tag(&cli, tag).await,
+        Some(Command::Pulse { node_id, message }) => cmd_pulse(&cli, node_id, message).await,
+        Some(Command::Listen) => cmd_listen(&cli).await,
+        Some(Command::Start) => cmd_start(&cli).await,
+        Some(Command::Stop) => cmd_stop().await,
+        Some(Command::Status) => cmd_status(&cli).await,
+        Some(Command::Node {
             k_neighbors,
             max_hops,
             state_dir,
@@ -256,7 +257,7 @@ async fn main() -> Result<()> {
             wallet,
             wallet_password,
             rpc_port,
-        } => {
+        }) => {
             let config = vess_artery::node_runner::NodeConfig {
                 k_neighbors: *k_neighbors,
                 max_hops: *max_hops,
@@ -280,8 +281,8 @@ async fn main() -> Result<()> {
             vess_artery::node_runner::run_node(config).await?;
             Ok(())
         }
-        Command::SetPassword { password } => cmd_set_password(&cli, password.clone()).await,
-        Command::TagCache(sub) => match sub {
+        Some(Command::SetPassword { password }) => cmd_set_password(&cli, password.clone()).await,
+        Some(Command::TagCache(sub)) => match sub {
             TagCacheCmd::List => cmd_tag_cache_list(&cli).await,
             TagCacheCmd::Clear { tag } => cmd_tag_cache_clear(&cli, tag.as_deref()).await,
         },
@@ -2031,4 +2032,399 @@ async fn cmd_status(cli: &Cli) -> Result<()> {
     println!("  `vess send <n> <+tag>` — send Vess");
     println!("  `vess stop`          — stop the node");
     Ok(())
+}
+
+// ── Windows: minimize-to-tray ────────────────────────────────────────────────
+#[cfg(windows)]
+mod sys_tray {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Set by the ctrl handler the moment the user clicks X.
+    /// Used by the REPL's stdin-EOF handler to enter tray-only mode instead of
+    /// exiting — because on modern Windows conhost destroys the console even
+    /// when the ctrl handler returns TRUE (though the PROCESS stays alive).
+    pub static IN_TRAY_MODE: AtomicBool = AtomicBool::new(false);
+
+    pub enum TrayCmd {
+        OpenConsole,
+        StopNode,
+        Exit,
+    }
+
+    /// Hide the console window (best-effort; may beat conhost's destroy).
+    pub fn hide_console() {
+        unsafe {
+            let hwnd = windows_sys::Win32::System::Console::GetConsoleWindow();
+            if !hwnd.is_null() {
+                windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow(
+                    hwnd,
+                    windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE,
+                );
+            }
+        }
+    }
+
+    /// Show and bring the console window to the foreground.
+    pub fn show_console() {
+        unsafe {
+            let hwnd = windows_sys::Win32::System::Console::GetConsoleWindow();
+            if !hwnd.is_null() {
+                windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow(
+                    hwnd,
+                    windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOW,
+                );
+                windows_sys::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
+            }
+        }
+    }
+
+    /// True if the console window still exists (hidden or visible).
+    pub fn console_alive() -> bool {
+        unsafe { !windows_sys::Win32::System::Console::GetConsoleWindow().is_null() }
+    }
+
+    unsafe extern "system" fn ctrl_handler(
+        ctrl_type: u32,
+    ) -> windows_sys::Win32::Foundation::BOOL {
+        if ctrl_type == windows_sys::Win32::System::Console::CTRL_CLOSE_EVENT {
+            // Hide the window immediately — wins the race on some conhost versions.
+            hide_console();
+            // Flag that the process should stay alive as a tray-only process.
+            // The REPL's stdin-EOF path checks this and enters the tray loop.
+            IN_TRAY_MODE.store(true, Ordering::SeqCst);
+            return 1; // TRUE — suppress default process-termination
+        }
+        0
+    }
+
+    pub fn register_close_handler() {
+        unsafe {
+            windows_sys::Win32::System::Console::SetConsoleCtrlHandler(
+                Some(ctrl_handler),
+                1,
+            );
+        }
+    }
+
+    pub fn spawn_tray(cmd_tx: tokio::sync::mpsc::UnboundedSender<TrayCmd>) {
+        std::thread::spawn(move || run_tray_thread(cmd_tx));
+    }
+
+    fn run_tray_thread(cmd_tx: tokio::sync::mpsc::UnboundedSender<TrayCmd>) {
+        use tray_icon::{
+            menu::{Menu, MenuEvent, MenuItem},
+            Icon, MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent,
+        };
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
+        };
+
+        // 16×16 green-circle RGBA icon.
+        let mut px = vec![0u8; 16 * 16 * 4];
+        for y in 0i32..16 {
+            for x in 0i32..16 {
+                if (x - 8) * (x - 8) + (y - 8) * (y - 8) <= 49 {
+                    let i = ((y * 16 + x) as usize) * 4;
+                    px[i] = 0;
+                    px[i + 1] = 200;
+                    px[i + 2] = 80;
+                    px[i + 3] = 255;
+                }
+            }
+        }
+        let icon = match Icon::from_rgba(px, 16, 16) {
+            Ok(i) => i,
+            Err(_) => return,
+        };
+
+        let open_item = MenuItem::new("Open Vess", true, None);
+        let stop_item = MenuItem::new("Stop Node", true, None);
+        let exit_item = MenuItem::new("Exit Vess", true, None);
+        let open_id = open_item.id().clone();
+        let stop_id = stop_item.id().clone();
+        let exit_id = exit_item.id().clone();
+
+        let menu = Menu::new();
+        let _ = menu.append(&open_item);
+        let _ = menu.append(&stop_item);
+        let _ = menu.append(&exit_item);
+
+        let _tray = match TrayIconBuilder::new()
+            .with_tooltip("Vess — Node Running")
+            .with_icon(icon)
+            .with_menu(Box::new(menu))
+            .build()
+        {
+            Ok(t) => t,
+            Err(_) => return,
+        };
+
+        loop {
+            // Left-click → open console.
+            while let Ok(event) = TrayIconEvent::receiver().try_recv() {
+                if let TrayIconEvent::Click {
+                    button: MouseButton::Left,
+                    button_state: MouseButtonState::Up,
+                    ..
+                } = event
+                {
+                    let _ = cmd_tx.send(TrayCmd::OpenConsole);
+                }
+            }
+
+            while let Ok(event) = MenuEvent::receiver().try_recv() {
+                if event.id == open_id {
+                    let _ = cmd_tx.send(TrayCmd::OpenConsole);
+                } else if event.id == stop_id {
+                    let _ = cmd_tx.send(TrayCmd::StopNode);
+                } else if event.id == exit_id {
+                    let _ = cmd_tx.send(TrayCmd::Exit);
+                }
+            }
+
+            unsafe {
+                let mut msg: MSG = std::mem::zeroed();
+                while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+                    TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+}
+
+// ── Interactive (double-click / no-subcommand) mode ──────────────────────────
+
+async fn cmd_interactive(cli: &Cli) -> Result<()> {
+    use std::io::{BufRead, Write};
+
+    println!("╔══════════════════════════════════════╗");
+    println!("║           Vess Digital Cash           ║");
+    println!("╚══════════════════════════════════════╝");
+    println!();
+
+    // Auto-start node on launch (handles first-run wizard, password, etc.).
+    if let Err(e) = cmd_start(cli).await {
+        println!("Warning: could not start node: {e}");
+    }
+    println!();
+
+    // Show balance if node is now running.
+    let port = rpc_port(cli);
+    if let Some(pid) = read_node_pid() {
+        if is_pid_alive(pid) {
+            if let Ok(resp) = rpc_call(port, &json!({"method": "balance"})).await {
+                if resp["ok"] == true {
+                    println!(
+                        "Balance: {} Vess  ({} bills)",
+                        resp["balance"], resp["bill_count"]
+                    );
+                }
+            }
+        }
+    }
+
+    println!();
+    println!("Type 'help' for commands, 'exit' to quit.");
+    println!();
+
+    // Windows: intercept the close-button → hide to tray. Spawn tray icon.
+    // Skip if we're a child process spawned by the tray to show a fresh REPL
+    // (the parent process already owns the tray icon).
+    #[cfg(windows)]
+    let (mut tray_rx, has_tray) = {
+        if std::env::var_os("VESS_TRAY_CHILD").is_some() {
+            let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<sys_tray::TrayCmd>();
+            (rx, false)
+        } else {
+            sys_tray::register_close_handler();
+            let (tray_tx, tray_rx) =
+                tokio::sync::mpsc::unbounded_channel::<sys_tray::TrayCmd>();
+            sys_tray::spawn_tray(tray_tx);
+            (tray_rx, true)
+        }
+    };
+
+    // Read stdin on a blocking thread so the async loop can also handle tray
+    // commands while blocked waiting for keyboard input.
+    let (stdin_tx, mut stdin_rx) =
+        tokio::sync::mpsc::unbounded_channel::<Option<String>>();
+    std::thread::spawn(move || {
+        let stdin = std::io::stdin();
+        for line in stdin.lock().lines() {
+            match line {
+                Ok(l) => {
+                    if stdin_tx.send(Some(l)).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => {
+                    let _ = stdin_tx.send(None);
+                    break;
+                }
+            }
+        }
+    });
+
+    // `tray_exit` is set when the user clicked X and we should enter the
+    // tray-only wait loop after the REPL loop ends.
+    let mut tray_exit = false;
+
+    loop {
+        print!("vess> ");
+        std::io::stdout().flush().ok();
+
+        let line_str: String;
+
+        #[cfg(windows)]
+        {
+            use std::sync::atomic::Ordering;
+            let sel = tokio::select! {
+                opt = stdin_rx.recv() => {
+                    match opt.flatten() {
+                        Some(l) => Some(l),
+                        None => {
+                            // stdin EOF.  On modern Windows, conhost destroys the
+                            // console even when our ctrl handler returned TRUE, making
+                            // stdin close.  If IN_TRAY_MODE is set the process is still
+                            // alive and should keep the tray icon — switch to tray-only.
+                            if sys_tray::IN_TRAY_MODE.load(Ordering::SeqCst) {
+                                tray_exit = true;
+                            }
+                            break;
+                        }
+                    }
+                }
+                cmd = tray_rx.recv() => {
+                    match cmd {
+                        Some(sys_tray::TrayCmd::OpenConsole) => {
+                            sys_tray::show_console();
+                        }
+                        Some(sys_tray::TrayCmd::StopNode) => {
+                            let _ = cmd_stop().await;
+                        }
+                        Some(sys_tray::TrayCmd::Exit) | None => {
+                            let _ = cmd_stop().await;
+                            std::process::exit(0);
+                        }
+                    }
+                    None // tray cmd handled — re-prompt
+                }
+            };
+            match sel {
+                Some(l) => line_str = l,
+                None => continue,
+            }
+        }
+
+        #[cfg(not(windows))]
+        {
+            match stdin_rx.recv().await.flatten() {
+                Some(l) => line_str = l,
+                None => {
+                    println!();
+                    return Ok(());
+                }
+            }
+        }
+
+        let line = line_str.trim().to_string();
+        if line.is_empty() {
+            continue;
+        }
+
+        let mut parts = line.splitn(4, ' ');
+        let cmd = parts.next().unwrap_or("");
+        let args: Vec<&str> = parts.collect();
+
+        let result: Result<()> = match cmd {
+            "exit" | "quit" | "q" => {
+                println!("Goodbye.");
+                break;
+            }
+            "help" | "h" | "?" => {
+                print_interactive_help();
+                Ok(())
+            }
+            "start" => cmd_start(cli).await,
+            "stop" => cmd_stop().await,
+            "status" => cmd_status(cli).await,
+            "balance" | "bal" => cmd_balance(cli).await,
+            "send" => {
+                if args.len() < 2 {
+                    println!("Usage: send <amount> <+tag>");
+                    Ok(())
+                } else {
+                    match args[0].parse::<u64>() {
+                        Ok(amount) => cmd_send(cli, amount, args[1], None, None).await,
+                        Err(_) => {
+                            println!("Invalid amount — must be a whole number.");
+                            Ok(())
+                        }
+                    }
+                }
+            }
+            "mint" => cmd_mint(cli, false, false).await,
+            "notifications" | "notifs" => cmd_notifications(cli, false, 1_000, 64).await,
+            _ => {
+                println!("Unknown command '{cmd}'. Type 'help' for a list.");
+                Ok(())
+            }
+        };
+
+        if let Err(e) = result {
+            println!("Error: {e}");
+        }
+        println!();
+    }
+
+    // Windows: if we exited the REPL because the user closed the console window,
+    // keep the process alive in tray-only mode.  The node keeps running; the user
+    // can reopen the console via the tray icon.
+    #[cfg(windows)]
+    if tray_exit && has_tray {
+        loop {
+            match tray_rx.recv().await {
+                Some(sys_tray::TrayCmd::OpenConsole) => {
+                    if sys_tray::console_alive() {
+                        // Console was only hidden (SW_HIDE won the race) — show it.
+                        sys_tray::show_console();
+                    } else {
+                        // Console was truly destroyed by conhost.
+                        // Spawn a fresh vess.exe child that will connect to the
+                        // already-running node and show a REPL.
+                        if let Ok(exe) = std::env::current_exe() {
+                            let _ = std::process::Command::new(exe)
+                                .env("VESS_TRAY_CHILD", "1")
+                                .spawn();
+                        }
+                    }
+                }
+                Some(sys_tray::TrayCmd::StopNode) => {
+                    let _ = cmd_stop().await;
+                }
+                Some(sys_tray::TrayCmd::Exit) | None => {
+                    let _ = cmd_stop().await;
+                    std::process::exit(0);
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn print_interactive_help() {
+    println!("Commands:");
+    println!("  start                  Start the background node");
+    println!("  stop                   Stop the background node");
+    println!("  status                 Show node status, balance & peer count");
+    println!("  balance                Show wallet balance");
+    println!("  send <amount> <+tag>   Send Vess to a recipient");
+    println!("  notifications          Show recent payment notifications");
+    println!("  mint                   Start mining");
+    println!("  help                   Show this help");
+    println!("  exit                   Close Vess");
 }
