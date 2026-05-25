@@ -10,6 +10,8 @@ Bitcoin-backed post-quantum digital cash.
 
 Vess keeps Bitcoin for hard issuance and uses its own network for ownership and transfer.
 
+Vess uses a simple user-facing payment identity, in the form of a human readable +vesstag, which is stored on the DHT and maps to a DKSAP master public key address. Tags can be claimed but ownership isn't guaranteed until a transaction is received to a given tag, and a small POW is required to claim one, preventing sybil.
+
 ---
 
 When a wallet is unlocked inside a running Vess node:
@@ -31,7 +33,7 @@ There is no manual bridge operator, no custodian, and no wrapped token. The supp
 
 Bitcoin is excellent at scarce issuance and terrible at private day-to-day cash flow. Every payment lands on a public graph. Every UTXO cluster becomes a surveillance surface. Every reuse mistake is permanent.
 
-Vess is the private spending layer for sats you are willing to destroy and re-issue as bearer cash.
+Vess is the private spending layer for sats you are willing to re-issue as bearer cash for convenience without sacrificing principle.
 
 Upgrading sats to Vess gives you:
 
@@ -39,7 +41,7 @@ Upgrading sats to Vess gives you:
 - No Vess blockchain to sync.
 - No public history of Vess transfers.
 - Post-quantum ownership keys and transfer authentication.
-- Feeless and instant payments
+- Feeless and instant payments.
 - Full node functionality on any phone or computer.
 - Deterministic ownership state via replicated registries instead of chain consensus.
 
@@ -56,7 +58,7 @@ Each bill has:
 - a `chain_depth`,
 - an owner verification key hash.
 
-Genesis binds the first owner to the bill. Transfers advance the ownership chain with post-quantum signatures. Nodes replicate ownership records through the deterministic DHT location instead of global block production.
+Genesis binds the first owner to the bill. Transfers advance the ownership chain with post-quantum signatures. Nodes replicate ownership records through the deterministic DHT location instead of global block production. Double spending is prohibitively difficult due to deterministic consensus rules rather than probabilistic chains.
 
 ### Payment model
 
@@ -75,6 +77,8 @@ Vess transfers are not published to a public ledger.
 - `+tags` are hashed before entering the network.
 - Ownership registries store current ownership state, not a public transfer history.
 - Bills are bearer instruments, not accounts.
+- Vess relies on a dual-layer stealth process, where both networking handshakes and value exchange are to one time addresses.
+- Vess is sent in common denominator bills in any 1,2,5 format (20, 500, 1000, and so on)
 
 ---
 
@@ -84,6 +88,7 @@ Vess ownership and privacy remain post-quantum even though issuance is Bitcoin-b
 
 | Purpose | Primitive |
 |---|---|
+| Network node handshake | Falcon & ML-KEM-768 |
 | Bitcoin onboarding | Native Bitcoin P2P and SegWit transactions |
 | Vess ownership signatures | ML-DSA-65 |
 | Stealth addressing / KEM | ML-KEM-768 |

@@ -253,13 +253,27 @@ fn wallet_display_name(name: &str) -> String {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> std::process::ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
     let cli = Cli::parse();
 
+    match dispatch_command(&cli).await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            if cli.json {
+                println!("{}", json!({ "ok": false, "error": error.to_string() }));
+            } else {
+                eprintln!("Error: {error}");
+            }
+            std::process::ExitCode::from(1)
+        }
+    }
+}
+
+async fn dispatch_command(cli: &Cli) -> Result<()> {
     match &cli.command {
         None => cmd_interactive(&cli).await,
         Some(Command::Init { tag, name }) => cmd_init(&cli, tag, name.as_deref()).await,
@@ -441,8 +455,10 @@ async fn spawn_udp_mesh_carrier() -> Result<PqUdpMeshCarrier> {
 
 /// Discover bootstrap peers through local/LAN and Bitcoin-side Vess peer discovery.
 /// Used by init/recover when the local node is not yet running.
-async fn discover_peers() -> Result<Vec<MeshCarrierContact>> {
-    println!("Discovering Vess peers through LAN and Bitcoin peers...");
+async fn discover_peers(verbose: bool) -> Result<Vec<MeshCarrierContact>> {
+    if verbose {
+        println!("Discovering Vess peers through LAN and Bitcoin peers...");
+    }
     let client = match vess_bitcoin::BitcoinLightClient::spawn(Default::default()).await {
         Ok(client) => Some(client),
         Err(error) => {
@@ -458,7 +474,9 @@ async fn discover_peers() -> Result<Vec<MeshCarrierContact>> {
         )
         .await;
         if !peers.is_empty() {
-            println!("Discovered {} Vess peer(s) on LAN/local host.", peers.len());
+            if verbose {
+                println!("Discovered {} Vess peer(s) on LAN/local host.", peers.len());
+            }
             return Ok(peers);
         }
 
@@ -468,7 +486,9 @@ async fn discover_peers() -> Result<Vec<MeshCarrierContact>> {
                 .await;
             tracing::info!(connected, "Bitcoin peer discovery connection wait finished");
             if connected == 0 {
-                println!("Still waiting for LAN or Bitcoin peers...");
+                if verbose {
+                    println!("Still waiting for LAN or Bitcoin peers...");
+                }
                 continue;
             }
 
@@ -484,22 +504,28 @@ async fn discover_peers() -> Result<Vec<MeshCarrierContact>> {
             }
 
             if !peers.is_empty() {
-                println!("Discovered {} Vess peer(s) through Bitcoin.", peers.len());
+                if verbose {
+                    println!("Discovered {} Vess peer(s) through Bitcoin.", peers.len());
+                }
                 return Ok(peers);
             }
 
-            println!(
-                "No Vess peers found yet through LAN or {connected} Bitcoin peer(s); still waiting..."
-            );
+            if verbose {
+                println!(
+                    "No Vess peers found yet through LAN or {connected} Bitcoin peer(s); still waiting..."
+                );
+            }
         } else {
-            println!("No Vess peers found yet on LAN/local host; still waiting...");
+            if verbose {
+                println!("No Vess peers found yet on LAN/local host; still waiting...");
+            }
         }
         tokio::time::sleep(std::time::Duration::from_secs(10)).await;
     }
 }
 
-async fn discover_recovery_targets(node: &MeshPulseNode) -> Result<Vec<MeshCarrierContact>> {
-    let peers = discover_peers().await?;
+async fn discover_recovery_targets(node: &MeshPulseNode, verbose: bool) -> Result<Vec<MeshCarrierContact>> {
+    let peers = discover_peers(verbose).await?;
     let mut targets = peers.clone();
 
     let pe_msg = PulseMessage::PeerExchange(vess_protocol::PeerExchange {
@@ -578,6 +604,7 @@ fn rpc_port(cli: &Cli) -> u16 {
 }
 
 async fn cmd_init(cli: &Cli, tag_str: &str, wallet_name: Option<&str>) -> Result<()> {
+    let verbose = !cli.json;
     let tag = VessTag::new(tag_str)?;
     for supplied_name in [wallet_name, cli.wallet_name.as_deref()]
         .into_iter()
@@ -601,8 +628,10 @@ async fn cmd_init(cli: &Cli, tag_str: &str, wallet_name: Option<&str>) -> Result
     let node = MeshPulseNode::spawn().await?;
     node.wait_online().await;
 
-    println!("Checking if tag {} is available...", tag.display());
-    let peers = discover_peers().await?;
+    if verbose {
+        println!("Checking if tag {} is available...", tag.display());
+    }
+    let peers = discover_peers(verbose).await?;
     let display_tag = tag.display();
     let (is_taken, target) =
         lookup_tag_on_reachable_peer(&node, &peers, tag.as_str(), &display_tag).await?;
@@ -615,7 +644,9 @@ async fn cmd_init(cli: &Cli, tag_str: &str, wallet_name: Option<&str>) -> Result
         );
     }
 
-    println!("Tag {} is available!", tag.display());
+    if verbose {
+        println!("Tag {} is available!", tag.display());
+    }
 
     let phrase = RecoveryPhrase::generate();
 
@@ -629,7 +660,9 @@ async fn cmd_init(cli: &Cli, tag_str: &str, wallet_name: Option<&str>) -> Result
     wallet.name = Some(wallet_tag_name.clone());
 
     {
-        println!("Computing Argon2id proof-of-work (~10 seconds, 2 GiB RAM)...");
+        if verbose {
+            println!("Computing Argon2id proof-of-work (~10 seconds, 2 GiB RAM)...");
+        }
 
         let tag_hash = *blake3::hash(tag.as_str().as_bytes()).as_bytes();
         let (pow_nonce, pow_hash) = vess_tag::compute_tag_pow(
@@ -673,12 +706,7 @@ async fn cmd_init(cli: &Cli, tag_str: &str, wallet_name: Option<&str>) -> Result
         node.send_message(&target, &msg).await?;
         node.shutdown().await;
 
-        if cli.json {
-            println!(
-                "{}",
-                json!({ "tag_registered": true, "tag": tag.display() })
-            );
-        } else {
+        if !cli.json {
             println!("Tag {} registration sent.", tag.display());
         }
     }
@@ -690,6 +718,7 @@ async fn cmd_init(cli: &Cli, tag_str: &str, wallet_name: Option<&str>) -> Result
             "{}",
             json!({
                 "ok": true,
+                "tag_registered": true,
                 "wallet_name": wallet.name,
                 "vesstag": tag.display(),
                 "recovery_phrase": phrase.display_phrase(),
@@ -733,6 +762,7 @@ async fn cmd_init(cli: &Cli, tag_str: &str, wallet_name: Option<&str>) -> Result
 }
 
 async fn cmd_recover(cli: &Cli, words: &str, wallet_name: Option<&str>) -> Result<()> {
+    let verbose = !cli.json;
     let wallet_name = wallet_name
         .or(cli.wallet_name.as_deref())
         .map(normalize_wallet_tag_name)
@@ -753,15 +783,19 @@ async fn cmd_recover(cli: &Cli, words: &str, wallet_name: Option<&str>) -> Resul
         BillFold::new()
     };
 
-    println!("Recovering bills via manifest...");
+    if verbose {
+        println!("Recovering bills via manifest...");
+    }
 
     let node = MeshPulseNode::spawn().await?;
     node.wait_online().await;
 
-    let targets = discover_recovery_targets(&node).await?;
+    let targets = discover_recovery_targets(&node, verbose).await?;
 
     let peer_count = targets.len();
-    println!("  Using {peer_count} peer(s) for recovery");
+    if verbose {
+        println!("  Using {peer_count} peer(s) for recovery");
+    }
 
     let manifest_key = vess_foundry::seal::manifest_dht_key(&spend_seed);
     let manifest_req = PulseMessage::ManifestRecover(vess_protocol::ManifestRecover {
@@ -779,14 +813,18 @@ async fn cmd_recover(cli: &Cli, words: &str, wallet_name: Option<&str>) -> Resul
                     Ok(entries) => {
                         manifest_entries = entries;
                         manifest_found = true;
-                        println!(
-                            "  Manifest found with {} bill entries",
-                            manifest_entries.len()
-                        );
+                        if verbose {
+                            println!(
+                                "  Manifest found with {} bill entries",
+                                manifest_entries.len()
+                            );
+                        }
                         break;
                     }
                     Err(e) => {
-                        println!("  Manifest decrypt failed from peer: {e}");
+                        if verbose {
+                            println!("  Manifest decrypt failed from peer: {e}");
+                        }
                     }
                 }
             }
@@ -817,11 +855,13 @@ async fn cmd_recover(cli: &Cli, words: &str, wallet_name: Option<&str>) -> Resul
             }
             let rec = &fetched_records[i];
             if !rec.found {
-                println!(
-                    "  [{}] mint_id {}: not found in registry",
-                    i,
-                    hex(&entry.mint_id[..4])
-                );
+                if verbose {
+                    println!(
+                        "  [{}] mint_id {}: not found in registry",
+                        i,
+                        hex(&entry.mint_id[..4])
+                    );
+                }
                 continue;
             }
 
@@ -829,10 +869,12 @@ async fn cmd_recover(cli: &Cli, words: &str, wallet_name: Option<&str>) -> Resul
             {
                 Some(d) => d,
                 None => {
-                    println!(
-                        "  [{i}] unknown denomination value: {}",
-                        rec.denomination_value
-                    );
+                    if verbose {
+                        println!(
+                            "  [{i}] unknown denomination value: {}",
+                            rec.denomination_value
+                        );
+                    }
                     continue;
                 }
             };
@@ -848,12 +890,14 @@ async fn cmd_recover(cli: &Cli, words: &str, wallet_name: Option<&str>) -> Resul
                 chain_depth: 0,
             };
 
-            println!(
-                "  [{}] recovered {} bill (mint_id: {})",
-                i,
-                bill.denomination,
-                hex(&bill.mint_id[..4]),
-            );
+            if verbose {
+                println!(
+                    "  [{}] recovered {} bill (mint_id: {})",
+                    i,
+                    bill.denomination,
+                    hex(&bill.mint_id[..4]),
+                );
+            }
             billfold.deposit(bill);
             recovered += 1;
             if entry.dht_index >= max_dht_index {
@@ -861,11 +905,15 @@ async fn cmd_recover(cli: &Cli, words: &str, wallet_name: Option<&str>) -> Resul
             }
         }
     } else {
-        println!("  No manifest found on any peer. No bills recovered.");
+        if verbose {
+            println!("  No manifest found on any peer. No bills recovered.");
+        }
     }
 
     node.shutdown().await;
-    println!("Recovery complete: {recovered} bills recovered.");
+    if verbose {
+        println!("Recovery complete: {recovered} bills recovered.");
+    }
 
     let mut wallet = WalletFile::new(address, encrypted, billfold, spend_seed, &enc_key)?;
     wallet.name = wallet_name.clone();
@@ -985,10 +1033,11 @@ async fn cmd_receive(cli: &Cli) -> Result<()> {
         );
     } else {
         println!("Bitcoin receive address:");
+        println!();
         println!("{address}");
         println!();
         println!("{qr_ascii}");
-        println!("Send BTC to this address. The running node will track it, burn it, and mint Vess after confirmation.");
+        println!("Notice: BTC sent to this address will be permanently upgraded to Vess.");
     }
 
     Ok(())
@@ -1252,6 +1301,7 @@ async fn cmd_send(
 }
 
 async fn cmd_register_tag(cli: &Cli, tag_str: &str) -> Result<()> {
+    let verbose = !cli.json;
     let path = wallet_path(cli)?;
     let mut wallet = WalletFile::load(&path)?;
 
@@ -1264,8 +1314,10 @@ async fn cmd_register_tag(cli: &Cli, tag_str: &str) -> Result<()> {
 
     let tag = VessTag::new(tag_str)?;
 
-    println!("Registering tag {}", tag.display());
-    println!("Computing Argon2id proof-of-work (this takes ~10 seconds and 2 GiB RAM)…");
+    if verbose {
+        println!("Registering tag {}", tag.display());
+        println!("Computing Argon2id proof-of-work (this takes ~10 seconds and 2 GiB RAM)…");
+    }
 
     let tag_hash = *blake3::hash(tag.as_str().as_bytes()).as_bytes();
 
@@ -1331,7 +1383,7 @@ async fn cmd_register_tag(cli: &Cli, tag_str: &str) -> Result<()> {
     }
 
     // ── Auto-harden with first available bill ────────────────────
-    let hardened = if let Some(bill) = wallet.billfold.bills().first() {
+    let (auto_hardening_attempted, hardened, hardening_error) = if let Some(bill) = wallet.billfold.bills().first() {
         let mint_id = bill.mint_id;
         let confirm_digest = {
             let mut h = blake3::Hasher::new();
@@ -1355,26 +1407,27 @@ async fn cmd_register_tag(cli: &Cli, tag_str: &str) -> Result<()> {
         .await?;
 
         if confirm_resp["ok"] == true {
-            if !cli.json {
+            if verbose {
                 println!("Tag {} auto-hardened with bill proof.", tag.display());
             }
-            true
+            (true, true, None)
         } else {
-            if !cli.json {
+            let error = confirm_resp["error"].as_str().unwrap_or("unknown").to_string();
+            if verbose {
                 println!(
                     "Tag registered but hardening failed: {}",
-                    confirm_resp["error"].as_str().unwrap_or("unknown")
+                    error
                 );
                 println!("You can harden later once you have bills in your wallet.");
             }
-            false
+            (true, false, Some(error))
         }
     } else {
-        if !cli.json {
+        if verbose {
             println!("No bills in wallet — tag registered but not hardened.");
             println!("The tag will be auto-hardened when you receive bills.");
         }
-        false
+        (false, false, Some("no bills in wallet".to_string()))
     };
 
     if cli.json {
@@ -1382,8 +1435,11 @@ async fn cmd_register_tag(cli: &Cli, tag_str: &str) -> Result<()> {
             "{}",
             json!({
                 "ok": true,
+                "tag_registered": true,
                 "tag": tag.display(),
+                "auto_hardening_attempted": auto_hardening_attempted,
                 "hardened": hardened,
+                "hardening_error": hardening_error,
             })
         );
     }
@@ -1462,7 +1518,18 @@ async fn cmd_set_password(cli: &Cli, password: String) -> Result<()> {
     wallet.set_password_cache(&raw_seed, &password)?;
     wallet.save(&path)?;
 
-    println!("Password set. Open Vess interactively to choose and load this wallet.");
+    if cli.json {
+        println!(
+            "{}",
+            json!({
+                "ok": true,
+                "password_set": true,
+                "wallet_path": path.display().to_string(),
+            })
+        );
+    } else {
+        println!("Password set. Open Vess interactively to choose and load this wallet.");
+    }
     Ok(())
 }
 
@@ -2177,8 +2244,6 @@ async fn cmd_unlock_wallet_at_path(
         println!("{resp}");
     } else {
         println!("Wallet unlocked on the running node.");
-        println!("Balance: {} Vess", resp["balance"]);
-        println!("Bills:   {}", resp["bill_count"]);
     }
 
     Ok(())
@@ -2323,7 +2388,7 @@ async fn wizard_new(
 
     // Check tag availability before doing the expensive PoW.
     println!("Checking if +{tag_str} is available…");
-    let peers = discover_peers().await?;
+    let peers = discover_peers(true).await?;
     let node = MeshPulseNode::spawn().await?;
     node.wait_online().await;
     let display_tag = format!("+{tag_str}");
@@ -2443,7 +2508,7 @@ async fn wizard_recover(
     let node = MeshPulseNode::spawn().await?;
     node.wait_online().await;
 
-    let targets = discover_recovery_targets(&node).await?;
+    let targets = discover_recovery_targets(&node, true).await?;
     println!("  Using {} peer(s) for manifest fetch", targets.len());
 
     let manifest_key = vess_foundry::seal::manifest_dht_key(&spend_seed);
@@ -2539,10 +2604,14 @@ async fn cmd_status(cli: &Cli) -> Result<()> {
         None => false,
         Some(pid) => {
             if is_pid_alive(pid) {
-                println!("Status:  RUNNING  (PID {pid})");
+                if !cli.json {
+                    println!("Status:  RUNNING  (PID {pid})");
+                }
                 true
             } else {
-                println!("Status:  NOT RUNNING  (stale PID file removed)");
+                if !cli.json {
+                    println!("Status:  NOT RUNNING  (stale PID file removed)");
+                }
                 clear_node_pid();
                 false
             }
@@ -2616,11 +2685,6 @@ async fn cmd_status(cli: &Cli) -> Result<()> {
         return Ok(());
     }
 
-    println!();
-    println!("  `vess balance`       — check balance");
-    println!("  `vess receive`       — show BTC receive address + QR");
-    println!("  `vess send <n> <+tag>` — send Vess");
-    println!("  `vess notifications --follow` — watch BTC -> Vess bridge events");
     Ok(())
 }
 
@@ -2630,7 +2694,7 @@ async fn cmd_interactive(cli: &Cli) -> Result<()> {
     use std::io::{BufRead, Write};
 
     println!("╔══════════════════════════════════════╗");
-    println!("║           Vess Digital Cash           ║");
+    println!("║        Vess: True Digital Cash       ║");
     println!("╚══════════════════════════════════════╝");
     println!();
 
