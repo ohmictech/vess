@@ -26,6 +26,8 @@ pub mod gossip;
 pub mod handshake;
 pub mod kademlia;
 pub mod limbo_buffer;
+pub mod local_discovery;
+pub mod mesh_contact;
 pub mod node_runner;
 pub mod ownership_registry;
 pub mod persistence;

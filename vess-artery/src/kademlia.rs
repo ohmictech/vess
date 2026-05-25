@@ -42,7 +42,7 @@ pub fn peer_age_factor(first_seen: u64, now: u64) -> f64 {
 }
 
 /// A peer entry in the routing table: just the Blake3 hash of the
-/// iroh EndpointId and the raw endpoint bytes for connectivity.
+/// mesh node ID and the serialized mesh contact bytes for connectivity.
 /// No wallet metadata, no stealth addresses, no payment history.
 #[derive(Clone, Debug)]
 pub struct RoutingPeer {
@@ -344,15 +344,16 @@ impl RoutingTable {
         self.get(peer_id).map(|p| p.id_bytes.clone())
     }
 
-    /// Fill the id_bytes for a peer that was restored from persistence
-    /// (where only hashes are stored). Returns true if found and updated.
+    /// Refresh the stored contact bytes for a peer.
+    ///
+    /// This is used both to fill contacts restored from persistence and to
+    /// replace stale serialized mesh contacts when a peer reannounces from a
+    /// new socket address. Returns true if found and updated.
     pub fn fill_id_bytes(&mut self, id_hash: &[u8; 32], id_bytes: Vec<u8>) -> bool {
         if let Some(idx) = self.bucket_index(id_hash) {
             if let Some(pos) = self.buckets[idx].position(id_hash) {
-                if self.buckets[idx].peers[pos].id_bytes.is_empty() {
-                    self.buckets[idx].peers[pos].id_bytes = id_bytes;
-                    return true;
-                }
+                self.buckets[idx].peers[pos].id_bytes = id_bytes;
+                return true;
             }
         }
         false

@@ -11,23 +11,28 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 
 use vess_foundry::reforge::{reforge, ReforgeRequest};
-use vess_foundry::spend_auth::generate_spend_keypair;
+use vess_foundry::spend_auth::{generate_spend_keypair, vk_hash};
 use vess_kloak::auto_reforge::ConsolidationScheduler;
 use vess_kloak::billfold::SpendCredential;
 use vess_kloak::payment::{prepare_payment_from_bills, prepare_payment_with_transfer};
 use vess_kloak::selection::{decompose_amount, select_bills_filtered};
+use vess_mesh::MeshCarrierContact;
 use vess_protocol::{ManifestStore, PulseMessage, TagLookup, TagStore};
 use vess_stealth::MasterStealthAddress;
 use vess_tag::{TagRecord, VessTag};
-use vess_vascular::VessNode;
+use vess_vascular::MeshPulseNode;
 
 use crate::gossip::k_nearest;
+use crate::mesh_contact::{
+    decode_contact_bytes, encode_contact_string, parse_contact_string, parse_node_id_hex,
+};
 use crate::node_runner::ArteryState;
 use crate::node_runner::WalletState;
 use crate::persistence::hex_key;
@@ -66,6 +71,52 @@ fn from_hex(hex_str: &str) -> Result<Vec<u8>, String> {
 
 /// Default RPC port.
 pub const DEFAULT_RPC_PORT: u16 = 9400;
+const LOCAL_TEST_FAUCET_ENV: &str = "VESS_LOCAL_TEST_FAUCET";
+
+fn local_test_faucet_enabled() -> bool {
+    std::env::var(LOCAL_TEST_FAUCET_ENV)
+        .map(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn local_test_faucet_digest(
+    nonce: &[u8; 32],
+    denomination_value: u64,
+    owner_vk_hash: &[u8; 32],
+) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"vess-local-test-faucet-digest-v0");
+    h.update(nonce);
+    h.update(&denomination_value.to_le_bytes());
+    h.update(owner_vk_hash);
+    *h.finalize().as_bytes()
+}
+
+fn resolve_target_contact_from_str(
+    state: &Arc<Mutex<ArteryState>>,
+    value: &str,
+) -> Result<MeshCarrierContact, String> {
+    if let Ok(contact) = parse_contact_string(value) {
+        return Ok(contact);
+    }
+
+    let peer_id = parse_node_id_hex(value).ok_or_else(|| {
+        "invalid node_id: expected serialized mesh contact or 64-char mesh node id".to_string()
+    })?;
+
+    let contact_bytes = {
+        let s = state.lock().unwrap();
+        s.routing_table
+            .peer_id_bytes(&peer_id)
+            .ok_or_else(|| format!("unknown node_id: {value}"))?
+    };
+    decode_contact_bytes(&contact_bytes).map_err(|e| format!("stored peer contact is invalid: {e}"))
+}
 
 // ── Request / Response types ────────────────────────────────────────
 
@@ -90,12 +141,15 @@ pub enum RpcRequest {
     SendDirect {
         amount: u64,
         recipient: String,
-        node_id: String,
+        #[serde(alias = "node_id")]
+        target: String,
         #[serde(default)]
         memo: Option<String>,
     },
     WalletUnlock {
         password: String,
+        #[serde(default)]
+        wallet_path: Option<String>,
     },
     WalletSetPassword {
         current_password: String,
@@ -126,6 +180,9 @@ pub enum RpcRequest {
         denomination_value: u64,
         proof_hex: String,
         digest_hex: String,
+    },
+    LocalTestFaucet {
+        amount: u64,
     },
     ManifestStore {
         dht_key_hex: String,
@@ -169,11 +226,18 @@ pub enum RpcData {
     NodeInfo {
         node_id: String,
         peer_count: usize,
-        verified_peers: usize,
+        verified_peer_count: usize,
+        node_contact: String,
         estimated_network_size: usize,
         tag_count: usize,
         registry_count: usize,
         limbo_count: usize,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        bitcoin_receive_address: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        bitcoin_tracked_balance: Option<u64>,
+        bitcoin_pending_burns: usize,
+        bitcoin_connected_peers: usize,
     },
     TagLookup {
         found: bool,
@@ -196,6 +260,11 @@ pub enum RpcData {
     WalletStatus {
         locked: bool,
         has_password: bool,
+    },
+    LocalTestFaucet {
+        amount: u64,
+        bill_count: usize,
+        balance: u64,
     },
     TagCacheList {
         entries: Vec<crate::tag_cache::TagCacheEntryView>,
@@ -228,7 +297,7 @@ pub(crate) async fn run_rpc_server(
     token: String,
     state: Arc<Mutex<ArteryState>>,
     senders: QueueSenders,
-    node: VessNode,
+    node: MeshPulseNode,
 ) -> Result<()> {
     let addr = format!("127.0.0.1:{port}");
     let listener = TcpListener::bind(&addr).await?;
@@ -285,7 +354,7 @@ async fn handle_request(
     line: &str,
     state: &Arc<Mutex<ArteryState>>,
     senders: &QueueSenders,
-    node: &VessNode,
+    node: &MeshPulseNode,
 ) -> RpcResponse {
     let req: RpcRequest = match serde_json::from_str(line) {
         Ok(r) => r,
@@ -294,7 +363,7 @@ async fn handle_request(
 
     match req {
         RpcRequest::Balance => handle_balance(state),
-        RpcRequest::NodeInfo => handle_node_info(state),
+        RpcRequest::NodeInfo => handle_node_info(state, node),
         RpcRequest::Notifications { max } => handle_notifications(state, max.unwrap_or(64)),
         RpcRequest::TagLookup { tag } => handle_tag_lookup(state, node, &tag).await,
         RpcRequest::Send {
@@ -305,11 +374,15 @@ async fn handle_request(
         RpcRequest::SendDirect {
             amount,
             recipient,
-            node_id,
+            target,
             memo,
-        } => handle_send_direct(state, amount, &recipient, &node_id, memo, senders, node).await,
-        RpcRequest::WalletUnlock { password } => {
-            handle_wallet_unlock(state, &password, &senders.oc_tx)
+        } => handle_send_direct(state, amount, &recipient, &target, memo, senders, node).await,
+        RpcRequest::WalletUnlock {
+            password,
+            wallet_path,
+        } => {
+            handle_wallet_unlock(state, node, &password, wallet_path.as_deref(), &senders.oc_tx)
+                .await
         }
         RpcRequest::WalletSetPassword {
             current_password,
@@ -369,6 +442,9 @@ async fn handle_request(
             &digest_hex,
             &senders.og_tx,
         ),
+        RpcRequest::LocalTestFaucet { amount } => {
+            handle_local_test_faucet(state, amount, &senders.og_tx)
+        }
         RpcRequest::ManifestStore {
             dht_key_hex,
             encrypted_manifest_hex,
@@ -398,18 +474,44 @@ fn handle_balance(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
     }
 }
 
-fn handle_node_info(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
+fn handle_node_info(state: &Arc<Mutex<ArteryState>>, node: &MeshPulseNode) -> RpcResponse {
     let s = state.lock().unwrap();
+    let node_contact = match encode_contact_string(&node.contact()) {
+        Ok(contact) => contact,
+        Err(error) => {
+            return RpcResponse::err(format!("failed to encode local mesh contact: {error}"))
+        }
+    };
+
     RpcResponse::ok(RpcData::NodeInfo {
         node_id: hex_key(&s.node_id),
         peer_count: s.routing_table.peer_count(),
-        verified_peers: s
+        verified_peer_count: s
             .peer_registry
             .count_in_state(crate::handshake::PeerState::Verified),
+        node_contact,
         estimated_network_size: s.estimated_network_size,
         tag_count: s.tag_dht.record_count(),
         registry_count: s.registry.len(),
         limbo_count: s.limbo_mint_ids.len(),
+        bitcoin_receive_address: s
+            .wallet
+            .as_ref()
+            .map(|wallet| wallet.bitcoin_receive_address.clone()),
+        bitcoin_tracked_balance: s
+            .wallet
+            .as_ref()
+            .map(|wallet| wallet.bitcoin_wallet.spendable_tracked_balance()),
+        bitcoin_pending_burns: s
+            .wallet
+            .as_ref()
+            .map(|wallet| wallet.bitcoin_wallet.pending_burn_count())
+            .unwrap_or(0),
+        bitcoin_connected_peers: s
+            .bitcoin_client
+            .as_ref()
+            .map(|client| client.connected_peers())
+            .unwrap_or(0),
     })
 }
 
@@ -428,6 +530,68 @@ const TAG_LOOKUP_FAN_OUT: usize = 9;
 /// Timeout (milliseconds) for a single peer's `TagLookup` response.
 const TAG_LOOKUP_TIMEOUT_MS: u64 = 4_000;
 
+fn tag_lookup_result_address(result: &vess_protocol::TagLookupResult) -> MasterStealthAddress {
+    MasterStealthAddress {
+        scan_ek: result.scan_ek.clone(),
+        spend_ek: result.spend_ek.clone(),
+    }
+}
+
+fn tag_lookup_address_fingerprint(address: &MasterStealthAddress) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&address.scan_ek);
+    hasher.update(&address.spend_ek);
+    *hasher.finalize().as_bytes()
+}
+
+fn validate_tag_lookup_result(
+    tag_hash: [u8; 32],
+    result: &vess_protocol::TagLookupResult,
+) -> Option<MasterStealthAddress> {
+    if result.registrant_vk.is_empty() || result.signature.is_empty() {
+        return None;
+    }
+
+    let address = tag_lookup_result_address(result);
+    let record = TagRecord {
+        tag_hash,
+        master_address: address.clone(),
+        pow_nonce: result.pow_nonce,
+        pow_hash: result.pow_hash.clone(),
+        registered_at: result.registered_at,
+        registrant_vk: result.registrant_vk.clone(),
+        signature: result.signature.clone(),
+        hardened_at: None,
+    };
+
+    match vess_tag::verify_record_signature(&record) {
+        Ok(true) => {}
+        _ => return None,
+    }
+
+    #[cfg(any(test, feature = "test-pow"))]
+    let pow_ok = vess_tag::verify_tag_pow_test(
+        &tag_hash,
+        &record.master_address.scan_ek,
+        &record.master_address.spend_ek,
+        &record.pow_nonce,
+        &record.pow_hash,
+    );
+    #[cfg(not(any(test, feature = "test-pow")))]
+    let pow_ok = vess_tag::verify_tag_pow(
+        &tag_hash,
+        &record.master_address.scan_ek,
+        &record.master_address.spend_ek,
+        &record.pow_nonce,
+        &record.pow_hash,
+    );
+
+    match pow_ok {
+        Ok(true) => Some(address),
+        _ => None,
+    }
+}
+
 /// Active DHT tag resolution.
 ///
 /// Priority order:
@@ -440,7 +604,7 @@ const TAG_LOOKUP_TIMEOUT_MS: u64 = 4_000;
 /// across the network.
 async fn resolve_tag(
     state: &Arc<Mutex<ArteryState>>,
-    node: &VessNode,
+    node: &MeshPulseNode,
     tag_str: &str,
 ) -> Option<MasterStealthAddress> {
     let now = std::time::SystemTime::now()
@@ -467,7 +631,8 @@ async fn resolve_tag(
                 scan_ek: record.master_address.scan_ek.clone(),
                 spend_ek: record.master_address.spend_ek.clone(),
             };
-            s.tag_cache.insert(tag_str, addr.scan_ek.clone(), addr.spend_ek.clone(), now);
+            s.tag_cache
+                .insert(tag_str, addr.scan_ek.clone(), addr.spend_ek.clone(), now);
             return Some(addr);
         }
     }
@@ -477,7 +642,7 @@ async fn resolve_tag(
     let tag_hash: [u8; 32] = *blake3::hash(tag_str.as_bytes()).as_bytes();
     let nonce: [u8; 16] = rand::random();
 
-    let targets: Vec<(iroh::EndpointId, [u8; 32])> = {
+    let targets: Vec<(MeshCarrierContact, [u8; 32])> = {
         let s = state.lock().unwrap();
         let peers = s.routing_table.routable_peers(|_| true);
         if peers.is_empty() {
@@ -489,9 +654,8 @@ async fn resolve_tag(
             .into_iter()
             .filter_map(|i| {
                 let p = &peers[i];
-                let arr: [u8; 32] = p.id_bytes.as_slice().try_into().ok()?;
-                let eid = iroh::EndpointId::from_bytes(&arr).ok()?;
-                Some((eid, p.id_hash))
+                let contact = decode_contact_bytes(&p.id_bytes).ok()?;
+                Some((contact, p.id_hash))
             })
             .collect()
     };
@@ -500,20 +664,19 @@ async fn resolve_tag(
         return None;
     }
 
+    let required_confirmations = std::cmp::min(crate::QUORUM_THRESHOLD, targets.len()).max(1);
+
     // Send `TagLookup` concurrently to all selected peers.
-    let lookup_msg = PulseMessage::TagLookup(TagLookup {
-        tag_hash,
-        nonce,
-    });
+    let lookup_msg = PulseMessage::TagLookup(TagLookup { tag_hash, nonce });
 
     let mut tasks = Vec::with_capacity(targets.len());
-    for (eid, id_hash) in targets {
+    for (contact, id_hash) in targets {
         let n = node.clone();
         let msg = lookup_msg.clone();
         tasks.push(tokio::spawn(async move {
             let resp = tokio::time::timeout(
                 std::time::Duration::from_millis(TAG_LOOKUP_TIMEOUT_MS),
-                n.send_message_with_response(eid, &msg),
+                n.send_message_with_response(&contact, &msg),
             )
             .await;
             (id_hash, resp)
@@ -523,7 +686,10 @@ async fn resolve_tag(
     let results = futures::future::join_all(tasks).await;
 
     // Collect responses and run quorum verification.
-    let mut resolver = TagResolver::new();
+    let mut resolver = TagResolver::with_threshold(required_confirmations);
+    let mut relaxed_candidate: Option<MasterStealthAddress> = None;
+    let mut relaxed_fingerprint: Option<[u8; 32]> = None;
+    let mut relaxed_conflict = false;
     for join_result in results {
         let Ok((id_hash, timeout_result)) = join_result else {
             continue;
@@ -535,6 +701,29 @@ async fn resolve_tag(
         if tlr.nonce != nonce {
             continue;
         }
+
+        let validated_address = match &tlr.result {
+            Some(result) => match validate_tag_lookup_result(tlr.tag_hash, result) {
+                Some(address) => Some(address),
+                None => continue,
+            },
+            None => None,
+        };
+
+        if let Some(address) = validated_address.clone() {
+            let fingerprint = tag_lookup_address_fingerprint(&address);
+            match relaxed_fingerprint {
+                None => {
+                    relaxed_fingerprint = Some(fingerprint);
+                    relaxed_candidate = Some(address);
+                }
+                Some(existing) if existing != fingerprint => {
+                    relaxed_conflict = true;
+                }
+                _ => {}
+            }
+        }
+
         match resolver.add_response(id_hash, &tlr) {
             TagResolution::Verified { address, .. } => {
                 // Quorum reached — cache and return.
@@ -548,10 +737,26 @@ async fn resolve_tag(
                 return Some(address);
             }
             TagResolution::Conflict { .. } => {
-                warn!(tag = tag_str, "tag lookup: conflicting records from network");
+                warn!(
+                    tag = tag_str,
+                    "tag lookup: conflicting records from network"
+                );
                 return None;
             }
             _ => {} // Pending or NotFound — keep collecting
+        }
+    }
+
+    if !relaxed_conflict && resolver.response_count() < crate::QUORUM_THRESHOLD {
+        if let Some(address) = relaxed_candidate {
+            let mut s = state.lock().unwrap();
+            s.tag_cache.insert(
+                tag_str,
+                address.scan_ek.clone(),
+                address.spend_ek.clone(),
+                now,
+            );
+            return Some(address);
         }
     }
 
@@ -560,7 +765,7 @@ async fn resolve_tag(
 
 async fn handle_tag_lookup(
     state: &Arc<Mutex<ArteryState>>,
-    node: &VessNode,
+    node: &MeshPulseNode,
     tag: &str,
 ) -> RpcResponse {
     let tag_str = tag.strip_prefix('+').unwrap_or(tag);
@@ -625,15 +830,24 @@ fn fire_opportunistic_consolidations(
     }
 
     // Largest target denomination first, cap at 2 to avoid network noise.
-    candidates
-        .sort_by(|a, b| b.target_denomination.value().cmp(&a.target_denomination.value()));
+    candidates.sort_by(|a, b| {
+        b.target_denomination
+            .value()
+            .cmp(&a.target_denomination.value())
+    });
     candidates.truncate(2);
 
     for candidate in candidates {
-        let input_bills: Vec<vess_foundry::VessBill> =
-            candidate.indices.iter().map(|&i| available[i].clone()).collect();
+        let input_bills: Vec<vess_foundry::VessBill> = candidate
+            .indices
+            .iter()
+            .map(|&i| available[i].clone())
+            .collect();
 
-        if input_bills.iter().any(|b| !cred_map.contains_key(&b.mint_id)) {
+        if input_bills
+            .iter()
+            .any(|b| !cred_map.contains_key(&b.mint_id))
+        {
             continue;
         }
 
@@ -659,7 +873,10 @@ fn fire_opportunistic_consolidations(
 
         let (new_bill, proof_bytes) = result.outputs[0].clone();
         let (new_vk, new_sk) = generate_spend_keypair();
-        let new_cred = SpendCredential { spend_vk: new_vk, spend_sk: new_sk };
+        let new_cred = SpendCredential {
+            spend_vk: new_vk,
+            spend_sk: new_sk,
+        };
 
         // Build and sign ReforgeAttestation.
         let mut sorted_consumed = result.consumed_mint_ids.clone();
@@ -708,36 +925,46 @@ fn fire_opportunistic_consolidations(
             continue;
         }
 
-        let _ = senders.ra_tx.send(vess_protocol::ReforgeAttestation {
-            consumed_mint_ids: result.consumed_mint_ids.clone(),
-            owner_vk: owner_vk_for_ra,
-            consume_sigs,
-            reforge_id,
-            output_mint_ids: vec![new_bill.mint_id],
-            hops_remaining: 6,
-        });
+        crate::node_runner::queue_local_reforge_attestation(
+            s,
+            &senders.ra_tx,
+            vess_protocol::ReforgeAttestation {
+                consumed_mint_ids: result.consumed_mint_ids.clone(),
+                owner_vk: owner_vk_for_ra,
+                consume_sigs,
+                reforge_id,
+                output_mint_ids: vec![new_bill.mint_id],
+                hops_remaining: 6,
+            },
+        );
 
         let owner_vk_hash = vess_foundry::spend_auth::vk_hash(&new_cred.spend_vk);
         let chain_tip = vess_foundry::genesis_chain_tip(&new_bill.mint_id, &owner_vk_hash);
-        let _ = senders.og_tx.send(vess_protocol::OwnershipGenesis {
-            mint_id: new_bill.mint_id,
-            chain_tip,
-            owner_vk_hash,
-            owner_vk: new_cred.spend_vk.clone(),
-            denomination_value: new_bill.denomination.value(),
-            proof: proof_bytes,
-            digest: new_bill.digest,
-            hops_remaining: 6,
-            chain_depth: 0,
-            output_index: 0,
-        });
+        crate::node_runner::queue_local_ownership_genesis(
+            s,
+            &senders.og_tx,
+            vess_protocol::OwnershipGenesis {
+                mint_id: new_bill.mint_id,
+                chain_tip,
+                owner_vk_hash,
+                owner_vk: new_cred.spend_vk.clone(),
+                denomination_value: new_bill.denomination.value(),
+                genesis_proof: vess_protocol::GenesisProof::Vess(proof_bytes),
+                digest: new_bill.digest,
+                hops_remaining: 6,
+                chain_depth: 0,
+                output_index: 0,
+            },
+        );
 
         // Update billfold atomically.
         let ws_mut = s.wallet.as_mut().unwrap();
         for mid in &result.consumed_mint_ids {
             ws_mut.billfold.withdraw(mid);
         }
-        ws_mut.billfold.deposit_with_credentials(new_bill.clone(), new_cred);
+        ws_mut
+            .billfold
+            .deposit_with_credentials(new_bill.clone(), new_cred);
 
         info!(
             "opportunistic consolidation: {}×{} → {} (mint_id {:?})",
@@ -751,7 +978,7 @@ fn fire_opportunistic_consolidations(
 
 async fn handle_send(
     state: &Arc<Mutex<ArteryState>>,
-    node: &VessNode,
+    node: &MeshPulseNode,
     amount: u64,
     recipient_tag: &str,
     memo: Option<String>,
@@ -936,14 +1163,18 @@ async fn handle_send(
         if consume_sigs.len() == result.consumed_mint_ids.len() {
             let output_mint_ids: Vec<[u8; 32]> =
                 result.outputs.iter().map(|(b, _)| b.mint_id).collect();
-            let _ = senders.ra_tx.send(vess_protocol::ReforgeAttestation {
-                consumed_mint_ids: result.consumed_mint_ids,
-                owner_vk: owner_vk_for_ra,
-                consume_sigs,
-                reforge_id,
-                output_mint_ids,
-                hops_remaining: 6,
-            });
+            crate::node_runner::queue_local_reforge_attestation(
+                &mut s,
+                &senders.ra_tx,
+                vess_protocol::ReforgeAttestation {
+                    consumed_mint_ids: result.consumed_mint_ids,
+                    owner_vk: owner_vk_for_ra,
+                    consume_sigs,
+                    reforge_id,
+                    output_mint_ids,
+                    hops_remaining: 6,
+                },
+            );
         }
 
         // OwnershipGenesis for each change bill (registers them in the DHT).
@@ -952,18 +1183,22 @@ async fn handle_send(
                 let owner_vk_hash = vess_foundry::spend_auth::vk_hash(&cred.spend_vk);
                 // Compute correct genesis chain_tip (reforge outputs have [0;32] placeholder).
                 let chain_tip = vess_foundry::genesis_chain_tip(&bill.mint_id, &owner_vk_hash);
-                let _ = senders.og_tx.send(vess_protocol::OwnershipGenesis {
-                    mint_id: bill.mint_id,
-                    chain_tip,
-                    owner_vk_hash,
-                    owner_vk: cred.spend_vk.clone(),
-                    denomination_value: bill.denomination.value(),
-                    proof: proof_bytes.clone(),
-                    digest: bill.digest,
-                    hops_remaining: 6,
-                    chain_depth: 0,
-                    output_index: (send_count + j) as u32,
-                });
+                crate::node_runner::queue_local_ownership_genesis(
+                    &mut s,
+                    &senders.og_tx,
+                    vess_protocol::OwnershipGenesis {
+                        mint_id: bill.mint_id,
+                        chain_tip,
+                        owner_vk_hash,
+                        owner_vk: cred.spend_vk.clone(),
+                        denomination_value: bill.denomination.value(),
+                        genesis_proof: vess_protocol::GenesisProof::Vess(proof_bytes.clone()),
+                        digest: bill.digest,
+                        hops_remaining: 6,
+                        chain_depth: 0,
+                        output_index: (send_count + j) as u32,
+                    },
+                );
             }
         }
 
@@ -973,18 +1208,22 @@ async fn handle_send(
                 let proof_bytes = result.outputs[i].1.clone();
                 let owner_vk_hash = vess_foundry::spend_auth::vk_hash(&cred.spend_vk);
                 let chain_tip = vess_foundry::genesis_chain_tip(&bill.mint_id, &owner_vk_hash);
-                let _ = senders.og_tx.send(vess_protocol::OwnershipGenesis {
-                    mint_id: bill.mint_id,
-                    chain_tip,
-                    owner_vk_hash,
-                    owner_vk: cred.spend_vk.clone(),
-                    denomination_value: bill.denomination.value(),
-                    proof: proof_bytes,
-                    digest: bill.digest,
-                    hops_remaining: 6,
-                    chain_depth: 0,
-                    output_index: i as u32,
-                });
+                crate::node_runner::queue_local_ownership_genesis(
+                    &mut s,
+                    &senders.og_tx,
+                    vess_protocol::OwnershipGenesis {
+                        mint_id: bill.mint_id,
+                        chain_tip,
+                        owner_vk_hash,
+                        owner_vk: cred.spend_vk.clone(),
+                        denomination_value: bill.denomination.value(),
+                        genesis_proof: vess_protocol::GenesisProof::Vess(proof_bytes),
+                        digest: bill.digest,
+                        hops_remaining: 6,
+                        chain_depth: 0,
+                        output_index: i as u32,
+                    },
+                );
             }
         }
 
@@ -1058,7 +1297,7 @@ async fn handle_send(
     })
 }
 
-/// Direct peer-to-peer send: connect to a specific node via QUIC and deliver
+/// Direct peer-to-peer send: connect to a specific mesh contact and deliver
 /// the payment with a 5-second timeout. No PoW handshake required — the
 /// connection is ephemeral and drops after the response.
 #[allow(clippy::too_many_arguments)]
@@ -1069,15 +1308,15 @@ async fn handle_send_direct(
     node_id_str: &str,
     memo: Option<String>,
     senders: &QueueSenders,
-    node: &VessNode,
+    node: &MeshPulseNode,
 ) -> RpcResponse {
-    // Parse node ID.
-    let target: iroh::EndpointId = match node_id_str.parse() {
-        Ok(id) => id,
-        Err(_) => return RpcResponse::err("invalid node_id: expected hex-encoded endpoint ID"),
+    let target = match resolve_target_contact_from_str(state, node_id_str) {
+        Ok(contact) => contact,
+        Err(error) => return RpcResponse::err(error),
     };
 
     let tag_str = recipient_tag.strip_prefix('+').unwrap_or(recipient_tag);
+    let direct_receipt_tag_hash = *blake3::hash(tag_str.as_bytes()).as_bytes();
 
     // ── Resolve tag (cache → local DHT → active DHT query) ──────────
     let recipient_address = match resolve_tag(state, node, tag_str).await {
@@ -1085,7 +1324,7 @@ async fn handle_send_direct(
         None => return RpcResponse::err(format!("tag +{tag_str} not found")),
     };
 
-    let (msg, payment_id, sent_mints) = {
+    let (mut msg, payment_id, sent_mints) = {
         let mut s = state.lock().unwrap();
 
         if s.wallet.is_none() {
@@ -1242,32 +1481,40 @@ async fn handle_send_direct(
             if consume_sigs.len() == result.consumed_mint_ids.len() {
                 let output_mint_ids: Vec<[u8; 32]> =
                     result.outputs.iter().map(|(b, _)| b.mint_id).collect();
-                let _ = senders.ra_tx.send(vess_protocol::ReforgeAttestation {
-                    consumed_mint_ids: result.consumed_mint_ids,
-                    owner_vk: owner_vk_for_ra,
-                    consume_sigs,
-                    reforge_id,
-                    output_mint_ids,
-                    hops_remaining: 6,
-                });
+                crate::node_runner::queue_local_reforge_attestation(
+                    &mut s,
+                    &senders.ra_tx,
+                    vess_protocol::ReforgeAttestation {
+                        consumed_mint_ids: result.consumed_mint_ids,
+                        owner_vk: owner_vk_for_ra,
+                        consume_sigs,
+                        reforge_id,
+                        output_mint_ids,
+                        hops_remaining: 6,
+                    },
+                );
             }
 
             for (j, (bill, proof_bytes)) in change_bills.iter().enumerate() {
                 if let Some(cred) = reforged_creds.get(&bill.mint_id) {
                     let owner_vk_hash = vess_foundry::spend_auth::vk_hash(&cred.spend_vk);
                     let chain_tip = vess_foundry::genesis_chain_tip(&bill.mint_id, &owner_vk_hash);
-                    let _ = senders.og_tx.send(vess_protocol::OwnershipGenesis {
-                        mint_id: bill.mint_id,
-                        chain_tip,
-                        owner_vk_hash,
-                        owner_vk: cred.spend_vk.clone(),
-                        denomination_value: bill.denomination.value(),
-                        proof: proof_bytes.clone(),
-                        digest: bill.digest,
-                        hops_remaining: 6,
-                        chain_depth: 0,
-                        output_index: (send_count + j) as u32,
-                    });
+                    crate::node_runner::queue_local_ownership_genesis(
+                        &mut s,
+                        &senders.og_tx,
+                        vess_protocol::OwnershipGenesis {
+                            mint_id: bill.mint_id,
+                            chain_tip,
+                            owner_vk_hash,
+                            owner_vk: cred.spend_vk.clone(),
+                            denomination_value: bill.denomination.value(),
+                            genesis_proof: vess_protocol::GenesisProof::Vess(proof_bytes.clone()),
+                            digest: bill.digest,
+                            hops_remaining: 6,
+                            chain_depth: 0,
+                            output_index: (send_count + j) as u32,
+                        },
+                    );
                 }
             }
 
@@ -1276,18 +1523,22 @@ async fn handle_send_direct(
                     let proof_bytes = result.outputs[i].1.clone();
                     let owner_vk_hash = vess_foundry::spend_auth::vk_hash(&cred.spend_vk);
                     let chain_tip = vess_foundry::genesis_chain_tip(&bill.mint_id, &owner_vk_hash);
-                    let _ = senders.og_tx.send(vess_protocol::OwnershipGenesis {
-                        mint_id: bill.mint_id,
-                        chain_tip,
-                        owner_vk_hash,
-                        owner_vk: cred.spend_vk.clone(),
-                        denomination_value: bill.denomination.value(),
-                        proof: proof_bytes,
-                        digest: bill.digest,
-                        hops_remaining: 6,
-                        chain_depth: 0,
-                        output_index: i as u32,
-                    });
+                    crate::node_runner::queue_local_ownership_genesis(
+                        &mut s,
+                        &senders.og_tx,
+                        vess_protocol::OwnershipGenesis {
+                            mint_id: bill.mint_id,
+                            chain_tip,
+                            owner_vk_hash,
+                            owner_vk: cred.spend_vk.clone(),
+                            denomination_value: bill.denomination.value(),
+                            genesis_proof: vess_protocol::GenesisProof::Vess(proof_bytes),
+                            digest: bill.digest,
+                            hops_remaining: 6,
+                            chain_depth: 0,
+                            output_index: i as u32,
+                        },
+                    );
                 }
             }
 
@@ -1327,16 +1578,40 @@ async fn handle_send_direct(
         }
     };
 
+    let recipient_stealth_id = match &mut msg {
+        PulseMessage::Payment(payment) => {
+            payment.direct_receipt_tag_hash = Some(direct_receipt_tag_hash);
+            payment.stealth_id
+        }
+        PulseMessage::DirectPayment(payment) => payment.recipient_stealth_id,
+        _ => return RpcResponse::err("internal error: direct send built a non-payment message"),
+    };
+
     // Send directly to the target node with a 5-second timeout.
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        node.send_message_with_response(target, &msg),
+        node.send_message_with_response(&target, &msg),
     )
     .await;
 
     match result {
         Ok(Ok(Some(PulseMessage::DirectPaymentResponse(dpr)))) => {
             if dpr.accepted {
+                if let Err(error) = verify_direct_payment_receipt(
+                    dpr.receipt.as_ref(),
+                    &payment_id,
+                    &direct_receipt_tag_hash,
+                    &recipient_stealth_id,
+                    &sent_mints,
+                    amount,
+                ) {
+                    let mut s = state.lock().unwrap();
+                    if let Some(ref mut ws) = s.wallet {
+                        ws.billfold.release(&sent_mints);
+                        s.flush_wallet();
+                    }
+                    return RpcResponse::err(format!("invalid direct payment receipt: {error}"));
+                }
                 let mut s = state.lock().unwrap();
                 if let Some(ref mut ws) = s.wallet {
                     for mid in &sent_mints {
@@ -1404,22 +1679,25 @@ async fn handle_send_direct(
     }
 }
 
-fn handle_wallet_unlock(
+async fn handle_wallet_unlock(
     state: &Arc<Mutex<ArteryState>>,
+    node: &MeshPulseNode,
     password: &str,
+    wallet_path_override: Option<&str>,
     oc_tx: &tokio::sync::mpsc::UnboundedSender<vess_protocol::OwnershipClaim>,
 ) -> RpcResponse {
     use vess_kloak::billfold::SpendCredential;
     use vess_kloak::payment::receive_and_claim;
 
-    // 1. Get wallet_path (set from config even when wallet is locked).
+    // 1. Get wallet_path from the request or node config.
     let wallet_path = {
         let s = state.lock().unwrap();
-        match &s.wallet_path {
-            Some(p) => p.clone(),
-            None => {
-                return RpcResponse::err("no wallet path configured — start node with --wallet")
-            }
+        if let Some(path) = wallet_path_override {
+            std::path::PathBuf::from(path)
+        } else if let Some(p) = &s.wallet_path {
+            p.clone()
+        } else {
+            return RpcResponse::err("no wallet path provided");
         }
     };
 
@@ -1445,6 +1723,11 @@ fn handle_wallet_unlock(
     let (stealth_secret, address) = vess_stealth::generate_master_keys_from_seed(&raw_seed);
     let enc_key = vess_kloak::recovery::encryption_key_from_seed(&raw_seed);
     let mailbox_key = vess_kloak::derive_mailbox_key(&address.spend_ek);
+    let (bitcoin_wallet, bitcoin_receive_address) =
+        match crate::node_runner::load_bitcoin_wallet_state(&wallet, &raw_seed, &enc_key) {
+            Ok(state) => state,
+            Err(e) => return RpcResponse::err(format!("failed to load bitcoin wallet state: {e}")),
+        };
 
     // Load billfold and decrypt spend credentials into it.
     let mut billfold = wallet.billfold.clone();
@@ -1453,77 +1736,87 @@ fn handle_wallet_unlock(
     }
 
     // 4. Set wallet state + sweep limbo.
-    let mut s = state.lock().unwrap();
-    s.wallet = Some(WalletState {
-        stealth_secret: stealth_secret.clone(),
-        billfold,
-        wallet_path: wallet_path.clone(),
-        enc_key,
-        mailbox_key,
-    });
+    let (balance, bill_count) = {
+        let mut s = state.lock().unwrap();
+        s.wallet_path = Some(wallet_path.clone());
+        s.wallet = Some(WalletState {
+            stealth_secret: stealth_secret.clone(),
+            billfold,
+            bitcoin_wallet,
+            bitcoin_receive_address,
+            wallet_path: wallet_path.clone(),
+            enc_key,
+            mailbox_key,
+        });
 
-    // Sweep existing limbo entries through the newly unlocked wallet.
-    let all_sids: Vec<[u8; 32]> = s.limbo_buffer.stealth_ids_with_payments();
-    let mut payloads: Vec<Vec<u8>> = Vec::new();
-    for sid in &all_sids {
-        for entry in s.limbo_buffer.peek(sid) {
-            payloads.push(entry.payment.stealth_payload.clone());
-        }
-    }
-    if !payloads.is_empty() {
-        let ws = s.wallet.as_mut().unwrap();
-        let mut received = 0u64;
-        let mut bill_count = 0usize;
-        let mut pending_claims = Vec::new();
-        for payload in &payloads {
-            match receive_and_claim(&ws.stealth_secret, payload) {
-                Ok(Some(result)) => {
-                    for claimed in result.claimed {
-                        received += claimed.bill.denomination.value();
-                        bill_count += 1;
-                        ws.billfold.deposit_with_credentials(
-                            claimed.bill,
-                            SpendCredential {
-                                spend_vk: claimed.spend_vk,
-                                spend_sk: claimed.spend_sk,
-                            },
-                        );
-                    }
-                    for claim in result.ownership_claims {
-                        if let PulseMessage::OwnershipClaim(oc) = claim {
-                            pending_claims.push(oc);
-                        }
-                    }
-                }
-                Ok(None) => {}
-                Err(_) => {}
+        // Sweep existing limbo entries through the newly unlocked wallet.
+        let all_sids: Vec<[u8; 32]> = s.limbo_buffer.stealth_ids_with_payments();
+        let mut payloads: Vec<Vec<u8>> = Vec::new();
+        for sid in &all_sids {
+            for entry in s.limbo_buffer.peek(sid) {
+                payloads.push(entry.payment.stealth_payload.clone());
             }
         }
-        for claim in pending_claims {
-            let _ = oc_tx.send(claim);
+        if !payloads.is_empty() {
+            let ws = s.wallet.as_mut().unwrap();
+            let mut received = 0u64;
+            let mut bill_count = 0usize;
+            let mut pending_claims = Vec::new();
+            for payload in &payloads {
+                match receive_and_claim(&ws.stealth_secret, payload) {
+                    Ok(Some(result)) => {
+                        for claimed in result.claimed {
+                            received += claimed.bill.denomination.value();
+                            bill_count += 1;
+                            ws.billfold.deposit_with_credentials(
+                                claimed.bill,
+                                SpendCredential {
+                                    spend_vk: claimed.spend_vk,
+                                    spend_sk: claimed.spend_sk,
+                                },
+                            );
+                        }
+                        for claim in result.ownership_claims {
+                            if let PulseMessage::OwnershipClaim(oc) = claim {
+                                pending_claims.push(oc);
+                            }
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(_) => {}
+                }
+            }
+            for claim in pending_claims {
+                crate::node_runner::queue_local_ownership_claim(&mut s, oc_tx, claim);
+            }
+            if received > 0 {
+                tracing::info!(
+                    amount = received,
+                    bills = bill_count,
+                    "swept limbo into wallet after unlock"
+                );
+                // Persist swept bills immediately.
+                s.flush_wallet();
+            }
         }
-        if received > 0 {
-            tracing::info!(
-                amount = received,
-                bills = bill_count,
-                "swept limbo into wallet after unlock"
-            );
-            // Persist swept bills immediately.
-            s.flush_wallet();
-        }
-    }
 
-    let balance = s.wallet.as_ref().map(|w| w.billfold.balance()).unwrap_or(0);
-    let bill_count = s
-        .wallet
-        .as_ref()
-        .map(|w| w.billfold.bills().len())
-        .unwrap_or(0);
+        let balance = s.wallet.as_ref().map(|w| w.billfold.balance()).unwrap_or(0);
+        let bill_count = s
+            .wallet
+            .as_ref()
+            .map(|w| w.billfold.bills().len())
+            .unwrap_or(0);
+        (balance, bill_count)
+    };
 
-    RpcResponse::ok(RpcData::Balance {
+    let response = RpcResponse::ok(RpcData::Balance {
         balance,
         bill_count,
-    })
+    });
+
+    crate::node_runner::refresh_mailbox_forward_subscriptions(node, state).await;
+
+    response
 }
 
 fn handle_wallet_set_password(
@@ -1584,6 +1877,55 @@ fn decode_hex_fixed<const N: usize>(hex_str: &str) -> Result<[u8; N], String> {
     let mut arr = [0u8; N];
     arr.copy_from_slice(&bytes);
     Ok(arr)
+}
+
+fn verify_direct_payment_receipt(
+    receipt: Option<&vess_protocol::DirectPaymentReceipt>,
+    payment_id: &[u8; 32],
+    tag_hash: &[u8; 32],
+    recipient_stealth_id: &[u8; 32],
+    sent_mints: &[[u8; 32]],
+    amount: u64,
+) -> Result<(), String> {
+    let receipt =
+        receipt.ok_or_else(|| "recipient did not include a signed receipt".to_string())?;
+    if &receipt.payment_id != payment_id {
+        return Err("receipt payment_id mismatch".to_string());
+    }
+    if &receipt.tag_hash != tag_hash {
+        return Err("receipt tag_hash mismatch".to_string());
+    }
+    if &receipt.recipient_stealth_id != recipient_stealth_id {
+        return Err("receipt recipient stealth_id mismatch".to_string());
+    }
+    if receipt.total_amount != amount {
+        return Err("receipt amount mismatch".to_string());
+    }
+
+    let mut expected_mints = sent_mints.to_vec();
+    let mut receipt_mints = receipt.claimed_mint_ids.clone();
+    expected_mints.sort_unstable();
+    receipt_mints.sort_unstable();
+    if receipt_mints != expected_mints {
+        return Err("receipt mint set mismatch".to_string());
+    }
+
+    let digest = vess_foundry::spend_auth::direct_payment_receipt_message(
+        payment_id,
+        tag_hash,
+        recipient_stealth_id,
+        &receipt.claimed_mint_ids,
+        receipt.total_amount,
+    );
+    match vess_foundry::spend_auth::verify_spend(
+        &receipt.recipient_owner_vk,
+        &digest,
+        &receipt.signature,
+    ) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err("receipt signature verification failed".to_string()),
+        Err(error) => Err(format!("receipt signature error: {error}")),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1650,8 +1992,20 @@ fn handle_tag_register(
         return RpcResponse::err(format!("tag {} is already registered", tag.display()));
     }
 
+    let addr_fp = record.address_fingerprint();
+    if s.tag_dht.has_address(&addr_fp) {
+        return RpcResponse::err(
+            "this wallet address already has a different tag registered; use a different wallet to claim another tag"
+                .to_string(),
+        );
+    }
+
     // Store in local tag DHT.
-    s.tag_dht.store(record);
+    if !s.tag_dht.store(record) {
+        return RpcResponse::err(
+            "tag registration was rejected by the local DHT state".to_string(),
+        );
+    }
 
     // Queue TagStore for gossip to other artery nodes.
     let _ = tag_store_tx.send(TagStore {
@@ -1722,9 +2076,113 @@ fn handle_tag_confirm(
     RpcResponse::ok(RpcData::Empty {})
 }
 
+fn handle_local_test_faucet(
+    state: &Arc<Mutex<ArteryState>>,
+    amount: u64,
+    og_tx: &tokio::sync::mpsc::UnboundedSender<vess_protocol::OwnershipGenesis>,
+) -> RpcResponse {
+    if !local_test_faucet_enabled() {
+        return RpcResponse::err(format!(
+            "local test faucet is disabled; set {LOCAL_TEST_FAUCET_ENV}=1 before starting the node"
+        ));
+    }
+    if amount == 0 {
+        return RpcResponse::err("amount must be greater than zero");
+    }
+
+    let denominations = vess_foundry::mint::optimal_breakdown(amount);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let mut rng = rand::thread_rng();
+    let mut genesis_records = Vec::with_capacity(denominations.len());
+
+    let (bill_count, balance) = {
+        let mut s = state.lock().unwrap();
+        let (bill_count, balance) = {
+            let Some(ws) = s.wallet.as_mut() else {
+                return RpcResponse::err("wallet not loaded — unlock first");
+            };
+
+            for denomination in denominations {
+                let (owner_vk, owner_sk) = generate_spend_keypair();
+                let owner_vk_hash = vk_hash(&owner_vk);
+                let mut nonce = [0u8; 32];
+                rng.fill_bytes(&mut nonce);
+                let digest = local_test_faucet_digest(&nonce, denomination.value(), &owner_vk_hash);
+                let mint_id = vess_foundry::derive_mint_id(&digest, &nonce);
+                let chain_tip = vess_foundry::genesis_chain_tip(&mint_id, &owner_vk_hash);
+                let stealth_id = {
+                    let mut h = blake3::Hasher::new();
+                    h.update(b"vess-local-test-faucet-stealth-v0");
+                    h.update(&mint_id);
+                    *h.finalize().as_bytes()
+                };
+                let bill = vess_foundry::VessBill {
+                    denomination,
+                    digest,
+                    created_at: now,
+                    stealth_id,
+                    dht_index: 0,
+                    mint_id,
+                    chain_tip,
+                    chain_depth: 0,
+                };
+                let cred = SpendCredential {
+                    spend_vk: owner_vk.clone(),
+                    spend_sk: owner_sk,
+                };
+                if ws.billfold.deposit_with_credentials(bill.clone(), cred) {
+                    genesis_records.push(vess_protocol::OwnershipGenesis {
+                        mint_id,
+                        chain_tip,
+                        owner_vk_hash,
+                        owner_vk,
+                        denomination_value: denomination.value(),
+                        genesis_proof: vess_protocol::GenesisProof::LocalTestFaucet(
+                            vess_protocol::LocalTestFaucetProof { nonce },
+                        ),
+                        digest,
+                        hops_remaining: 6,
+                        chain_depth: 0,
+                        output_index: 0,
+                    });
+                }
+            }
+            (genesis_records.len(), ws.billfold.available_balance())
+        };
+
+        s.push_notification(crate::node_runner::WalletNotification {
+            kind: "local_test_faucet".to_string(),
+            created_at: now,
+            payment_id: String::new(),
+            amount: Some(amount),
+            bill_count: Some(genesis_records.len()),
+            counterparty: None,
+            message: format!("Local test faucet minted {amount} Vess."),
+        });
+        s.flush_wallet();
+        (bill_count, balance)
+    };
+
+    {
+        let mut s = state.lock().unwrap();
+        for og in genesis_records {
+            crate::node_runner::queue_local_ownership_genesis(&mut s, og_tx, og);
+        }
+    }
+
+    RpcResponse::ok(RpcData::LocalTestFaucet {
+        amount,
+        bill_count,
+        balance,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_ownership_genesis(
-    _state: &Arc<Mutex<ArteryState>>,
+    state: &Arc<Mutex<ArteryState>>,
     mint_id_hex: &str,
     chain_tip_hex: &str,
     owner_vk_hash_hex: &str,
@@ -1759,18 +2217,23 @@ fn handle_ownership_genesis(
         Err(e) => return RpcResponse::err(format!("invalid digest_hex: {e}")),
     };
 
-    let _ = og_tx.send(vess_protocol::OwnershipGenesis {
-        mint_id,
-        chain_tip,
-        owner_vk_hash,
-        owner_vk,
-        denomination_value,
-        proof,
-        digest,
-        hops_remaining: 6,
-        chain_depth: 0,
-        output_index: 0,
-    });
+    let mut s = state.lock().unwrap();
+    crate::node_runner::queue_local_ownership_genesis(
+        &mut s,
+        og_tx,
+        vess_protocol::OwnershipGenesis {
+            mint_id,
+            chain_tip,
+            owner_vk_hash,
+            owner_vk,
+            denomination_value,
+            genesis_proof: vess_protocol::GenesisProof::Vess(proof),
+            digest,
+            hops_remaining: 6,
+            chain_depth: 0,
+            output_index: 0,
+        },
+    );
 
     RpcResponse::ok(RpcData::Empty {})
 }
@@ -1797,7 +2260,8 @@ fn handle_manifest_store(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    s.manifest_store.insert(dht_key, (encrypted_manifest.clone(), now));
+    s.manifest_store
+        .insert(dht_key, (encrypted_manifest.clone(), now));
 
     // Queue for gossip.
     let _ = manifest_tx.send(ManifestStore {
@@ -1836,4 +2300,3 @@ fn handle_tag_cache_clear(state: &Arc<Mutex<ArteryState>>, tag: Option<&str>) ->
         }
     }
 }
-

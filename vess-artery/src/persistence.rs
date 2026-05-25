@@ -61,6 +61,13 @@ pub struct ArterySnapshot {
     /// Encrypted wallet manifests keyed by hex-encoded DHT key.
     #[serde(default)]
     pub manifests: BTreeMap<String, Vec<u8>>,
+    /// Locally-retained ownership records kept for future seed sync even when
+    /// this node is not currently in the active shard for those mint_ids.
+    #[serde(default)]
+    pub retained_ownership_records: Vec<OwnershipRecord>,
+    /// Locally-retained consumed tombstones kept for future seed sync.
+    #[serde(default)]
+    pub retained_consumed_records: BTreeMap<String, ConsumedRecord>,
     /// Payment IDs that are currently held in limbo (waiting for claim or expiry).
     /// Persisting these prevents re-processing a payment whose stealth payload was
     /// put into limbo but whose limbo record was never cleaned up after a restart.
@@ -84,6 +91,8 @@ impl ArterySnapshot {
             ownership_records: Vec::new(),
             consumed_records: BTreeMap::new(),
             manifests: BTreeMap::new(),
+            retained_ownership_records: Vec::new(),
+            retained_consumed_records: BTreeMap::new(),
             limbo_payment_ids: Vec::new(),
         }
     }

@@ -46,6 +46,8 @@ pub enum TagResolution {
 /// Collects `TagLookupResponse` messages from multiple nodes and
 /// determines whether quorum has been reached.
 pub struct TagResolver {
+    /// Required number of distinct matching responses for verification.
+    threshold: usize,
     /// Node ID → response. Deduplicates by node.
     responses: HashMap<[u8; 32], Option<ResponseKey>>,
     /// Count per unique `(scan_ek, spend_ek)` fingerprint.
@@ -74,7 +76,13 @@ impl Default for TagResolver {
 impl TagResolver {
     /// Create a new resolver for a single tag lookup operation.
     pub fn new() -> Self {
+        Self::with_threshold(QUORUM_THRESHOLD)
+    }
+
+    /// Create a resolver with an explicit quorum threshold.
+    pub fn with_threshold(threshold: usize) -> Self {
         Self {
+            threshold: threshold.max(1),
             responses: HashMap::new(),
             fingerprint_counts: HashMap::new(),
         }
@@ -140,7 +148,7 @@ impl TagResolver {
             .max_by_key(|(_, _, count)| *count)
             .unwrap();
 
-        if best.2 >= QUORUM_THRESHOLD {
+        if best.2 >= self.threshold {
             return TagResolution::Verified {
                 address: best.0.clone(),
                 confirming_nodes: best.2,
@@ -210,6 +218,24 @@ mod tests {
             } => {
                 assert_eq!(confirming_nodes, 5);
             }
+            other => panic!("expected Verified, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn smaller_threshold_allows_tiny_network_verification() {
+        let mut resolver = TagResolver::with_threshold(2);
+        let resp = make_response(&[0x11; 64], &[0x22; 64], "tiny");
+
+        assert!(matches!(
+            resolver.add_response([0x01; 32], &resp),
+            TagResolution::Pending { .. }
+        ));
+
+        match resolver.add_response([0x02; 32], &resp) {
+            TagResolution::Verified {
+                confirming_nodes, ..
+            } => assert_eq!(confirming_nodes, 2),
             other => panic!("expected Verified, got {other:?}"),
         }
     }

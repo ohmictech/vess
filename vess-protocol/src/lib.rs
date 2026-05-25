@@ -16,6 +16,91 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Bitcoin network identifier used by burn-backed bill genesis proofs.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum BitcoinNetwork {
+    Mainnet,
+    Testnet,
+    Signet,
+    Regtest,
+}
+
+/// Shared proof for all Vess bills derived from a single Bitcoin burn.
+///
+/// The burn commits atomically to the first Vess owner and the exact
+/// canonical 1-2-5 bill decomposition of the burned satoshi amount.
+/// Each resulting bill carries this bundle proof plus its `output_index`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BitcoinBurnBundleProof {
+    /// Bitcoin network the burn was observed on.
+    pub network: BitcoinNetwork,
+    /// Transaction ID of the burn transaction.
+    pub txid: [u8; 32],
+    /// Block hash containing the burn transaction.
+    pub block_hash: [u8; 32],
+    /// Height of the containing block in the validated header chain.
+    #[serde(default)]
+    pub block_height: u64,
+    /// Confirmations observed by the validating Bitcoin light client.
+    #[serde(default)]
+    pub confirmations: u32,
+    /// Minimum confirmations required by the validating Bitcoin light client.
+    #[serde(default)]
+    pub required_confirmations: u32,
+    /// Cumulative validated chainwork at the containing block, big-endian.
+    #[serde(default)]
+    pub chain_work: [u8; 32],
+    /// Merkle root committed by the containing block header.
+    pub merkle_root: [u8; 32],
+    /// Merkle branch proving `txid` inclusion in the block.
+    pub merkle_proof: Vec<[u8; 32]>,
+    /// Leaf index of `txid` in the block's merkle tree.
+    pub merkle_index: u32,
+    /// Total irreversibly burned amount in satoshis.
+    pub burn_amount_sats: u64,
+    /// Full ML-DSA-65 verification key of the first Vess owner.
+    pub first_owner_vk: Vec<u8>,
+    /// Blake3 hash of the first owner's ML-DSA-65 verification key.
+    pub first_owner_vk_hash: [u8; 32],
+    /// Canonical 1-2-5 bill values for this burn amount.
+    pub output_values: Vec<u64>,
+    /// 32-byte OP_RETURN payload committing to the first owner, the total
+    /// burned sat amount, and the canonical largest-first 1-2-5 denomination
+    /// bundle.
+    pub burn_commitment_payload: Vec<u8>,
+}
+
+/// Development-only proof for local faucet bills.
+///
+/// Nodes only accept this proof when local test faucet mode is explicitly
+/// enabled. It is meant for same-machine/LAN development and must never be
+/// treated as production monetary backing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalTestFaucetProof {
+    /// Random nonce used to derive the faucet bill identity.
+    pub nonce: [u8; 32],
+}
+
+/// Proof object used to justify genesis registration of a bill.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum GenesisProof {
+    /// Existing Vess-native genesis proof bytes.
+    ///
+    /// These bytes are further parsed by validators as one of:
+    /// - single STARK proof
+    /// - aggregate proof
+    /// - sampled aggregate proof
+    /// - reforge proof
+    Vess(Vec<u8>),
+
+    /// Bitcoin burn bundle proof shared across all outputs of one burn.
+    BitcoinBurn(BitcoinBurnBundleProof),
+
+    /// Local testing faucet proof. Accepted only when explicitly enabled by
+    /// the node operator.
+    LocalTestFaucet(LocalTestFaucetProof),
+}
+
 /// Top-level pulse message envelope.
 ///
 /// Every vascular pulse carries exactly one of these variants.
@@ -44,6 +129,12 @@ pub enum PulseMessage {
 
     /// Response to a peer exchange request.
     PeerExchangeResponse(PeerExchangeResponse),
+
+    /// Ask a bootstrap/seed peer for DHT records this node should now shard.
+    DhtSeedRequest(DhtSeedRequest),
+
+    /// Response containing initial DHT shard data for a joining node.
+    DhtSeedResponse(DhtSeedResponse),
 
     /// Handshake challenge: prove you are running an authorised protocol version.
     HandshakeChallenge(HandshakeChallenge),
@@ -172,6 +263,14 @@ pub struct Payment {
     /// spend_ek, so no additional out-of-band communication is needed.
     #[serde(default)]
     pub mailbox_key: Option<[u8; 32]>,
+
+    /// Optional tag hash requiring a signed direct-payment receipt.
+    ///
+    /// Direct senders set this to bind the recipient's acknowledgement to the
+    /// resolved VessTag and this payment's `stealth_id`. Relay paths leave it
+    /// empty because fire-and-forget relays do not consume responses.
+    #[serde(default)]
+    pub direct_receipt_tag_hash: Option<[u8; 32]>,
 }
 
 // ── Tag Operations ───────────────────────────────────────────────────
@@ -292,8 +391,8 @@ pub struct MailboxSweepResponse {
 /// Ask a shard custodian to push any incoming payments matching
 /// `mailbox_key` to this node via [`LimboDeliver`].
 ///
-/// The subscribing peer is identified by its transport-layer endpoint ID
-/// (i.e. whoever sent this message).  A new registration for the same
+/// The subscribing peer is identified by its transport-layer mesh contact
+/// (i.e. whoever sent this message). A new registration for the same
 /// key replaces any prior subscription (last-writer wins).
 ///
 /// Subscriptions expire after `ttl_secs` seconds (capped server-side at
@@ -359,15 +458,147 @@ pub struct RegistryQueryResponse {
 /// Request a peer's known peer list for discovery.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerExchange {
-    /// The sender's endpoint ID bytes (32 bytes).
+    /// The sender's mesh node ID bytes (32 bytes).
     pub sender_id: Vec<u8>,
 }
 
-/// Response with known peers' endpoint ID bytes.
+/// Response with known peers' serialized mesh contact bytes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerExchangeResponse {
-    /// Endpoint ID bytes of known peers (up to 10).
+    /// Serialized mesh contacts of known peers (up to 10).
     pub peers: Vec<Vec<u8>>,
+}
+
+// ── DHT Seed Sync ───────────────────────────────────────────────────
+
+/// Request initial DHT shard data from a seed/bootstrap peer.
+///
+/// A joining node sends this after the mesh handshake. The responder returns
+/// records whose DHT keys fall into the requester's shard area according to
+/// the responder's current routing-table view. This gives the first few test
+/// nodes DHT continuity before normal gossip has enough peers to converge.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DhtSeedRequest {
+    /// Requester's mesh node ID. Responders reject requests where this does not
+    /// match the authenticated transport peer.
+    pub requester_node_id: [u8; 32],
+    /// Exclusive cursor for paginating tag records by tag hash.
+    #[serde(default)]
+    pub after_tag_hash: Option<[u8; 32]>,
+    /// Exclusive cursor for paginating manifest records by DHT key.
+    #[serde(default)]
+    pub after_manifest_key: Option<[u8; 32]>,
+    /// Exclusive cursor for paginating ownership records by mint_id.
+    #[serde(default)]
+    pub after_ownership_mint_id: Option<[u8; 32]>,
+    /// Exclusive cursor for paginating consumed tombstones by mint_id.
+    #[serde(default)]
+    pub after_consumed_mint_id: Option<[u8; 32]>,
+    /// Maximum tag records to return.
+    pub max_tags: u16,
+    /// Maximum encrypted manifest records to return.
+    pub max_manifests: u16,
+    /// Maximum ownership records to return.
+    #[serde(default)]
+    pub max_ownership_records: u16,
+    /// Maximum consumed-record tombstones to return.
+    #[serde(default)]
+    pub max_consumed_records: u16,
+}
+
+/// A tag DHT record transferred during seed sync.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DhtSeedTagRecord {
+    /// Blake3 hash of the tag string.
+    pub tag_hash: [u8; 32],
+    /// Scan encapsulation key.
+    pub scan_ek: Vec<u8>,
+    /// Spend encapsulation key.
+    pub spend_ek: Vec<u8>,
+    /// PoW nonce.
+    pub pow_nonce: [u8; 32],
+    /// PoW hash.
+    pub pow_hash: Vec<u8>,
+    /// Registration timestamp.
+    pub registered_at: u64,
+    /// Registrant verification key.
+    pub registrant_vk: Vec<u8>,
+    /// Registrant signature over the tag record digest.
+    pub signature: Vec<u8>,
+    /// Hardened timestamp, if this tag has already been hardened.
+    #[serde(default)]
+    pub hardened_at: Option<u64>,
+}
+
+/// An ownership registry record transferred during seed sync.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DhtSeedOwnershipRecord {
+    /// Permanent bill identity.
+    pub mint_id: [u8; 32],
+    /// Current ownership chain tip.
+    pub chain_tip: [u8; 32],
+    /// Blake3 hash of the current owner's verification key.
+    pub current_owner_vk_hash: [u8; 32],
+    /// Full current owner verification key.
+    pub current_owner_vk: Vec<u8>,
+    /// Denomination value for supply tracking.
+    pub denomination_value: u64,
+    /// Unix timestamp when this record was last updated.
+    pub updated_at: u64,
+    /// Blake3 hash of the verified genesis proof bytes, if known.
+    pub proof_hash: [u8; 32],
+    /// Genesis or burn commitment digest.
+    pub digest: [u8; 32],
+    /// Minting nonce or equivalent derived nonce, if known.
+    pub nonce: [u8; 32],
+    /// Previous owner vk hash from the winning claim, if any.
+    #[serde(default)]
+    pub prev_claim_vk_hash: Option<[u8; 32]>,
+    /// Deterministic hash of the winning claim, if any.
+    #[serde(default)]
+    pub claim_hash: Option<[u8; 32]>,
+    /// Number of transfers since genesis.
+    #[serde(default)]
+    pub chain_depth: u64,
+    /// Encrypted bill recovery payload for the current owner.
+    #[serde(default)]
+    pub encrypted_bill: Vec<u8>,
+}
+
+/// A consumed-bill tombstone transferred during seed sync.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DhtSeedConsumedRecord {
+    /// Mint ID that was consumed by a reforge.
+    pub mint_id: [u8; 32],
+    /// Reforge event identifier.
+    pub reforge_id: [u8; 32],
+    /// Output mint IDs produced by the reforge.
+    pub output_mint_ids: Vec<[u8; 32]>,
+    /// Unix timestamp when the bill was consumed.
+    pub consumed_at: u64,
+    /// Denomination value of the consumed bill, if known.
+    #[serde(default)]
+    pub denomination_value: u64,
+    /// Original bill digest, if known.
+    #[serde(default)]
+    pub digest: [u8; 32],
+}
+
+/// Initial DHT data returned by a seed/bootstrap peer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DhtSeedResponse {
+    /// Responder mesh node ID.
+    pub responder_node_id: [u8; 32],
+    /// Tag records the requester should store.
+    pub tags: Vec<DhtSeedTagRecord>,
+    /// Encrypted wallet manifests the requester should store.
+    pub manifests: Vec<ManifestStore>,
+    /// Ownership records the requester should store.
+    #[serde(default)]
+    pub ownership_records: Vec<DhtSeedOwnershipRecord>,
+    /// Consumed-bill tombstones the requester should store.
+    #[serde(default)]
+    pub consumed_records: Vec<DhtSeedConsumedRecord>,
 }
 
 // ── Kademlia FIND_NODE ───────────────────────────────────────────────
@@ -382,7 +613,7 @@ pub struct PeerExchangeResponse {
 pub struct FindNode {
     /// The 32-byte target to find closest peers for.
     pub target: [u8; 32],
-    /// The requester's endpoint ID bytes (so the responder can add us
+    /// The requester's mesh node ID bytes (so the responder can add us
     /// to their routing table).
     pub sender_id: Vec<u8>,
 }
@@ -390,7 +621,7 @@ pub struct FindNode {
 /// Response to a [`FindNode`] request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FindNodeResponse {
-    /// Endpoint ID bytes of the K closest peers the responder knows.
+    /// Serialized mesh contacts of the K closest peers the responder knows.
     pub peers: Vec<Vec<u8>>,
 }
 
@@ -411,9 +642,9 @@ pub struct HandshakeChallenge {
 /// Response to a [`HandshakeChallenge`].
 ///
 /// Contains `blake3::keyed_hash(PROTOCOL_VERSION_HASH, nonce)` which proves
-/// the responder possesses the correct build-time version hash.  The QUIC
-/// transport already authenticates the peer's identity (ed25519), so no
-/// additional signature is required.
+/// the responder possesses the correct build-time version hash. The mesh
+/// transport already binds the session to the responder's mesh identity, so
+/// no additional signature is required here.
 ///
 /// Also contains an Argon2id proof-of-work over the nonce. This forces
 /// each connecting node to spend ~2-5 seconds + 256 MiB RAM, making
@@ -546,9 +777,12 @@ pub struct OwnershipGenesis {
     pub owner_vk: Vec<u8>,
     /// Denomination value for supply tracking.
     pub denomination_value: u64,
-    /// Serialised STARK proof bytes (for artery to verify the bill is real).
-    pub proof: Vec<u8>,
-    /// VM execution digest.
+    /// Typed genesis proof for this bill.
+    pub genesis_proof: GenesisProof,
+    /// Genesis commitment hash.
+    ///
+    /// For Vess-native bills this is the VM or compound proof digest.
+    /// For Bitcoin-burned bills this is the burn bundle commitment hash.
     pub digest: [u8; 32],
     /// Remaining gossip hops (decremented at each relay, stops at 0).
     pub hops_remaining: u8,
@@ -739,13 +973,13 @@ pub struct OwnershipFetchResponse {
 
 // ── Direct Peer-to-Peer Payment ──────────────────────────────────────
 
-/// Direct payment sent over a QUIC bi-stream between two wallets.
+/// Direct payment sent over a direct mesh session between two wallets.
 ///
 /// Bypasses artery relay nodes entirely — the receiver verifies proofs
 /// inline and claims ownership locally, broadcasting [`OwnershipClaim`]
 /// messages when artery connectivity is available.
 ///
-/// The QUIC transport provides encryption, so no stealth wrapping is
+/// The direct mesh transport provides encryption, so no stealth wrapping is
 /// needed. The `transfer_payload` is a serialized `TransferPayload`
 /// (defined in `vess-kloak`) containing the bills, sender verification
 /// keys, and transfer authorization signatures.
@@ -767,7 +1001,7 @@ pub struct DirectPayment {
 
 /// Response to a [`DirectPayment`].
 ///
-/// Returned over the same QUIC bi-stream. If `accepted` is `true`, the
+/// Returned over the same direct mesh session. If `accepted` is `true`, the
 /// receiver has verified the proofs and will broadcast ownership claims.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DirectPaymentResponse {
@@ -775,9 +1009,31 @@ pub struct DirectPaymentResponse {
     pub payment_id: [u8; 32],
     /// Whether the payment was accepted.
     pub accepted: bool,
+    /// Signed acceptance receipt, required when `accepted` is true for direct payments.
+    #[serde(default)]
+    pub receipt: Option<DirectPaymentReceipt>,
     /// Human-readable rejection reason (empty if accepted).
     #[serde(default)]
     pub reason: String,
+}
+
+/// Recipient-signed proof that a direct payment was accepted for a specific tag.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DirectPaymentReceipt {
+    /// Echoed payment ID.
+    pub payment_id: [u8; 32],
+    /// Blake3 hash of the recipient tag the sender resolved.
+    pub tag_hash: [u8; 32],
+    /// Stealth ID from the encrypted payment payload.
+    pub recipient_stealth_id: [u8; 32],
+    /// Mint IDs accepted by the recipient.
+    pub claimed_mint_ids: Vec<[u8; 32]>,
+    /// Total accepted amount.
+    pub total_amount: u64,
+    /// Recipient's fresh owner verification key for the first claimed bill.
+    pub recipient_owner_vk: Vec<u8>,
+    /// ML-DSA-65 signature over the receipt digest.
+    pub signature: Vec<u8>,
 }
 
 impl PulseMessage {
@@ -806,6 +1062,7 @@ mod tests {
             created_at: 1000,
             bill_count: 1,
             mailbox_key: None,
+            direct_receipt_tag_hash: None,
         });
         let bytes = msg.to_bytes().unwrap();
         let decoded = PulseMessage::from_bytes(&bytes).unwrap();
@@ -829,6 +1086,37 @@ mod tests {
         let decoded = PulseMessage::from_bytes(&bytes).unwrap();
         match decoded {
             PulseMessage::TagLookup(t) => assert_eq!(t.tag_hash, tag_hash),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn dht_seed_request_round_trip_with_cursors() {
+        let msg = PulseMessage::DhtSeedRequest(DhtSeedRequest {
+            requester_node_id: [0x11; 32],
+            after_tag_hash: Some([0x22; 32]),
+            after_manifest_key: Some([0x33; 32]),
+            after_ownership_mint_id: Some([0x44; 32]),
+            after_consumed_mint_id: Some([0x55; 32]),
+            max_tags: 10,
+            max_manifests: 11,
+            max_ownership_records: 12,
+            max_consumed_records: 13,
+        });
+        let bytes = msg.to_bytes().unwrap();
+        let decoded = PulseMessage::from_bytes(&bytes).unwrap();
+        match decoded {
+            PulseMessage::DhtSeedRequest(req) => {
+                assert_eq!(req.requester_node_id, [0x11; 32]);
+                assert_eq!(req.after_tag_hash, Some([0x22; 32]));
+                assert_eq!(req.after_manifest_key, Some([0x33; 32]));
+                assert_eq!(req.after_ownership_mint_id, Some([0x44; 32]));
+                assert_eq!(req.after_consumed_mint_id, Some([0x55; 32]));
+                assert_eq!(req.max_tags, 10);
+                assert_eq!(req.max_manifests, 11);
+                assert_eq!(req.max_ownership_records, 12);
+                assert_eq!(req.max_consumed_records, 13);
+            }
             _ => panic!("wrong variant"),
         }
     }

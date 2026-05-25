@@ -1,36 +1,48 @@
 //! Unified CLI for the Vess protocol.
 //!
-//! `init` and `recover` bootstrap a wallet via DNS seed discovery.
+//! `init` and `recover` bootstrap a wallet via Bitcoin-side Vess peer discovery.
 //! All other commands route through the local node's JSON-RPC server
 //! (default port 9400). `node` starts an artery node with optional
 //! embedded wallet and RPC listener.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use qrcode::QrCode;
+use rand::Rng;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing_subscriber::EnvFilter;
 
-use vess_kloak::billfold::SpendCredential;
-use vess_kloak::payment::build_genesis_messages;
-use vess_kloak::persistence::WalletFile;
+use vess_kloak::persistence::{
+    list_wallets, named_wallet_path, read_active_wallet_path, set_active_wallet_path,
+    WalletDescriptor, WalletFile,
+};
 use vess_kloak::recovery::{
     derive_raw_seed, encrypt_secrets, encryption_key_from_seed, recover_master_keys,
     spend_seed_from_raw_seed, RecoveryPhrase,
 };
 use vess_kloak::BillFold;
+use vess_mesh::{
+    decode_mesh_contact, decode_mesh_contact_string, encode_mesh_contact_string,
+    validate_mesh_contact, MeshCarrier, MeshCarrierContact, PqUdpMeshCarrier,
+};
 use vess_protocol::{PulseMessage, TagLookup, TagRegister};
 use vess_stealth::generate_master_keys_from_seed;
 use vess_tag::VessTag;
-use vess_vascular::VessNode;
+use vess_vascular::MeshPulseNode;
 
 #[derive(Parser)]
 #[command(name = "vess", version, about = "Vess — stateless P2P digital cash")]
 struct Cli {
-    /// Path to wallet file (default: ~/.vess/wallet.json).
+    /// Path to wallet file. Overrides --wallet-name and active wallet selection.
     #[arg(long, global = true)]
     wallet: Option<PathBuf>,
+
+    /// VessTag of a local wallet stored under ~/.vess/wallets/.
+    #[arg(long, global = true)]
+    wallet_name: Option<String>,
 
     /// Output JSON instead of human-readable text (for AI agents / automation).
     #[arg(long, global = true)]
@@ -53,20 +65,23 @@ enum Command {
         /// VessTag to claim (e.g. "alice" or "+alice").
         #[arg(long)]
         tag: String,
+        name: Option<String>,
     },
-
-    /// Recover a wallet from a recovery phrase.
+    /// Recover a wallet from a 12-word recovery phrase.
     Recover {
-        /// The 5 BIP39 words separated by spaces.
-        #[arg(long)]
+        /// The 12-word BIP39 recovery phrase.
         words: String,
-        /// The 5-digit PIN.
+        /// Local wallet VessTag name to store the recovered wallet under.
         #[arg(long)]
-        pin: String,
+        name: Option<String>,
     },
 
     /// Show wallet balance and denomination breakdown.
     Balance,
+
+    /// Show the current Bitcoin receive address and an ASCII QR code.
+    #[command(alias = "recieve")]
+    Receive,
 
     /// Show sender/receiver wallet notifications from the local node.
     Notifications {
@@ -81,6 +96,13 @@ enum Command {
         max: usize,
     },
 
+    /// Local testing only: give the loaded wallet faucet bills.
+    #[command(alias = "test-mint")]
+    Faucet {
+        /// Amount of local-test Vess to add.
+        amount: u64,
+    },
+
     /// Send Vess to a recipient (by +tag or stealth address).
     Send {
         /// Amount to send.
@@ -90,20 +112,10 @@ enum Command {
         /// Optional encrypted memo (max 256 bytes, e.g. order ID or note).
         #[arg(long)]
         memo: Option<String>,
-        /// Send directly to a specific node via QUIC (hex node ID).
+        /// Send directly to a serialized mesh contact or cached mesh node ID.
         /// Bypasses mesh relay for instant IRL payments.
         #[arg(long)]
         node_direct: Option<String>,
-    },
-
-    /// Mint new vess via proof-of-work (flow-based: mine until Ctrl+C).
-    Mint {
-        /// Only finalize an existing session (aggregate + register, no further mining).
-        #[arg(long)]
-        finalize: bool,
-        /// Show status of an existing mint session.
-        #[arg(long)]
-        status: bool,
     },
 
     /// Register a VessTag (computes PoW and auto-hardens if bills are available).
@@ -114,8 +126,8 @@ enum Command {
 
     /// Send a raw Pulse to a remote node (low-level).
     Pulse {
-        /// Target node's endpoint ID (hex).
-        node_id: String,
+        /// Target node's serialized mesh contact.
+        target: String,
         /// Message payload.
         message: String,
     },
@@ -123,18 +135,19 @@ enum Command {
     /// Listen for raw incoming Pulses (low-level).
     Listen,
 
-    /// Start the Vess node as an always-on background service.
-    ///
-    /// On first run, guides you through wallet creation or recovery
-    /// and sets a quick-unlock password. On subsequent runs, prompts
-    /// for the password and re-starts the background node.
-    Start,
-
-    /// Stop the background Vess node that was started with `vess start`.
-    Stop,
-
     /// Show whether the background node is running and a wallet summary.
     Status,
+
+    /// Build dist/vess.exe, a release executable that opens the interactive CLI.
+    #[command(alias = "build-exe")]
+    Compile {
+        /// Output executable path.
+        #[arg(long, default_value = "dist/vess.exe")]
+        output: PathBuf,
+        /// Build the debug profile instead of release.
+        #[arg(long)]
+        debug: bool,
+    },
 
     /// Run as a full artery node (network participant).
     Node {
@@ -147,19 +160,19 @@ enum Command {
         /// State directory for persistence (default: ~/.vess-artery).
         #[arg(long)]
         state_dir: Option<PathBuf>,
-        /// Bootstrap peer node IDs to connect to on startup (comma-separated).
+        /// Optional manual bootstrap peer mesh contacts (comma-separated).
         #[arg(long, value_delimiter = ',')]
         bootstrap: Vec<String>,
-        /// DNS seed domains for peer discovery (comma-separated).
-        /// Defaults to node.vess.network. Use --no-seed to disable.
+        /// Legacy DNS seed domains for fallback peer discovery (comma-separated).
+        /// Normal startup uses Bitcoin-side Vess peer discovery first.
         #[arg(long, value_delimiter = ',')]
         seed: Vec<String>,
-        /// Disable automatic DNS seed resolution.
+        /// Disable legacy DNS seed fallback.
         #[arg(long, default_value = "false")]
         no_seed: bool,
         /// Path to wallet file. Embeds wallet in node for auto-receive.
         /// Requires VESS_WALLET_PASSWORD (or --wallet-password) to unlock,
-        /// or VESS_RECOVERY_PHRASE + VESS_RECOVERY_PIN as fallback.
+        /// or VESS_RECOVERY_PHRASE as fallback.
         #[arg(long)]
         wallet: Option<PathBuf>,
         /// Password for fast wallet unlock.
@@ -173,7 +186,7 @@ enum Command {
     /// Set a password for fast daily wallet unlock.
     ///
     /// Requires the wallet encryption key (via VESS_WALLET_PASSWORD or
-    /// VESS_RECOVERY_PHRASE + VESS_RECOVERY_PIN) to encrypt the key
+    /// VESS_RECOVERY_PHRASE) to encrypt the key
     /// cache.  After this, the node only needs the password to start.
     SetPassword {
         /// The new password to set.
@@ -202,9 +215,41 @@ enum TagCacheCmd {
 fn wallet_path(cli: &Cli) -> Result<PathBuf> {
     if let Some(ref p) = cli.wallet {
         Ok(p.clone())
+    } else if let Some(ref name) = cli.wallet_name {
+        named_wallet_path(name)
+    } else if let Some(active) = read_active_wallet_path()? {
+        Ok(active)
     } else {
-        vess_kloak::persistence::default_wallet_path()
+        let wallets = list_wallets()?;
+        match wallets.len() {
+            0 => vess_kloak::persistence::default_wallet_path(),
+            1 => Ok(wallets[0].path.clone()),
+            _ => anyhow::bail!(
+                "multiple wallets found; use --wallet-name <+tag>, --wallet <path>, or open Vess interactively to choose one"
+            ),
+        }
     }
+}
+
+fn wallet_create_path(cli: &Cli, name: Option<&str>) -> Result<(PathBuf, Option<String>)> {
+    if let Some(ref p) = cli.wallet {
+        return Ok((p.clone(), None));
+    }
+    let name = name.or(cli.wallet_name.as_deref());
+    if let Some(name) = name {
+        return Ok((named_wallet_path(name)?, Some(name.trim().to_string())));
+    }
+    Ok((vess_kloak::persistence::default_wallet_path()?, None))
+}
+
+fn normalize_wallet_tag_name(value: &str) -> Result<String> {
+    Ok(VessTag::new(value)?.as_str().to_string())
+}
+
+fn wallet_display_name(name: &str) -> String {
+    VessTag::new(name)
+        .map(|tag| tag.display())
+        .unwrap_or_else(|_| name.to_string())
 }
 
 #[tokio::main]
@@ -217,14 +262,16 @@ async fn main() -> Result<()> {
 
     match &cli.command {
         None => cmd_interactive(&cli).await,
-        Some(Command::Init { tag }) => cmd_init(&cli, tag).await,
-        Some(Command::Recover { words, pin }) => cmd_recover(&cli, words, pin).await,
+        Some(Command::Init { tag, name }) => cmd_init(&cli, tag, name.as_deref()).await,
+        Some(Command::Recover { words, name }) => cmd_recover(&cli, words, name.as_deref()).await,
         Some(Command::Balance) => cmd_balance(&cli).await,
+        Some(Command::Receive) => cmd_receive(&cli).await,
         Some(Command::Notifications {
             follow,
             interval_ms,
             max,
         }) => cmd_notifications(&cli, *follow, *interval_ms, *max).await,
+        Some(Command::Faucet { amount }) => cmd_faucet(&cli, *amount).await,
         Some(Command::Send {
             amount,
             recipient,
@@ -240,13 +287,11 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        Some(Command::Mint { finalize, status }) => cmd_mint(&cli, *finalize, *status).await,
         Some(Command::RegisterTag { tag }) => cmd_register_tag(&cli, tag).await,
-        Some(Command::Pulse { node_id, message }) => cmd_pulse(&cli, node_id, message).await,
+        Some(Command::Pulse { target, message }) => cmd_pulse(&cli, target, message).await,
         Some(Command::Listen) => cmd_listen(&cli).await,
-        Some(Command::Start) => cmd_start(&cli).await,
-        Some(Command::Stop) => cmd_stop().await,
         Some(Command::Status) => cmd_status(&cli).await,
+        Some(Command::Compile { output, debug }) => cmd_compile(&cli, output, *debug).await,
         Some(Command::Node {
             k_neighbors,
             max_hops,
@@ -266,13 +311,8 @@ async fn main() -> Result<()> {
                     None => vess_artery::persistence::NodeStorage::default_dir()?,
                 },
                 bootstrap: bootstrap.clone(),
-                seeds: if *no_seed {
-                    Vec::new()
-                } else if seed.is_empty() {
-                    vec![vess_artery::dns_seed::DEFAULT_SEED_DOMAIN.to_string()]
-                } else {
-                    seed.clone()
-                },
+                use_dns_seeds: !*no_seed && !seed.is_empty(),
+                seeds: if *no_seed { Vec::new() } else { seed.clone() },
                 ready_tx: None,
                 wallet_path: wallet.clone(),
                 rpc_port: *rpc_port,
@@ -291,15 +331,8 @@ async fn main() -> Result<()> {
 
 // ── Subcommand implementations ──────────────────────────────────────
 
-/// Derive the wallet encryption key.  Tries password-based unlock first
-/// (VESS_WALLET_PASSWORD env var), then falls back to recovery phrase + PIN.
-fn derive_enc_key(cli: &Cli) -> Result<[u8; 32]> {
-    let raw_seed = derive_raw_seed_for_wallet(cli)?;
-    Ok(encryption_key_from_seed(&raw_seed))
-}
-
 /// Obtain the 64-byte raw_seed.  Tries password-based unlock first
-/// (VESS_WALLET_PASSWORD env var), then falls back to recovery phrase + PIN.
+/// (VESS_WALLET_PASSWORD env var), then falls back to the 12-word recovery phrase.
 fn derive_raw_seed_for_wallet(cli: &Cli) -> Result<[u8; 64]> {
     // Fast path: password-based unlock.
     if let Ok(pwd) = std::env::var("VESS_WALLET_PASSWORD") {
@@ -307,15 +340,10 @@ fn derive_raw_seed_for_wallet(cli: &Cli) -> Result<[u8; 64]> {
         let wallet = WalletFile::load(&wpath)?;
         return wallet.unlock_with_password(&pwd);
     }
-    // Slow path: recovery phrase + PIN.
-    let words = std::env::var("VESS_RECOVERY_PHRASE").map_err(|_| {
-        anyhow::anyhow!(
-            "set VESS_WALLET_PASSWORD or VESS_RECOVERY_PHRASE + VESS_RECOVERY_PIN env vars"
-        )
-    })?;
-    let pin = std::env::var("VESS_RECOVERY_PIN")
-        .map_err(|_| anyhow::anyhow!("set VESS_RECOVERY_PIN env var for this operation"))?;
-    let phrase = RecoveryPhrase::from_input(&words, &pin)?;
+    // Slow path: 12-word recovery phrase.
+    let words = std::env::var("VESS_RECOVERY_PHRASE")
+        .map_err(|_| anyhow::anyhow!("set VESS_WALLET_PASSWORD or VESS_RECOVERY_PHRASE env var"))?;
+    let phrase = RecoveryPhrase::from_input(&words)?;
     derive_raw_seed(&phrase)
 }
 
@@ -340,8 +368,15 @@ fn read_rpc_token(state_dir: &std::path::Path) -> Result<String> {
 /// parsed response.  The caller is responsible for constructing the request
 /// object (must be a single JSON line).
 async fn rpc_call(port: u16, request: &serde_json::Value) -> Result<serde_json::Value> {
-    let state_dir = vess_artery::persistence::NodeStorage::default_dir()?;
+    let state_dir = rpc_state_dir()?;
     rpc_call_with_dir(port, &state_dir, request).await
+}
+
+fn rpc_state_dir() -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os(VESS_RPC_STATE_DIR_ENV) {
+        return Ok(PathBuf::from(path));
+    }
+    vess_artery::persistence::NodeStorage::default_dir()
 }
 
 async fn rpc_call_with_dir(
@@ -376,64 +411,206 @@ async fn rpc_call_with_dir(
     Ok(resp)
 }
 
-/// Discover artery peers via DNS seeds. Used by init/recover when the
-/// local node is not yet running.
-async fn discover_peers() -> Result<Vec<iroh::EndpointId>> {
-    let seeds =
-        vess_artery::dns_seed::resolve_seeds(vess_artery::dns_seed::DEFAULT_SEED_DOMAIN).await?;
-    let mut peers = Vec::new();
-    for s in &seeds {
-        if let Ok(eid) = s.parse::<iroh::EndpointId>() {
-            peers.push(eid);
+fn parse_mesh_contact(value: &str) -> Result<MeshCarrierContact> {
+    let contact = decode_mesh_contact_string(value)
+        .map_err(|error| anyhow::anyhow!("invalid mesh contact: {error}"))?;
+    validate_mesh_contact(&contact)?;
+    Ok(contact)
+}
+
+fn decode_mesh_contact_bytes(bytes: &[u8]) -> Result<MeshCarrierContact> {
+    let contact = decode_mesh_contact(bytes)
+        .map_err(|error| anyhow::anyhow!("invalid mesh contact bytes: {error}"))?;
+    validate_mesh_contact(&contact)?;
+    Ok(contact)
+}
+
+async fn spawn_udp_mesh_carrier() -> Result<PqUdpMeshCarrier> {
+    let mut seed = [0u8; 64];
+    rand::thread_rng().fill(&mut seed);
+    PqUdpMeshCarrier::bind_from_seed(
+        std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+            std::net::Ipv4Addr::UNSPECIFIED,
+            0,
+        )),
+        &seed,
+        0,
+    )
+    .await
+}
+
+/// Discover bootstrap peers through local/LAN and Bitcoin-side Vess peer discovery.
+/// Used by init/recover when the local node is not yet running.
+async fn discover_peers() -> Result<Vec<MeshCarrierContact>> {
+    println!("Discovering Vess peers through LAN and Bitcoin peers...");
+    let client = match vess_bitcoin::BitcoinLightClient::spawn(Default::default()).await {
+        Ok(client) => Some(client),
+        Err(error) => {
+            tracing::warn!(%error, "Bitcoin peer discovery failed to start; continuing with LAN discovery");
+            None
+        }
+    };
+
+    loop {
+        let mut peers = vess_artery::local_discovery::discover_lan_peer_contacts(
+            std::time::Duration::from_secs(2),
+            None,
+        )
+        .await;
+        if !peers.is_empty() {
+            println!("Discovered {} Vess peer(s) on LAN/local host.", peers.len());
+            return Ok(peers);
+        }
+
+        if let Some(client) = &client {
+            let connected = client
+                .wait_for_peers(1, std::time::Duration::from_secs(5))
+                .await;
+            tracing::info!(connected, "Bitcoin peer discovery connection wait finished");
+            if connected == 0 {
+                println!("Still waiting for LAN or Bitcoin peers...");
+                continue;
+            }
+
+            let discovered = client.discover_vess_nodes().await;
+            for node in discovered {
+                match parse_mesh_contact(&node.contact) {
+                    Ok(contact) if !peers.contains(&contact) => peers.push(contact),
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::warn!(node_id = %node.node_id, "Bitcoin-discovered Vess contact rejected: {error}");
+                    }
+                }
+            }
+
+            if !peers.is_empty() {
+                println!("Discovered {} Vess peer(s) through Bitcoin.", peers.len());
+                return Ok(peers);
+            }
+
+            println!(
+                "No Vess peers found yet through LAN or {connected} Bitcoin peer(s); still waiting..."
+            );
+        } else {
+            println!("No Vess peers found yet on LAN/local host; still waiting...");
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+    }
+}
+
+async fn discover_recovery_targets(node: &MeshPulseNode) -> Result<Vec<MeshCarrierContact>> {
+    let peers = discover_peers().await?;
+    let mut targets = peers.clone();
+
+    let pe_msg = PulseMessage::PeerExchange(vess_protocol::PeerExchange {
+        sender_id: node.id().as_bytes().to_vec(),
+    });
+
+    for bootstrap_target in &peers {
+        if let Ok(Some(PulseMessage::PeerExchangeResponse(resp))) = node
+            .send_message_with_response(bootstrap_target, &pe_msg)
+            .await
+        {
+            for peer_bytes in &resp.peers {
+                if let Ok(contact) = decode_mesh_contact_bytes(peer_bytes) {
+                    if !targets.contains(&contact) {
+                        targets.push(contact);
+                    }
+                }
+            }
+            break;
         }
     }
-    if peers.is_empty() {
-        anyhow::bail!("no artery peers found via DNS seeds — check your internet connection");
+
+    Ok(targets)
+}
+
+async fn lookup_tag_on_reachable_peer(
+    node: &MeshPulseNode,
+    peers: &[MeshCarrierContact],
+    tag_str: &str,
+    display_tag: &str,
+) -> Result<(bool, MeshCarrierContact)> {
+    let lookup = PulseMessage::TagLookup(TagLookup {
+        tag_hash: *blake3::hash(tag_str.as_bytes()).as_bytes(),
+        nonce: rand::random(),
+    });
+    let mut failures = 0usize;
+
+    for target in peers {
+        match node.send_message_with_response(target, &lookup).await {
+            Ok(Some(PulseMessage::TagLookupResponse(tlr))) => {
+                return Ok((tlr.result.is_some(), target.clone()));
+            }
+            Ok(other) => {
+                failures += 1;
+                tracing::warn!(
+                    ?other,
+                    "discovered Vess peer returned unexpected tag lookup response"
+                );
+            }
+            Err(error) => {
+                failures += 1;
+                tracing::warn!(%error, "discovered Vess peer did not answer tag lookup");
+            }
+        }
     }
-    Ok(peers)
+
+    anyhow::bail!(
+        "no discovered Vess peer answered tag lookup for {display_tag}; {failures} discovered peer(s) may be stale or still starting. Try again in a few seconds"
+    )
 }
 
-/// Return the RPC port to use: explicit --rpc flag or default 9400.
+const VESS_RPC_PORT_ENV: &str = "VESS_RPC_PORT";
+const VESS_RPC_STATE_DIR_ENV: &str = "VESS_RPC_STATE_DIR";
+const VESS_NODE_PID_ENV: &str = "VESS_NODE_PID";
+
+/// Return the RPC port to use: explicit --rpc flag, interactive instance env,
+/// or default 9400.
 fn rpc_port(cli: &Cli) -> u16 {
-    cli.rpc.unwrap_or(vess_artery::rpc::DEFAULT_RPC_PORT)
+    cli.rpc
+        .or_else(|| {
+            std::env::var(VESS_RPC_PORT_ENV)
+                .ok()
+                .and_then(|value| value.parse().ok())
+        })
+        .unwrap_or(vess_artery::rpc::DEFAULT_RPC_PORT)
 }
 
-async fn cmd_init(cli: &Cli, tag_str: &str) -> Result<()> {
-    let path = wallet_path(cli)?;
+async fn cmd_init(cli: &Cli, tag_str: &str, wallet_name: Option<&str>) -> Result<()> {
+    let tag = VessTag::new(tag_str)?;
+    for supplied_name in [wallet_name, cli.wallet_name.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        let normalized = normalize_wallet_tag_name(supplied_name)?;
+        if normalized != tag.as_str() {
+            anyhow::bail!(
+                "wallet name must match the VessTag being claimed: expected {}, got {}",
+                tag.display(),
+                wallet_display_name(&normalized)
+            );
+        }
+    }
+    let wallet_tag_name = tag.as_str().to_string();
+    let (path, _) = wallet_create_path(cli, Some(&wallet_tag_name))?;
     if path.exists() {
         anyhow::bail!("wallet already exists at {}", path.display());
     }
 
-    let tag = VessTag::new(tag_str)?;
+    let node = MeshPulseNode::spawn().await?;
+    node.wait_online().await;
 
-    // ── Discover artery peers via DNS seeds ──────────────────────
+    println!("Checking if tag {} is available...", tag.display());
     let peers = discover_peers().await?;
-    let target = peers[0];
-
-    // ── Check tag availability BEFORE creating wallet ────────────
-    let vess_node = VessNode::spawn().await?;
-    vess_node.wait_online().await;
-
-    println!("Checking if tag {} is available…", tag.display());
-
-    let lookup = PulseMessage::TagLookup(TagLookup {
-        tag_hash: *blake3::hash(tag.as_str().as_bytes()).as_bytes(),
-        nonce: rand::random(),
-    });
-
-    let resp = vess_node
-        .send_message_with_response(target, &lookup)
-        .await?;
-
-    let is_taken = match &resp {
-        Some(PulseMessage::TagLookupResponse(tlr)) => tlr.result.is_some(),
-        _ => false,
-    };
+    let display_tag = tag.display();
+    let (is_taken, target) =
+        lookup_tag_on_reachable_peer(&node, &peers, tag.as_str(), &display_tag).await?;
 
     if is_taken {
-        vess_node.shutdown().await;
+        node.shutdown().await;
         anyhow::bail!(
-            "tag {} is already claimed — wallet was NOT created",
+            "tag {} is already claimed - wallet was NOT created",
             tag.display()
         );
     }
@@ -442,7 +619,6 @@ async fn cmd_init(cli: &Cli, tag_str: &str) -> Result<()> {
 
     let phrase = RecoveryPhrase::generate();
 
-    // Derive raw seed → deterministic ML-KEM keys + encryption key + spend seed.
     let raw_seed = derive_raw_seed(&phrase)?;
     let (secret, address) = generate_master_keys_from_seed(&raw_seed);
     let enc_key = encryption_key_from_seed(&raw_seed);
@@ -450,10 +626,10 @@ async fn cmd_init(cli: &Cli, tag_str: &str) -> Result<()> {
     let encrypted = encrypt_secrets(&secret, &enc_key)?;
 
     let mut wallet = WalletFile::new(address, encrypted, BillFold::new(), spend_seed, &enc_key)?;
+    wallet.name = Some(wallet_tag_name.clone());
 
-    // ── Register tag ─────────────────────────────────────────────
     {
-        println!("Computing Argon2id proof-of-work (~10 seconds, 2 GiB RAM)…");
+        println!("Computing Argon2id proof-of-work (~10 seconds, 2 GiB RAM)...");
 
         let tag_hash = *blake3::hash(tag.as_str().as_bytes()).as_bytes();
         let (pow_nonce, pow_hash) = vess_tag::compute_tag_pow(
@@ -494,8 +670,8 @@ async fn cmd_init(cli: &Cli, tag_str: &str) -> Result<()> {
             signature,
         });
 
-        vess_node.send_message(target, &msg).await?;
-        vess_node.shutdown().await;
+        node.send_message(&target, &msg).await?;
+        node.shutdown().await;
 
         if cli.json {
             println!(
@@ -509,10 +685,13 @@ async fn cmd_init(cli: &Cli, tag_str: &str) -> Result<()> {
 
     if cli.json {
         wallet.save(&path)?;
+        set_active_wallet_path(&path)?;
         println!(
             "{}",
             json!({
                 "ok": true,
+                "wallet_name": wallet.name,
+                "vesstag": tag.display(),
                 "recovery_phrase": phrase.display_phrase(),
                 "wallet_path": path.display().to_string(),
             })
@@ -523,31 +702,27 @@ async fn cmd_init(cli: &Cli, tag_str: &str) -> Result<()> {
         println!("This is the ONLY way to recover your wallet.");
         println!("=========================================\n");
 
-        // Require re-entry before saving.
         use std::io::{self, Write};
 
         println!("Please re-enter your recovery phrase to confirm you saved it.\n");
 
-        print!("Enter your 5 words (space-separated): ");
+        print!("Enter your 12-word recovery phrase: ");
         io::stdout().flush()?;
-        let mut words_input = String::new();
-        io::stdin().read_line(&mut words_input)?;
+        let mut phrase_input = String::new();
+        io::stdin().read_line(&mut phrase_input)?;
 
-        print!("Enter your 5-digit PIN: ");
-        io::stdout().flush()?;
-        let mut pin_input = String::new();
-        io::stdin().read_line(&mut pin_input)?;
+        let phrase_match = RecoveryPhrase::from_input(&phrase_input)
+            .map(|entered| entered == phrase)
+            .unwrap_or(false);
 
-        let words_match = words_input.split_whitespace().collect::<Vec<_>>() == phrase.words;
-        let pin_match = pin_input.trim() == phrase.pin;
-
-        if !words_match || !pin_match {
+        if !phrase_match {
             anyhow::bail!(
-                "recovery phrase verification failed — wallet NOT saved. Run `vess init` again."
+                "recovery phrase verification failed - wallet NOT saved. Run `vess init` again."
             );
         }
 
         wallet.save(&path)?;
+        set_active_wallet_path(&path)?;
         println!(
             "Recovery phrase verified. Wallet created at {}",
             path.display()
@@ -557,18 +732,20 @@ async fn cmd_init(cli: &Cli, tag_str: &str) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_recover(cli: &Cli, words: &str, pin: &str) -> Result<()> {
-    let path = wallet_path(cli)?;
-    let phrase = RecoveryPhrase::from_input(words, pin)?;
+async fn cmd_recover(cli: &Cli, words: &str, wallet_name: Option<&str>) -> Result<()> {
+    let wallet_name = wallet_name
+        .or(cli.wallet_name.as_deref())
+        .map(normalize_wallet_tag_name)
+        .transpose()?;
+    let (path, _) = wallet_create_path(cli, wallet_name.as_deref())?;
+    let phrase = RecoveryPhrase::from_input(words)?;
 
-    // Deterministically regenerate keys from phrase alone.
     let (secret, address) = recover_master_keys(&phrase)?;
     let raw_seed = derive_raw_seed(&phrase)?;
     let enc_key = encryption_key_from_seed(&raw_seed);
     let spend_seed = spend_seed_from_raw_seed(&raw_seed);
     let encrypted = encrypt_secrets(&secret, &enc_key)?;
 
-    // Create or overwrite wallet with regenerated keys.
     let mut billfold = if path.exists() {
         let existing = WalletFile::load(&path)?;
         existing.billfold
@@ -576,41 +753,16 @@ async fn cmd_recover(cli: &Cli, words: &str, pin: &str) -> Result<()> {
         BillFold::new()
     };
 
-    // ── Manifest-based bill recovery ────────────────────────────────
-    println!("Recovering bills via manifest…");
+    println!("Recovering bills via manifest...");
 
-    let node = VessNode::spawn().await?;
+    let node = MeshPulseNode::spawn().await?;
     node.wait_online().await;
 
-    // Discover artery peers via DNS seeds.
-    let peers = discover_peers().await?;
-    let bootstrap_target = peers[0];
-
-    // Discover additional peers via PeerExchange for fan-out.
-    let mut targets: Vec<iroh::EndpointId> = vec![bootstrap_target];
-
-    let pe_msg = PulseMessage::PeerExchange(vess_protocol::PeerExchange {
-        sender_id: vec![0u8; 32],
-    });
-    if let Ok(Some(PulseMessage::PeerExchangeResponse(resp))) = node
-        .send_message_with_response(bootstrap_target, &pe_msg)
-        .await
-    {
-        for peer_bytes in &resp.peers {
-            if let Ok(arr) = <[u8; 32]>::try_from(peer_bytes.as_slice()) {
-                if let Ok(eid) = iroh::EndpointId::from_bytes(&arr) {
-                    if !targets.contains(&eid) {
-                        targets.push(eid);
-                    }
-                }
-            }
-        }
-    }
+    let targets = discover_recovery_targets(&node).await?;
 
     let peer_count = targets.len();
     println!("  Using {peer_count} peer(s) for recovery");
 
-    // Step 1: Fetch manifest.
     let manifest_key = vess_foundry::seal::manifest_dht_key(&spend_seed);
     let manifest_req = PulseMessage::ManifestRecover(vess_protocol::ManifestRecover {
         dht_key: manifest_key,
@@ -619,7 +771,7 @@ async fn cmd_recover(cli: &Cli, words: &str, pin: &str) -> Result<()> {
     let mut manifest_entries = Vec::new();
     let mut manifest_found = false;
 
-    for &peer in &targets {
+    for peer in &targets {
         let resp = node.send_message_with_response(peer, &manifest_req).await;
         if let Ok(Some(PulseMessage::ManifestRecoverResponse(mrr))) = resp {
             if mrr.found {
@@ -645,15 +797,13 @@ async fn cmd_recover(cli: &Cli, words: &str, pin: &str) -> Result<()> {
     let mut max_dht_index: u64 = 0;
 
     if manifest_found && !manifest_entries.is_empty() {
-        // Step 2: Fetch ownership records for each mint_id.
         let mint_ids: Vec<[u8; 32]> = manifest_entries.iter().map(|e| e.mint_id).collect();
         let fetch_req = PulseMessage::OwnershipFetch(vess_protocol::OwnershipFetch {
             mint_ids: mint_ids.clone(),
         });
 
-        // Try each peer until we get a response.
         let mut fetched_records = Vec::new();
-        for &peer in &targets {
+        for peer in &targets {
             let resp = node.send_message_with_response(peer, &fetch_req).await;
             if let Ok(Some(PulseMessage::OwnershipFetchResponse(ofr))) = resp {
                 fetched_records = ofr.records;
@@ -661,7 +811,6 @@ async fn cmd_recover(cli: &Cli, words: &str, pin: &str) -> Result<()> {
             }
         }
 
-        // Step 3: Reconstruct bills from registry data.
         for (i, entry) in manifest_entries.iter().enumerate() {
             if i >= fetched_records.len() {
                 break;
@@ -719,14 +868,17 @@ async fn cmd_recover(cli: &Cli, words: &str, pin: &str) -> Result<()> {
     println!("Recovery complete: {recovered} bills recovered.");
 
     let mut wallet = WalletFile::new(address, encrypted, billfold, spend_seed, &enc_key)?;
+    wallet.name = wallet_name.clone();
     wallet.next_dht_index = max_dht_index;
     wallet.save(&path)?;
+    set_active_wallet_path(&path)?;
 
     if cli.json {
         println!(
             "{}",
             json!({
                 "ok": true,
+                "wallet_name": wallet.name,
                 "wallet_path": path.display().to_string(),
                 "recovered_bills": recovered,
                 "balance": wallet.billfold.balance(),
@@ -789,6 +941,56 @@ async fn cmd_balance(cli: &Cli) -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+fn render_ascii_qr(data: &str) -> Result<String> {
+    let code = QrCode::new(data.as_bytes())
+        .map_err(|error| anyhow::anyhow!("failed to encode QR code: {error}"))?;
+    Ok(code
+        .render::<char>()
+        .quiet_zone(true)
+        .module_dimensions(2, 1)
+        .dark_color('#')
+        .light_color(' ')
+        .build())
+}
+
+async fn cmd_receive(cli: &Cli) -> Result<()> {
+    let port = rpc_port(cli);
+    let resp = rpc_call(port, &json!({"method": "node_info"})).await?;
+    if resp["ok"] != true {
+        anyhow::bail!("{}", resp["error"].as_str().unwrap_or("unknown error"));
+    }
+
+    let address = resp["bitcoin_receive_address"]
+        .as_str()
+        .filter(|address| !address.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "wallet is not loaded in the running node; open Vess interactively or run `vess node --wallet ... --rpc-port {port}`"
+            )
+        })?;
+    let qr_ascii = render_ascii_qr(address)?;
+
+    if cli.json {
+        println!(
+            "{}",
+            json!({
+                "ok": true,
+                "address": address,
+                "bitcoin_receive_address": address,
+                "qr_ascii": qr_ascii,
+            })
+        );
+    } else {
+        println!("Bitcoin receive address:");
+        println!("{address}");
+        println!();
+        println!("{qr_ascii}");
+        println!("Send BTC to this address. The running node will track it, burn it, and mint Vess after confirmation.");
+    }
+
     Ok(())
 }
 
@@ -889,6 +1091,114 @@ async fn auto_watch_send_confirmation(cli: &Cli, payment_id: &str, timeout_ms: u
     Ok(())
 }
 
+async fn cmd_faucet(cli: &Cli, amount: u64) -> Result<()> {
+    let port = rpc_port(cli);
+    let resp = rpc_call(
+        port,
+        &json!({"method": "local_test_faucet", "amount": amount}),
+    )
+    .await?;
+    if resp["ok"] == true {
+        if cli.json {
+            println!("{resp}");
+        } else {
+            println!("Local test faucet minted {} Vess.", resp["amount"]);
+            println!("Bills:   {}", resp["bill_count"]);
+            println!("Balance: {} Vess", resp["balance"]);
+            println!("These bills are only valid on nodes started with VESS_LOCAL_TEST_FAUCET=1.");
+        }
+    } else {
+        anyhow::bail!("{}", resp["error"].as_str().unwrap_or("unknown error"));
+    }
+    Ok(())
+}
+
+async fn cmd_compile(cli: &Cli, output: &Path, debug: bool) -> Result<()> {
+    let workspace_root = find_workspace_root()?;
+    let profile = if debug { "debug" } else { "release" };
+
+    let mut build = std::process::Command::new("cargo");
+    build
+        .current_dir(&workspace_root)
+        .arg("build")
+        .arg("-p")
+        .arg("vess-cli")
+        .arg("--bin")
+        .arg("vess");
+    if !debug {
+        build.arg("--release");
+    }
+
+    if !cli.json {
+        println!("Building Vess {profile} executable...");
+    }
+
+    let status = build.status().context("failed to run cargo build")?;
+    if !status.success() {
+        anyhow::bail!("cargo build failed with status {status}");
+    }
+
+    let exe_name = if cfg!(windows) { "vess.exe" } else { "vess" };
+    let built_exe = workspace_root.join("target").join(profile).join(exe_name);
+    if !built_exe.exists() {
+        anyhow::bail!("built executable was not found at {}", built_exe.display());
+    }
+
+    let output_path = if output.is_absolute() {
+        output.to_path_buf()
+    } else {
+        workspace_root.join(output)
+    };
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    std::fs::copy(&built_exe, &output_path).with_context(|| {
+        format!(
+            "failed to copy {} to {}",
+            built_exe.display(),
+            output_path.display()
+        )
+    })?;
+
+    if cli.json {
+        println!(
+            "{}",
+            json!({
+                "ok": true,
+                "profile": profile,
+                "executable": output_path,
+                "interactive_on_launch": true,
+            })
+        );
+    } else {
+        println!("Built interactive Vess executable:");
+        println!("  {}", output_path.display());
+        println!("Run it with no arguments, or double-click it, to open the interactive CLI.");
+    }
+
+    Ok(())
+}
+
+fn find_workspace_root() -> Result<PathBuf> {
+    let mut dir = std::env::current_dir().context("read current directory")?;
+    loop {
+        let manifest = dir.join("Cargo.toml");
+        if manifest.exists() {
+            let contents = std::fs::read_to_string(&manifest)
+                .with_context(|| format!("read {}", manifest.display()))?;
+            if contents.contains("[workspace]") && contents.contains("\"vess-cli\"") {
+                return Ok(dir);
+            }
+        }
+        if !dir.pop() {
+            anyhow::bail!(
+                "could not find the Vess workspace root; run this command from inside the source tree"
+            );
+        }
+    }
+}
+
 async fn cmd_send(
     cli: &Cli,
     amount: u64,
@@ -902,7 +1212,7 @@ async fn cmd_send(
             "method": "send_direct",
             "amount": amount,
             "recipient": recipient_id,
-            "node_id": node_id,
+            "target": node_id,
         })
     } else {
         json!({
@@ -921,7 +1231,7 @@ async fn cmd_send(
             println!("{resp}");
         } else {
             if node_direct.is_some() {
-                println!("Direct payment accepted!");
+                println!("Direct payment accepted by target contact.");
             } else {
                 println!("Payment sent!");
             }
@@ -939,257 +1249,6 @@ async fn cmd_send(
         anyhow::bail!("{}", resp["error"].as_str().unwrap_or("unknown error"));
     }
     Ok(())
-}
-
-async fn cmd_mint(cli: &Cli, finalize_only: bool, status_only: bool) -> Result<()> {
-    let path = wallet_path(cli)?;
-    let mut wallet = WalletFile::load(&path)?;
-
-    // Decrypt spend seed (required for DHT key derivation and sealing).
-    let enc_key = derive_enc_key(cli)?;
-    let spend_seed = wallet.decrypt_spend_seed(&enc_key)?;
-
-    // Session file lives next to the wallet.
-    let session_path = path.with_extension("mint-session.json");
-
-    // Generate ML-DSA-65 keypair — the owner's vk_hash is baked into STARK seeds.
-    let (spend_vk, spend_sk) = vess_foundry::spend_auth::generate_spend_keypair();
-    let owner_vk_hash = vess_foundry::spend_auth::vk_hash(&spend_vk);
-
-    // ── Status mode ────────────────────────────────────────────────
-    if status_only {
-        let state =
-            vess_foundry::mint::MintSessionState::load_or_create(&session_path, owner_vk_hash);
-        if state.solves.is_empty() {
-            if cli.json {
-                println!(
-                    "{}",
-                    json!({ "ok": true, "solves": 0, "vess": 0, "attempts": state.total_attempts })
-                );
-            } else {
-                println!("No active mint session (0 solves).");
-            }
-        } else {
-            let vess = state.solves.len();
-            let breakdown = vess_foundry::mint::optimal_breakdown(vess as u64);
-            let bill_count = breakdown.len();
-            if cli.json {
-                println!(
-                    "{}",
-                    json!({
-                        "ok": true,
-                        "solves": vess,
-                        "vess": vess,
-                        "attempts": state.total_attempts,
-                        "bills_after_aggregation": bill_count,
-                    })
-                );
-            } else {
-                println!("Mint session: {} solves ({} vess)", vess, vess);
-                println!("Attempts:     {}", state.total_attempts);
-                println!(
-                    "Aggregation:  {} bills ({})",
-                    bill_count,
-                    breakdown
-                        .iter()
-                        .map(|d| format!("{d}"))
-                        .collect::<Vec<_>>()
-                        .join(" + ")
-                );
-            }
-        }
-        return Ok(());
-    }
-
-    // ── Mine (unless --finalize) ───────────────────────────────────
-    if !finalize_only {
-        let json_mode = cli.json;
-        if !json_mode {
-            println!("Mining vess… (1 solve = 1 vess). Press Ctrl+C to stop and finalize.");
-        }
-
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let stop_clone = stop.clone();
-        ctrlc_flag(&stop_clone);
-
-        let sp = session_path.clone();
-        let vk_hash = owner_vk_hash;
-        let state = tokio::task::spawn_blocking(move || {
-            vess_foundry::mint::mine_flow(&sp, &vk_hash, stop, |count, attempts| {
-                if json_mode {
-                    println!(
-                        "{}",
-                        serde_json::json!({
-                            "event": "solve",
-                            "solves": count,
-                            "attempts": attempts,
-                        })
-                    );
-                } else {
-                    println!("  Solve #{count} found! ({attempts} total attempts)");
-                }
-            })
-        })
-        .await?;
-
-        if state.solves.is_empty() {
-            if !cli.json {
-                println!("No solves found. Session saved — resume with `vess mint`.");
-            }
-            return Ok(());
-        }
-
-        if !cli.json {
-            println!(
-                "\nMining stopped. {} solves ({} vess) accumulated.",
-                state.solves.len(),
-                state.solves.len()
-            );
-        }
-    }
-
-    // ── Finalize: aggregate + register ─────────────────────────────
-    let state = vess_foundry::mint::MintSessionState::load_or_create(&session_path, owner_vk_hash);
-    if state.solves.is_empty() {
-        if cli.json {
-            println!(
-                "{}",
-                json!({ "ok": false, "error": "no solves to finalize" })
-            );
-        } else {
-            println!("No solves to finalize.");
-        }
-        return Ok(());
-    }
-
-    let solve_count = state.solves.len();
-    let json_regen = cli.json;
-    let bills = vess_foundry::mint::aggregate_solves(
-        &state.solves,
-        &owner_vk_hash,
-        Some(&|current, total| {
-            if json_regen {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "event": "proof_regen",
-                        "current": current,
-                        "total": total,
-                    })
-                );
-            } else {
-                print!("\r  Regenerating proofs: {current}/{total}");
-            }
-        }),
-    );
-    if !json_regen {
-        println!(); // newline after \r progress
-    }
-
-    if !cli.json {
-        println!(
-            "Aggregating {} solves into {} bill(s):",
-            solve_count,
-            bills.len()
-        );
-        for (b, _) in &bills {
-            println!("  {} (mint_id: {})", b.denomination, b.mint_id_hex());
-        }
-    }
-
-    // Store aggregated bills in wallet.
-    for (bill, _proof_bytes) in &bills {
-        let mut b = bill.clone();
-        let dht_index = wallet.alloc_dht_index();
-        b.dht_index = dht_index;
-
-        wallet.billfold.deposit_with_credentials(
-            b.clone(),
-            SpendCredential {
-                spend_vk: spend_vk.clone(),
-                spend_sk: spend_sk.clone(),
-            },
-        );
-    }
-
-    // Broadcast OwnershipGenesis for every aggregated bill via RPC.
-    let port = rpc_port(cli);
-    let genesis_msgs = build_genesis_messages(&bills, &spend_vk);
-    for gm in &genesis_msgs {
-        if let PulseMessage::OwnershipGenesis(og) = gm {
-            rpc_call(
-                port,
-                &json!({
-                    "method": "ownership_genesis",
-                    "mint_id_hex": hex(&og.mint_id),
-                    "chain_tip_hex": hex(&og.chain_tip),
-                    "owner_vk_hash_hex": hex(&og.owner_vk_hash),
-                    "owner_vk_hex": hex(&og.owner_vk),
-                    "denomination_value": og.denomination_value,
-                    "proof_hex": hex(&og.proof),
-                    "digest_hex": hex(&og.digest),
-                }),
-            )
-            .await?;
-        }
-    }
-
-    wallet.save(&path)?;
-
-    // Update the recovery manifest via RPC.
-    {
-        let manifest_entries: Vec<vess_foundry::seal::ManifestEntry> = wallet
-            .billfold
-            .bills()
-            .iter()
-            .map(|b| vess_foundry::seal::ManifestEntry {
-                mint_id: b.mint_id,
-                dht_index: b.dht_index,
-            })
-            .collect();
-        let manifest_key = vess_foundry::seal::manifest_dht_key(&spend_seed);
-        let encrypted_manifest =
-            vess_foundry::seal::encrypt_manifest(&spend_seed, &manifest_entries)?;
-
-        rpc_call(
-            port,
-            &json!({
-                "method": "manifest_store",
-                "dht_key_hex": hex(&manifest_key),
-                "encrypted_manifest_hex": hex(&encrypted_manifest),
-            }),
-        )
-        .await?;
-    }
-
-    // Clean up session file after successful finalization.
-    if session_path.exists() {
-        let _ = std::fs::remove_file(&session_path);
-    }
-
-    if cli.json {
-        println!(
-            "{}",
-            json!({
-                "ok": true,
-                "solves": solve_count,
-                "bills": bills.len(),
-                "balance": wallet.billfold.balance(),
-            })
-        );
-    } else {
-        println!("Ownership genesis + manifest sent to artery node.");
-        println!("Balance: {} Vess", wallet.billfold.balance());
-    }
-    Ok(())
-}
-
-/// Set a Ctrl+C handler that flips the stop flag.
-fn ctrlc_flag(stop: &std::sync::Arc<std::sync::atomic::AtomicBool>) {
-    let s = stop.clone();
-    let _ = ctrlc::set_handler(move || {
-        s.store(true, std::sync::atomic::Ordering::Relaxed);
-    });
 }
 
 async fn cmd_register_tag(cli: &Cli, tag_str: &str) -> Result<()> {
@@ -1313,7 +1372,7 @@ async fn cmd_register_tag(cli: &Cli, tag_str: &str) -> Result<()> {
     } else {
         if !cli.json {
             println!("No bills in wallet — tag registered but not hardened.");
-            println!("The tag will be auto-hardened when you receive or mint bills.");
+            println!("The tag will be auto-hardened when you receive bills.");
         }
         false
     };
@@ -1331,17 +1390,12 @@ async fn cmd_register_tag(cli: &Cli, tag_str: &str) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_pulse(cli: &Cli, node_id: &str, message: &str) -> Result<()> {
-    let node = VessNode::spawn().await?;
-
-    let target: iroh::EndpointId = node_id
-        .parse()
-        .map_err(|e| anyhow::anyhow!("invalid endpoint id: {e}"))?;
-
-    node.send_pulse(target, message.as_bytes()).await?;
-    node.shutdown().await;
+async fn cmd_pulse(cli: &Cli, target: &str, message: &str) -> Result<()> {
+    let target = parse_mesh_contact(target)?;
+    let carrier = spawn_udp_mesh_carrier().await?;
+    carrier.send(&target, message.as_bytes()).await?;
     if cli.json {
-        println!("{}", json!({ "ok": true, "node_id": node_id }));
+        println!("{}", json!({ "ok": true, "target": target }));
     } else {
         println!("Pulse delivered.");
     }
@@ -1350,38 +1404,51 @@ async fn cmd_pulse(cli: &Cli, node_id: &str, message: &str) -> Result<()> {
 
 async fn cmd_listen(cli: &Cli) -> Result<()> {
     let json_mode = cli.json;
-    let node = VessNode::spawn().await?;
-    if !json_mode {
-        println!("Connecting to relay for NAT traversal…");
-    }
-    node.wait_online().await;
+    let carrier = spawn_udp_mesh_carrier().await?;
+    let local_contact = carrier.local_contact();
+    let local_contact_string = encode_mesh_contact_string(&local_contact)?;
 
     if json_mode {
         println!(
             "{}",
-            json!({ "event": "ready", "node_id": node.id().to_string() })
+            json!({
+                "event": "ready",
+                "node_id": local_contact
+                    .node_id()
+                    .map(|node_id| node_id.to_string())
+                    .unwrap_or_else(|| "?".to_string()),
+                "node_contact": local_contact_string,
+            })
         );
     } else {
-        println!("Node ID:   {}", node.id());
-        println!("Node Addr: {:?}", node.addr());
+        println!(
+            "Node ID:   {}",
+            local_contact
+                .node_id()
+                .map(|node_id| node_id.to_string())
+                .unwrap_or_else(|| "?".to_string())
+        );
+        println!("Mesh contact: {}", local_contact_string);
         println!("Listening for Pulses… (Ctrl+C to stop)\n");
     }
 
-    node.listen(move |peer, payload| {
-        if json_mode {
-            let msg = String::from_utf8_lossy(&payload);
-            println!(
-                "{}",
-                serde_json::json!({ "event": "pulse", "peer": peer.to_string(), "payload": msg })
-            );
-        } else {
-            let msg = String::from_utf8_lossy(&payload);
-            println!("[{peer}] {msg}");
-        }
-    })
-    .await?;
-
-    node.shutdown().await;
+    carrier
+        .listen_with_response(move |peer, payload| {
+            if json_mode {
+                let msg = String::from_utf8_lossy(&payload);
+                let peer_contact = encode_mesh_contact_string(&peer.contact)
+                    .unwrap_or_else(|_| peer.contact.to_string());
+                println!(
+                    "{}",
+                    serde_json::json!({ "event": "pulse", "peer": peer_contact, "payload": msg })
+                );
+            } else {
+                let msg = String::from_utf8_lossy(&payload);
+                println!("[{}] {msg}", peer.contact);
+            }
+            Vec::new()
+        })
+        .await?;
     Ok(())
 }
 
@@ -1395,9 +1462,7 @@ async fn cmd_set_password(cli: &Cli, password: String) -> Result<()> {
     wallet.set_password_cache(&raw_seed, &password)?;
     wallet.save(&path)?;
 
-    println!(
-        "Password set.  The node can now start with VESS_WALLET_PASSWORD or --wallet-password."
-    );
+    println!("Password set. Open Vess interactively to choose and load this wallet.");
     Ok(())
 }
 
@@ -1440,7 +1505,10 @@ async fn cmd_tag_cache_clear(cli: &Cli, tag: Option<&str>) -> Result<()> {
         println!("{resp}");
     } else {
         match tag {
-            Some(t) => println!("Removed +{} from tag cache.", t.strip_prefix('+').unwrap_or(t)),
+            Some(t) => println!(
+                "Removed +{} from tag cache.",
+                t.strip_prefix('+').unwrap_or(t)
+            ),
             None => println!("Tag cache cleared."),
         }
     }
@@ -1476,27 +1544,24 @@ fn node_pid_path() -> Result<PathBuf> {
     Ok(vess_data_dir()?.join("node.pid"))
 }
 
-fn node_log_path() -> Result<PathBuf> {
-    Ok(vess_data_dir()?.join("node.log"))
-}
-
 fn read_node_pid() -> Option<u32> {
+    if let Some(pid) = std::env::var(VESS_NODE_PID_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+    {
+        return Some(pid);
+    }
     node_pid_path()
         .ok()
         .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|s| s.trim().parse().ok())
 }
 
-fn write_node_pid(pid: u32) -> Result<()> {
-    let path = node_pid_path()?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&path, pid.to_string())?;
-    Ok(())
-}
-
 fn clear_node_pid() {
+    if std::env::var_os(VESS_NODE_PID_ENV).is_some() {
+        std::env::remove_var(VESS_NODE_PID_ENV);
+        return;
+    }
     if let Ok(p) = node_pid_path() {
         let _ = std::fs::remove_file(p);
     }
@@ -1562,128 +1627,629 @@ fn prompt_password(msg: &str) -> Result<String> {
     rpassword::prompt_password(msg).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
-// ── `vess start` ─────────────────────────────────────────────────────
+#[derive(Clone)]
+struct ActiveNodeRecord {
+    pid: u32,
+    lease_path: PathBuf,
+}
 
-async fn cmd_start(cli: &Cli) -> Result<()> {
-    let port = rpc_port(cli);
-    let wallet_file = wallet_path(cli)?;
+type ActiveNodeRef = std::sync::Arc<std::sync::Mutex<Option<ActiveNodeRecord>>>;
 
-    // 1. Bail early if a node process is already running.
-    if let Some(pid) = read_node_pid() {
-        if is_pid_alive(pid) {
-            println!("Vess node is already running (PID {pid}).");
-            println!("  Balance: run `vess balance`");
-            println!("  Stop:    run `vess stop`");
-            return Ok(());
-        }
-        // Stale PID file from a previous crash — clean it up.
-        clear_node_pid();
+#[derive(Clone)]
+struct CliNodeSlot {
+    state_dir: PathBuf,
+    lease_path: PathBuf,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CliNodeLease {
+    owner_pid: u32,
+    #[serde(default)]
+    node_pid: Option<u32>,
+    claimed_at_unix: u64,
+}
+
+impl CliNodeSlot {
+    fn record_node_pid(&self, owner_pid: u32, node_pid: u32) -> Result<()> {
+        write_cli_node_lease(
+            &self.lease_path,
+            &CliNodeLease {
+                owner_pid,
+                node_pid: Some(node_pid),
+                claimed_at_unix: now_unix(),
+            },
+        )
+    }
+}
+
+struct NodeProcessGuard {
+    child: std::process::Child,
+    pid: u32,
+    port: u16,
+    state_dir: PathBuf,
+    lease_path: PathBuf,
+    active_node: ActiveNodeRef,
+}
+
+impl NodeProcessGuard {
+    fn is_running(&mut self) -> bool {
+        self.child.try_wait().ok().flatten().is_none() && is_pid_alive(self.pid)
     }
 
-    // 2. First-run wizard (creates wallet + sets password) or prompt for
-    //    the password on an already-initialised wallet.
-    let password: String = if !wallet_file.exists() {
-        first_run_wizard(&wallet_file).await?
-    } else {
-        // Use env var if already set (e.g. CI / scripted installs).
-        if let Ok(pwd) = std::env::var("VESS_WALLET_PASSWORD") {
-            let wf = WalletFile::load(&wallet_file)?;
-            wf.unlock_with_password(&pwd)
-                .map_err(|_| anyhow::anyhow!("VESS_WALLET_PASSWORD env var contains an incorrect password"))?;
-            pwd
-        } else {
-            let wf = WalletFile::load(&wallet_file)?;
-            if wf.password_cache.is_none() {
-                // Wallet exists but has never had a password set.
-                println!("Your wallet doesn't have a quick-unlock password yet.");
-                println!("This is required to restart the background service without entering");
-                println!("your recovery phrase each time.\n");
-                setup_new_password(&wallet_file, &derive_raw_seed_for_wallet(cli)?)?
-            } else {
-                let pwd = prompt_password("Enter wallet password: ")?;
-                wf.unlock_with_password(&pwd)
-                    .map_err(|_| anyhow::anyhow!("incorrect password"))?;
-                pwd
+    fn stop(&mut self) -> Result<()> {
+        if self.child.try_wait()?.is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+        release_cli_node_slot(&self.lease_path);
+        clear_interactive_node_env(self.pid, self.port, &self.state_dir);
+        if let Ok(mut active) = self.active_node.lock() {
+            if active
+                .as_ref()
+                .map(|record| record.pid == self.pid)
+                .unwrap_or(false)
+            {
+                *active = None;
             }
         }
-    };
+        Ok(())
+    }
+}
 
-    // 3. Spawn the artery node as a detached background process.
-    let log_path = node_log_path()?;
-    if let Some(parent) = log_path.parent() {
+impl Drop for NodeProcessGuard {
+    fn drop(&mut self) {
+        let _ = self.stop();
+    }
+}
+
+fn allocate_local_rpc_port() -> Result<u16> {
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+    Ok(listener.local_addr()?.port())
+}
+
+fn cli_node_slots_dir() -> Result<PathBuf> {
+    Ok(vess_data_dir()?.join("cli-nodes"))
+}
+
+fn read_cli_node_lease(lease_path: &Path) -> Option<CliNodeLease> {
+    std::fs::read(lease_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+}
+
+fn write_cli_node_lease(lease_path: &Path, lease: &CliNodeLease) -> Result<()> {
+    let bytes = serde_json::to_vec(lease).context("serialize CLI node lease")?;
+    std::fs::write(lease_path, bytes)
+        .with_context(|| format!("write CLI node lease: {}", lease_path.display()))?;
+    Ok(())
+}
+
+fn create_cli_node_lease(lease_path: &Path, lease: &CliNodeLease) -> Result<bool> {
+    use std::io::Write;
+
+    if let Some(parent) = lease_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    let bytes = serde_json::to_vec(lease).context("serialize CLI node lease")?;
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(lease_path)
+    {
+        Ok(mut file) => {
+            file.write_all(&bytes)
+                .with_context(|| format!("write CLI node lease: {}", lease_path.display()))?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(error)
+            .with_context(|| format!("create CLI node lease: {}", lease_path.display())),
+    }
+}
+
+fn release_cli_node_slot(lease_path: &Path) {
+    let _ = std::fs::remove_file(lease_path);
+}
+
+fn cli_node_lease_is_active<F>(lease: &CliNodeLease, is_alive: &F) -> bool
+where
+    F: Fn(u32) -> bool,
+{
+    is_alive(lease.owner_pid) || lease.node_pid.map(is_alive).unwrap_or(false)
+}
+
+fn try_claim_cli_node_slot_with<F>(
+    slot_dir: &Path,
+    owner_pid: u32,
+    is_alive: &F,
+) -> Result<Option<CliNodeSlot>>
+where
+    F: Fn(u32) -> bool,
+{
+    std::fs::create_dir_all(slot_dir)
+        .with_context(|| format!("create CLI node slot dir: {}", slot_dir.display()))?;
+
+    let lease_path = slot_dir.join("lease.json");
+    if let Some(lease) = read_cli_node_lease(&lease_path) {
+        if cli_node_lease_is_active(&lease, is_alive) {
+            return Ok(None);
+        }
+        release_cli_node_slot(&lease_path);
+    } else if lease_path.exists() {
+        release_cli_node_slot(&lease_path);
+    }
+
+    let lease = CliNodeLease {
+        owner_pid,
+        node_pid: None,
+        claimed_at_unix: now_unix(),
+    };
+    if create_cli_node_lease(&lease_path, &lease)? {
+        return Ok(Some(CliNodeSlot {
+            state_dir: slot_dir.to_path_buf(),
+            lease_path,
+        }));
+    }
+    Ok(None)
+}
+
+fn allocate_cli_node_slot_with<F>(base_dir: &Path, owner_pid: u32, is_alive: &F) -> Result<CliNodeSlot>
+where
+    F: Fn(u32) -> bool,
+{
+    std::fs::create_dir_all(base_dir)
+        .with_context(|| format!("create CLI node pool dir: {}", base_dir.display()))?;
+
+    let mut existing_dirs = Vec::new();
+    for entry in std::fs::read_dir(base_dir)
+        .with_context(|| format!("read CLI node pool dir: {}", base_dir.display()))?
+    {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            existing_dirs.push(entry.path());
+        }
+    }
+    existing_dirs.sort();
+
+    for slot_dir in existing_dirs {
+        if let Some(slot) = try_claim_cli_node_slot_with(&slot_dir, owner_pid, is_alive)? {
+            return Ok(slot);
+        }
+    }
+
+    for index in 1u32.. {
+        let slot_dir = base_dir.join(format!("slot-{index:04}"));
+        if let Some(slot) = try_claim_cli_node_slot_with(&slot_dir, owner_pid, is_alive)? {
+            return Ok(slot);
+        }
+    }
+
+    unreachable!("CLI node slot allocator exhausted unexpectedly")
+}
+
+fn allocate_cli_node_slot() -> Result<CliNodeSlot> {
+    let owner_pid = std::process::id();
+    let base_dir = cli_node_slots_dir()?;
+    allocate_cli_node_slot_with(&base_dir, owner_pid, &is_pid_alive)
+}
+
+fn set_interactive_node_env(pid: u32, port: u16, state_dir: &Path) {
+    std::env::set_var(VESS_NODE_PID_ENV, pid.to_string());
+    std::env::set_var(VESS_RPC_PORT_ENV, port.to_string());
+    std::env::set_var(VESS_RPC_STATE_DIR_ENV, state_dir);
+}
+
+fn clear_interactive_node_env(pid: u32, port: u16, state_dir: &Path) {
+    if std::env::var(VESS_NODE_PID_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        == Some(pid)
+    {
+        std::env::remove_var(VESS_NODE_PID_ENV);
+    }
+    if std::env::var(VESS_RPC_PORT_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        == Some(port)
+    {
+        std::env::remove_var(VESS_RPC_PORT_ENV);
+    }
+    if std::env::var_os(VESS_RPC_STATE_DIR_ENV)
+        .map(PathBuf::from)
+        .as_deref()
+        == Some(state_dir)
+    {
+        std::env::remove_var(VESS_RPC_STATE_DIR_ENV);
+    }
+}
+
+fn install_interactive_node_signal_handler(active_node: ActiveNodeRef) {
+    let _ = ctrlc::set_handler(move || {
+        let active = active_node.lock().ok().and_then(|guard| guard.clone());
+        if let Some(active) = active {
+            let _ = kill_pid(active.pid);
+            release_cli_node_slot(&active.lease_path);
+        }
+        std::process::exit(0);
+    });
+}
+
+async fn spawn_interactive_node(cli: &Cli, active_node: ActiveNodeRef) -> Result<NodeProcessGuard> {
+    let port = cli.rpc.unwrap_or(allocate_local_rpc_port()?);
+    let owner_pid = std::process::id();
+    let slot = allocate_cli_node_slot()?;
+    let state_dir = slot.state_dir.clone();
+    std::fs::create_dir_all(&state_dir)?;
+    let log_path = state_dir.join("node.log");
     let log_file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&log_path)?;
     let log_file2 = log_file.try_clone()?;
 
-    let exe = std::env::current_exe()
-        .map_err(|e| anyhow::anyhow!("cannot find own executable: {e}"))?;
-    let wallet_str = wallet_file.display().to_string();
+    let exe =
+        std::env::current_exe().map_err(|e| anyhow::anyhow!("cannot find own executable: {e}"))?;
     let port_str = port.to_string();
+    let state_dir_arg = state_dir.display().to_string();
 
     let mut cmd = std::process::Command::new(&exe);
-    cmd.args(["node", "--wallet", &wallet_str, "--rpc-port", &port_str]);
-    // Pass password via env var — safer than CLI args (not visible in `ps`).
-    cmd.env("VESS_WALLET_PASSWORD", &password);
+    cmd.args([
+        "node",
+        "--rpc-port",
+        &port_str,
+        "--state-dir",
+        &state_dir_arg,
+    ]);
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(log_file);
     cmd.stderr(log_file2);
 
-    // On Windows, detach from the console entirely.
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW);
-    }
-
     let child = cmd
         .spawn()
-        .map_err(|e| anyhow::anyhow!("failed to launch node process: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("failed to launch per-CLI node process: {e}"));
+    let child = match child {
+        Ok(child) => child,
+        Err(error) => {
+            release_cli_node_slot(&slot.lease_path);
+            return Err(error);
+        }
+    };
     let pid = child.id();
-    write_node_pid(pid)?;
+    if let Err(error) = slot.record_node_pid(owner_pid, pid) {
+        let _ = kill_pid(pid);
+        release_cli_node_slot(&slot.lease_path);
+        return Err(error);
+    }
+    set_interactive_node_env(pid, port, &state_dir);
+    if let Ok(mut active) = active_node.lock() {
+        *active = Some(ActiveNodeRecord {
+            pid,
+            lease_path: slot.lease_path.clone(),
+        });
+    }
 
-    println!("\nVess node started!");
+    let mut guard = NodeProcessGuard {
+        child,
+        pid,
+        port,
+        state_dir,
+        lease_path: slot.lease_path.clone(),
+        active_node,
+    };
+
+    if !wait_for_node_rpc(cli, std::time::Duration::from_secs(30)).await {
+        let _ = guard.stop();
+        anyhow::bail!(
+            "per-CLI node RPC did not become ready; see {}",
+            log_path.display()
+        );
+    }
+
+    println!("Vess node started for this CLI instance.");
     println!("  PID:     {pid}");
+    println!("  RPC:     127.0.0.1:{port}");
+    println!("  State:   {}", slot.state_dir.display());
     println!("  Log:     {}", log_path.display());
-    println!("  Balance: run `vess balance`  (takes a few seconds to connect)");
-    println!("  Stop:    run `vess stop`");
+    Ok(guard)
+}
+
+async fn restart_interactive_node_if_needed(
+    cli: &Cli,
+    active_node: ActiveNodeRef,
+    node_guard: &mut Option<NodeProcessGuard>,
+) -> Result<()> {
+    let stopped = node_guard
+        .as_mut()
+        .map(|guard| !guard.is_running())
+        .unwrap_or(false);
+    if !stopped {
+        return Ok(());
+    }
+
+    if let Some(mut guard) = node_guard.take() {
+        let _ = guard.stop();
+    }
+    println!("This CLI instance's node stopped unexpectedly; restarting it now...");
+    let guard = spawn_interactive_node(cli, active_node).await?;
+    *node_guard = Some(guard);
+    if let Err(e) = ensure_wallet_layer(cli).await {
+        println!("Warning: wallet layer not loaded: {e}");
+    }
     Ok(())
 }
 
-/// Prompt for and confirm a new password, set it on the wallet, save.
-/// Returns the chosen password.
-fn setup_new_password(wallet_path: &PathBuf, raw_seed: &[u8; 64]) -> Result<String> {
-    println!("Set a quick-unlock password for the background service.");
-    println!("(Your recovery phrase is the fallback if you forget it.)\n");
-    let password = loop {
-        let pwd = prompt_password("  New password:     ")?;
-        if pwd.is_empty() {
-            println!("  Password cannot be empty.");
+fn interactive_command_uses_node(cmd: &str) -> bool {
+    matches!(
+        cmd,
+        "status"
+            | "balance"
+            | "bal"
+            | "receive"
+            | "recv"
+            | "recieve"
+            | "faucet"
+            | "test-mint"
+            | "send"
+            | "notifications"
+            | "notifs"
+    )
+}
+
+async fn wait_for_node_rpc(cli: &Cli, timeout: std::time::Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if rpc_call(rpc_port(cli), &json!({"method": "node_info"}))
+            .await
+            .map(|resp| resp["ok"] == true)
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
+
+async fn wallet_loaded_in_node(cli: &Cli) -> bool {
+    rpc_call(rpc_port(cli), &json!({"method": "node_info"}))
+        .await
+        .map(|resp| resp["ok"] == true && resp["bitcoin_receive_address"].as_str().is_some())
+        .unwrap_or(false)
+}
+
+enum WalletOpenChoice {
+    Existing(PathBuf),
+    CreateOrRecover,
+    Skip,
+}
+
+fn prompt_wallet_tag_destination() -> Result<(PathBuf, String)> {
+    loop {
+        let name = prompt("Enter this wallet's VessTag (e.g. +alice): ")?;
+        let name = match normalize_wallet_tag_name(&name) {
+            Ok(name) => name,
+            Err(e) => {
+                println!("Invalid VessTag: {e}");
+                continue;
+            }
+        };
+        let path = match named_wallet_path(&name) {
+            Ok(path) => path,
+            Err(e) => {
+                println!("Invalid wallet filename: {e}");
+                continue;
+            }
+        };
+        if path.exists() {
+            println!(
+                "A wallet for {} already exists. Choose another tag.",
+                wallet_display_name(&name)
+            );
             continue;
         }
-        let pwd2 = prompt_password("  Confirm password: ")?;
-        if pwd != pwd2 {
-            println!("  Passwords don't match. Try again.\n");
-            continue;
+        return Ok((path, name));
+    }
+}
+
+fn resolve_wizard_wallet_destination(
+    wallet_path: Option<&PathBuf>,
+    wallet_name: Option<&str>,
+) -> Result<(PathBuf, Option<String>)> {
+    match wallet_path {
+        Some(wallet_path) => Ok((
+            wallet_path.clone(),
+            wallet_name.map(normalize_wallet_tag_name).transpose()?,
+        )),
+        None => {
+            if let Some(wallet_name) = wallet_name {
+                let wallet_name = normalize_wallet_tag_name(wallet_name)?;
+                Ok((named_wallet_path(&wallet_name)?, Some(wallet_name)))
+            } else {
+                let (wallet_path, wallet_name) = prompt_wallet_tag_destination()?;
+                Ok((wallet_path, Some(wallet_name)))
+            }
         }
-        break pwd;
+    }
+}
+
+fn print_local_wallets(wallets: &[WalletDescriptor]) {
+    if wallets.is_empty() {
+        println!("No local wallets found.");
+        return;
+    }
+    println!("Local wallets:");
+    for (idx, wallet) in wallets.iter().enumerate() {
+        let kind = if wallet.legacy_default {
+            "legacy default"
+        } else {
+            "named"
+        };
+        println!(
+            "  [{}] {} ({}) — {}",
+            idx + 1,
+            wallet_display_name(&wallet.name),
+            kind,
+            wallet.path.display()
+        );
+    }
+}
+
+fn prompt_wallet_open_choice(wallets: &[WalletDescriptor]) -> Result<WalletOpenChoice> {
+    if wallets.len() == 1 {
+        let wallet = &wallets[0];
+        println!("Found wallet: {}", wallet_display_name(&wallet.name));
+        let answer = prompt("Unlock this wallet now? [Y/n/new]: ")?;
+        return match answer.trim().to_ascii_lowercase().as_str() {
+            "n" | "no" | "skip" => Ok(WalletOpenChoice::Skip),
+            "new" | "create" | "recover" => Ok(WalletOpenChoice::CreateOrRecover),
+            _ => Ok(WalletOpenChoice::Existing(wallet.path.clone())),
+        };
+    }
+
+    print_local_wallets(wallets);
+    println!("  [N] Create or recover another VessTag wallet");
+    println!("  [S] Skip wallet unlock");
+    loop {
+        let answer = prompt("Choose wallet to open: ")?;
+        let answer = answer.trim();
+        if matches!(answer.to_ascii_lowercase().as_str(), "s" | "skip" | "n/a") {
+            return Ok(WalletOpenChoice::Skip);
+        }
+        if matches!(
+            answer.to_ascii_lowercase().as_str(),
+            "n" | "new" | "create" | "recover"
+        ) {
+            return Ok(WalletOpenChoice::CreateOrRecover);
+        }
+        match answer.parse::<usize>() {
+            Ok(index) if (1..=wallets.len()).contains(&index) => {
+                return Ok(WalletOpenChoice::Existing(wallets[index - 1].path.clone()))
+            }
+            _ => println!("Enter a wallet number, N for new/recover, or S to skip."),
+        }
+    }
+}
+
+async fn cmd_unlock_wallet_at_path(
+    cli: &Cli,
+    wallet_file: &Path,
+    password: Option<String>,
+) -> Result<()> {
+    if !wallet_file.exists() {
+        anyhow::bail!(
+            "wallet not found at {}; create or recover one first",
+            wallet_file.display()
+        );
+    }
+
+    if !wait_for_node_rpc(cli, std::time::Duration::from_secs(20)).await {
+        anyhow::bail!(
+            "local node RPC is not ready yet; open Vess interactively or run `vess node --rpc-port {}`",
+            rpc_port(cli)
+        );
+    }
+
+    let password = match password {
+        Some(password) => password,
+        None => prompt_password("Enter wallet password: ")?,
     };
-    let mut wf = WalletFile::load(wallet_path)?;
-    wf.set_password_cache(raw_seed, &password)?;
-    wf.save(wallet_path)?;
-    println!("  Password set ✓\n");
-    Ok(password)
+    let resp = rpc_call(
+        rpc_port(cli),
+        &json!({
+            "method": "wallet_unlock",
+            "password": password,
+            "wallet_path": wallet_file.display().to_string(),
+        }),
+    )
+    .await?;
+
+    if resp["ok"] != true {
+        anyhow::bail!(
+            "{}",
+            resp["error"].as_str().unwrap_or("wallet unlock failed")
+        );
+    }
+    set_active_wallet_path(wallet_file)?;
+
+    if cli.json {
+        println!("{resp}");
+    } else {
+        println!("Wallet unlocked on the running node.");
+        println!("Balance: {} Vess", resp["balance"]);
+        println!("Bills:   {}", resp["bill_count"]);
+    }
+
+    Ok(())
+}
+
+async fn ensure_wallet_layer(cli: &Cli) -> Result<()> {
+    if !wait_for_node_rpc(cli, std::time::Duration::from_secs(20)).await {
+        println!("Node is still starting; network discovery continues in the background.");
+        return Ok(());
+    }
+    if wallet_loaded_in_node(cli).await {
+        return Ok(());
+    }
+
+    if cli.wallet.is_none() && cli.wallet_name.is_none() {
+        let wallets = list_wallets()?;
+        if wallets.is_empty() {
+            println!("No local wallets found. The node is already running without a wallet.");
+            let answer = prompt("Create or recover a wallet now? [Y/n]: ")?;
+            if matches!(answer.trim().to_ascii_lowercase().as_str(), "n" | "no") {
+                return Ok(());
+            }
+            let (wallet_file, password) = first_run_wizard(None, None).await?;
+            cmd_unlock_wallet_at_path(cli, &wallet_file, Some(password)).await?;
+            return Ok(());
+        }
+
+        match prompt_wallet_open_choice(&wallets)? {
+            WalletOpenChoice::Skip => return Ok(()),
+            WalletOpenChoice::CreateOrRecover => {
+                let (wallet_file, password) = first_run_wizard(None, None).await?;
+                cmd_unlock_wallet_at_path(cli, &wallet_file, Some(password)).await?;
+                return Ok(());
+            }
+            WalletOpenChoice::Existing(wallet_file) => {
+                cmd_unlock_wallet_at_path(cli, &wallet_file, None).await?;
+                return Ok(());
+            }
+        }
+    }
+
+    let wallet_file = wallet_path(cli)?;
+    if !wallet_file.exists() {
+        println!(
+            "Selected wallet not found at {}. The node is already running without a wallet.",
+            wallet_file.display()
+        );
+        let answer = prompt("Create or recover a wallet now? [Y/n]: ")?;
+        if matches!(answer.trim().to_ascii_lowercase().as_str(), "n" | "no") {
+            return Ok(());
+        }
+        let (created_wallet_file, password) =
+            first_run_wizard(Some(&wallet_file), cli.wallet_name.as_deref()).await?;
+        cmd_unlock_wallet_at_path(cli, &created_wallet_file, Some(password)).await?;
+        return Ok(());
+    }
+
+    let answer = prompt("Unlock wallet on the running node now? [Y/n]: ")?;
+    if matches!(answer.trim().to_ascii_lowercase().as_str(), "n" | "no") {
+        return Ok(());
+    }
+    cmd_unlock_wallet_at_path(cli, &wallet_file, None).await
 }
 
 /// Interactive first-run wizard: creates or recovers a wallet, sets an
-/// unlock password, and returns that password so the caller can pass it
-/// to the background node process.
-async fn first_run_wizard(wallet_path: &PathBuf) -> Result<String> {
+/// unlock password, and returns that password so the caller can unlock
+/// the wallet into the already-running node.
+async fn first_run_wizard(
+    wallet_path: Option<&PathBuf>,
+    wallet_name: Option<&str>,
+) -> Result<(PathBuf, String)> {
     println!();
     println!("  ╔══════════════════════════════════════╗");
     println!("  ║  Welcome to Vess — first-time setup  ║");
@@ -1695,9 +2261,9 @@ async fn first_run_wizard(wallet_path: &PathBuf) -> Result<String> {
 
     let choice = prompt("Your choice [1/2]: ")?;
 
-    let raw_seed: [u8; 64] = match choice.trim() {
-        "2" => wizard_recover(wallet_path).await?,
-        _ => wizard_new(wallet_path).await?,
+    let (wallet_path, raw_seed): (PathBuf, [u8; 64]) = match choice.trim() {
+        "2" => wizard_recover(wallet_path, wallet_name).await?,
+        _ => wizard_new(wallet_path, wallet_name).await?,
     };
 
     // Now set a quick-unlock password (raw_seed still in scope — no re-prompt).
@@ -1718,44 +2284,54 @@ async fn first_run_wizard(wallet_path: &PathBuf) -> Result<String> {
         break pwd;
     };
 
-    let mut wf = WalletFile::load(wallet_path)?;
+    let mut wf = WalletFile::load(&wallet_path)?;
     wf.set_password_cache(&raw_seed, &password)?;
-    wf.save(wallet_path)?;
+    wf.save(&wallet_path)?;
     println!("  Password set ✓\n");
-    Ok(password)
+    Ok((wallet_path, password))
 }
 
 /// Wizard sub-flow: create a brand new wallet. Returns the raw_seed so the
 /// caller can set up a password without asking for the phrase again.
-async fn wizard_new(wallet_path: &PathBuf) -> Result<[u8; 64]> {
+async fn wizard_new(
+    wallet_path: Option<&PathBuf>,
+    wallet_name: Option<&str>,
+) -> Result<(PathBuf, [u8; 64])> {
     println!();
     println!("── New Wallet Setup ─────────────────────────────────────");
 
-    let tag_str = loop {
-        let t = prompt("Choose a +tag for your wallet (e.g. alice): ")?;
-        let t = t.trim_start_matches('+').trim().to_string();
-        if t.is_empty() {
-            println!("Tag cannot be empty.");
-            continue;
+    let (wallet_path, wallet_name) = resolve_wizard_wallet_destination(wallet_path, wallet_name)?;
+
+    let tag_str = if let Some(wallet_name) = wallet_name {
+        println!(
+            "Using {} as this wallet's VessTag.",
+            wallet_display_name(&wallet_name)
+        );
+        wallet_name
+    } else {
+        loop {
+            let t = prompt("Choose a +tag for your wallet (e.g. alice): ")?;
+            match normalize_wallet_tag_name(&t) {
+                Ok(tag) => break tag,
+                Err(e) => {
+                    println!("Invalid VessTag: {e}");
+                    continue;
+                }
+            }
         }
-        break t;
     };
 
     // Check tag availability before doing the expensive PoW.
     println!("Checking if +{tag_str} is available…");
     let peers = discover_peers().await?;
-    let target = peers[0];
-    let vess_node = VessNode::spawn().await?;
-    vess_node.wait_online().await;
-
-    let lookup = PulseMessage::TagLookup(TagLookup {
-        tag_hash: *blake3::hash(tag_str.as_bytes()).as_bytes(),
-        nonce: rand::random(),
-    });
-    let resp = vess_node.send_message_with_response(target, &lookup).await?;
-    if matches!(&resp, Some(PulseMessage::TagLookupResponse(tlr)) if tlr.result.is_some()) {
-        vess_node.shutdown().await;
-        anyhow::bail!("+{tag_str} is already taken. Run `vess start` again and pick another tag.");
+    let node = MeshPulseNode::spawn().await?;
+    node.wait_online().await;
+    let display_tag = format!("+{tag_str}");
+    let (is_taken, target) =
+        lookup_tag_on_reachable_peer(&node, &peers, &tag_str, &display_tag).await?;
+    if is_taken {
+        node.shutdown().await;
+        anyhow::bail!("+{tag_str} is already taken. Pick another tag and try again.");
     }
     println!("+{tag_str} is available!");
 
@@ -1767,6 +2343,7 @@ async fn wizard_new(wallet_path: &PathBuf) -> Result<[u8; 64]> {
     let spend_seed = spend_seed_from_raw_seed(&raw_seed);
     let encrypted = encrypt_secrets(&secret, &enc_key)?;
     let mut wallet = WalletFile::new(address, encrypted, BillFold::new(), spend_seed, &enc_key)?;
+    wallet.name = Some(tag_str.clone());
 
     // Compute tag PoW and register.
     println!("\nComputing proof-of-work for tag registration (~10 s, 2 GiB RAM)…");
@@ -1805,47 +2382,50 @@ async fn wizard_new(wallet_path: &PathBuf) -> Result<[u8; 64]> {
         registrant_vk,
         signature,
     });
-    vess_node.send_message(target, &msg).await?;
-    vess_node.shutdown().await;
+    node.send_message(&target, &msg).await?;
+    node.shutdown().await;
     println!("+{tag_str} registered!");
 
     // Display recovery phrase and require confirmation before saving.
     println!();
     println!("  ╔═══════════════════════════════════════════════════════════════╗");
-    println!("  ║  YOUR RECOVERY PHRASE — WRITE THIS DOWN NOW!                 ║");
-    println!("  ╠═══════════════════════════════════════════════════════════════╣");
-    println!("  ║  {}  ║", phrase.display_phrase());
+    println!("  ║  YOUR 12-WORD RECOVERY PHRASE — WRITE THIS DOWN NOW!         ║");
     println!("  ╚═══════════════════════════════════════════════════════════════╝");
+    println!("  {}", phrase.display_phrase());
     println!();
     println!("  This is the ONLY way to recover your wallet if you lose your password.");
     println!("  Store it offline — paper, not a screenshot.\n");
 
     loop {
-        let words_in = prompt("  Re-enter your 5 words to confirm you saved them: ")?;
-        let pin_in = prompt("  Re-enter your PIN: ")?;
-        let words_ok = words_in.split_whitespace().collect::<Vec<_>>() == phrase.words;
-        let pin_ok = pin_in.trim() == phrase.pin;
-        if words_ok && pin_ok {
+        let words_in = prompt("  Re-enter your 12-word phrase to confirm you saved it: ")?;
+        let phrase_ok = RecoveryPhrase::from_input(&words_in)
+            .map(|entered| entered == phrase)
+            .unwrap_or(false);
+        if phrase_ok {
             println!("  Recovery phrase confirmed ✓\n");
             break;
         }
         println!("  That doesn't match. Please try again.\n");
     }
 
-    wallet.save(wallet_path)?;
-    Ok(raw_seed)
+    wallet.save(&wallet_path)?;
+    Ok((wallet_path, raw_seed))
 }
 
-/// Wizard sub-flow: recover wallet from recovery phrase + PIN.
+/// Wizard sub-flow: recover wallet from a 12-word recovery phrase.
 /// Returns the raw_seed so the caller can set up a password without
 /// asking for the phrase a second time.
-async fn wizard_recover(wallet_path: &PathBuf) -> Result<[u8; 64]> {
+async fn wizard_recover(
+    wallet_path: Option<&PathBuf>,
+    wallet_name: Option<&str>,
+) -> Result<(PathBuf, [u8; 64])> {
     println!();
     println!("── Wallet Recovery ─────────────────────────────────────");
 
-    let words = prompt("Enter your 5 recovery words (space-separated): ")?;
-    let pin = prompt("Enter your 5-digit PIN: ")?;
-    let phrase = RecoveryPhrase::from_input(&words, &pin)?;
+    let (wallet_path, wallet_name) = resolve_wizard_wallet_destination(wallet_path, wallet_name)?;
+
+    let words = prompt("Enter your 12-word recovery phrase: ")?;
+    let phrase = RecoveryPhrase::from_input(&words)?;
 
     let (secret, address) = recover_master_keys(&phrase)?;
     let raw_seed = derive_raw_seed(&phrase)?;
@@ -1854,35 +2434,16 @@ async fn wizard_recover(wallet_path: &PathBuf) -> Result<[u8; 64]> {
     let encrypted = encrypt_secrets(&secret, &enc_key)?;
 
     let mut billfold = if wallet_path.exists() {
-        WalletFile::load(wallet_path)?.billfold
+        WalletFile::load(&wallet_path)?.billfold
     } else {
         BillFold::new()
     };
 
     println!("\nConnecting to the network to recover your bills…");
-    let node = VessNode::spawn().await?;
+    let node = MeshPulseNode::spawn().await?;
     node.wait_online().await;
 
-    let peers = discover_peers().await?;
-    let bootstrap_target = peers[0];
-    let mut targets: Vec<iroh::EndpointId> = vec![bootstrap_target];
-
-    let pe_msg = PulseMessage::PeerExchange(vess_protocol::PeerExchange {
-        sender_id: vec![0u8; 32],
-    });
-    if let Ok(Some(PulseMessage::PeerExchangeResponse(resp))) =
-        node.send_message_with_response(bootstrap_target, &pe_msg).await
-    {
-        for pb in &resp.peers {
-            if let Ok(arr) = <[u8; 32]>::try_from(pb.as_slice()) {
-                if let Ok(eid) = iroh::EndpointId::from_bytes(&arr) {
-                    if !targets.contains(&eid) {
-                        targets.push(eid);
-                    }
-                }
-            }
-        }
-    }
+    let targets = discover_recovery_targets(&node).await?;
     println!("  Using {} peer(s) for manifest fetch", targets.len());
 
     let manifest_key = vess_foundry::seal::manifest_dht_key(&spend_seed);
@@ -1892,7 +2453,7 @@ async fn wizard_recover(wallet_path: &PathBuf) -> Result<[u8; 64]> {
 
     let mut manifest_entries = Vec::new();
     let mut manifest_found = false;
-    for &peer in &targets {
+    for peer in &targets {
         if let Ok(Some(PulseMessage::ManifestRecoverResponse(mrr))) =
             node.send_message_with_response(peer, &manifest_req).await
         {
@@ -1912,10 +2473,9 @@ async fn wizard_recover(wallet_path: &PathBuf) -> Result<[u8; 64]> {
     let mut max_dht_index = 0u64;
     if manifest_found && !manifest_entries.is_empty() {
         let mint_ids: Vec<[u8; 32]> = manifest_entries.iter().map(|e| e.mint_id).collect();
-        let fetch_req =
-            PulseMessage::OwnershipFetch(vess_protocol::OwnershipFetch { mint_ids });
+        let fetch_req = PulseMessage::OwnershipFetch(vess_protocol::OwnershipFetch { mint_ids });
         let mut fetched = Vec::new();
-        for &peer in &targets {
+        for peer in &targets {
             if let Ok(Some(PulseMessage::OwnershipFetchResponse(ofr))) =
                 node.send_message_with_response(peer, &fetch_req).await
             {
@@ -1963,30 +2523,11 @@ async fn wizard_recover(wallet_path: &PathBuf) -> Result<[u8; 64]> {
     node.shutdown().await;
 
     let mut wallet = WalletFile::new(address, encrypted, billfold, spend_seed, &enc_key)?;
+    wallet.name = wallet_name;
     wallet.next_dht_index = max_dht_index;
-    wallet.save(wallet_path)?;
+    wallet.save(&wallet_path)?;
     println!("  Wallet saved ✓\n");
-    Ok(raw_seed)
-}
-
-// ── `vess stop` ──────────────────────────────────────────────────────
-async fn cmd_stop() -> Result<()> {
-    match read_node_pid() {
-        None => {
-            println!("No background Vess node is running (no PID file found).");
-        }
-        Some(pid) => {
-            if !is_pid_alive(pid) {
-                println!("Process {pid} is no longer running (stale PID file removed).");
-                clear_node_pid();
-            } else {
-                kill_pid(pid)?;
-                clear_node_pid();
-                println!("Vess node (PID {pid}) stopped.");
-            }
-        }
-    }
-    Ok(())
+    Ok((wallet_path, raw_seed))
 }
 
 // ── `vess status` ────────────────────────────────────────────────────
@@ -2009,190 +2550,78 @@ async fn cmd_status(cli: &Cli) -> Result<()> {
     };
 
     if !running {
-        println!("Run `vess start` to start the node.");
+        if cli.json {
+            println!("{}", json!({ "ok": true, "running": false }));
+            return Ok(());
+        }
+        println!("No Vess node is registered for this CLI session.");
+        println!("Open Vess interactively, or run `vess node --rpc-port {port}` in another shell.");
         return Ok(());
     }
 
+    let mut balance = None;
+    let mut bill_count = None;
     // Try RPC for live stats.
     if let Ok(resp) = rpc_call(port, &json!({"method": "balance"})).await {
         if resp["ok"] == true {
-            println!("Balance: {} Vess  ({} bills)", resp["balance"], resp["bill_count"]);
+            balance = resp["balance"].as_u64();
+            bill_count = resp["bill_count"].as_u64();
         }
     }
 
     if let Ok(resp) = rpc_call(port, &json!({"method": "node_info"})).await {
         if resp["ok"] == true {
+            if cli.json {
+                println!(
+                    "{}",
+                    json!({
+                        "ok": true,
+                        "running": true,
+                        "balance": balance,
+                        "bill_count": bill_count,
+                        "verified_peer_count": resp["verified_peer_count"],
+                        "node_id": resp["node_id"],
+                        "node_contact": resp["node_contact"],
+                        "bitcoin_receive_address": resp["bitcoin_receive_address"],
+                        "bitcoin_tracked_balance": resp["bitcoin_tracked_balance"],
+                        "bitcoin_pending_burns": resp["bitcoin_pending_burns"],
+                        "bitcoin_connected_peers": resp["bitcoin_connected_peers"],
+                    })
+                );
+                return Ok(());
+            }
+
+            if let (Some(balance), Some(bill_count)) = (balance, bill_count) {
+                println!("Balance: {} Vess  ({} bills)", balance, bill_count);
+            }
             println!("Peers:   {}", resp["verified_peer_count"]);
             println!("Node ID: {}", resp["node_id"].as_str().unwrap_or("?"));
+            println!(
+                "Mesh contact: {}",
+                resp["node_contact"].as_str().unwrap_or("?")
+            );
+            if let Some(address) = resp["bitcoin_receive_address"].as_str() {
+                println!("BTC receive: {}", address);
+            }
+            if let Some(tracked_balance) = resp["bitcoin_tracked_balance"].as_u64() {
+                println!("BTC tracked: {} sats", tracked_balance);
+            }
+            println!("BTC pending burns: {}", resp["bitcoin_pending_burns"]);
+            println!("BTC peers: {}", resp["bitcoin_connected_peers"]);
         }
+    }
+
+    if cli.json {
+        println!("{}", json!({ "ok": true, "running": true }));
+        return Ok(());
     }
 
     println!();
     println!("  `vess balance`       — check balance");
+    println!("  `vess receive`       — show BTC receive address + QR");
     println!("  `vess send <n> <+tag>` — send Vess");
-    println!("  `vess stop`          — stop the node");
+    println!("  `vess notifications --follow` — watch BTC -> Vess bridge events");
     Ok(())
-}
-
-// ── Windows: minimize-to-tray ────────────────────────────────────────────────
-#[cfg(windows)]
-mod sys_tray {
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    /// Set by the ctrl handler the moment the user clicks X.
-    /// Used by the REPL's stdin-EOF handler to enter tray-only mode instead of
-    /// exiting — because on modern Windows conhost destroys the console even
-    /// when the ctrl handler returns TRUE (though the PROCESS stays alive).
-    pub static IN_TRAY_MODE: AtomicBool = AtomicBool::new(false);
-
-    pub enum TrayCmd {
-        OpenConsole,
-        StopNode,
-        Exit,
-    }
-
-    /// Hide the console window (best-effort; may beat conhost's destroy).
-    pub fn hide_console() {
-        unsafe {
-            let hwnd = windows_sys::Win32::System::Console::GetConsoleWindow();
-            if !hwnd.is_null() {
-                windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow(
-                    hwnd,
-                    windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE,
-                );
-            }
-        }
-    }
-
-    /// Show and bring the console window to the foreground.
-    pub fn show_console() {
-        unsafe {
-            let hwnd = windows_sys::Win32::System::Console::GetConsoleWindow();
-            if !hwnd.is_null() {
-                windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow(
-                    hwnd,
-                    windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOW,
-                );
-                windows_sys::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
-            }
-        }
-    }
-
-    /// True if the console window still exists (hidden or visible).
-    pub fn console_alive() -> bool {
-        unsafe { !windows_sys::Win32::System::Console::GetConsoleWindow().is_null() }
-    }
-
-    unsafe extern "system" fn ctrl_handler(
-        ctrl_type: u32,
-    ) -> windows_sys::Win32::Foundation::BOOL {
-        if ctrl_type == windows_sys::Win32::System::Console::CTRL_CLOSE_EVENT {
-            // Hide the window immediately — wins the race on some conhost versions.
-            hide_console();
-            // Flag that the process should stay alive as a tray-only process.
-            // The REPL's stdin-EOF path checks this and enters the tray loop.
-            IN_TRAY_MODE.store(true, Ordering::SeqCst);
-            return 1; // TRUE — suppress default process-termination
-        }
-        0
-    }
-
-    pub fn register_close_handler() {
-        unsafe {
-            windows_sys::Win32::System::Console::SetConsoleCtrlHandler(
-                Some(ctrl_handler),
-                1,
-            );
-        }
-    }
-
-    pub fn spawn_tray(cmd_tx: tokio::sync::mpsc::UnboundedSender<TrayCmd>) {
-        std::thread::spawn(move || run_tray_thread(cmd_tx));
-    }
-
-    fn run_tray_thread(cmd_tx: tokio::sync::mpsc::UnboundedSender<TrayCmd>) {
-        use tray_icon::{
-            menu::{Menu, MenuEvent, MenuItem},
-            Icon, MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent,
-        };
-        use windows_sys::Win32::UI::WindowsAndMessaging::{
-            DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
-        };
-
-        // 16×16 green-circle RGBA icon.
-        let mut px = vec![0u8; 16 * 16 * 4];
-        for y in 0i32..16 {
-            for x in 0i32..16 {
-                if (x - 8) * (x - 8) + (y - 8) * (y - 8) <= 49 {
-                    let i = ((y * 16 + x) as usize) * 4;
-                    px[i] = 0;
-                    px[i + 1] = 200;
-                    px[i + 2] = 80;
-                    px[i + 3] = 255;
-                }
-            }
-        }
-        let icon = match Icon::from_rgba(px, 16, 16) {
-            Ok(i) => i,
-            Err(_) => return,
-        };
-
-        let open_item = MenuItem::new("Open Vess", true, None);
-        let stop_item = MenuItem::new("Stop Node", true, None);
-        let exit_item = MenuItem::new("Exit Vess", true, None);
-        let open_id = open_item.id().clone();
-        let stop_id = stop_item.id().clone();
-        let exit_id = exit_item.id().clone();
-
-        let menu = Menu::new();
-        let _ = menu.append(&open_item);
-        let _ = menu.append(&stop_item);
-        let _ = menu.append(&exit_item);
-
-        let _tray = match TrayIconBuilder::new()
-            .with_tooltip("Vess — Node Running")
-            .with_icon(icon)
-            .with_menu(Box::new(menu))
-            .build()
-        {
-            Ok(t) => t,
-            Err(_) => return,
-        };
-
-        loop {
-            // Left-click → open console.
-            while let Ok(event) = TrayIconEvent::receiver().try_recv() {
-                if let TrayIconEvent::Click {
-                    button: MouseButton::Left,
-                    button_state: MouseButtonState::Up,
-                    ..
-                } = event
-                {
-                    let _ = cmd_tx.send(TrayCmd::OpenConsole);
-                }
-            }
-
-            while let Ok(event) = MenuEvent::receiver().try_recv() {
-                if event.id == open_id {
-                    let _ = cmd_tx.send(TrayCmd::OpenConsole);
-                } else if event.id == stop_id {
-                    let _ = cmd_tx.send(TrayCmd::StopNode);
-                } else if event.id == exit_id {
-                    let _ = cmd_tx.send(TrayCmd::Exit);
-                }
-            }
-
-            unsafe {
-                let mut msg: MSG = std::mem::zeroed();
-                while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
-                    TranslateMessage(&msg);
-                    DispatchMessageW(&msg);
-                }
-            }
-
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-    }
 }
 
 // ── Interactive (double-click / no-subcommand) mode ──────────────────────────
@@ -2205,9 +2634,21 @@ async fn cmd_interactive(cli: &Cli) -> Result<()> {
     println!("╚══════════════════════════════════════╝");
     println!();
 
-    // Auto-start node on launch (handles first-run wizard, password, etc.).
-    if let Err(e) = cmd_start(cli).await {
-        println!("Warning: could not start node: {e}");
+    // Every interactive CLI owns its own node process. The node starts before
+    // wallet entry and is stopped automatically when this CLI exits.
+    let active_node = std::sync::Arc::new(std::sync::Mutex::new(None));
+    install_interactive_node_signal_handler(active_node.clone());
+    let mut node_guard = match spawn_interactive_node(cli, active_node.clone()).await {
+        Ok(guard) => Some(guard),
+        Err(e) => {
+            println!("Warning: could not start this CLI's node: {e}");
+            None
+        }
+    };
+    if node_guard.is_some() {
+        if let Err(e) = ensure_wallet_layer(cli).await {
+            println!("Warning: wallet layer not loaded: {e}");
+        }
     }
     println!();
 
@@ -2230,27 +2671,9 @@ async fn cmd_interactive(cli: &Cli) -> Result<()> {
     println!("Type 'help' for commands, 'exit' to quit.");
     println!();
 
-    // Windows: intercept the close-button → hide to tray. Spawn tray icon.
-    // Skip if we're a child process spawned by the tray to show a fresh REPL
-    // (the parent process already owns the tray icon).
-    #[cfg(windows)]
-    let (mut tray_rx, has_tray) = {
-        if std::env::var_os("VESS_TRAY_CHILD").is_some() {
-            let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<sys_tray::TrayCmd>();
-            (rx, false)
-        } else {
-            sys_tray::register_close_handler();
-            let (tray_tx, tray_rx) =
-                tokio::sync::mpsc::unbounded_channel::<sys_tray::TrayCmd>();
-            sys_tray::spawn_tray(tray_tx);
-            (tray_rx, true)
-        }
-    };
-
-    // Read stdin on a blocking thread so the async loop can also handle tray
-    // commands while blocked waiting for keyboard input.
-    let (stdin_tx, mut stdin_rx) =
-        tokio::sync::mpsc::unbounded_channel::<Option<String>>();
+    // Read stdin on a blocking thread so the async loop is not blocked waiting
+    // for keyboard input.
+    let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::unbounded_channel::<Option<String>>();
     std::thread::spawn(move || {
         let stdin = std::io::stdin();
         for line in stdin.lock().lines() {
@@ -2268,65 +2691,16 @@ async fn cmd_interactive(cli: &Cli) -> Result<()> {
         }
     });
 
-    // `tray_exit` is set when the user clicked X and we should enter the
-    // tray-only wait loop after the REPL loop ends.
-    let mut tray_exit = false;
-
     loop {
         print!("vess> ");
         std::io::stdout().flush().ok();
 
         let line_str: String;
-
-        #[cfg(windows)]
-        {
-            use std::sync::atomic::Ordering;
-            let sel = tokio::select! {
-                opt = stdin_rx.recv() => {
-                    match opt.flatten() {
-                        Some(l) => Some(l),
-                        None => {
-                            // stdin EOF.  On modern Windows, conhost destroys the
-                            // console even when our ctrl handler returned TRUE, making
-                            // stdin close.  If IN_TRAY_MODE is set the process is still
-                            // alive and should keep the tray icon — switch to tray-only.
-                            if sys_tray::IN_TRAY_MODE.load(Ordering::SeqCst) {
-                                tray_exit = true;
-                            }
-                            break;
-                        }
-                    }
-                }
-                cmd = tray_rx.recv() => {
-                    match cmd {
-                        Some(sys_tray::TrayCmd::OpenConsole) => {
-                            sys_tray::show_console();
-                        }
-                        Some(sys_tray::TrayCmd::StopNode) => {
-                            let _ = cmd_stop().await;
-                        }
-                        Some(sys_tray::TrayCmd::Exit) | None => {
-                            let _ = cmd_stop().await;
-                            std::process::exit(0);
-                        }
-                    }
-                    None // tray cmd handled — re-prompt
-                }
-            };
-            match sel {
-                Some(l) => line_str = l,
-                None => continue,
-            }
-        }
-
-        #[cfg(not(windows))]
-        {
-            match stdin_rx.recv().await.flatten() {
-                Some(l) => line_str = l,
-                None => {
-                    println!();
-                    return Ok(());
-                }
+        match stdin_rx.recv().await.flatten() {
+            Some(l) => line_str = l,
+            None => {
+                println!();
+                break;
             }
         }
 
@@ -2339,6 +2713,16 @@ async fn cmd_interactive(cli: &Cli) -> Result<()> {
         let cmd = parts.next().unwrap_or("");
         let args: Vec<&str> = parts.collect();
 
+        if interactive_command_uses_node(cmd) {
+            if let Err(e) =
+                restart_interactive_node_if_needed(cli, active_node.clone(), &mut node_guard).await
+            {
+                println!("Error: {e}");
+                println!();
+                continue;
+            }
+        }
+
         let result: Result<()> = match cmd {
             "exit" | "quit" | "q" => {
                 println!("Goodbye.");
@@ -2348,10 +2732,28 @@ async fn cmd_interactive(cli: &Cli) -> Result<()> {
                 print_interactive_help();
                 Ok(())
             }
-            "start" => cmd_start(cli).await,
-            "stop" => cmd_stop().await,
             "status" => cmd_status(cli).await,
+            "wallets" => {
+                let wallets = list_wallets()?;
+                print_local_wallets(&wallets);
+                Ok(())
+            }
             "balance" | "bal" => cmd_balance(cli).await,
+            "receive" | "recv" | "recieve" => cmd_receive(cli).await,
+            "faucet" | "test-mint" => {
+                if args.is_empty() {
+                    println!("Usage: faucet <amount>");
+                    Ok(())
+                } else {
+                    match args[0].parse::<u64>() {
+                        Ok(amount) => cmd_faucet(cli, amount).await,
+                        Err(_) => {
+                            println!("Invalid amount — must be a whole number.");
+                            Ok(())
+                        }
+                    }
+                }
+            }
             "send" => {
                 if args.len() < 2 {
                     println!("Usage: send <amount> <+tag>");
@@ -2366,11 +2768,17 @@ async fn cmd_interactive(cli: &Cli) -> Result<()> {
                     }
                 }
             }
-            "mint" => cmd_mint(cli, false, false).await,
             "notifications" | "notifs" => cmd_notifications(cli, false, 1_000, 64).await,
             _ => {
+                if matches!(cmd, "start" | "stop") {
+                    println!(
+                        "`{cmd}` is no longer a CLI command. This CLI now manages its node automatically."
+                    );
+                    Ok(())
+                } else {
                 println!("Unknown command '{cmd}'. Type 'help' for a list.");
-                Ok(())
+                    Ok(())
+                }
             }
         };
 
@@ -2380,51 +2788,87 @@ async fn cmd_interactive(cli: &Cli) -> Result<()> {
         println!();
     }
 
-    // Windows: if we exited the REPL because the user closed the console window,
-    // keep the process alive in tray-only mode.  The node keeps running; the user
-    // can reopen the console via the tray icon.
-    #[cfg(windows)]
-    if tray_exit && has_tray {
-        loop {
-            match tray_rx.recv().await {
-                Some(sys_tray::TrayCmd::OpenConsole) => {
-                    if sys_tray::console_alive() {
-                        // Console was only hidden (SW_HIDE won the race) — show it.
-                        sys_tray::show_console();
-                    } else {
-                        // Console was truly destroyed by conhost.
-                        // Spawn a fresh vess.exe child that will connect to the
-                        // already-running node and show a REPL.
-                        if let Ok(exe) = std::env::current_exe() {
-                            let _ = std::process::Command::new(exe)
-                                .env("VESS_TRAY_CHILD", "1")
-                                .spawn();
-                        }
-                    }
-                }
-                Some(sys_tray::TrayCmd::StopNode) => {
-                    let _ = cmd_stop().await;
-                }
-                Some(sys_tray::TrayCmd::Exit) | None => {
-                    let _ = cmd_stop().await;
-                    std::process::exit(0);
-                }
-            }
-        }
-    }
-
+    drop(node_guard);
     Ok(())
 }
 
 fn print_interactive_help() {
     println!("Commands:");
-    println!("  start                  Start the background node");
-    println!("  stop                   Stop the background node");
-    println!("  status                 Show node status, balance & peer count");
+    println!("  status                 Show node status, Vess balance & BTC receive state");
+    println!("  wallets                List local VessTag wallets");
     println!("  balance                Show wallet balance");
+    println!("  receive                Show BTC receive address + QR code");
+    println!("  faucet <amount>        Add local-test bills (requires VESS_LOCAL_TEST_FAUCET=1)");
     println!("  send <amount> <+tag>   Send Vess to a recipient");
     println!("  notifications          Show recent payment notifications");
-    println!("  mint                   Start mining");
     println!("  help                   Show this help");
     println!("  exit                   Close Vess");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_cli_node_pool_dir(test_name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "vess-cli-node-pool-{test_name}-{:016x}",
+            rand::thread_rng().gen::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn reuses_existing_unleased_slot_before_creating_new_one() {
+        let base_dir = temp_cli_node_pool_dir("reuse-existing");
+        let busy_slot = base_dir.join("slot-0001");
+        let free_slot = base_dir.join("slot-0002");
+        std::fs::create_dir_all(&busy_slot).unwrap();
+        std::fs::create_dir_all(&free_slot).unwrap();
+
+        write_cli_node_lease(
+            &busy_slot.join("lease.json"),
+            &CliNodeLease {
+                owner_pid: 42,
+                node_pid: Some(420),
+                claimed_at_unix: 1,
+            },
+        )
+        .unwrap();
+
+        let slot = allocate_cli_node_slot_with(&base_dir, 1000, &|pid| pid == 42 || pid == 420)
+            .unwrap();
+        assert_eq!(slot.state_dir, free_slot);
+        assert_eq!(read_cli_node_lease(&slot.lease_path).unwrap().owner_pid, 1000);
+
+        release_cli_node_slot(&slot.lease_path);
+        let _ = std::fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn reclaims_stale_slot_lease_before_allocating_new_slot() {
+        let base_dir = temp_cli_node_pool_dir("reclaim-stale");
+        let stale_slot = base_dir.join("slot-0001");
+        std::fs::create_dir_all(&stale_slot).unwrap();
+
+        write_cli_node_lease(
+            &stale_slot.join("lease.json"),
+            &CliNodeLease {
+                owner_pid: 77,
+                node_pid: Some(770),
+                claimed_at_unix: 1,
+            },
+        )
+        .unwrap();
+
+        let slot = allocate_cli_node_slot_with(&base_dir, 2000, &|_| false).unwrap();
+        assert_eq!(slot.state_dir, stale_slot);
+
+        let lease = read_cli_node_lease(&slot.lease_path).unwrap();
+        assert_eq!(lease.owner_pid, 2000);
+        assert_eq!(lease.node_pid, None);
+
+        release_cli_node_slot(&slot.lease_path);
+        let _ = std::fs::remove_dir_all(base_dir);
+    }
 }

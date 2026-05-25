@@ -1,11 +1,11 @@
 //! DNS seed resolution for bootstrap peer discovery.
 //!
 //! Nodes query `_vess.<domain>` for TXT records containing bootstrap
-//! EndpointIds. Uses hickory-resolver for pure-Rust, cross-platform
+//! mesh contacts. Uses hickory-resolver for pure-Rust, cross-platform
 //! DNS resolution — no external binaries required.
 //!
 //! Expected TXT record format:
-//!   `_vess.example.com  TXT  "node=<base32_endpoint_id>"`
+//!   `_vess.example.com  TXT  "contact=<hex(compact MeshCarrierContact)>"`
 //!
 //! Multiple TXT records may be published for redundancy.
 
@@ -14,9 +14,8 @@ use hickory_resolver::proto::rr::RData;
 use hickory_resolver::TokioResolver;
 use tracing::info;
 
-/// Default DNS seed domain. Nodes query this automatically unless
-/// `--no-seed` is passed.
-pub const DEFAULT_SEED_DOMAIN: &str = "node.vess.network";
+use crate::mesh_contact::{decode_contact_bytes, encode_contact_bytes, encode_contact_string};
+use vess_mesh::{validate_public_mesh_contact, MeshCarrierContact};
 
 /// Name of the seeds file that lives alongside the artery state.
 pub const SEEDS_FILENAME: &str = "seeds.txt";
@@ -27,18 +26,23 @@ const DEFAULT_SEEDS_CONTENT: &str = "\
 # Nodes resolve _vess.<domain> TXT records at startup to find bootstrap peers.
 # Lines starting with # are comments. Blank lines are ignored.
 #
-# You can add community-run seed domains below the defaults.
-
-node.vess.network
+# Add one or more community-run seed domains below.
 ";
 
-/// Prefix inside each TXT record value that precedes the EndpointId.
-const NODE_PREFIX: &str = "node=";
+/// Prefix inside each TXT record value that precedes the serialized mesh contact.
+const CONTACT_PREFIX: &str = "contact=";
 
-/// Resolve DNS TXT records at `_vess.<domain>` and return the raw
-/// EndpointId strings found within.
+/// Encode a serialized mesh contact into the TXT-safe record format used by Vess DNS seeds.
+pub fn encode_seed_contact_record(contact: &MeshCarrierContact) -> Result<String> {
+    validate_public_mesh_contact(contact)?;
+    let contact_bytes = encode_contact_bytes(contact)?;
+    Ok(format!("{CONTACT_PREFIX}{}", hex_encode(&contact_bytes)))
+}
+
+/// Resolve DNS TXT records at `_vess.<domain>` and return serialized
+/// mesh contact strings found within.
 ///
-/// Records that do not start with `node=` are silently skipped so
+/// Records that do not start with `contact=` are silently skipped so
 /// that the TXT RRset can carry other metadata in the future.
 pub async fn resolve_seeds(domain: &str) -> Result<Vec<String>> {
     let lookup_name = format!("_vess.{domain}");
@@ -51,10 +55,38 @@ pub async fn resolve_seeds(domain: &str) -> Result<Vec<String>> {
     let mut peers = Vec::new();
     for txt in &records {
         let txt = txt.trim();
-        if let Some(id_str) = txt.strip_prefix(NODE_PREFIX) {
-            let id_str = id_str.trim();
-            if !id_str.is_empty() {
-                peers.push(id_str.to_string());
+        if let Some(contact_hex) = txt.strip_prefix(CONTACT_PREFIX) {
+            let contact_hex = contact_hex.trim();
+            if contact_hex.is_empty() {
+                continue;
+            }
+
+            let contact_bytes = match hex_decode(contact_hex) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    info!(dns = %lookup_name, %error, "skipping invalid DNS seed contact record");
+                    continue;
+                }
+            };
+
+            let contact = match decode_contact_bytes(&contact_bytes) {
+                Ok(contact) => contact,
+                Err(error) => {
+                    info!(dns = %lookup_name, %error, "skipping undecodable DNS seed contact");
+                    continue;
+                }
+            };
+
+            if let Err(error) = validate_public_mesh_contact(&contact) {
+                info!(dns = %lookup_name, %error, "skipping non-public DNS seed contact");
+                continue;
+            }
+
+            match encode_contact_string(&contact) {
+                Ok(contact_str) => peers.push(contact_str),
+                Err(error) => {
+                    info!(dns = %lookup_name, %error, "skipping unencodable DNS seed contact");
+                }
             }
         }
     }
@@ -92,13 +124,31 @@ async fn resolve_txt(name: &str) -> Result<Vec<String>> {
     Ok(records)
 }
 
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn hex_decode(value: &str) -> std::result::Result<Vec<u8>, String> {
+    if !value.len().is_multiple_of(2) {
+        return Err("odd-length hex string".to_string());
+    }
+
+    (0..value.len())
+        .step_by(2)
+        .map(|index| {
+            u8::from_str_radix(&value[index..index + 2], 16)
+                .map_err(|error| format!("invalid hex at offset {index}: {error}"))
+        })
+        .collect()
+}
+
 // ── Seeds file ─────────────────────────────────────────────────────
 
 /// Load DNS seed domains from `seeds.txt` in the given directory.
 ///
-/// If the file doesn't exist, it is created with sensible defaults
-/// (including `node.vess.network`). Users can add community seed
-/// domains by editing this file — it is read fresh on every startup.
+/// If the file doesn't exist, it is created with comments only. Users can
+/// add community seed domains by editing this file — it is read fresh on
+/// every startup.
 ///
 /// Format: one domain per line, `#` comments, blank lines ignored.
 pub fn load_seeds_file(state_dir: &std::path::Path) -> Vec<String> {
@@ -108,11 +158,11 @@ pub fn load_seeds_file(state_dir: &std::path::Path) -> Vec<String> {
     if !path.exists() {
         if let Err(e) = std::fs::create_dir_all(state_dir) {
             info!(error = %e, "could not create state dir for seeds.txt");
-            return vec![DEFAULT_SEED_DOMAIN.to_string()];
+            return Vec::new();
         }
         if let Err(e) = std::fs::write(&path, DEFAULT_SEEDS_CONTENT) {
             info!(error = %e, "could not write default seeds.txt");
-            return vec![DEFAULT_SEED_DOMAIN.to_string()];
+            return Vec::new();
         }
         info!(path = %path.display(), "created default seeds.txt");
     }
@@ -127,15 +177,11 @@ pub fn load_seeds_file(state_dir: &std::path::Path) -> Vec<String> {
                 .map(|l| l.to_string())
                 .collect();
             info!(count = seeds.len(), path = %path.display(), "loaded seeds.txt");
-            if seeds.is_empty() {
-                vec![DEFAULT_SEED_DOMAIN.to_string()]
-            } else {
-                seeds
-            }
+            seeds
         }
         Err(e) => {
-            info!(error = %e, "could not read seeds.txt — using default seed");
-            vec![DEFAULT_SEED_DOMAIN.to_string()]
+            info!(error = %e, "could not read seeds.txt");
+            Vec::new()
         }
     }
 }
@@ -143,31 +189,40 @@ pub fn load_seeds_file(state_dir: &std::path::Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vess_mesh::MeshCarrierContact;
 
     #[test]
-    fn parse_node_prefix() {
-        let txt = "node=abc123def456";
-        assert_eq!(txt.strip_prefix(NODE_PREFIX), Some("abc123def456"));
+    fn encode_seed_contact_round_trips() {
+        let (_, mesh_address) = vess_mesh::generate_mesh_keys_from_seed(&[7u8; 64], 1);
+        let contact = MeshCarrierContact::UdpSocket {
+            addr: "93.184.216.34:9444".to_string(),
+            mesh_address,
+        };
+
+        let txt = encode_seed_contact_record(&contact).unwrap();
+        let encoded = txt.trim().strip_prefix(CONTACT_PREFIX).unwrap();
+        let decoded = decode_contact_bytes(&hex_decode(encoded).unwrap()).unwrap();
+        assert_eq!(decoded, contact);
     }
 
     #[test]
-    fn skip_non_node_records() {
+    fn skip_non_contact_records() {
         let txt = "v=spf1 include:example.com ~all";
-        assert!(txt.strip_prefix(NODE_PREFIX).is_none());
+        assert!(txt.strip_prefix(CONTACT_PREFIX).is_none());
     }
 
     #[test]
     fn trim_whitespace() {
-        let txt = "  node=  abc123  ";
-        let id = txt.trim().strip_prefix(NODE_PREFIX).unwrap().trim();
-        assert_eq!(id, "abc123");
+        let txt = "  contact=  abcd  ";
+        let encoded = txt.trim().strip_prefix(CONTACT_PREFIX).unwrap().trim();
+        assert_eq!(encoded, "abcd");
     }
 
     #[test]
     fn load_seeds_file_creates_default() {
         let dir = tempfile::tempdir().unwrap();
         let seeds = load_seeds_file(dir.path());
-        assert!(seeds.contains(&DEFAULT_SEED_DOMAIN.to_string()));
+        assert!(seeds.is_empty());
         assert!(dir.path().join(SEEDS_FILENAME).exists());
     }
 
@@ -176,24 +231,24 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join(SEEDS_FILENAME),
-            "# comment\nnode.vess.network\ncustom.example.com\n\n",
+            "# comment\nseed-a.example.com\nseed-b.example.com\n\n",
         )
         .unwrap();
         let seeds = load_seeds_file(dir.path());
         assert_eq!(
             seeds,
             vec![
-                "node.vess.network".to_string(),
-                "custom.example.com".to_string(),
+                "seed-a.example.com".to_string(),
+                "seed-b.example.com".to_string(),
             ]
         );
     }
 
     #[test]
-    fn load_seeds_file_empty_falls_back() {
+    fn load_seeds_file_empty_returns_empty() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(SEEDS_FILENAME), "# only comments\n").unwrap();
         let seeds = load_seeds_file(dir.path());
-        assert_eq!(seeds, vec![DEFAULT_SEED_DOMAIN.to_string()]);
+        assert!(seeds.is_empty());
     }
 }

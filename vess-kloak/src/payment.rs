@@ -204,6 +204,7 @@ pub fn prepare_payment(
         created_at: now_unix(),
         bill_count,
         mailbox_key: Some(derive_mailbox_key(&recipient.spend_ek)),
+        direct_receipt_tag_hash: None,
     });
 
     Ok((msg, payment_id, selection.send_indices))
@@ -281,6 +282,7 @@ pub fn prepare_payment_with_transfer(
         created_at: timestamp,
         bill_count,
         mailbox_key: Some(derive_mailbox_key(&recipient.spend_ek)),
+        direct_receipt_tag_hash: None,
     });
 
     Ok((msg, payment_id, selection.send_indices))
@@ -340,6 +342,7 @@ pub fn prepare_payment_from_bills(
         created_at: timestamp,
         bill_count,
         mailbox_key: Some(derive_mailbox_key(&recipient.spend_ek)),
+        direct_receipt_tag_hash: None,
     });
 
     Ok((msg, payment_id))
@@ -350,8 +353,8 @@ pub fn prepare_payment_from_bills(
 /// Prepare a direct peer-to-peer payment (bypasses artery relay).
 ///
 /// Selects bills from the billfold, signs transfer authorizations, and
-/// builds a [`DirectPayment`] message that can be sent over a QUIC
-/// bi-stream to the recipient. The recipient verifies proofs inline.
+/// builds a [`DirectPayment`] message that can be sent over a direct
+/// mesh session to the recipient. The recipient verifies proofs inline.
 ///
 /// `recipient_stealth_id` is the receiver's stealth address identifier
 /// (e.g. derived from their `MasterStealthAddress` or exchanged out-of-band).
@@ -504,7 +507,11 @@ pub fn try_decrypt_transfer_payload(
 
     let tp = postcard::from_bytes::<TransferPayload>(&plaintext)
         .map_err(|e| anyhow!("stealth payload decrypted but not a valid TransferPayload: {e}"))?;
-    Ok(Some(DecryptedTransfer::WithAuth(tp, stealth_id, recovery_key)))
+    Ok(Some(DecryptedTransfer::WithAuth(
+        tp,
+        stealth_id,
+        recovery_key,
+    )))
 }
 
 /// Result of decrypting a stealth payload.
@@ -594,7 +601,7 @@ pub fn claim_transfer_bills(
         let encrypted_bill = {
             match recovery_key {
                 Some(key) => {
-                    use chacha20poly1305::{ChaCha20Poly1305, KeyInit, aead::Aead};
+                    use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, KeyInit};
                     // Derive a per-bill nonce from the key + mint_id so each bill
                     // within a multi-bill transfer has a unique nonce.
                     let nonce_bytes = {
@@ -610,7 +617,8 @@ pub fn claim_transfer_bills(
                     let bill_bytes = postcard::to_allocvec(&bill).unwrap_or_default();
                     let cipher = ChaCha20Poly1305::new((&key).into());
                     let nonce = chacha20poly1305::Nonce::from_slice(&nonce_bytes);
-                    cipher.encrypt(nonce, bill_bytes.as_ref())
+                    cipher
+                        .encrypt(nonce, bill_bytes.as_ref())
                         .unwrap_or_default()
                 }
                 None => {
@@ -672,7 +680,7 @@ pub fn build_genesis_messages(bills: &[(VessBill, Vec<u8>)], owner_vk: &[u8]) ->
                 owner_vk_hash,
                 owner_vk: owner_vk.to_vec(),
                 denomination_value: bill.denomination.value(),
-                proof: proof_bytes.clone(),
+                genesis_proof: vess_protocol::GenesisProof::Vess(proof_bytes.clone()),
                 digest: bill.digest,
                 hops_remaining: 6,
                 chain_depth: 0,

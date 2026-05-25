@@ -56,7 +56,11 @@ impl TagCache {
         } else {
             HashMap::new()
         };
-        Self { entries, path, dirty: false }
+        Self {
+            entries,
+            path,
+            dirty: false,
+        }
     }
 
     /// Look up a tag.  Updates `last_used` and marks the cache dirty.
@@ -142,11 +146,8 @@ impl TagCache {
 
     /// Returns an iterator over `(tag_str, entry)` pairs sorted by `last_used` descending.
     pub fn list_sorted(&self) -> Vec<(&str, &CachedTag)> {
-        let mut pairs: Vec<(&str, &CachedTag)> = self
-            .entries
-            .iter()
-            .map(|(k, v)| (k.as_str(), v))
-            .collect();
+        let mut pairs: Vec<(&str, &CachedTag)> =
+            self.entries.iter().map(|(k, v)| (k.as_str(), v)).collect();
         pairs.sort_by(|a, b| b.1.last_used.cmp(&a.1.last_used));
         pairs
     }

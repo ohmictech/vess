@@ -7,8 +7,9 @@
 //! - Encrypted spend seed (protected by recovery-phrase-derived key).
 //! - Encrypted spend credentials (ML-DSA-65 signing keys for each bill).
 //! - Encrypted tag registrant signing key.
+//! - Encrypted Bitcoin auto-burn state (address indexes, tracked UTXOs, pending burns).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -70,6 +71,11 @@ impl EncryptedBlob {
 pub struct WalletFile {
     /// Format version for forward compatibility.
     pub version: u32,
+    /// Optional user-facing local wallet VessTag name. Older single-wallet
+    /// files do not contain this field and are shown as `default` by wallet
+    /// discovery.
+    #[serde(default)]
+    pub name: Option<String>,
     /// The public master stealth address.
     pub master_address: MasterStealthAddress,
     /// Encrypted secret keys (requires recovery phrase to decrypt).
@@ -103,6 +109,11 @@ pub struct WalletFile {
     /// Keyed by mint_id, serialized via serde_json then AEAD-encrypted.
     #[serde(default)]
     pub encrypted_spend_credentials: Option<EncryptedBlob>,
+
+    /// Encrypted Bitcoin auto-burn wallet state.
+    /// Stores derived address indexes, tracked UTXOs, and pending burn retry state.
+    #[serde(default)]
+    pub encrypted_bitcoin_wallet_state: Option<EncryptedBlob>,
 
     /// Password-encrypted copy of the encryption key for fast daily unlock.
     /// Set via `vess init --password` or `vess set-password`.
@@ -179,6 +190,7 @@ impl WalletFile {
         let encrypted_spend_seed = Some(EncryptedSpendSeed::encrypt(&spend_seed, enc_key)?);
         Ok(Self {
             version: Self::CURRENT_VERSION,
+            name: None,
             master_address,
             encrypted_secrets,
             billfold,
@@ -189,6 +201,7 @@ impl WalletFile {
             tag_registrant_sk: Vec::new(),
             encrypted_tag_sk: None,
             encrypted_spend_credentials: None,
+            encrypted_bitcoin_wallet_state: None,
             password_cache: None,
         })
     }
@@ -251,6 +264,29 @@ impl WalletFile {
         // If no encrypted blob, the billfold may still have legacy plaintext
         // credentials from deserialization — those remain untouched.
         Ok(())
+    }
+
+    /// Encrypt and store opaque Bitcoin wallet state bytes.
+    pub fn set_encrypted_bitcoin_wallet_state(
+        &mut self,
+        state_bytes: &[u8],
+        enc_key: &[u8; 32],
+    ) -> Result<()> {
+        if state_bytes.is_empty() {
+            self.encrypted_bitcoin_wallet_state = None;
+        } else {
+            self.encrypted_bitcoin_wallet_state =
+                Some(EncryptedBlob::encrypt(state_bytes, enc_key)?);
+        }
+        Ok(())
+    }
+
+    /// Decrypt and return opaque Bitcoin wallet state bytes, if present.
+    pub fn decrypt_bitcoin_wallet_state(&self, enc_key: &[u8; 32]) -> Result<Option<Vec<u8>>> {
+        self.encrypted_bitcoin_wallet_state
+            .as_ref()
+            .map(|blob| blob.decrypt(enc_key))
+            .transpose()
     }
 
     // ── Tag key encryption ──────────────────────────────────────
@@ -374,6 +410,189 @@ pub fn default_wallet_path() -> Result<std::path::PathBuf> {
     Ok(home.join(".vess").join("wallet.json"))
 }
 
+/// Local Vess application directory: `~/.vess`.
+pub fn wallet_storage_dir() -> Result<PathBuf> {
+    let home = dirs_next().context("cannot determine home directory")?;
+    Ok(home.join(".vess"))
+}
+
+/// Directory containing named local wallet files.
+pub fn named_wallets_dir() -> Result<PathBuf> {
+    Ok(wallet_storage_dir()?.join("wallets"))
+}
+
+/// Marker file storing the last successfully opened wallet path.
+pub fn active_wallet_marker_path() -> Result<PathBuf> {
+    Ok(wallet_storage_dir()?.join("active-wallet"))
+}
+
+/// One discovered local wallet object.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WalletDescriptor {
+    /// Display name shown to the user, normally the wallet's VessTag without `+`.
+    pub name: String,
+    /// Wallet JSON file path.
+    pub path: PathBuf,
+    /// True for the historical single-wallet path `~/.vess/wallet.json`.
+    pub legacy_default: bool,
+}
+
+/// Convert a display wallet name or VessTag into a safe, stable filename stem.
+pub fn sanitize_wallet_name(name: &str) -> Result<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("wallet name cannot be empty");
+    }
+
+    let mut out = String::new();
+    let mut last_dash = false;
+    for ch in trimmed.chars() {
+        let lower = ch.to_ascii_lowercase();
+        if lower.is_ascii_alphanumeric() {
+            out.push(lower);
+            last_dash = false;
+        } else if !last_dash {
+            out.push('-');
+            last_dash = true;
+        }
+        if out.len() >= 64 {
+            break;
+        }
+    }
+
+    let out = out.trim_matches('-').to_string();
+    if out.is_empty() {
+        anyhow::bail!("wallet name must contain at least one letter or number");
+    }
+
+    let reserved = [
+        "con",
+        "prn",
+        "aux",
+        "nul",
+        "com1",
+        "com2",
+        "com3",
+        "com4",
+        "com5",
+        "com6",
+        "com7",
+        "com8",
+        "com9",
+        "lpt1",
+        "lpt2",
+        "lpt3",
+        "lpt4",
+        "lpt5",
+        "lpt6",
+        "lpt7",
+        "lpt8",
+        "lpt9",
+        "active-wallet",
+    ];
+    if reserved.contains(&out.as_str()) {
+        anyhow::bail!("wallet name `{}` is reserved", trimmed);
+    }
+
+    Ok(out)
+}
+
+/// Path for a named local wallet object.
+pub fn named_wallet_path(name: &str) -> Result<PathBuf> {
+    let slug = sanitize_wallet_name(name)?;
+    Ok(named_wallets_dir()?.join(format!("{slug}.json")))
+}
+
+/// List valid wallet objects stored locally, including the historical default.
+pub fn list_wallets() -> Result<Vec<WalletDescriptor>> {
+    let mut wallets = Vec::new();
+    let mut seen = std::collections::HashSet::<PathBuf>::new();
+
+    let legacy = default_wallet_path()?;
+    if legacy.exists() {
+        if let Ok(wallet) = WalletFile::load(&legacy) {
+            let name = wallet
+                .name
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| "default".to_string());
+            seen.insert(legacy.clone());
+            wallets.push(WalletDescriptor {
+                name,
+                path: legacy,
+                legacy_default: true,
+            });
+        }
+    }
+
+    let dir = named_wallets_dir()?;
+    if dir.exists() {
+        for entry in std::fs::read_dir(&dir)
+            .with_context(|| format!("read wallet directory: {}", dir.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            if seen.contains(&path) {
+                continue;
+            }
+            let Ok(wallet) = WalletFile::load(&path) else {
+                continue;
+            };
+            let name = wallet
+                .name
+                .filter(|name| !name.trim().is_empty())
+                .or_else(|| {
+                    path.file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .map(|stem| stem.to_string())
+                })
+                .unwrap_or_else(|| "unnamed".to_string());
+            seen.insert(path.clone());
+            wallets.push(WalletDescriptor {
+                name,
+                path,
+                legacy_default: false,
+            });
+        }
+    }
+
+    wallets.sort_by(|a, b| {
+        a.name
+            .to_ascii_lowercase()
+            .cmp(&b.name.to_ascii_lowercase())
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    Ok(wallets)
+}
+
+/// Read the last successfully opened wallet path, ignoring stale markers.
+pub fn read_active_wallet_path() -> Result<Option<PathBuf>> {
+    let marker = active_wallet_marker_path()?;
+    if !marker.exists() {
+        return Ok(None);
+    }
+    let path = PathBuf::from(std::fs::read_to_string(&marker)?.trim());
+    if path.as_os_str().is_empty() || !path.exists() {
+        return Ok(None);
+    }
+    Ok(Some(path))
+}
+
+/// Persist the last successfully opened wallet path for non-interactive commands.
+pub fn set_active_wallet_path(path: &Path) -> Result<()> {
+    let marker = active_wallet_marker_path()?;
+    if let Some(parent) = marker.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create wallet directory: {}", parent.display()))?;
+    }
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    std::fs::write(&marker, path.display().to_string())
+        .with_context(|| format!("write active wallet marker: {}", marker.display()))?;
+    Ok(())
+}
+
 fn dirs_next() -> Option<std::path::PathBuf> {
     #[cfg(target_os = "windows")]
     {
@@ -432,5 +651,39 @@ mod tests {
         assert_eq!(loaded.version, WalletFile::CURRENT_VERSION);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn encrypted_bitcoin_wallet_state_round_trip() {
+        let (secret, address) = generate_master_keys();
+        let phrase = RecoveryPhrase::generate();
+        let enc_key = derive_encryption_key_with_params(&phrase, 1, 64, 1).unwrap();
+        let encrypted = encrypt_secrets(&secret, &enc_key).unwrap();
+
+        let mut wallet =
+            WalletFile::new(address, encrypted, BillFold::new(), [0u8; 32], &enc_key).unwrap();
+        let state_bytes = br#"{"next_external_index":1,"pending_burns":[]}"#;
+
+        wallet
+            .set_encrypted_bitcoin_wallet_state(state_bytes, &enc_key)
+            .unwrap();
+
+        let decrypted = wallet
+            .decrypt_bitcoin_wallet_state(&enc_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(decrypted, state_bytes);
+    }
+
+    #[test]
+    fn wallet_names_are_sanitized_for_filenames() {
+        assert_eq!(
+            sanitize_wallet_name("Personal Wallet").unwrap(),
+            "personal-wallet"
+        );
+        assert_eq!(sanitize_wallet_name("+alice").unwrap(), "alice");
+        assert_eq!(sanitize_wallet_name("  Alice/BTC  ").unwrap(), "alice-btc");
+        assert!(sanitize_wallet_name("   ").is_err());
+        assert!(sanitize_wallet_name("CON").is_err());
     }
 }

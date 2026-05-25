@@ -1,5 +1,7 @@
 [workspace]
 members = [
+    "vess-bitcoin",
+    "vess-mesh",
     "vess-vascular",
     "vess-cli",
     "vess-foundry",
@@ -9,6 +11,5 @@ members = [
     "vess-kloak",
     "vess-protocol",
     "vess-tests",
-    "vess-android",
 ]
 resolver = "2"

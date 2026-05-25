@@ -80,6 +80,30 @@ pub fn transfer_message(
     *h.finalize().as_bytes()
 }
 
+/// Construct the digest signed by recipients when acknowledging a direct payment.
+///
+/// The receipt binds the acknowledgement to the resolved tag, recipient stealth
+/// route, payment id, amount, and exact set of accepted bills.
+pub fn direct_payment_receipt_message(
+    payment_id: &[u8; 32],
+    tag_hash: &[u8; 32],
+    recipient_stealth_id: &[u8; 32],
+    claimed_mint_ids: &[[u8; 32]],
+    total_amount: u64,
+) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"vess-direct-payment-receipt-v1");
+    h.update(payment_id);
+    h.update(tag_hash);
+    h.update(recipient_stealth_id);
+    h.update(&total_amount.to_le_bytes());
+    h.update(&(claimed_mint_ids.len() as u32).to_le_bytes());
+    for mint_id in claimed_mint_ids {
+        h.update(mint_id);
+    }
+    *h.finalize().as_bytes()
+}
+
 /// Sign a spend authorization using the owner's ML-DSA-65 signing key.
 pub fn sign_spend(sk_bytes: &[u8], message: &[u8; 32]) -> Result<Vec<u8>> {
     let sk = dilithium3::SecretKey::from_bytes(sk_bytes)
@@ -122,6 +146,29 @@ mod tests {
 
         let sig = sign_spend(&sk, &msg).unwrap();
         assert!(verify_spend(&vk, &msg, &sig).unwrap());
+    }
+
+    #[test]
+    fn direct_receipt_binds_tag_and_mints() {
+        let msg = direct_payment_receipt_message(
+            &[0x01; 32],
+            &[0x02; 32],
+            &[0x03; 32],
+            &[[0x04; 32], [0x05; 32]],
+            7,
+        );
+        let changed_tag = direct_payment_receipt_message(
+            &[0x01; 32],
+            &[0x09; 32],
+            &[0x03; 32],
+            &[[0x04; 32], [0x05; 32]],
+            7,
+        );
+        let changed_mints =
+            direct_payment_receipt_message(&[0x01; 32], &[0x02; 32], &[0x03; 32], &[[0x04; 32]], 7);
+
+        assert_ne!(msg, changed_tag);
+        assert_ne!(msg, changed_mints);
     }
 
     #[test]

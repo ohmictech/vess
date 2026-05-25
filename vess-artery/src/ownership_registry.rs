@@ -234,7 +234,13 @@ impl OwnershipRegistry {
             .unwrap_or((0, [0u8; 32]));
         self.consumed.insert(
             *mint_id,
-            ConsumedRecord { reforge_id, output_mint_ids, consumed_at, denomination_value, digest },
+            ConsumedRecord {
+                reforge_id,
+                output_mint_ids,
+                consumed_at,
+                denomination_value,
+                digest,
+            },
         );
         removed
     }
@@ -242,6 +248,20 @@ impl OwnershipRegistry {
     /// Return the tombstone for a consumed bill, if one exists.
     pub fn was_consumed(&self, mint_id: &[u8; 32]) -> Option<&ConsumedRecord> {
         self.consumed.get(mint_id)
+    }
+
+    /// Import or replace a consumed-bill tombstone.
+    ///
+    /// Used by seed sync to install a known reforge tombstone directly.
+    /// Any active record for the same mint_id is removed so the tombstone wins.
+    pub fn insert_consumed_record(
+        &mut self,
+        mint_id: [u8; 32],
+        record: ConsumedRecord,
+    ) -> Option<ConsumedRecord> {
+        self.records.remove(&mint_id);
+        self.merkle_root = None;
+        self.consumed.insert(mint_id, record)
     }
 
     /// Number of active mint_ids in the registry.

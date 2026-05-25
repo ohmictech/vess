@@ -174,7 +174,11 @@ impl LimboBuffer {
     ///
     /// Used on [`MailboxForwardRegister`] to immediately deliver any already-waiting
     /// payments to the newly-subscribed node.
-    pub fn payments_by_mailbox_key(&self, key: &[u8; 32], max: usize) -> Vec<vess_protocol::Payment> {
+    pub fn payments_by_mailbox_key(
+        &self,
+        key: &[u8; 32],
+        max: usize,
+    ) -> Vec<vess_protocol::Payment> {
         let mut out = Vec::with_capacity(max.min(128));
         'outer: for entries in self.entries.values() {
             for entry in entries {
@@ -356,6 +360,7 @@ mod tests {
             created_at: 1000,
             bill_count: bill_ids.len() as u8,
             mailbox_key: None,
+            direct_receipt_tag_hash: None,
         }
     }
 
@@ -385,7 +390,14 @@ mod tests {
         let bid3 = [0x33; 32];
 
         // Two payments for same recipient
-        buf.hold(sid, test_payment(sid, &[bid1]), vec![bid1], 1000, PEER_A, None);
+        buf.hold(
+            sid,
+            test_payment(sid, &[bid1]),
+            vec![bid1],
+            1000,
+            PEER_A,
+            None,
+        );
         buf.hold(
             sid,
             test_payment(sid, &[bid2, bid3]),
@@ -409,7 +421,14 @@ mod tests {
         let sid = [0xAA; 32];
         let bid = [0x11; 32];
 
-        buf.hold(sid, test_payment(sid, &[bid]), vec![bid], 1000, PEER_A, None);
+        buf.hold(
+            sid,
+            test_payment(sid, &[bid]),
+            vec![bid],
+            1000,
+            PEER_A,
+            None,
+        );
         assert_eq!(buf.total_entries(), 1);
 
         // Recipient claims — removes the entry
@@ -476,7 +495,14 @@ mod tests {
                 b[0..2].copy_from_slice(&(i as u16).to_le_bytes());
                 b
             };
-            assert!(buf.hold(sid, test_payment(sid, &[bid]), vec![bid], 1000, PEER_A, None));
+            assert!(buf.hold(
+                sid,
+                test_payment(sid, &[bid]),
+                vec![bid],
+                1000,
+                PEER_A,
+                None
+            ));
         }
         assert_eq!(buf.total_entries(), MAX_ENTRIES_PER_PEER);
 

@@ -11,6 +11,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
+use bitcoin::hashes::Hash;
+use rand::Rng;
 use serde::Serialize;
 use tracing::{info, warn};
 
@@ -19,27 +21,62 @@ use crate::gossip::{
 };
 use crate::handshake::{compute_handshake_hmac, compute_handshake_pow, verify_handshake_pow};
 use crate::kademlia::{RoutingPeer, RoutingTable};
-use crate::ownership_registry::OwnershipRecord;
+use crate::mesh_contact::{
+    contact_bytes_node_id, contact_node_id_bytes, decode_contact_bytes, encode_contact_bytes,
+    encode_contact_string, parse_contact_string,
+};
+use crate::ownership_registry::{ConsumedRecord, OwnershipRecord};
 use crate::persistence::{hex_key, unhex_key, ArterySnapshot, NodeStorage};
 use crate::{
     dht_replication_factor, BanishmentManager, LimboBuffer, OwnershipRegistry, PeerRegistry,
     PeerState, ReputationTable, TagDht, ALLOWED_VERSIONS, PROTOCOL_VERSION_HASH,
 };
 
+use vess_mesh::MeshCarrierContact;
 use vess_protocol::{
-    FetchedRecord, FindNodeResponse, HandshakeChallenge, HandshakeResponse, MailboxCollectResponse,
-    MailboxForwardAck, MailboxSweepResponse, ManifestRecoverResponse, OwnershipClaim,
+    BitcoinNetwork, DhtSeedConsumedRecord, DhtSeedOwnershipRecord, DhtSeedRequest,
+    DhtSeedResponse, DhtSeedTagRecord, FetchedRecord, FindNodeResponse, GenesisProof,
+    HandshakeChallenge, HandshakeResponse, MailboxCollectResponse, MailboxForwardAck,
+    MailboxSweepResponse, ManifestRecoverResponse, ManifestStore, OwnershipClaim,
     OwnershipFetchResponse, OwnershipGenesis, PeerExchange, PeerExchangeResponse, PulseMessage,
     ReforgeAttestation, RegistryQueryResponse, TagConfirm, TagLookupResponse, TagLookupResult,
     TagStore,
 };
-use vess_vascular::VessNode;
+use vess_vascular::MeshPulseNode;
 
 use vess_kloak::billfold::SpendCredential;
-use vess_kloak::payment::receive_and_claim;
+use vess_kloak::payment::{receive_and_claim, ClaimedBill};
 use vess_stealth::StealthSecretKey;
 
 const MAX_WALLET_NOTIFICATIONS: usize = 256;
+const AUTO_BURN_FEE_SATS: u64 = 500;
+const AUTO_BURN_RETRY_SECS: u64 = 30;
+const MESH_NODE_SEED_FILENAME: &str = "mesh-node-seed.bin";
+const LOCAL_TEST_FAUCET_ENV: &str = "VESS_LOCAL_TEST_FAUCET";
+
+fn local_test_faucet_enabled() -> bool {
+    std::env::var(LOCAL_TEST_FAUCET_ENV)
+        .map(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn local_test_faucet_digest(
+    nonce: &[u8; 32],
+    denomination_value: u64,
+    owner_vk_hash: &[u8; 32],
+) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"vess-local-test-faucet-digest-v0");
+    h.update(nonce);
+    h.update(&denomination_value.to_le_bytes());
+    h.update(owner_vk_hash);
+    *h.finalize().as_bytes()
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct WalletNotification {
@@ -61,7 +98,7 @@ pub struct WalletNotification {
 /// to `target_id_bytes` for every payment whose `mailbox_key` matches.
 #[derive(Debug, Clone)]
 pub(crate) struct ForwardRecord {
-    /// Raw 32-byte `EndpointId` of the subscribing node.
+    /// Serialized mesh contact of the subscribing node.
     pub(crate) target_id_bytes: Vec<u8>,
     /// Unix timestamp when the subscription expires.
     pub(crate) expires_at: u64,
@@ -79,12 +116,315 @@ pub(crate) struct OutboundPaymentRecord {
 /// Messages older than this are rejected as stale / potential replays.
 const MAX_MESSAGE_AGE_SECS: u64 = 300; // 5 minutes
 
+fn bitcoin_network_tag(network: BitcoinNetwork) -> &'static [u8] {
+    match network {
+        BitcoinNetwork::Mainnet => b"bitcoin-mainnet",
+        BitcoinNetwork::Testnet => b"bitcoin-testnet",
+        BitcoinNetwork::Signet => b"bitcoin-signet",
+        BitcoinNetwork::Regtest => b"bitcoin-regtest",
+    }
+}
+
+fn bitcoin_burn_bundle_commitment(burn: &vess_protocol::BitcoinBurnBundleProof) -> [u8; 32] {
+    let payload_hash = blake3::hash(&burn.burn_commitment_payload);
+    let mut h = blake3::Hasher::new();
+    h.update(b"vess-bitcoin-burn-bundle-v0");
+    h.update(bitcoin_network_tag(burn.network));
+    h.update(&burn.txid);
+    h.update(&burn.block_hash);
+    h.update(&burn.merkle_root);
+    h.update(&burn.merkle_index.to_le_bytes());
+    h.update(&burn.burn_amount_sats.to_le_bytes());
+    h.update(&burn.first_owner_vk_hash);
+    for node in &burn.merkle_proof {
+        h.update(node);
+    }
+    for value in &burn.output_values {
+        h.update(&value.to_le_bytes());
+    }
+    h.update(payload_hash.as_bytes());
+    *h.finalize().as_bytes()
+}
+
+fn expected_bitcoin_burn_payload(burn: &vess_protocol::BitcoinBurnBundleProof) -> [u8; 32] {
+    vess_foundry::bitcoin_burn_payload_commitment(
+        &burn.first_owner_vk_hash,
+        burn.burn_amount_sats,
+        &burn.output_values,
+    )
+}
+
+fn min_bitcoin_burn_confirmations(network: BitcoinNetwork) -> u32 {
+    match network {
+        BitcoinNetwork::Mainnet | BitcoinNetwork::Testnet | BitcoinNetwork::Signet => 6,
+        BitcoinNetwork::Regtest => 1,
+    }
+}
+
+fn bitcoin_burn_merkle_root(burn: &vess_protocol::BitcoinBurnBundleProof) -> [u8; 32] {
+    let mut current = burn.txid;
+    let mut index = burn.merkle_index;
+    for sibling in &burn.merkle_proof {
+        let mut data = Vec::with_capacity(64);
+        if index % 2 == 0 {
+            data.extend_from_slice(&current);
+            data.extend_from_slice(sibling);
+        } else {
+            data.extend_from_slice(sibling);
+            data.extend_from_slice(&current);
+        }
+        current = *bitcoin::hashes::sha256d::Hash::hash(&data).as_byte_array();
+        index /= 2;
+    }
+    current
+}
+
+fn build_direct_payment_receipt(
+    payment_id: [u8; 32],
+    tag_hash: [u8; 32],
+    recipient_stealth_id: [u8; 32],
+    claimed: &[ClaimedBill],
+) -> Option<vess_protocol::DirectPaymentReceipt> {
+    let signer = claimed.first()?;
+    let claimed_mint_ids: Vec<[u8; 32]> = claimed.iter().map(|bill| bill.bill.mint_id).collect();
+    let total_amount: u64 = claimed
+        .iter()
+        .map(|bill| bill.bill.denomination.value())
+        .sum();
+    let digest = vess_foundry::spend_auth::direct_payment_receipt_message(
+        &payment_id,
+        &tag_hash,
+        &recipient_stealth_id,
+        &claimed_mint_ids,
+        total_amount,
+    );
+    let signature = vess_foundry::spend_auth::sign_spend(&signer.spend_sk, &digest).ok()?;
+    Some(vess_protocol::DirectPaymentReceipt {
+        payment_id,
+        tag_hash,
+        recipient_stealth_id,
+        claimed_mint_ids,
+        total_amount,
+        recipient_owner_vk: signer.spend_vk.clone(),
+        signature,
+    })
+}
+
+fn protocol_bitcoin_network(network: vess_bitcoin::BitcoinNetwork) -> BitcoinNetwork {
+    match network {
+        vess_bitcoin::BitcoinNetwork::Mainnet => BitcoinNetwork::Mainnet,
+        vess_bitcoin::BitcoinNetwork::Testnet => BitcoinNetwork::Testnet,
+        vess_bitcoin::BitcoinNetwork::Signet => BitcoinNetwork::Signet,
+        vess_bitcoin::BitcoinNetwork::Regtest => BitcoinNetwork::Regtest,
+    }
+}
+
+fn confirmed_burn_outputs(
+    pending: &vess_bitcoin::PendingBurn,
+    confirmation: &vess_bitcoin::BurnConfirmationProof,
+    network: vess_bitcoin::BitcoinNetwork,
+    hops_remaining: u8,
+) -> Result<(Vec<OwnershipGenesis>, Vec<vess_foundry::VessBill>)> {
+    let output_values = vess_foundry::bitcoin_burn_output_values(pending.burn_amount_sats);
+    let burn = vess_protocol::BitcoinBurnBundleProof {
+        network: protocol_bitcoin_network(network),
+        txid: *pending.txid.as_byte_array(),
+        block_hash: *confirmation.block_hash.as_byte_array(),
+        block_height: confirmation.block_height,
+        confirmations: confirmation.confirmations,
+        required_confirmations: confirmation.required_confirmations,
+        chain_work: confirmation.chain_work,
+        merkle_root: *confirmation.merkle_root.as_byte_array(),
+        merkle_proof: confirmation.merkle_proof.clone(),
+        merkle_index: confirmation.merkle_index,
+        burn_amount_sats: pending.burn_amount_sats,
+        first_owner_vk: pending.first_owner_vk.clone(),
+        first_owner_vk_hash: pending.first_owner_vk_hash,
+        output_values: output_values.clone(),
+        burn_commitment_payload: vess_foundry::bitcoin_burn_payload_commitment(
+            &pending.first_owner_vk_hash,
+            pending.burn_amount_sats,
+            &output_values,
+        )
+        .to_vec(),
+    };
+    let digest = bitcoin_burn_bundle_commitment(&burn);
+    let created_at = confirmation.header_time as u64;
+
+    let mut genesis_records = Vec::with_capacity(output_values.len());
+    let mut bills = Vec::with_capacity(output_values.len());
+    for (output_index, denomination_value) in output_values.iter().copied().enumerate() {
+        let mint_id = vess_foundry::bitcoin_burn_mint_id(&burn.txid, output_index as u32);
+        let chain_tip = vess_foundry::genesis_chain_tip(&mint_id, &pending.first_owner_vk_hash);
+        let denomination =
+            vess_foundry::Denomination::from_value(denomination_value).ok_or_else(|| {
+                anyhow::anyhow!("invalid Vess denomination value {denomination_value}")
+            })?;
+
+        genesis_records.push(OwnershipGenesis {
+            mint_id,
+            chain_tip,
+            owner_vk_hash: pending.first_owner_vk_hash,
+            owner_vk: pending.first_owner_vk.clone(),
+            denomination_value,
+            genesis_proof: GenesisProof::BitcoinBurn(burn.clone()),
+            digest,
+            hops_remaining,
+            chain_depth: 0,
+            output_index: output_index as u32,
+        });
+
+        bills.push(vess_foundry::VessBill {
+            denomination,
+            digest,
+            created_at,
+            stealth_id: [0u8; 32],
+            dht_index: 0,
+            mint_id,
+            chain_tip,
+            chain_depth: 0,
+        });
+    }
+
+    Ok((genesis_records, bills))
+}
+
+pub(crate) fn load_bitcoin_wallet_state(
+    wallet: &vess_kloak::WalletFile,
+    raw_seed: &[u8; 64],
+    enc_key: &[u8; 32],
+) -> Result<(vess_bitcoin::BitcoinWallet, String)> {
+    let persisted_state = wallet.decrypt_bitcoin_wallet_state(enc_key)?;
+    let mut bitcoin_wallet = vess_bitcoin::BitcoinWallet::from_vess_seed_with_state(
+        vess_bitcoin::BitcoinNetwork::Mainnet,
+        raw_seed,
+        persisted_state.as_deref(),
+    )?;
+    let bitcoin_receive_address = bitcoin_wallet.ensure_receive_address()?.address.to_string();
+    Ok((bitcoin_wallet, bitcoin_receive_address))
+}
+
+fn queue_auto_burn_if_needed(state: &mut ArteryState) -> Vec<vess_bitcoin::PendingBurn> {
+    let now = ArteryState::now_unix();
+    let pending = match state.wallet.as_mut() {
+        Some(ws) => match ws
+            .bitcoin_wallet
+            .queue_auto_burn_if_needed(AUTO_BURN_FEE_SATS, now)
+        {
+            Ok(pending) => pending,
+            Err(e) => {
+                warn!(error = %e, "failed to queue automatic bitcoin burn");
+                None
+            }
+        },
+        None => None,
+    };
+
+    if let Some(ref pending_burn) = pending {
+        state.push_notification(WalletNotification {
+            kind: "bitcoin_burn_queued".to_string(),
+            created_at: now,
+            payment_id: pending_burn.txid.to_string(),
+            amount: Some(pending_burn.burn_amount_sats),
+            bill_count: Some(pending_burn.transaction.output.len()),
+            counterparty: None,
+            message: format!(
+                "Queued automatic Bitcoin burn {} for {} sats.",
+                pending_burn.txid, pending_burn.burn_amount_sats
+            ),
+        });
+    }
+
+    pending.into_iter().collect()
+}
+
+async fn broadcast_pending_burns(
+    state: Arc<Mutex<ArteryState>>,
+    client: vess_bitcoin::BitcoinLightClient,
+    pending_burns: Vec<vess_bitcoin::PendingBurn>,
+) {
+    for pending in pending_burns {
+        let first_attempt = pending.last_broadcast_at.is_none();
+        match client
+            .broadcast_transaction(pending.transaction.clone())
+            .await
+        {
+            Ok(txid) => {
+                let now = ArteryState::now_unix();
+                let mut s = state.lock().unwrap();
+                if let Some(ws) = s.wallet.as_mut() {
+                    ws.bitcoin_wallet
+                        .mark_pending_burn_broadcast_success(&pending.txid, now);
+                }
+                if first_attempt {
+                    s.push_notification(WalletNotification {
+                        kind: "bitcoin_burn_broadcast".to_string(),
+                        created_at: now,
+                        payment_id: txid.to_string(),
+                        amount: Some(pending.burn_amount_sats),
+                        bill_count: Some(pending.transaction.output.len()),
+                        counterparty: None,
+                        message: format!(
+                            "Broadcast automatic Bitcoin burn {} for {} sats.",
+                            txid, pending.burn_amount_sats
+                        ),
+                    });
+                }
+                s.flush_wallet();
+            }
+            Err(e) => {
+                warn!(txid = %pending.txid, error = %e, "failed to broadcast automatic bitcoin burn");
+                let now = ArteryState::now_unix();
+                let mut s = state.lock().unwrap();
+                if let Some(ws) = s.wallet.as_mut() {
+                    ws.bitcoin_wallet.mark_pending_burn_broadcast_failure(
+                        &pending.txid,
+                        now,
+                        e.to_string(),
+                    );
+                }
+                if first_attempt {
+                    s.push_notification(WalletNotification {
+                        kind: "bitcoin_burn_broadcast_failed".to_string(),
+                        created_at: now,
+                        payment_id: pending.txid.to_string(),
+                        amount: Some(pending.burn_amount_sats),
+                        bill_count: Some(pending.transaction.output.len()),
+                        counterparty: None,
+                        message: format!(
+                            "Initial automatic Bitcoin burn broadcast failed for {}.",
+                            pending.txid
+                        ),
+                    });
+                }
+                s.flush_wallet();
+            }
+        }
+    }
+}
+
 /// Maximum clock skew tolerance into the future (seconds).
 const MAX_FUTURE_SKEW_SECS: u64 = 30;
 
 /// Maximum number of mint_ids allowed in a single RegistryQuery or
 /// OwnershipFetch request. Prevents memory-exhaustion DoS.
 const MAX_QUERY_MINT_IDS: usize = 256;
+
+/// Maximum serialized mesh contact size accepted from discovery paths.
+/// JSON-encoded ML-KEM contacts are large, but should stay well below this.
+const MAX_SERIALIZED_MESH_CONTACT_BYTES: usize = 16 * 1024;
+
+/// Maximum number of contacts accepted or returned in one peer-discovery response.
+/// Keep this small while contacts are JSON-serialized so UDP responses stay bounded.
+const MAX_PEER_EXCHANGE_PEERS: usize = 4;
+
+/// Maximum records returned by one seed-time DHT shard sync response.
+const MAX_DHT_SEED_TAGS: usize = 256;
+const MAX_DHT_SEED_MANIFESTS: usize = 64;
+const MAX_DHT_SEED_OWNERSHIP_RECORDS: usize = 256;
+const MAX_DHT_SEED_CONSUMED_RECORDS: usize = 256;
+/// Maximum encrypted-manifest payload bytes returned by one seed sync response.
+const MAX_DHT_SEED_MANIFEST_BYTES: usize = 128 * 1024;
 
 /// Maximum number of items in a LimboHold bill_ids array.
 const MAX_LIMBO_HOLD_IDS: usize = 256;
@@ -160,9 +500,8 @@ impl DuplicateTracker {
         // M2: Shrink the inner map by dropping expired window entries before
         // inserting.  Without this, every fake hash from a long-lived peer
         // accumulates forever inside the inner HashMap.
-        peer_entry.retain(|_, (_, first_seen)| {
-            now.saturating_sub(*first_seen) <= DUPLICATE_WINDOW_SECS
-        });
+        peer_entry
+            .retain(|_, (_, first_seen)| now.saturating_sub(*first_seen) <= DUPLICATE_WINDOW_SECS);
 
         let (count, first_seen) = peer_entry.entry(*payload_hash).or_insert((0, now));
 
@@ -257,6 +596,837 @@ fn timestamp_is_valid(ts: u64) -> bool {
     ts <= now + MAX_FUTURE_SKEW_SECS && now.saturating_sub(ts) <= MAX_MESSAGE_AGE_SECS
 }
 
+fn load_or_create_mesh_seed(state_dir: &std::path::Path) -> Result<[u8; 64]> {
+    let path = state_dir.join(MESH_NODE_SEED_FILENAME);
+    if let Ok(bytes) = std::fs::read(&path) {
+        if bytes.len() == 64 {
+            let mut seed = [0u8; 64];
+            seed.copy_from_slice(&bytes);
+            return Ok(seed);
+        }
+    }
+
+    std::fs::create_dir_all(state_dir)?;
+    let mut seed = [0u8; 64];
+    rand::thread_rng().fill(&mut seed);
+    std::fs::write(&path, seed)?;
+    Ok(seed)
+}
+
+fn peer_hash_from_contact_bytes(contact_bytes: &[u8]) -> Option<[u8; 32]> {
+    if contact_bytes.len() > MAX_SERIALIZED_MESH_CONTACT_BYTES {
+        return None;
+    }
+    contact_bytes_node_id(contact_bytes)
+}
+
+fn bootstrap_string_from_contact(contact: &MeshCarrierContact) -> Option<String> {
+    encode_contact_string(contact).ok()
+}
+
+fn queue_discovered_peer_contact(
+    state: &Arc<Mutex<ArteryState>>,
+    contact: MeshCarrierContact,
+    source: &'static str,
+) {
+    let Some(peer_hash) = contact_node_id_bytes(&contact) else {
+        warn!(source, "discovered peer contact is missing a mesh node id");
+        return;
+    };
+    let target_bytes = match encode_contact_bytes(&contact) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            warn!(source, "failed to encode discovered peer contact: {error}");
+            return;
+        }
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let mut s = state.lock().unwrap();
+    if peer_hash == s.node_id {
+        return;
+    }
+    if s.routing_table.insert(RoutingPeer {
+        id_hash: peer_hash,
+        id_bytes: target_bytes,
+        last_seen: now,
+        first_seen: now,
+    }) && s.peer_registry.state(&peer_hash) != PeerState::Verified
+        && !s.handshake_queue.contains(&peer_hash)
+    {
+        s.handshake_queue.push(peer_hash);
+        info!(source, "queued discovered Vess peer for handshake");
+    }
+    s.estimated_network_size = s.routing_table.estimated_network_size();
+    let repl = dht_replication_factor(s.estimated_network_size);
+    s.tag_dht.set_k_replication(repl);
+}
+
+fn dht_seed_tag_from_record(record: &vess_tag::TagRecord) -> DhtSeedTagRecord {
+    DhtSeedTagRecord {
+        tag_hash: record.tag_hash,
+        scan_ek: record.master_address.scan_ek.clone(),
+        spend_ek: record.master_address.spend_ek.clone(),
+        pow_nonce: record.pow_nonce,
+        pow_hash: record.pow_hash.clone(),
+        registered_at: record.registered_at,
+        registrant_vk: record.registrant_vk.clone(),
+        signature: record.signature.clone(),
+        hardened_at: record.hardened_at,
+    }
+}
+
+fn tag_record_from_dht_seed(record: DhtSeedTagRecord) -> vess_tag::TagRecord {
+    vess_tag::TagRecord {
+        tag_hash: record.tag_hash,
+        master_address: vess_stealth::MasterStealthAddress {
+            scan_ek: record.scan_ek,
+            spend_ek: record.spend_ek,
+        },
+        pow_nonce: record.pow_nonce,
+        pow_hash: record.pow_hash,
+        registered_at: record.registered_at,
+        registrant_vk: record.registrant_vk,
+        signature: record.signature,
+        hardened_at: record.hardened_at,
+    }
+}
+
+fn dht_seed_ownership_from_record(record: &OwnershipRecord) -> DhtSeedOwnershipRecord {
+    DhtSeedOwnershipRecord {
+        mint_id: record.mint_id,
+        chain_tip: record.chain_tip,
+        current_owner_vk_hash: record.current_owner_vk_hash,
+        current_owner_vk: record.current_owner_vk.clone(),
+        denomination_value: record.denomination_value,
+        updated_at: record.updated_at,
+        proof_hash: record.proof_hash,
+        digest: record.digest,
+        nonce: record.nonce,
+        prev_claim_vk_hash: record.prev_claim_vk_hash,
+        claim_hash: record.claim_hash,
+        chain_depth: record.chain_depth,
+        encrypted_bill: record.encrypted_bill.clone(),
+    }
+}
+
+fn ownership_record_from_dht_seed(record: DhtSeedOwnershipRecord) -> OwnershipRecord {
+    OwnershipRecord {
+        mint_id: record.mint_id,
+        chain_tip: record.chain_tip,
+        current_owner_vk_hash: record.current_owner_vk_hash,
+        current_owner_vk: record.current_owner_vk,
+        denomination_value: record.denomination_value,
+        updated_at: record.updated_at,
+        proof_hash: record.proof_hash,
+        digest: record.digest,
+        nonce: record.nonce,
+        prev_claim_vk_hash: record.prev_claim_vk_hash,
+        claim_hash: record.claim_hash,
+        chain_depth: record.chain_depth,
+        encrypted_bill: record.encrypted_bill,
+    }
+}
+
+fn dht_seed_consumed_from_record(
+    mint_id: [u8; 32],
+    record: &ConsumedRecord,
+) -> DhtSeedConsumedRecord {
+    DhtSeedConsumedRecord {
+        mint_id,
+        reforge_id: record.reforge_id,
+        output_mint_ids: record.output_mint_ids.clone(),
+        consumed_at: record.consumed_at,
+        denomination_value: record.denomination_value,
+        digest: record.digest,
+    }
+}
+
+fn consumed_record_from_dht_seed(record: DhtSeedConsumedRecord) -> ([u8; 32], ConsumedRecord) {
+    (
+        record.mint_id,
+        ConsumedRecord {
+            reforge_id: record.reforge_id,
+            output_mint_ids: record.output_mint_ids,
+            consumed_at: record.consumed_at,
+            denomination_value: record.denomination_value,
+            digest: record.digest,
+        },
+    )
+}
+
+fn ownership_record_supersedes(candidate: &OwnershipRecord, incumbent: &OwnershipRecord) -> bool {
+    candidate.chain_depth > incumbent.chain_depth
+        || (candidate.chain_depth == incumbent.chain_depth
+            && (candidate.updated_at > incumbent.updated_at
+                || (candidate.updated_at == incumbent.updated_at
+                    && candidate.claim_hash.unwrap_or([0xff; 32])
+                        < incumbent.claim_hash.unwrap_or([0xff; 32]))))
+}
+
+fn consumed_record_supersedes(candidate: &ConsumedRecord, incumbent: &ConsumedRecord) -> bool {
+    candidate.consumed_at > incumbent.consumed_at
+        || (candidate.consumed_at == incumbent.consumed_at
+            && candidate.output_mint_ids.len() > incumbent.output_mint_ids.len())
+}
+
+fn upsert_seed_ownership_record(
+    records: &mut HashMap<[u8; 32], OwnershipRecord>,
+    record: OwnershipRecord,
+) {
+    match records.get(&record.mint_id) {
+        Some(existing) if !ownership_record_supersedes(&record, existing) => {}
+        _ => {
+            records.insert(record.mint_id, record);
+        }
+    }
+}
+
+fn upsert_seed_consumed_record(
+    records: &mut HashMap<[u8; 32], ConsumedRecord>,
+    mint_id: [u8; 32],
+    record: ConsumedRecord,
+) {
+    match records.get(&mint_id) {
+        Some(existing) if !consumed_record_supersedes(&record, existing) => {}
+        _ => {
+            records.insert(mint_id, record);
+        }
+    }
+}
+
+fn collect_seed_ownership_records(state: &ArteryState) -> HashMap<[u8; 32], OwnershipRecord> {
+    let mut records = state.retained_ownership_records.clone();
+    for record in state.registry.all_records() {
+        upsert_seed_ownership_record(&mut records, record);
+    }
+    records
+}
+
+fn collect_seed_consumed_records(state: &ArteryState) -> HashMap<[u8; 32], ConsumedRecord> {
+    let mut records = state.retained_consumed_records.clone();
+    for (mint_id, record) in state.registry.all_consumed() {
+        upsert_seed_consumed_record(&mut records, mint_id, record);
+    }
+    records
+}
+
+fn ownership_claim_hash(oc: &OwnershipClaim) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"vess-claim-hash-v1");
+    h.update(&oc.mint_id);
+    h.update(&vess_foundry::spend_auth::vk_hash(&oc.prev_owner_vk));
+    h.update(&oc.new_owner_vk_hash);
+    h.update(&oc.transfer_sig);
+    h.update(&(oc.timestamp / 60).to_le_bytes());
+    *h.finalize().as_bytes()
+}
+
+fn proof_hash_and_nonce_from_genesis(og: &OwnershipGenesis) -> Option<([u8; 32], [u8; 32])> {
+    match &og.genesis_proof {
+        GenesisProof::Vess(proof_bytes) => {
+            let proof_hash = *blake3::hash(proof_bytes).as_bytes();
+            if let Ok(iop_proof) = vess_foundry::proof::deserialize_proof(proof_bytes) {
+                Some((proof_hash, iop_proof.nonce))
+            } else if let Ok(agg) = vess_foundry::proof::AggregateProof::deserialize(proof_bytes) {
+                let mut h = blake3::Hasher::new();
+                h.update(b"vess-aggregate-nonce-v0");
+                for sub in &agg.d1_proofs {
+                    if let Ok(p) = vess_foundry::proof::deserialize_proof(sub) {
+                        h.update(&p.nonce);
+                    }
+                }
+                Some((proof_hash, *h.finalize().as_bytes()))
+            } else if let Ok(sap) = vess_foundry::proof::SampledAggregateProof::deserialize(proof_bytes) {
+                Some((proof_hash, sap.nonce_tree_root))
+            } else if vess_foundry::reforge::deserialize_reforge_proof(proof_bytes).is_ok() {
+                Some((proof_hash, og.digest))
+            } else {
+                None
+            }
+        }
+        GenesisProof::BitcoinBurn(_) => Some((og.digest, og.digest)),
+        GenesisProof::LocalTestFaucet(proof) => {
+            let mut h = blake3::Hasher::new();
+            h.update(b"vess-local-test-faucet-proof-v0");
+            h.update(&proof.nonce);
+            Some((*h.finalize().as_bytes(), proof.nonce))
+        }
+    }
+}
+
+pub(crate) fn retain_local_ownership_genesis(
+    state: &mut ArteryState,
+    og: &OwnershipGenesis,
+    updated_at: u64,
+) {
+    let Some((proof_hash, proof_nonce)) = proof_hash_and_nonce_from_genesis(og) else {
+        return;
+    };
+
+    state.retained_consumed_records.remove(&og.mint_id);
+    upsert_seed_ownership_record(
+        &mut state.retained_ownership_records,
+        OwnershipRecord {
+            mint_id: og.mint_id,
+            chain_tip: og.chain_tip,
+            current_owner_vk_hash: og.owner_vk_hash,
+            current_owner_vk: og.owner_vk.clone(),
+            denomination_value: og.denomination_value,
+            updated_at,
+            proof_hash,
+            digest: og.digest,
+            nonce: proof_nonce,
+            prev_claim_vk_hash: None,
+            claim_hash: None,
+            chain_depth: og.chain_depth,
+            encrypted_bill: Vec::new(),
+        },
+    );
+}
+
+pub(crate) fn local_seed_record_from_claimed_bill(
+    claim: &OwnershipClaim,
+    bill: &vess_foundry::VessBill,
+    owner_vk: &[u8],
+    updated_at: u64,
+) -> OwnershipRecord {
+    OwnershipRecord {
+        mint_id: bill.mint_id,
+        chain_tip: bill.chain_tip,
+        current_owner_vk_hash: claim.new_owner_vk_hash,
+        current_owner_vk: owner_vk.to_vec(),
+        denomination_value: bill.denomination.value(),
+        updated_at,
+        proof_hash: [0u8; 32],
+        digest: bill.digest,
+        nonce: [0u8; 32],
+        prev_claim_vk_hash: Some(vess_foundry::spend_auth::vk_hash(&claim.prev_owner_vk)),
+        claim_hash: Some(ownership_claim_hash(claim)),
+        chain_depth: bill.chain_depth,
+        encrypted_bill: claim.encrypted_bill.clone(),
+    }
+}
+
+pub(crate) fn local_seed_claim_fallback_from_wallet(
+    state: &ArteryState,
+    oc: &OwnershipClaim,
+    updated_at: u64,
+) -> Option<OwnershipRecord> {
+    let wallet = state.wallet.as_ref()?;
+    let bill = wallet
+        .billfold
+        .bills()
+        .iter()
+        .find(|bill| bill.mint_id == oc.mint_id)?;
+    Some(local_seed_record_from_claimed_bill(
+        oc,
+        bill,
+        &oc.new_owner_vk,
+        updated_at,
+    ))
+}
+
+pub(crate) fn retain_local_ownership_claim(
+    state: &mut ArteryState,
+    oc: &OwnershipClaim,
+    fallback: Option<OwnershipRecord>,
+    updated_at: u64,
+) {
+    let record = state
+        .retained_ownership_records
+        .remove(&oc.mint_id)
+        .or(fallback);
+    let Some(mut record) = record else {
+        return;
+    };
+
+    record.chain_tip = oc.new_chain_tip;
+    record.current_owner_vk_hash = oc.new_owner_vk_hash;
+    record.current_owner_vk = oc.new_owner_vk.clone();
+    record.updated_at = updated_at;
+    record.prev_claim_vk_hash = Some(vess_foundry::spend_auth::vk_hash(&oc.prev_owner_vk));
+    record.claim_hash = Some(ownership_claim_hash(oc));
+    record.chain_depth = oc.chain_depth;
+    record.encrypted_bill = oc.encrypted_bill.clone();
+    state.retained_consumed_records.remove(&oc.mint_id);
+    upsert_seed_ownership_record(&mut state.retained_ownership_records, record);
+}
+
+pub(crate) fn retain_local_reforge_attestation(
+    state: &mut ArteryState,
+    ra: &ReforgeAttestation,
+    consumed_at: u64,
+) {
+    for mint_id in &ra.consumed_mint_ids {
+        let removed = state
+            .retained_ownership_records
+            .remove(mint_id)
+            .or_else(|| state.registry.get(mint_id).cloned());
+        let existing = state.retained_consumed_records.get(mint_id).cloned();
+        let (denomination_value, digest) = removed
+            .as_ref()
+            .map(|record| (record.denomination_value, record.digest))
+            .or_else(|| {
+                existing
+                    .as_ref()
+                    .map(|record| (record.denomination_value, record.digest))
+            })
+            .unwrap_or((0, [0u8; 32]));
+        upsert_seed_consumed_record(
+            &mut state.retained_consumed_records,
+            *mint_id,
+            ConsumedRecord {
+                reforge_id: ra.reforge_id,
+                output_mint_ids: ra.output_mint_ids.clone(),
+                consumed_at,
+                denomination_value,
+                digest,
+            },
+        );
+    }
+}
+
+pub(crate) fn queue_local_ownership_genesis(
+    state: &mut ArteryState,
+    tx: &tokio::sync::mpsc::UnboundedSender<OwnershipGenesis>,
+    og: OwnershipGenesis,
+) {
+    retain_local_ownership_genesis(state, &og, ArteryState::now_unix());
+    let _ = tx.send(og);
+}
+
+pub(crate) fn queue_local_ownership_claim(
+    state: &mut ArteryState,
+    tx: &tokio::sync::mpsc::UnboundedSender<OwnershipClaim>,
+    oc: OwnershipClaim,
+) {
+    let updated_at = ArteryState::now_unix();
+    let fallback = local_seed_claim_fallback_from_wallet(state, &oc, updated_at);
+    retain_local_ownership_claim(state, &oc, fallback, updated_at);
+    let _ = tx.send(oc);
+}
+
+pub(crate) fn queue_local_reforge_attestation(
+    state: &mut ArteryState,
+    tx: &tokio::sync::mpsc::UnboundedSender<ReforgeAttestation>,
+    ra: ReforgeAttestation,
+) {
+    retain_local_reforge_attestation(state, &ra, ArteryState::now_unix());
+    let _ = tx.send(ra);
+}
+
+fn node_should_store_seeded_key(
+    dht_key: &[u8; 32],
+    candidate_node_id: &[u8; 32],
+    local_node_id: &[u8; 32],
+    known_peer_ids: &[[u8; 32]],
+    replication: usize,
+) -> bool {
+    if candidate_node_id == local_node_id {
+        return false;
+    }
+    let candidate_distance = crate::gossip::xor_distance(candidate_node_id, dht_key);
+    let mut closer_count =
+        usize::from(crate::gossip::xor_distance(local_node_id, dht_key) < candidate_distance);
+
+    for peer_id in known_peer_ids {
+        if peer_id == candidate_node_id || peer_id == local_node_id {
+            continue;
+        }
+        if crate::gossip::xor_distance(peer_id, dht_key) < candidate_distance {
+            closer_count += 1;
+        }
+    }
+
+    closer_count < replication.max(1)
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct DhtSeedCursor {
+    after_tag_hash: Option<[u8; 32]>,
+    after_manifest_key: Option<[u8; 32]>,
+    after_ownership_mint_id: Option<[u8; 32]>,
+    after_consumed_mint_id: Option<[u8; 32]>,
+}
+
+impl DhtSeedCursor {
+    fn into_request(self, requester_node_id: [u8; 32]) -> DhtSeedRequest {
+        DhtSeedRequest {
+            requester_node_id,
+            after_tag_hash: self.after_tag_hash,
+            after_manifest_key: self.after_manifest_key,
+            after_ownership_mint_id: self.after_ownership_mint_id,
+            after_consumed_mint_id: self.after_consumed_mint_id,
+            max_tags: MAX_DHT_SEED_TAGS as u16,
+            max_manifests: MAX_DHT_SEED_MANIFESTS as u16,
+            max_ownership_records: MAX_DHT_SEED_OWNERSHIP_RECORDS as u16,
+            max_consumed_records: MAX_DHT_SEED_CONSUMED_RECORDS as u16,
+        }
+    }
+
+    fn advance_from_response(&mut self, response: &DhtSeedResponse) {
+        if let Some(last) = response.tags.last() {
+            self.after_tag_hash = Some(last.tag_hash);
+        }
+        if let Some(last) = response.manifests.last() {
+            self.after_manifest_key = Some(last.dht_key);
+        }
+        if let Some(last) = response.ownership_records.last() {
+            self.after_ownership_mint_id = Some(last.mint_id);
+        }
+        if let Some(last) = response.consumed_records.last() {
+            self.after_consumed_mint_id = Some(last.mint_id);
+        }
+    }
+}
+
+fn dht_seed_response_is_empty(response: &DhtSeedResponse) -> bool {
+    response.tags.is_empty()
+        && response.manifests.is_empty()
+        && response.ownership_records.is_empty()
+        && response.consumed_records.is_empty()
+}
+
+fn dht_seed_cursor_allows_key(key: &[u8; 32], cursor: Option<[u8; 32]>) -> bool {
+    cursor.map(|after| key > &after).unwrap_or(true)
+}
+
+async fn request_dht_seed_catchup(
+    node: &MeshPulseNode,
+    target: &MeshCarrierContact,
+    state: &Arc<Mutex<ArteryState>>,
+) {
+    const MAX_DHT_SEED_CATCHUP_ROUNDS: usize = 1024;
+
+    let requester_node_id = *node.id().as_bytes();
+    let mut cursor = DhtSeedCursor::default();
+
+    for round in 0..MAX_DHT_SEED_CATCHUP_ROUNDS {
+        let dht_seed_request = PulseMessage::DhtSeedRequest(cursor.into_request(requester_node_id));
+        let response = match node.send_message_with_response(target, &dht_seed_request).await {
+            Ok(Some(PulseMessage::DhtSeedResponse(response))) => response,
+            Ok(_) => {
+                warn!(round, "unexpected DHT seed response from peer");
+                return;
+            }
+            Err(error) => {
+                warn!(round, %error, "DHT seed catch-up failed");
+                return;
+            }
+        };
+
+        let empty_page = dht_seed_response_is_empty(&response);
+        cursor.advance_from_response(&response);
+        ingest_dht_seed_response(state, response);
+        if empty_page {
+            return;
+        }
+    }
+
+    warn!("DHT seed catch-up hit round limit before reaching an empty page");
+}
+
+pub(crate) async fn refresh_mailbox_forward_subscriptions(
+    node: &MeshPulseNode,
+    state: &Arc<Mutex<ArteryState>>,
+) {
+    let (mailbox_key, nearest_peers) = {
+        let s = state.lock().unwrap();
+        let mailbox_key = match s.wallet.as_ref().map(|wallet| wallet.mailbox_key) {
+            Some(key) => key,
+            None => return,
+        };
+        let nearest_peers = s
+            .routing_table
+            .closest_peers(&mailbox_key, s.gossip_config.k_neighbors)
+            .into_iter()
+            .filter(|peer| s.peer_registry.state(&peer.id_hash) == PeerState::Verified)
+            .map(|peer| peer.id_bytes)
+            .collect::<Vec<_>>();
+        (mailbox_key, nearest_peers)
+    };
+
+    if nearest_peers.is_empty() {
+        return;
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    for peer_bytes in nearest_peers {
+        let target = match decode_contact_bytes(&peer_bytes) {
+            Ok(contact) => contact,
+            Err(_) => continue,
+        };
+        let nonce: [u8; 16] = {
+            use rand::Rng;
+            rand::thread_rng().gen()
+        };
+        let msg = PulseMessage::MailboxForwardRegister(vess_protocol::MailboxForwardRegister {
+            mailbox_key,
+            timestamp: now,
+            ttl_secs: MAX_FORWARD_TTL_SECS as u32,
+            nonce,
+        });
+        match node.send_message_with_response(&target, &msg).await {
+            Ok(Some(PulseMessage::MailboxForwardAck(ack))) => {
+                if ack.accepted {
+                    info!(queued = ack.queued_forwarded, "mailbox forward subscription accepted");
+                } else {
+                    info!("mailbox forward subscription rejected by peer");
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn ingest_dht_seed_response(state: &Arc<Mutex<ArteryState>>, response: DhtSeedResponse) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let mut inserted_tags = 0usize;
+    let mut inserted_manifests = 0usize;
+    let mut inserted_ownership_records = 0usize;
+    let mut inserted_consumed_records = 0usize;
+    let mut s = state.lock().unwrap();
+    let peer_ids: Vec<[u8; 32]> = s
+        .routing_table
+        .routable_peers(|_| true)
+        .iter()
+        .map(|p| p.id_hash)
+        .collect();
+    let repl = dht_replication_factor(s.estimated_network_size);
+
+    for seeded_tag in response.tags.into_iter().take(MAX_DHT_SEED_TAGS) {
+        let tag_hash = seeded_tag.tag_hash;
+        if !s.tag_dht.should_store(&tag_hash, &peer_ids)
+            || s.tag_dht.lookup_by_hash(&tag_hash).is_some()
+        {
+            continue;
+        }
+        let record = tag_record_from_dht_seed(seeded_tag);
+        if record.registrant_vk.is_empty() || record.signature.is_empty() {
+            continue;
+        }
+        match vess_tag::verify_record_signature(&record) {
+            Ok(true) => {}
+            _ => continue,
+        }
+        if s.tag_dht.store(record) {
+            inserted_tags += 1;
+        }
+    }
+
+    for manifest in response.manifests.into_iter().take(MAX_DHT_SEED_MANIFESTS) {
+        if manifest.encrypted_manifest.len() > MAX_MANIFEST_SIZE {
+            continue;
+        }
+        if !s.registry.should_store(&manifest.dht_key, &peer_ids, repl) {
+            continue;
+        }
+        if s.manifest_store.len() >= MAX_MANIFEST_ENTRIES {
+            if let Some(&oldest_key) = s
+                .manifest_store
+                .iter()
+                .min_by_key(|(_, (_, ts))| ts)
+                .map(|(k, _)| k)
+            {
+                s.manifest_store.remove(&oldest_key);
+            }
+        }
+        s.manifest_store
+            .insert(manifest.dht_key, (manifest.encrypted_manifest, now));
+        inserted_manifests += 1;
+    }
+
+    for seeded_record in response
+        .ownership_records
+        .into_iter()
+        .take(MAX_DHT_SEED_OWNERSHIP_RECORDS)
+    {
+        let mint_id = seeded_record.mint_id;
+        if !s.registry.should_store(&mint_id, &peer_ids, repl) {
+            continue;
+        }
+        let record = ownership_record_from_dht_seed(seeded_record);
+        if !record.current_owner_vk.is_empty()
+            && vess_foundry::spend_auth::vk_hash(&record.current_owner_vk)
+                != record.current_owner_vk_hash
+        {
+            continue;
+        }
+        if s.registry.was_consumed(&mint_id).is_some() {
+            continue;
+        }
+        if let Some(existing) = s.registry.get(&mint_id).cloned() {
+            if !ownership_record_supersedes(&record, &existing) {
+                continue;
+            }
+            if let Some(existing_mut) = s.registry.get_mut(&mint_id) {
+                *existing_mut = record;
+                inserted_ownership_records += 1;
+            }
+            continue;
+        }
+        if s.registry.register(record) {
+            inserted_ownership_records += 1;
+        }
+    }
+
+    for seeded_record in response
+        .consumed_records
+        .into_iter()
+        .take(MAX_DHT_SEED_CONSUMED_RECORDS)
+    {
+        let (mint_id, record) = consumed_record_from_dht_seed(seeded_record);
+        if !s.registry.should_store(&mint_id, &peer_ids, repl) {
+            continue;
+        }
+        if let Some(existing) = s.registry.was_consumed(&mint_id).cloned() {
+            if !consumed_record_supersedes(&record, &existing) {
+                continue;
+            }
+        }
+        s.registry.insert_consumed_record(mint_id, record);
+        inserted_consumed_records += 1;
+    }
+
+    if inserted_tags > 0
+        || inserted_manifests > 0
+        || inserted_ownership_records > 0
+        || inserted_consumed_records > 0
+    {
+        info!(
+            responder = ?&response.responder_node_id[..4],
+            inserted_tags,
+            inserted_manifests,
+            inserted_ownership_records,
+            inserted_consumed_records,
+            "seeded initial DHT shard data from peer"
+        );
+    }
+}
+
+fn spawn_local_lan_discovery(local_contact: MeshCarrierContact, state: Arc<Mutex<ArteryState>>) {
+    let loopback_contact = match crate::local_discovery::loopback_contact(&local_contact) {
+        Ok(contact) => contact,
+        Err(error) => {
+            warn!(%error, "failed to build loopback Vess contact for local discovery");
+            local_contact.clone()
+        }
+    };
+
+    if let Err(error) = crate::local_discovery::publish_local_contact(&loopback_contact) {
+        crate::local_discovery::log_publish_error(error);
+    }
+
+    tokio::spawn(async move {
+        let self_node_id = {
+            let s = state.lock().unwrap();
+            s.node_id
+        };
+        let socket = match crate::local_discovery::bind_lan_discovery_socket(
+            crate::local_discovery::LAN_DISCOVERY_PORT,
+        ) {
+            Ok(socket) => Some(socket),
+            Err(error) => {
+                warn!(%error, "LAN Vess discovery listener unavailable; same-PC file discovery remains enabled");
+                None
+            }
+        };
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+
+        if let Some(socket) = socket {
+            let mut buffer = vec![0u8; 64 * 1024];
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        if let Err(error) = crate::local_discovery::publish_local_contact(&loopback_contact) {
+                            crate::local_discovery::log_publish_error(error);
+                        }
+                        if let Err(error) = crate::local_discovery::send_lan_announcement(&socket, &local_contact).await {
+                            warn!(%error, "failed to send Vess LAN discovery announcement");
+                        }
+                        for contact in crate::local_discovery::discover_local_file_contacts(Some(self_node_id)) {
+                            queue_discovered_peer_contact(&state, contact, "local-file");
+                        }
+                    }
+                    recv = socket.recv_from(&mut buffer) => {
+                        let Ok((len, source)) = recv else {
+                            continue;
+                        };
+                        match crate::local_discovery::parse_lan_discovery_message(&buffer[..len], source) {
+                            Ok(crate::local_discovery::ParsedLanDiscovery::Probe) => {
+                                if let Err(error) = crate::local_discovery::send_probe_response(&socket, source, &local_contact).await {
+                                    warn!(%error, "failed to send Vess LAN discovery probe response");
+                                }
+                            }
+                            Ok(crate::local_discovery::ParsedLanDiscovery::Contact(contact)) => {
+                                queue_discovered_peer_contact(&state, contact, "lan");
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                }
+            }
+        } else {
+            loop {
+                interval.tick().await;
+                if let Err(error) = crate::local_discovery::publish_local_contact(&loopback_contact)
+                {
+                    crate::local_discovery::log_publish_error(error);
+                }
+                for contact in
+                    crate::local_discovery::discover_local_file_contacts(Some(self_node_id))
+                {
+                    queue_discovered_peer_contact(&state, contact, "local-file");
+                }
+            }
+        }
+    });
+}
+
+fn spawn_bitcoin_vess_discovery(
+    client: vess_bitcoin::BitcoinLightClient,
+    state: Arc<Mutex<ArteryState>>,
+) {
+    tokio::spawn(async move {
+        loop {
+            let connected = client
+                .wait_for_peers(1, std::time::Duration::from_secs(30))
+                .await;
+            if connected == 0 {
+                info!("still waiting for Bitcoin peers for Vess bootstrap discovery");
+                continue;
+            }
+
+            let discovered = client.discover_vess_nodes().await;
+            if discovered.is_empty() {
+                info!(
+                    connected,
+                    "no Vess bootstrap nodes found yet through Bitcoin peers; still waiting"
+                );
+            }
+            for node in discovered {
+                match parse_contact_string(&node.contact) {
+                    Ok(contact) => queue_discovered_peer_contact(&state, contact, "bitcoin"),
+                    Err(error) => {
+                        warn!(node_id = %node.node_id, "Bitcoin-discovered Vess contact rejected: {error}")
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        }
+    });
+}
+
 /// Configuration for running an artery node.
 pub struct NodeConfig {
     /// Number of gossip neighbors (K).
@@ -265,13 +1435,14 @@ pub struct NodeConfig {
     pub max_hops: u8,
     /// State directory for persistence.
     pub state_dir: PathBuf,
-    /// Bootstrap peer node IDs to connect to on startup.
+    /// Bootstrap peer mesh contacts to connect to on startup.
     pub bootstrap: Vec<String>,
-    /// DNS seed domains. TXT records at `_vess.<domain>` are resolved
-    /// at startup and the resulting EndpointIds are fed into bootstrap.
-    /// Defaults to `["node.vess.network"]`.
+    /// Whether to resolve legacy DNS seed domains from `seeds` as fallback.
+    pub use_dns_seeds: bool,
+    /// Legacy DNS seed domains. Normal bootstrap discovers Vess peers through
+    /// Bitcoin peers first; these are only optional fallback hints.
     pub seeds: Vec<String>,
-    /// Optional channel to signal the node's endpoint ID once online.
+    /// Optional channel to signal the node's mesh node ID once online.
     /// Useful for tests that need to connect before `run_node` blocks.
     pub ready_tx: Option<tokio::sync::oneshot::Sender<String>>,
     /// Path to a vess-kloak wallet file.  When set the node embeds the
@@ -296,7 +1467,8 @@ impl Default for NodeConfig {
             max_hops: 3,
             state_dir: NodeStorage::default_dir().unwrap_or_else(|_| PathBuf::from(".vess-artery")),
             bootstrap: Vec::new(),
-            seeds: vec![crate::dns_seed::DEFAULT_SEED_DOMAIN.to_string()],
+            use_dns_seeds: false,
+            seeds: Vec::new(),
             ready_tx: None,
             wallet_path: None,
             rpc_port: None,
@@ -363,6 +1535,8 @@ impl PaymentLatencyTracker {
 pub(crate) struct WalletState {
     pub(crate) stealth_secret: StealthSecretKey,
     pub(crate) billfold: vess_kloak::BillFold,
+    pub(crate) bitcoin_wallet: vess_bitcoin::BitcoinWallet,
+    pub(crate) bitcoin_receive_address: String,
     pub(crate) wallet_path: PathBuf,
     /// Encryption key for spend credentials and tag keys on disk.
     pub(crate) enc_key: [u8; 32],
@@ -401,6 +1575,13 @@ pub(crate) struct ArteryState {
     /// Encrypted wallet manifests keyed by DHT key.
     /// Value is `(encrypted_manifest, inserted_at_unix_secs)` for oldest-first eviction.
     pub(crate) manifest_store: HashMap<[u8; 32], (Vec<u8>, u64)>,
+    /// Locally-retained ownership records for bills this node originated or
+    /// currently owns, kept even when this node is not in the live DHT shard.
+    /// Used to seed newly closer peers during bootstrap.
+    pub(crate) retained_ownership_records: HashMap<[u8; 32], OwnershipRecord>,
+    /// Locally-retained tombstones for consumed bills this node originated or
+    /// tracked, so newly closer peers can learn reforge outcomes during seed sync.
+    pub(crate) retained_consumed_records: HashMap<[u8; 32], ConsumedRecord>,
     /// Unix-millis timestamp when each bill entered limbo (keyed by mint_id,
     /// populated at auto-receive time for end-to-end latency tracking).
     pub(crate) limbo_entry_times: HashMap<[u8; 32], u64>,
@@ -413,9 +1594,14 @@ pub(crate) struct ArteryState {
     /// broadcaster being falsely banished) due to gossip ordering races.
     /// Value is `(OwnershipGenesis, buffered_at_unix_secs)` for TTL eviction.
     /// C1: Enforced global cap + per-key cap to prevent memory exhaustion.
-    pub(crate) pending_reforge_genesis: HashMap<[u8; 32], Vec<(vess_protocol::OwnershipGenesis, u64)>>,
+    pub(crate) pending_reforge_genesis:
+        HashMap<[u8; 32], Vec<(vess_protocol::OwnershipGenesis, u64)>>,
     /// Embedded wallet — trial-decrypts incoming payments automatically.
     pub(crate) wallet: Option<WalletState>,
+    /// Background Bitcoin light client used for burn verification and
+    /// transaction broadcast/onboarding.
+    #[allow(dead_code)]
+    pub(crate) bitcoin_client: Option<vess_bitcoin::BitcoinLightClient>,
     /// Wallet file path (set from config even when wallet is locked).
     /// Used by the RPC `wallet_unlock` endpoint to load the file.
     pub(crate) wallet_path: Option<PathBuf>,
@@ -556,6 +1742,18 @@ impl ArteryState {
                 if let Err(e) = wf.encrypt_spend_credentials(&ws.billfold, &ws.enc_key) {
                     tracing::warn!(error = %e, "failed to encrypt spend credentials");
                 }
+                match ws.bitcoin_wallet.export_state_bytes() {
+                    Ok(state_bytes) => {
+                        if let Err(e) =
+                            wf.set_encrypted_bitcoin_wallet_state(&state_bytes, &ws.enc_key)
+                        {
+                            tracing::warn!(error = %e, "failed to encrypt bitcoin wallet state");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to serialize bitcoin wallet state");
+                    }
+                }
                 if let Err(e) = wf.save(&ws.wallet_path) {
                     tracing::warn!(error = %e, "failed to flush wallet to disk");
                 }
@@ -614,6 +1812,16 @@ impl ArteryState {
                 .map(|(k, v)| (hex_key(&k), v))
                 .collect(),
             manifests,
+            retained_ownership_records: self
+                .retained_ownership_records
+                .values()
+                .cloned()
+                .collect(),
+            retained_consumed_records: self
+                .retained_consumed_records
+                .iter()
+                .map(|(k, v)| (hex_key(k), v.clone()))
+                .collect(),
             // M5: persist the set of in-flight limbo payment IDs so a restart
             // cannot be used to replay a payment that is already in limbo.
             limbo_payment_ids: self.limbo_payment_ids.iter().cloned().collect(),
@@ -659,16 +1867,30 @@ impl ArteryState {
         self.tag_dht.load_hardening_proofs(snap.hardening_proofs);
 
         // Restore ownership registry.
-        let consumed: std::collections::HashMap<[u8; 32], crate::ownership_registry::ConsumedRecord> =
-            snap.consumed_records
-                .into_iter()
-                .filter_map(|(k, v)| unhex_key(&k).ok().map(|key| (key, v)))
-                .collect();
+        let consumed: std::collections::HashMap<
+            [u8; 32],
+            crate::ownership_registry::ConsumedRecord,
+        > = snap
+            .consumed_records
+            .into_iter()
+            .filter_map(|(k, v)| unhex_key(&k).ok().map(|key| (key, v)))
+            .collect();
         self.registry = OwnershipRegistry::from_records_with_tombstones(
             self.node_id,
             snap.ownership_records,
             consumed,
         );
+
+        self.retained_ownership_records = snap
+            .retained_ownership_records
+            .into_iter()
+            .map(|record| (record.mint_id, record))
+            .collect();
+        self.retained_consumed_records = snap
+            .retained_consumed_records
+            .into_iter()
+            .filter_map(|(k, v)| unhex_key(&k).ok().map(|key| (key, v)))
+            .collect();
 
         // Restore manifest store, assigning insertion time 0 for entries loaded
         // from a snapshot (they sort before any new arrivals for eviction purposes).
@@ -713,7 +1935,11 @@ fn compute_gossip_targets_scored(
         })
         .collect();
     ranked.sort_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-    let mut indices: Vec<usize> = ranked.into_iter().take(k).map(|(ci, _)| nearest[ci]).collect();
+    let mut indices: Vec<usize> = ranked
+        .into_iter()
+        .take(k)
+        .map(|(ci, _)| nearest[ci])
+        .collect();
     let extra = random_fan_out(total_peers, &indices, fan);
     for ei in extra {
         if !indices.contains(&ei) {
@@ -723,16 +1949,16 @@ fn compute_gossip_targets_scored(
     indices
 }
 
-/// Batch-send grouped messages to peers over single QUIC connections.
+/// Batch-send grouped messages to peers over single mesh sessions.
 /// Sends to all target peers concurrently via tokio::spawn.
 ///
-/// E1: Batch-send **pre-serialized** payloads to peers over single QUIC
-/// connections.  The caller serializes each logical message once and shares
+/// E1: Batch-send **pre-serialized** payloads to peers over single mesh
+/// sessions. The caller serializes each logical message once and shares
 /// the byte buffer via `Arc<Vec<u8>>` across all target peers — eliminating
 /// the `PulseMessage::clone()` + re-`to_bytes()` multiplication that the
 /// `PulseMessage`-based path incurs per target.
 async fn batch_forward_bytes_to_peers(
-    node: &VessNode,
+    node: &MeshPulseNode,
     routable_peers: &[Vec<u8>],
     per_peer: HashMap<usize, Vec<Arc<Vec<u8>>>>,
 ) {
@@ -741,17 +1967,13 @@ async fn batch_forward_bytes_to_peers(
         if idx >= routable_peers.len() || payloads.is_empty() {
             continue;
         }
-        let arr: [u8; 32] = match routable_peers[idx].as_slice().try_into() {
-            Ok(a) => a,
-            Err(_) => continue,
-        };
-        let target = match iroh::EndpointId::from_bytes(&arr) {
-            Ok(id) => id,
+        let target = match decode_contact_bytes(&routable_peers[idx]) {
+            Ok(contact) => contact,
             Err(_) => continue,
         };
         let peer_node = node.clone();
         tasks.push(tokio::spawn(async move {
-            if let Err(e) = peer_node.send_raw_pulses_to_peer(target, &payloads).await {
+            if let Err(e) = peer_node.send_raw_pulses_to_peer(&target, &payloads).await {
                 warn!("batch forward (raw) to peer failed: {e}");
             }
         }));
@@ -763,7 +1985,7 @@ async fn batch_forward_bytes_to_peers(
 
 /// Run the artery node. Blocks until the process is interrupted (Ctrl+C).
 ///
-/// Returns the node's endpoint ID string for display/use.
+/// Returns the node's mesh node ID string for display/use.
 pub async fn run_node(config: NodeConfig) -> Result<String> {
     let storage = NodeStorage::open(&config.state_dir)?;
     let snapshot = storage.load()?;
@@ -776,7 +1998,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
         let wallet = WalletFile::load(wallet_path)?;
 
         // Try password-based unlock first (fast ~1 s, 256 MiB), then
-        // fall back to recovery phrase via env vars (slow ~10 s, 2 GiB).
+        // fall back to the 12-word recovery phrase via env vars.
         let password = config
             .wallet_password
             .clone()
@@ -785,18 +2007,15 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
         let raw_seed = if let Some(ref pwd) = password {
             wallet.unlock_with_password(pwd)?
         } else {
-            // Fallback: recovery phrase + PIN from env vars (VESS_RECOVERY_PHRASE + VESS_RECOVERY_PIN).
+            // Fallback: 12-word recovery phrase from VESS_RECOVERY_PHRASE.
             use vess_kloak::recovery::{derive_raw_seed, RecoveryPhrase};
             let phrase_words = std::env::var("VESS_RECOVERY_PHRASE").map_err(|_| {
                 anyhow::anyhow!(
                     "wallet unlock requires --wallet-password / VESS_WALLET_PASSWORD \
-                     or VESS_RECOVERY_PHRASE + VESS_RECOVERY_PIN env vars"
+                     or VESS_RECOVERY_PHRASE env var"
                 )
             })?;
-            let pin = std::env::var("VESS_RECOVERY_PIN").map_err(|_| {
-                anyhow::anyhow!("VESS_RECOVERY_PIN env var required with VESS_RECOVERY_PHRASE")
-            })?;
-            let phrase = RecoveryPhrase::from_input(&phrase_words, &pin)?;
+            let phrase = RecoveryPhrase::from_input(&phrase_words)?;
             derive_raw_seed(&phrase)?
         };
 
@@ -811,10 +2030,19 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
             tracing::warn!(error = %e, "failed to decrypt spend credentials — wallet may be from older version");
         }
 
-        info!(path = %wallet_path.display(), "wallet loaded — auto-receive enabled");
+        let (bitcoin_wallet, bitcoin_receive_address) =
+            load_bitcoin_wallet_state(&wallet, &raw_seed, &enc_key)?;
+
+        info!(
+            path = %wallet_path.display(),
+            bitcoin_receive_address = %bitcoin_receive_address,
+            "wallet loaded — auto-receive enabled"
+        );
         Some(WalletState {
             stealth_secret,
             billfold,
+            bitcoin_wallet,
+            bitcoin_receive_address,
             wallet_path: wallet_path.clone(),
             enc_key,
             mailbox_key,
@@ -823,13 +2051,59 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
         None
     };
 
-    let node = VessNode::spawn().await?;
+    info!("Starting Bitcoin peer discovery before Vess mesh bootstrap...");
+    let bitcoin_client = match vess_bitcoin::BitcoinLightClient::spawn(Default::default()).await {
+        Ok(client) => {
+            info!(
+                peers = client.connected_peers(),
+                "bitcoin light client started"
+            );
+            Some(client)
+        }
+        Err(e) => {
+            warn!("bitcoin light client failed to start: {e}");
+            None
+        }
+    };
+    let bitcoin_seed_client = bitcoin_client.clone();
+    if let Some(client) = &bitcoin_seed_client {
+        let connected = client
+            .wait_for_peers(1, std::time::Duration::from_secs(5))
+            .await;
+        info!(
+            connected,
+            "initial Bitcoin peer discovery connection wait finished"
+        );
+    }
 
-    info!("Starting artery node…");
+    let mesh_seed = load_or_create_mesh_seed(&config.state_dir)?;
+    let node = MeshPulseNode::bind_from_seed(
+        std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+            std::net::Ipv4Addr::UNSPECIFIED,
+            0,
+        )),
+        &mesh_seed,
+        0,
+    )
+    .await?;
+
+    info!("Starting artery node...");
     node.wait_online().await;
 
     let node_id_str = node.id().to_string();
-    let node_id_bytes: [u8; 32] = *blake3::hash(node.id().as_bytes()).as_bytes();
+    let node_id_bytes: [u8; 32] = *node.id().as_bytes();
+    if let Some(client) = &bitcoin_seed_client {
+        let local_contact = node.contact();
+        match vess_mesh::validate_public_mesh_contact(&local_contact) {
+            Ok(()) => {
+                let local_contact = encode_contact_string(&local_contact)?;
+                client.set_local_vess_seed_node(node_id_str.clone(), local_contact);
+            }
+            Err(error) => {
+                warn!(%error, "local mesh contact is not public-routable; skipping Bitcoin seed advertisement");
+            }
+        }
+    }
 
     let gossip_config = GossipConfig {
         k_neighbors: config.k_neighbors,
@@ -860,10 +2134,13 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
         limbo_mint_ids: std::collections::HashSet::new(),
         limbo_payment_ids: std::collections::HashSet::new(),
         manifest_store: HashMap::new(),
+        retained_ownership_records: HashMap::new(),
+        retained_consumed_records: HashMap::new(),
         limbo_entry_times: HashMap::new(),
         payment_latency: PaymentLatencyTracker::new(1000),
         pending_reforge_genesis: HashMap::new(),
         wallet: wallet_state,
+        bitcoin_client,
         wallet_path: config.wallet_path.clone(),
         notifications: VecDeque::new(),
         outbound_payments: HashMap::new(),
@@ -877,6 +2154,177 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
         mailbox_fwd_limiter: crate::gossip::PeerRateLimiter::new(5, 60),
     }));
 
+    if let Some(client) = {
+        let s = state.lock().unwrap();
+        s.bitcoin_client.clone()
+    } {
+        let state_for_bitcoin = state.clone();
+        let retry_state = state.clone();
+        let retry_client = client.clone();
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_secs(AUTO_BURN_RETRY_SECS));
+            loop {
+                interval.tick().await;
+                let pending_burns = {
+                    let mut s = retry_state.lock().unwrap();
+                    let mut pending_burns = queue_auto_burn_if_needed(&mut s);
+                    if let Some(ws) = s.wallet.as_ref() {
+                        pending_burns.extend(ws.bitcoin_wallet.pending_burns_ready_for_broadcast(
+                            ArteryState::now_unix(),
+                            AUTO_BURN_RETRY_SECS,
+                        ));
+                    }
+                    if !pending_burns.is_empty() {
+                        s.flush_wallet();
+                    }
+                    pending_burns
+                };
+
+                if !pending_burns.is_empty() {
+                    broadcast_pending_burns(
+                        retry_state.clone(),
+                        retry_client.clone(),
+                        pending_burns,
+                    )
+                    .await;
+                }
+            }
+        });
+
+        let subscriber_client = client.clone();
+        tokio::spawn(async move {
+            let mut rx = subscriber_client.subscribe_transactions();
+            loop {
+                match rx.recv().await {
+                    Ok(observed) => {
+                        let pending_burns = {
+                            let mut s = state_for_bitcoin.lock().unwrap();
+                            let mut active_receive_address = None;
+                            let mut rotated_receive_address = None;
+                            let mut update = None;
+                            if let Some(ws) = s.wallet.as_mut() {
+                                active_receive_address = Some(ws.bitcoin_receive_address.clone());
+                                let current_receive_address = ws.bitcoin_receive_address.clone();
+                                let wallet_update =
+                                    ws.bitcoin_wallet.record_transaction(&observed.transaction);
+                                let used_current_receive_address =
+                                    wallet_update.discovered_utxos.iter().any(|utxo| {
+                                        utxo.address.to_string() == current_receive_address
+                                    });
+                                if used_current_receive_address {
+                                    match ws.bitcoin_wallet.issue_receive_address() {
+                                        Ok(next_receive_address) => {
+                                            ws.bitcoin_receive_address =
+                                                next_receive_address.address.to_string();
+                                            rotated_receive_address =
+                                                Some(ws.bitcoin_receive_address.clone());
+                                        }
+                                        Err(e) => {
+                                            warn!(error = %e, "failed to rotate bitcoin receive address after first tracked use");
+                                        }
+                                    }
+                                }
+                                update = Some(wallet_update);
+                            }
+
+                            if let Some(ref update) = update {
+                                if !update.discovered_utxos.is_empty() {
+                                    let received_sats: u64 = update
+                                        .discovered_utxos
+                                        .iter()
+                                        .map(|utxo| utxo.value_sats)
+                                        .sum();
+                                    s.push_notification(WalletNotification {
+                                        kind: "bitcoin_received".to_string(),
+                                        created_at: ArteryState::now_unix(),
+                                        payment_id: observed.txid.to_string(),
+                                        amount: Some(received_sats),
+                                        bill_count: Some(update.discovered_utxos.len()),
+                                        counterparty: Some(observed.peer.to_string()),
+                                        message: format!(
+                                            "Tracked {} sat(s) to {} Bitcoin output(s) in {} for receive address {}.",
+                                            received_sats,
+                                            update.discovered_utxos.len(),
+                                            observed.txid,
+                                            active_receive_address.unwrap_or_else(|| "<unknown>".to_string())
+                                        ),
+                                    });
+                                    if let Some(ref next_receive_address) = rotated_receive_address
+                                    {
+                                        s.push_notification(WalletNotification {
+                                            kind: "bitcoin_receive_address_rotated".to_string(),
+                                            created_at: ArteryState::now_unix(),
+                                            payment_id: observed.txid.to_string(),
+                                            amount: None,
+                                            bill_count: None,
+                                            counterparty: None,
+                                            message: format!(
+                                                "Rotated Bitcoin receive address after {}. New receive address: {}.",
+                                                observed.txid, next_receive_address
+                                            ),
+                                        });
+                                    }
+                                }
+                                for pending_txid in &update.seen_pending_burns {
+                                    s.push_notification(WalletNotification {
+                                        kind: "bitcoin_burn_seen".to_string(),
+                                        created_at: ArteryState::now_unix(),
+                                        payment_id: pending_txid.to_string(),
+                                        amount: None,
+                                        bill_count: None,
+                                        counterparty: Some(observed.peer.to_string()),
+                                        message: format!(
+                                            "Observed pending Bitcoin burn {} from peer {}.",
+                                            pending_txid, observed.peer
+                                        ),
+                                    });
+                                }
+                                for pending_txid in &update.conflicted_pending_burns {
+                                    s.push_notification(WalletNotification {
+                                        kind: "bitcoin_burn_conflicted".to_string(),
+                                        created_at: ArteryState::now_unix(),
+                                        payment_id: pending_txid.to_string(),
+                                        amount: None,
+                                        bill_count: None,
+                                        counterparty: Some(observed.peer.to_string()),
+                                        message: format!(
+                                            "Pending Bitcoin burn {} conflicted with observed transaction {}.",
+                                            pending_txid, observed.txid
+                                        ),
+                                    });
+                                }
+                            }
+
+                            let pending_burns = queue_auto_burn_if_needed(&mut s);
+                            if let Some(ref update) = update {
+                                if update.has_state_change() || !pending_burns.is_empty() {
+                                    s.flush_wallet();
+                                }
+                            } else if !pending_burns.is_empty() {
+                                s.flush_wallet();
+                            }
+                            pending_burns
+                        };
+
+                        if !pending_burns.is_empty() {
+                            broadcast_pending_burns(
+                                state_for_bitcoin.clone(),
+                                subscriber_client.clone(),
+                                pending_burns,
+                            )
+                            .await;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        warn!(skipped, "bitcoin transaction subscriber lagged behind");
+                    }
+                }
+            }
+        });
+    }
+
     // ── Gossip drain channels ───────────────────────────────────────
     // Unbounded mpsc channels decouple queue producers (handler) from
     // consumers (drain loops) so drain loops never contend on the main
@@ -889,7 +2337,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
     let (oc_tx, mut oc_rx) = tokio::sync::mpsc::unbounded_channel::<OwnershipClaim>();
     let (ra_tx, mut ra_rx) = tokio::sync::mpsc::unbounded_channel::<ReforgeAttestation>();
     let (pay_tx, mut pay_rx) = tokio::sync::mpsc::unbounded_channel::<vess_protocol::Payment>();
-    // Forward channel: (target EndpointId bytes, Payment to deliver).
+    // Forward channel: (target serialized mesh contact, Payment to deliver).
     // The drain task below sends a LimboDeliver to subscribed nodes.
     let (fwd_tx, mut fwd_rx) =
         tokio::sync::mpsc::unbounded_channel::<(Vec<u8>, vess_protocol::Payment)>();
@@ -953,7 +2401,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     }
                 }
                 for claim in pending_claims {
-                    let _ = oc_tx.send(claim);
+                    queue_local_ownership_claim(&mut s, &oc_tx, claim);
                 }
                 if received > 0 {
                     info!(
@@ -967,6 +2415,10 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
     }
 
     info!(node_id = %node.id(), state = %config.state_dir.display(), version = %hex_key(&PROTOCOL_VERSION_HASH), k = config.k_neighbors, max_hops = config.max_hops, "Artery node online");
+    spawn_local_lan_discovery(node.contact(), state.clone());
+    if let Some(client) = bitcoin_seed_client.clone() {
+        spawn_bitcoin_vess_discovery(client, state.clone());
+    }
     if config.wallet_path.is_some() {
         let s = state.lock().unwrap();
         let bal = s.wallet.as_ref().map(|w| w.billfold.balance()).unwrap_or(0);
@@ -988,7 +2440,8 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600));
+                let _ =
+                    std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600));
             }
         }
         info!(port, "RPC server listening");
@@ -1004,13 +2457,132 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
         };
         let rpc_node = node.clone();
         tokio::spawn(async move {
-            if let Err(e) = crate::rpc::run_rpc_server(port, rpc_token, rpc_state, rpc_senders, rpc_node).await
+            if let Err(e) =
+                crate::rpc::run_rpc_server(port, rpc_token, rpc_state, rpc_senders, rpc_node).await
             {
                 warn!(error = %e, "RPC server exited with error");
             }
         });
     }
     info!("listening for protocol messages");
+
+    if let Some(confirm_client) = {
+        let s = state.lock().unwrap();
+        s.bitcoin_client.clone()
+    } {
+        let confirm_state = state.clone();
+        let confirm_og_tx = og_tx.clone();
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_secs(AUTO_BURN_RETRY_SECS));
+            loop {
+                interval.tick().await;
+
+                let (pending_burns, hops_remaining) = {
+                    let s = confirm_state.lock().unwrap();
+                    let pending_burns = s
+                        .wallet
+                        .as_ref()
+                        .map(|ws| ws.bitcoin_wallet.pending_burns())
+                        .unwrap_or_default();
+                    (pending_burns, s.gossip_config.max_hops)
+                };
+
+                for pending in pending_burns {
+                    let confirmation = match confirm_client
+                        .request_burn_confirmation(pending.txid, pending.created_at)
+                        .await
+                    {
+                        Ok(Some(confirmation)) => confirmation,
+                        Ok(None) => continue,
+                        Err(e) => {
+                            warn!(txid = %pending.txid, error = %e, "failed to confirm automatic bitcoin burn");
+                            continue;
+                        }
+                    };
+
+                    let (genesis_records, bills) = match confirmed_burn_outputs(
+                        &pending,
+                        &confirmation,
+                        vess_bitcoin::BitcoinNetwork::Mainnet,
+                        hops_remaining,
+                    ) {
+                        Ok(outputs) => outputs,
+                        Err(e) => {
+                            warn!(txid = %pending.txid, error = %e, "failed to assemble bitcoin burn ownership genesis records");
+                            continue;
+                        }
+                    };
+
+                    let minted_total: u64 =
+                        bills.iter().map(|bill| bill.denomination.value()).sum();
+                    let bill_count = bills.len();
+                    let spend_credential = SpendCredential {
+                        spend_vk: pending.first_owner_vk.clone(),
+                        spend_sk: pending.first_owner_sk.clone(),
+                    };
+
+                    let should_gossip = {
+                        let mut s = confirm_state.lock().unwrap();
+                        let removed = if let Some(ws) = s.wallet.as_mut() {
+                            if ws
+                                .bitcoin_wallet
+                                .remove_pending_burn(&pending.txid)
+                                .is_none()
+                            {
+                                false
+                            } else {
+                                for bill in &bills {
+                                    ws.billfold.deposit_with_credentials(
+                                        bill.clone(),
+                                        spend_credential.clone(),
+                                    );
+                                }
+                                true
+                            }
+                        } else {
+                            false
+                        };
+
+                        if removed {
+                            s.push_notification(WalletNotification {
+                                kind: "bitcoin_burn_confirmed".to_string(),
+                                created_at: ArteryState::now_unix(),
+                                payment_id: pending.txid.to_string(),
+                                amount: Some(minted_total),
+                                bill_count: Some(bill_count),
+                                counterparty: Some(confirmation.block_hash.to_string()),
+                                message: format!(
+                                    "Confirmed Bitcoin burn {} in block {} and minted {} Vess bill(s) for {} sats.",
+                                    pending.txid,
+                                    confirmation.block_hash,
+                                    bill_count,
+                                    minted_total
+                                ),
+                            });
+                            s.flush_wallet();
+                            info!(
+                                txid = %pending.txid,
+                                block_hash = %confirmation.block_hash,
+                                minted_total,
+                                bill_count,
+                                "confirmed automatic bitcoin burn and generated ownership genesis"
+                            );
+                        }
+
+                        removed
+                    };
+
+                    if should_gossip {
+                        let mut s = confirm_state.lock().unwrap();
+                        for og in genesis_records {
+                            queue_local_ownership_genesis(&mut s, &confirm_og_tx, og);
+                        }
+                    }
+                }
+            }
+        });
+    }
 
     // ── Periodic state flush (every 60 seconds) ─────────────────────
     let flush_state = state.clone();
@@ -1051,7 +2623,10 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     s.limbo_entry_times.remove(mid);
                 }
                 if !stale.is_empty() {
-                    info!(count = stale.len(), "evicted expired limbo_mint_ids entries");
+                    info!(
+                        count = stale.len(),
+                        "evicted expired limbo_mint_ids entries"
+                    );
                 }
                 // Release bill reservations older than the limbo TTL (3600 s).
                 if let Some(ref mut ws) = s.wallet {
@@ -1075,7 +2650,10 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 s.mailbox_fwd.retain(|_, r| r.expires_at > now);
                 let evicted_fwd = before_fwd - s.mailbox_fwd.len();
                 if evicted_fwd > 0 {
-                    info!(count = evicted_fwd, "evicted expired mailbox forward subscriptions");
+                    info!(
+                        count = evicted_fwd,
+                        "evicted expired mailbox forward subscriptions"
+                    );
                 }
                 // C1: Evict pending-reforge-genesis entries older than the TTL.
                 // Without this, keys created by fake attestations linger forever.
@@ -1147,23 +2725,49 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
         }
     });
 
-    // ── DNS seed resolution ─────────────────────────────────────────
-    // Load seeds from seeds.txt (created with defaults on first run),
-    // then merge any extra seeds from the NodeConfig.
-    let file_seeds = crate::dns_seed::load_seeds_file(&config.state_dir);
-    let mut all_seeds = file_seeds;
-    for s in &config.seeds {
-        if !all_seeds.contains(s) {
-            all_seeds.push(s.clone());
-        }
-    }
+    // ── Bootstrap discovery ─────────────────────────────────────────
     let mut all_bootstrap = config.bootstrap.clone();
-    for domain in &all_seeds {
-        match crate::dns_seed::resolve_seeds(domain).await {
-            Ok(peers) => all_bootstrap.extend(peers),
-            Err(e) => warn!(domain = %domain, "DNS seed resolution failed: {e}"),
+    {
+        let s = state.lock().unwrap();
+        all_bootstrap.extend(
+            s.routing_table
+                .routable_peers(|_| true)
+                .into_iter()
+                .filter_map(|peer| String::from_utf8(peer.id_bytes).ok()),
+        );
+    }
+    let local_peers = crate::local_discovery::discover_lan_peer_contacts(
+        std::time::Duration::from_secs(2),
+        Some(node_id_bytes),
+    )
+    .await;
+    if !local_peers.is_empty() {
+        info!(
+            count = local_peers.len(),
+            "discovered Vess bootstrap nodes via LAN/local discovery"
+        );
+        all_bootstrap.extend(local_peers.iter().filter_map(bootstrap_string_from_contact));
+    }
+    if let Some(client) = &bitcoin_seed_client {
+        let discovered = client.discover_vess_nodes().await;
+        if !discovered.is_empty() {
+            info!(
+                count = discovered.len(),
+                "discovered Vess bootstrap nodes via Bitcoin peers"
+            );
+            all_bootstrap.extend(discovered.into_iter().map(|node| node.contact));
         }
     }
+    if config.use_dns_seeds {
+        for domain in &config.seeds {
+            match crate::dns_seed::resolve_seeds(domain).await {
+                Ok(peers) => all_bootstrap.extend(peers),
+                Err(e) => warn!(domain = %domain, "legacy DNS seed resolution failed: {e}"),
+            }
+        }
+    }
+    all_bootstrap.sort_unstable();
+    all_bootstrap.dedup();
 
     // ── Bootstrap ───────────────────────────────────────────────────
     if !all_bootstrap.is_empty() {
@@ -1177,14 +2781,24 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 if peer_str.is_empty() {
                     continue;
                 }
-                let target: iroh::EndpointId = match peer_str.parse() {
-                    Ok(id) => id,
+                let target = match parse_contact_string(peer_str) {
+                    Ok(contact) => contact,
                     Err(e) => {
                         warn!("invalid bootstrap peer {peer_str}: {e}");
                         continue;
                     }
                 };
-                let peer_hash: [u8; 32] = *blake3::hash(target.as_bytes()).as_bytes();
+                let Some(peer_hash) = contact_node_id_bytes(&target) else {
+                    warn!("bootstrap peer {peer_str} is missing a mesh node id");
+                    continue;
+                };
+                let target_bytes = match encode_contact_bytes(&target) {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        warn!("failed to encode bootstrap peer {peer_str}: {e}");
+                        continue;
+                    }
+                };
 
                 {
                     let mut s = boot_state.lock().unwrap();
@@ -1195,7 +2809,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                             .as_secs();
                         s.routing_table.insert(RoutingPeer {
                             id_hash: peer_hash,
-                            id_bytes: target.as_bytes().to_vec(),
+                            id_bytes: target_bytes.clone(),
                             last_seen: boot_now,
                             first_seen: boot_now,
                         });
@@ -1209,7 +2823,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 };
                 let challenge = PulseMessage::HandshakeChallenge(HandshakeChallenge { nonce });
                 match boot_node
-                    .send_message_with_response(target, &challenge)
+                    .send_message_with_response(&target, &challenge)
                     .await
                 {
                     Ok(Some(PulseMessage::HandshakeResponse(resp))) => {
@@ -1221,7 +2835,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                         ) {
                             // Verify Argon2id PoW from the bootstrap peer.
                             if resp.pow_hash.is_empty()
-                                || !verify_handshake_pow(target.as_bytes(), &nonce, &resp.pow_hash)
+                                || !verify_handshake_pow(&peer_hash, &nonce, &resp.pow_hash)
                             {
                                 warn!(peer = %peer_str, "bootstrap peer PoW verification failed — banishing");
                                 s.peer_registry.mark_banished(peer_hash);
@@ -1249,15 +2863,24 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 let msg = PulseMessage::PeerExchange(PeerExchange {
                     sender_id: boot_node.id().as_bytes().to_vec(),
                 });
-                match boot_node.send_message_with_response(target, &msg).await {
+                match boot_node.send_message_with_response(&target, &msg).await {
                     Ok(Some(PulseMessage::PeerExchangeResponse(resp))) => {
+                        if resp.peers.len() > MAX_PEER_EXCHANGE_PEERS {
+                            warn!(
+                                peer = %peer_str,
+                                count = resp.peers.len(),
+                                "bootstrap peer returned too many contacts; truncating response"
+                            );
+                        }
                         let mut s = boot_state.lock().unwrap();
                         let now = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs();
-                        for peer_bytes in &resp.peers {
-                            let peer_hash: [u8; 32] = *blake3::hash(peer_bytes).as_bytes();
+                        for peer_bytes in resp.peers.iter().take(MAX_PEER_EXCHANGE_PEERS) {
+                            let Some(peer_hash) = peer_hash_from_contact_bytes(peer_bytes) else {
+                                continue;
+                            };
                             if peer_hash == s.node_id {
                                 continue;
                             }
@@ -1268,9 +2891,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                                     last_seen: now,
                                     first_seen: now,
                                 });
-                                if let Ok(arr) = <[u8; 32]>::try_from(peer_bytes.as_slice()) {
-                                    s.handshake_queue.push(arr);
-                                }
+                                s.handshake_queue.push(peer_hash);
                             }
                         }
                         s.estimated_network_size = s.routing_table.estimated_network_size();
@@ -1285,6 +2906,8 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     Ok(_) => warn!("unexpected response from bootstrap peer"),
                     Err(e) => warn!("bootstrap peer {peer_str} unreachable: {e}"),
                 }
+
+                request_dht_seed_catchup(&boot_node, &target, &boot_state).await;
             }
         });
     }
@@ -1330,7 +2953,10 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
             for ms in &manifests {
                 let bytes = match PulseMessage::ManifestStore(ms.clone()).to_bytes() {
                     Ok(b) => Arc::new(b),
-                    Err(e) => { warn!(error = %e, "serialize ManifestStore failed"); continue; }
+                    Err(e) => {
+                        warn!(error = %e, "serialize ManifestStore failed");
+                        continue;
+                    }
                 };
                 let indices = compute_gossip_targets_scored(
                     &ms.dht_key,
@@ -1342,10 +2968,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     routable_peers.len(),
                 );
                 for idx in indices {
-                    per_peer
-                        .entry(idx)
-                        .or_default()
-                        .push(Arc::clone(&bytes));
+                    per_peer.entry(idx).or_default().push(Arc::clone(&bytes));
                 }
             }
             batch_forward_bytes_to_peers(&manifest_drain_node, &routable_peers, per_peer).await;
@@ -1392,7 +3015,10 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 let dht_key = ts.tag_hash;
                 let bytes = match PulseMessage::TagStore(ts.clone()).to_bytes() {
                     Ok(b) => Arc::new(b),
-                    Err(e) => { warn!(error = %e, "serialize TagStore failed"); continue; }
+                    Err(e) => {
+                        warn!(error = %e, "serialize TagStore failed");
+                        continue;
+                    }
                 };
                 let indices = compute_gossip_targets_scored(
                     &dht_key,
@@ -1404,10 +3030,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     routable_peers.len(),
                 );
                 for idx in indices {
-                    per_peer
-                        .entry(idx)
-                        .or_default()
-                        .push(Arc::clone(&bytes));
+                    per_peer.entry(idx).or_default().push(Arc::clone(&bytes));
                 }
             }
             batch_forward_bytes_to_peers(&tag_drain_node, &routable_peers, per_peer).await;
@@ -1454,7 +3077,10 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 let dht_key = tc.tag_hash;
                 let bytes = match PulseMessage::TagConfirm(tc.clone()).to_bytes() {
                     Ok(b) => Arc::new(b),
-                    Err(e) => { warn!(error = %e, "serialize TagConfirm failed"); continue; }
+                    Err(e) => {
+                        warn!(error = %e, "serialize TagConfirm failed");
+                        continue;
+                    }
                 };
                 let indices = compute_gossip_targets_scored(
                     &dht_key,
@@ -1466,10 +3092,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     routable_peers.len(),
                 );
                 for idx in indices {
-                    per_peer
-                        .entry(idx)
-                        .or_default()
-                        .push(Arc::clone(&bytes));
+                    per_peer.entry(idx).or_default().push(Arc::clone(&bytes));
                 }
             }
             batch_forward_bytes_to_peers(&confirm_drain_node, &routable_peers, per_peer).await;
@@ -1517,7 +3140,10 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 // clone multiplying by fan-out targets (E1).
                 let bytes = match PulseMessage::OwnershipGenesis(og.clone()).to_bytes() {
                     Ok(b) => Arc::new(b),
-                    Err(e) => { warn!(error = %e, "serialize OwnershipGenesis failed"); continue; }
+                    Err(e) => {
+                        warn!(error = %e, "serialize OwnershipGenesis failed");
+                        continue;
+                    }
                 };
                 let indices = compute_gossip_targets_scored(
                     &og.mint_id,
@@ -1529,10 +3155,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     routable_peers.len(),
                 );
                 for idx in indices {
-                    per_peer
-                        .entry(idx)
-                        .or_default()
-                        .push(Arc::clone(&bytes));
+                    per_peer.entry(idx).or_default().push(Arc::clone(&bytes));
                 }
             }
             batch_forward_bytes_to_peers(&og_drain_node, &routable_peers, per_peer).await;
@@ -1578,7 +3201,10 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
             for oc in &items {
                 let bytes = match PulseMessage::OwnershipClaim(oc.clone()).to_bytes() {
                     Ok(b) => Arc::new(b),
-                    Err(e) => { warn!(error = %e, "serialize OwnershipClaim failed"); continue; }
+                    Err(e) => {
+                        warn!(error = %e, "serialize OwnershipClaim failed");
+                        continue;
+                    }
                 };
                 let indices = compute_gossip_targets_scored(
                     &oc.mint_id,
@@ -1590,10 +3216,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     routable_peers.len(),
                 );
                 for idx in indices {
-                    per_peer
-                        .entry(idx)
-                        .or_default()
-                        .push(Arc::clone(&bytes));
+                    per_peer.entry(idx).or_default().push(Arc::clone(&bytes));
                 }
             }
             batch_forward_bytes_to_peers(&oc_drain_node, &routable_peers, per_peer).await;
@@ -1639,7 +3262,10 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
             for ra in &items {
                 let bytes = match PulseMessage::ReforgeAttestation(ra.clone()).to_bytes() {
                     Ok(b) => Arc::new(b),
-                    Err(e) => { warn!(error = %e, "serialize ReforgeAttestation failed"); continue; }
+                    Err(e) => {
+                        warn!(error = %e, "serialize ReforgeAttestation failed");
+                        continue;
+                    }
                 };
                 for cid in &ra.consumed_mint_ids {
                     let indices = compute_gossip_targets_scored(
@@ -1652,10 +3278,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                         routable_peers.len(),
                     );
                     for idx in indices {
-                        per_peer
-                            .entry(idx)
-                            .or_default()
-                            .push(Arc::clone(&bytes));
+                        per_peer.entry(idx).or_default().push(Arc::clone(&bytes));
                     }
                 }
             }
@@ -1705,7 +3328,10 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
             for p in &items {
                 let bytes = match PulseMessage::Payment(p.clone()).to_bytes() {
                     Ok(b) => Arc::new(b),
-                    Err(e) => { warn!(error = %e, "serialize Payment failed"); continue; }
+                    Err(e) => {
+                        warn!(error = %e, "serialize Payment failed");
+                        continue;
+                    }
                 };
                 let indices = compute_gossip_targets_scored(
                     // Route by mailbox_key when present — puts payment into the
@@ -1719,10 +3345,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     routable_peers.len(),
                 );
                 for idx in indices {
-                    per_peer
-                        .entry(idx)
-                        .or_default()
-                        .push(Arc::clone(&bytes));
+                    per_peer.entry(idx).or_default().push(Arc::clone(&bytes));
                 }
             }
             batch_forward_bytes_to_peers(&pay_drain_node, &routable_peers, per_peer).await;
@@ -1737,16 +3360,12 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
     let fwd_drain_node = node.clone();
     tokio::spawn(async move {
         while let Some((target_bytes, payment)) = fwd_rx.recv().await {
-            let arr: [u8; 32] = match target_bytes.as_slice().try_into() {
-                Ok(a) => a,
-                Err(_) => continue,
-            };
-            let target = match iroh::EndpointId::from_bytes(&arr) {
-                Ok(id) => id,
+            let target = match decode_contact_bytes(&target_bytes) {
+                Ok(contact) => contact,
                 Err(_) => continue,
             };
             let msg = PulseMessage::LimboDeliver(vess_protocol::LimboDeliver { payment });
-            if let Err(e) = fwd_drain_node.send_message(target, &msg).await {
+            if let Err(e) = fwd_drain_node.send_message(&target, &msg).await {
                 warn!(error = %e, "mailbox forward delivery failed");
             }
         }
@@ -1777,27 +3396,31 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 };
 
                 for peer_bytes in peers_to_ask {
-                    let arr: [u8; 32] = match peer_bytes.as_slice().try_into() {
-                        Ok(a) => a,
-                        Err(_) => continue,
-                    };
-                    let target = match iroh::EndpointId::from_bytes(&arr) {
-                        Ok(id) => id,
+                    let target = match decode_contact_bytes(&peer_bytes) {
+                        Ok(contact) => contact,
                         Err(_) => continue,
                     };
                     let msg = PulseMessage::PeerExchange(PeerExchange {
                         sender_id: pex_node.id().as_bytes().to_vec(),
                     });
                     if let Ok(Some(PulseMessage::PeerExchangeResponse(resp))) =
-                        pex_node.send_message_with_response(target, &msg).await
+                        pex_node.send_message_with_response(&target, &msg).await
                     {
+                        if resp.peers.len() > MAX_PEER_EXCHANGE_PEERS {
+                            warn!(
+                                count = resp.peers.len(),
+                                "peer exchange returned too many contacts; truncating response"
+                            );
+                        }
                         let mut s = pex_state.lock().unwrap();
                         let now = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs();
-                        for new_peer_bytes in &resp.peers {
-                            let hash: [u8; 32] = *blake3::hash(new_peer_bytes).as_bytes();
+                        for new_peer_bytes in resp.peers.iter().take(MAX_PEER_EXCHANGE_PEERS) {
+                            let Some(hash) = peer_hash_from_contact_bytes(new_peer_bytes) else {
+                                continue;
+                            };
                             if hash == s.node_id {
                                 continue;
                             }
@@ -1808,9 +3431,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                                     last_seen: now,
                                     first_seen: now,
                                 });
-                                if let Ok(arr) = <[u8; 32]>::try_from(new_peer_bytes.as_slice()) {
-                                    s.handshake_queue.push(arr);
-                                }
+                                s.handshake_queue.push(hash);
                             }
                         }
                     }
@@ -1834,9 +3455,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 s.handshake_queue.drain(..).collect()
             };
 
-            for id_bytes in peers_to_challenge {
-                let peer_hash: [u8; 32] = *blake3::hash(&id_bytes).as_bytes();
-
+            for peer_hash in peers_to_challenge {
                 {
                     let s = hs_state.lock().unwrap();
                     let st = s.peer_registry.state(&peer_hash);
@@ -1845,8 +3464,15 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     }
                 }
 
-                let target = match iroh::EndpointId::from_bytes(&id_bytes) {
-                    Ok(id) => id,
+                let target_bytes = {
+                    let s = hs_state.lock().unwrap();
+                    match s.routing_table.peer_id_bytes(&peer_hash) {
+                        Some(bytes) => bytes,
+                        None => continue,
+                    }
+                };
+                let target = match decode_contact_bytes(&target_bytes) {
+                    Ok(contact) => contact,
                     Err(_) => continue,
                 };
 
@@ -1856,27 +3482,40 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 };
 
                 let challenge = PulseMessage::HandshakeChallenge(HandshakeChallenge { nonce });
-                if let Ok(Some(PulseMessage::HandshakeResponse(resp))) =
-                    hs_node.send_message_with_response(target, &challenge).await
+                if let Ok(Some(PulseMessage::HandshakeResponse(resp))) = hs_node
+                    .send_message_with_response(&target, &challenge)
+                    .await
                 {
-                    let mut s = hs_state.lock().unwrap();
-                    if s.peer_registry
-                        .verify_response(&peer_hash, &resp.hmac, &ALLOWED_VERSIONS)
-                    {
-                        // Verify Argon2id PoW from the peer.
-                        if resp.pow_hash.is_empty()
-                            || !verify_handshake_pow(&id_bytes, &nonce, &resp.pow_hash)
-                        {
-                            warn!("peer PoW verification failed — banishing");
+                    let verified = {
+                        let mut s = hs_state.lock().unwrap();
+                        if s.peer_registry.verify_response(
+                            &peer_hash,
+                            &resp.hmac,
+                            &ALLOWED_VERSIONS,
+                        ) {
+                            // Verify Argon2id PoW from the peer.
+                            if resp.pow_hash.is_empty()
+                                || !verify_handshake_pow(&peer_hash, &nonce, &resp.pow_hash)
+                            {
+                                warn!("peer PoW verification failed — banishing");
+                                s.peer_registry.mark_banished(peer_hash);
+                                hs_ban.banish(peer_hash);
+                                false
+                            } else {
+                                info!("peer verified via handshake");
+                                true
+                            }
+                        } else {
                             s.peer_registry.mark_banished(peer_hash);
                             hs_ban.banish(peer_hash);
-                        } else {
-                            info!("peer verified via handshake");
+                            info!("peer banished — invalid handshake response");
+                            false
                         }
-                    } else {
-                        s.peer_registry.mark_banished(peer_hash);
-                        hs_ban.banish(peer_hash);
-                        info!("peer banished — invalid handshake response");
+                    };
+
+                    if verified {
+                        request_dht_seed_catchup(&hs_node, &target, &hs_state).await;
+                        refresh_mailbox_forward_subscriptions(&hs_node, &hs_state).await;
                     }
                 }
             }
@@ -1913,24 +3552,20 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     Some(b) => b,
                     None => continue, // peer no longer in routing table
                 };
-                let id_arr: [u8; 32] = match id_bytes.as_slice().try_into() {
-                    Ok(a) => a,
-                    Err(_) => continue,
-                };
 
                 let nonce = {
                     let mut s = reverify_state.lock().unwrap();
                     s.peer_registry.issue_challenge(peer_hash)
                 };
 
-                let target = match iroh::EndpointId::from_bytes(&id_arr) {
-                    Ok(id) => id,
+                let target = match decode_contact_bytes(&id_bytes) {
+                    Ok(contact) => contact,
                     Err(_) => continue,
                 };
 
                 let challenge = PulseMessage::HandshakeChallenge(HandshakeChallenge { nonce });
                 match reverify_node
-                    .send_message_with_response(target, &challenge)
+                    .send_message_with_response(&target, &challenge)
                     .await
                 {
                     Ok(Some(PulseMessage::HandshakeResponse(resp))) => {
@@ -1941,7 +3576,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                             &ALLOWED_VERSIONS,
                         ) {
                             if resp.pow_hash.is_empty()
-                                || !verify_handshake_pow(&id_bytes, &nonce, &resp.pow_hash)
+                                || !verify_handshake_pow(&peer_hash, &nonce, &resp.pow_hash)
                             {
                                 warn!("re-verification PoW failed — banishing");
                                 s.peer_registry.mark_banished(peer_hash);
@@ -2022,15 +3657,11 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
 
             for (peers, msg) in notify_msgs {
                 for peer_bytes in &peers {
-                    let arr: [u8; 32] = match peer_bytes.as_slice().try_into() {
-                        Ok(a) => a,
+                    let target = match decode_contact_bytes(peer_bytes) {
+                        Ok(contact) => contact,
                         Err(_) => continue,
                     };
-                    let target = match iroh::EndpointId::from_bytes(&arr) {
-                        Ok(id) => id,
-                        Err(_) => continue,
-                    };
-                    if let Err(e) = limbo_node.send_message(target, &msg).await {
+                    if let Err(e) = limbo_node.send_message(&target, &msg).await {
                         warn!("limbo notify failed: {e}");
                     }
                 }
@@ -2044,72 +3675,17 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
     // for our `mailbox_key` so they push matching payments via LimboDeliver.
     // Runs every 30 minutes, which is half the maximum TTL (3600 s), so the
     // subscription stays continuously active without waiting for expiry.
-    // The first attempt is delayed by 15 s to allow bootstrap peers to connect.
+    // The first attempt is delayed by 5 s to allow bootstrap peers to connect.
     let fwd_sub_node = node.clone();
     let fwd_sub_state = state.clone();
     tokio::spawn(async move {
         // Give bootstrap / handshake tasks a head-start before we register.
-        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        refresh_mailbox_forward_subscriptions(&fwd_sub_node, &fwd_sub_state).await;
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(1_800));
         loop {
             interval.tick().await;
-
-            // Snapshot mailbox_key and nearest verified peers under the lock.
-            let (mailbox_key, nearest_peers) = {
-                let s = fwd_sub_state.lock().unwrap();
-                let mk = match s.wallet.as_ref().map(|w| w.mailbox_key) {
-                    Some(k) => k,
-                    None => continue, // no wallet — nothing to subscribe for
-                };
-                let peers = s
-                    .routing_table
-                    .closest_peers(&mk, s.gossip_config.k_neighbors)
-                    .into_iter()
-                    .filter(|p| s.peer_registry.state(&p.id_hash) == PeerState::Verified)
-                    .map(|p| p.id_bytes)
-                    .collect::<Vec<_>>();
-                (mk, peers)
-            };
-
-            if nearest_peers.is_empty() {
-                continue; // no verified peers yet — will retry in 30 min
-            }
-
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-
-            for peer_bytes in &nearest_peers {
-                let arr: [u8; 32] = match peer_bytes.as_slice().try_into() {
-                    Ok(a) => a,
-                    Err(_) => continue,
-                };
-                let target = match iroh::EndpointId::from_bytes(&arr) {
-                    Ok(id) => id,
-                    Err(_) => continue,
-                };
-                let nonce: [u8; 16] = {
-                    use rand::Rng;
-                    rand::thread_rng().gen()
-                };
-                let msg = PulseMessage::MailboxForwardRegister(vess_protocol::MailboxForwardRegister {
-                    mailbox_key,
-                    timestamp: now,
-                    ttl_secs: MAX_FORWARD_TTL_SECS as u32,
-                    nonce,
-                });
-                match fwd_sub_node.send_message_with_response(target, &msg).await {
-                    Ok(Some(PulseMessage::MailboxForwardAck(ack))) => {
-                        if ack.accepted {
-                            info!(queued = ack.queued_forwarded, "mailbox forward subscription accepted");
-                        } else {
-                            info!("mailbox forward subscription rejected by peer");
-                        }
-                    }
-                    _ => {} // unreachable or unexpected — silently skip
-                }
-            }
+            refresh_mailbox_forward_subscriptions(&fwd_sub_node, &fwd_sub_state).await;
         }
     });
 
@@ -2131,7 +3707,9 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
     let h_pay_tx = pay_tx.clone();
     let h_fwd_tx = fwd_tx.clone();
     node.listen_messages_with_response(move |peer, msg| {
-        let peer_hash: [u8; 32] = *blake3::hash(peer.as_bytes()).as_bytes();
+        let Some(peer_hash) = peer.node_id().map(|node_id| *node_id.as_bytes()) else {
+            return None;
+        };
         if ban_ref.is_banished(&peer_hash) {
             return None;
         }
@@ -2139,17 +3717,23 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
         let mut state = st.lock().unwrap();
 
         let peer_id: [u8; 32] = peer_hash;
-        let peer_bytes = peer.as_bytes().to_vec();
+        let peer_bytes = match encode_contact_bytes(&peer.contact) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                warn!(peer = %peer, error = %e, "failed to serialize peer contact");
+                return None;
+            }
+        };
         let now_ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
         if state.routing_table.contains(&peer_id) {
-            state.routing_table.fill_id_bytes(&peer_id, peer_bytes);
+            state.routing_table.fill_id_bytes(&peer_id, peer_bytes.clone());
         } else {
             let inserted = state.routing_table.insert(RoutingPeer {
                 id_hash: peer_id,
-                id_bytes: peer_bytes,
+                id_bytes: peer_bytes.clone(),
                 last_seen: now_ts,
                 first_seen: now_ts,
             });
@@ -2164,7 +3748,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 let hmac = compute_handshake_hmac(&PROTOCOL_VERSION_HASH, &hc.nonce);
                 // Compute Argon2id PoW over (our node_id, nonce) to prove we invested
                 // real resources. This makes Sybil node creation expensive.
-                let pow_hash = compute_handshake_pow(peer.as_bytes(), &hc.nonce);
+                let pow_hash = compute_handshake_pow(&peer_id, &hc.nonce);
                 return Some(PulseMessage::HandshakeResponse(HandshakeResponse {
                     hmac,
                     pow_hash,
@@ -2189,7 +3773,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 match stored_nonce {
                     Some(nonce) => {
                         if hr.pow_hash.is_empty()
-                            || !verify_handshake_pow(peer.as_bytes(), &nonce, &hr.pow_hash)
+                            || !verify_handshake_pow(&peer_id, &nonce, &hr.pow_hash)
                         {
                             warn!(%peer, "handshake PoW verification failed — banishing");
                             state.peer_registry.mark_banished(peer_id);
@@ -2250,9 +3834,8 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
         );
         if mesh_critical && state.peer_registry.state(&peer_id) != PeerState::Verified {
             if state.peer_registry.state(&peer_id) == PeerState::Unknown {
-                let id_bytes = peer.as_bytes().to_owned();
-                if !state.handshake_queue.contains(&id_bytes) {
-                    state.handshake_queue.push(id_bytes);
+                if !state.handshake_queue.contains(&peer_id) {
+                    state.handshake_queue.push(peer_id);
                 }
             }
             return None;
@@ -2337,14 +3920,14 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 let ttl = (mfr.ttl_secs as u64).min(MAX_FORWARD_TTL_SECS);
                 let expires_at = now + ttl;
                 state.mailbox_fwd.insert(mfr.mailbox_key, ForwardRecord {
-                    target_id_bytes: peer.as_bytes().to_vec(),
+                    target_id_bytes: peer_bytes.clone(),
                     expires_at,
                 });
 
                 // Immediately push any already-waiting payments for this key.
                 let waiting = state.limbo_buffer.payments_by_mailbox_key(&mfr.mailbox_key, MAX_SWEEP_PAYLOADS);
                 let queued_forwarded = waiting.len() as u32;
-                let target_bytes = peer.as_bytes().to_vec();
+                let target_bytes = peer_bytes.clone();
                 for payment in waiting {
                     let _ = h_fwd_tx.send((target_bytes.clone(), payment));
                 }
@@ -2540,6 +4123,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 let relay_copy = p.clone();
                 let payment_id = p.payment_id;
                 let mailbox_key = p.mailbox_key;
+                let direct_receipt_tag_hash = p.direct_receipt_tag_hash;
 
                 if !state.limbo_buffer.hold(stealth_id, p, Vec::new(), now, peer_id, mailbox_key) {
                     warn!(%peer, "payment rejected: limbo buffer at capacity or peer quota exceeded");
@@ -2574,6 +4158,28 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                         &payload,
                     ) {
                         Ok(Some(result)) => {
+                            let receipt = if let Some(tag_hash) = direct_receipt_tag_hash {
+                                match build_direct_payment_receipt(
+                                    payment_id,
+                                    tag_hash,
+                                    stealth_id,
+                                    &result.claimed,
+                                ) {
+                                    Some(receipt) => Some(receipt),
+                                    None => {
+                                        return Some(PulseMessage::DirectPaymentResponse(
+                                            vess_protocol::DirectPaymentResponse {
+                                                payment_id,
+                                                accepted: false,
+                                                receipt: None,
+                                                reason: "failed to sign direct payment receipt".to_string(),
+                                            },
+                                        ));
+                                    }
+                                }
+                            } else {
+                                None
+                            };
                             let mut total = 0u64;
                             let mut pending_oc = Vec::new();
                             let mut claimed_mids: Vec<[u8; 32]> = Vec::new();
@@ -2608,7 +4214,9 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                                 counterparty: None,
                                 message: format!("Received {total} Vess and claimed ownership."),
                             });
-                            for oc in pending_oc { let _ = h_oc_tx.send(oc); }
+                            for oc in pending_oc {
+                                queue_local_ownership_claim(&mut state, &h_oc_tx, oc);
+                            }
                             // Wallet is persisted by the periodic flush task
                             // (every 60s); avoid blocking disk I/O in the
                             // payment-receive hot path. At worst a crash
@@ -2622,6 +4230,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                                 vess_protocol::DirectPaymentResponse {
                                     payment_id,
                                     accepted: true,
+                                    receipt,
                                     reason: String::new(),
                                 },
                             ));
@@ -2643,18 +4252,156 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 // Return K-closest peers to the requester from routing table.
                 let peers: Vec<Vec<u8>> = state.routing_table.routable_peers(|_| true)
                     .into_iter()
-                    .take(crate::kademlia::K_BUCKET_SIZE)
+                    .filter(|p| !p.id_bytes.is_empty() && p.id_bytes.len() <= MAX_SERIALIZED_MESH_CONTACT_BYTES)
+                    .take(MAX_PEER_EXCHANGE_PEERS)
                     .map(|p| p.id_bytes)
                     .collect();
                 Some(PulseMessage::PeerExchangeResponse(PeerExchangeResponse { peers }))
             }
 
+            PulseMessage::DhtSeedRequest(req) => {
+                if req.requester_node_id != peer_id {
+                    warn!(%peer, "DHT seed request node id does not match transport peer");
+                    return None;
+                }
+
+                let peer_ids: Vec<[u8; 32]> = state
+                    .routing_table
+                    .routable_peers(|_| true)
+                    .iter()
+                    .map(|p| p.id_hash)
+                    .collect();
+                let repl = dht_replication_factor(state.estimated_network_size);
+                let max_tags = usize::from(req.max_tags).min(MAX_DHT_SEED_TAGS);
+                let max_manifests = usize::from(req.max_manifests).min(MAX_DHT_SEED_MANIFESTS);
+                let max_ownership_records = usize::from(req.max_ownership_records)
+                    .min(MAX_DHT_SEED_OWNERSHIP_RECORDS);
+                let max_consumed_records = usize::from(req.max_consumed_records)
+                    .min(MAX_DHT_SEED_CONSUMED_RECORDS);
+
+                let tags: Vec<DhtSeedTagRecord> = state
+                    .tag_dht
+                    .all_records()
+                    .filter(|record| dht_seed_cursor_allows_key(&record.tag_hash, req.after_tag_hash))
+                    .filter(|record| {
+                        node_should_store_seeded_key(
+                            &record.tag_hash,
+                            &req.requester_node_id,
+                            &state.node_id,
+                            &peer_ids,
+                            state.tag_dht.k_replication(),
+                        )
+                    })
+                    .take(max_tags)
+                    .map(dht_seed_tag_from_record)
+                    .collect();
+
+                let mut manifests: Vec<ManifestStore> = Vec::new();
+                let mut manifest_bytes = 0usize;
+                let mut manifest_keys: Vec<[u8; 32]> = state.manifest_store.keys().copied().collect();
+                manifest_keys.sort();
+                for dht_key in manifest_keys {
+                    if !dht_seed_cursor_allows_key(&dht_key, req.after_manifest_key) {
+                        continue;
+                    }
+                    let Some((encrypted_manifest, _)) = state.manifest_store.get(&dht_key) else {
+                        continue;
+                    };
+                    let record_len = encrypted_manifest.len();
+                    if manifests.len() >= max_manifests {
+                        break;
+                    }
+                    if record_len > MAX_MANIFEST_SIZE
+                        || record_len > MAX_DHT_SEED_MANIFEST_BYTES
+                        || manifest_bytes.saturating_add(record_len) > MAX_DHT_SEED_MANIFEST_BYTES
+                    {
+                        continue;
+                    }
+                    if !node_should_store_seeded_key(
+                            &dht_key,
+                            &req.requester_node_id,
+                            &state.node_id,
+                            &peer_ids,
+                            repl,
+                        )
+                    {
+                        continue;
+                    }
+                    manifests.push(ManifestStore {
+                        dht_key,
+                        encrypted_manifest: encrypted_manifest.clone(),
+                        hops_remaining: 0,
+                    });
+                    manifest_bytes = manifest_bytes.saturating_add(record_len);
+                }
+
+                let mut ownership_records: Vec<OwnershipRecord> =
+                    collect_seed_ownership_records(&state).into_values().collect();
+                ownership_records.sort_by_key(|record| record.mint_id);
+                let ownership_records: Vec<DhtSeedOwnershipRecord> = ownership_records
+                    .into_iter()
+                    .filter(|record| {
+                        dht_seed_cursor_allows_key(&record.mint_id, req.after_ownership_mint_id)
+                    })
+                    .filter(|record| {
+                        node_should_store_seeded_key(
+                            &record.mint_id,
+                            &req.requester_node_id,
+                            &state.node_id,
+                            &peer_ids,
+                            repl,
+                        )
+                    })
+                    .take(max_ownership_records)
+                    .map(|record| dht_seed_ownership_from_record(&record))
+                    .collect();
+
+                let mut consumed_records: Vec<([u8; 32], ConsumedRecord)> =
+                    collect_seed_consumed_records(&state).into_iter().collect();
+                consumed_records.sort_by_key(|(mint_id, _)| *mint_id);
+                let consumed_records: Vec<DhtSeedConsumedRecord> = consumed_records
+                    .into_iter()
+                    .filter(|(mint_id, _)| {
+                        dht_seed_cursor_allows_key(mint_id, req.after_consumed_mint_id)
+                    })
+                    .filter(|(mint_id, _)| {
+                        node_should_store_seeded_key(
+                            mint_id,
+                            &req.requester_node_id,
+                            &state.node_id,
+                            &peer_ids,
+                            repl,
+                        )
+                    })
+                    .take(max_consumed_records)
+                    .map(|(mint_id, record)| dht_seed_consumed_from_record(mint_id, &record))
+                    .collect();
+
+                info!(
+                    %peer,
+                    tags = tags.len(),
+                    manifests = manifests.len(),
+                    ownership_records = ownership_records.len(),
+                    consumed_records = consumed_records.len(),
+                    "serving DHT seed shard sync"
+                );
+                Some(PulseMessage::DhtSeedResponse(DhtSeedResponse {
+                    responder_node_id: state.node_id,
+                    tags,
+                    manifests,
+                    ownership_records,
+                    consumed_records,
+                }))
+            }
+
+            PulseMessage::DhtSeedResponse(_) => None,
+
             PulseMessage::FindNode(fn_req) => {
                 // Kademlia FIND_NODE: return K-closest peers to the target.
                 let closest = state.routing_table.closest_peers(&fn_req.target, crate::kademlia::K_BUCKET_SIZE);
                 let peers: Vec<Vec<u8>> = closest.into_iter()
-                    .filter(|p| !p.id_bytes.is_empty())
-                    .take(crate::kademlia::K_BUCKET_SIZE)
+                    .filter(|p| !p.id_bytes.is_empty() && p.id_bytes.len() <= MAX_SERIALIZED_MESH_CONTACT_BYTES)
+                    .take(MAX_PEER_EXCHANGE_PEERS)
                     .map(|p| p.id_bytes)
                     .collect();
                 Some(PulseMessage::FindNodeResponse(FindNodeResponse { peers }))
@@ -2769,7 +4516,9 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                                 }
                             }
                             info!(amount = total, "auto-received limbo-deliver payment");
-                            for oc in pending_oc { let _ = h_oc_tx.send(oc); }
+                            for oc in pending_oc {
+                                queue_local_ownership_claim(&mut state, &h_oc_tx, oc);
+                            }
                         }
                         Ok(None) => {}
                         Err(e) => {
@@ -3046,16 +4795,6 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
             PulseMessage::OwnershipGenesis(og) => {
                 info!(%peer, "ownership genesis for mint_id {:?}", &og.mint_id[..4]);
 
-                // 0a. Reject oversized proofs before any deserialization attempt.
-                //     Prevents OOM DoS via crafted multi-GB proof fields.
-                const MAX_PROOF_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
-                if og.proof.len() > MAX_PROOF_BYTES {
-                    warn!("ownership genesis: proof exceeds size limit ({} bytes) — banishing peer", og.proof.len());
-                    state.peer_registry.mark_banished(peer_id);
-                    ban_ref.banish(peer_id);
-                    return None;
-                }
-
                 // 0b. Reject genesis for a bill that was already consumed via reforge.
                 //     Without this check, a replayed OwnershipGenesis for a spent bill
                 //     would re-register it as active, polluting the registry.
@@ -3075,234 +4814,362 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 }
 
                 // 2. Verify proof — supports STARK, aggregate, and reforge proofs.
-                //    Single STARK: D1 bills or 1:1 reforges (postcard VessProof).
-                //    Aggregate: D2+ bills from flow-based minting (postcard AggregateProof).
-                //    ReforgeProof: split/combine outputs.
+                //    Native Vess proof bytes cover STARK, aggregate, sampled aggregate,
+                //    and reforge outputs. Bitcoin burns use a shared bundle proof where
+                //    every output bill commits to one indexed slice of the burned amount.
                 let proof_nonce: [u8; 32];
+                let proof_hash: [u8; 32];
                 // Set to true when the ReforgeProof branch already verified mint_id
                 // (uses different derivation formula from minted bills).
                 let mut mint_id_pre_verified = false;
-                if let Ok(iop_proof) = vess_foundry::proof::deserialize_proof(&og.proof) {
-                    // ── Single STARK path ──
-                    if let Err(e) = vess_foundry::proof::verify_proof(&iop_proof, &og.digest) {
-                        warn!("ownership genesis: STARK verification failed: {e:?} — banishing peer");
-                        state.peer_registry.mark_banished(peer_id);
-                        ban_ref.banish(peer_id);
-                        return None;
-                    }
-                    if iop_proof.owner_vk_hash != og.owner_vk_hash {
-                        warn!("ownership genesis: proof owner_vk_hash mismatch — banishing peer");
-                        state.peer_registry.mark_banished(peer_id);
-                        ban_ref.banish(peer_id);
-                        return None;
-                    }
-                    // Verify claimed denomination matches what the proof was generated for.
-                    if iop_proof.denomination.value() != og.denomination_value {
-                        warn!("ownership genesis: denomination mismatch (proof={}, claimed={}) — banishing peer",
-                              iop_proof.denomination.value(), og.denomination_value);
-                        state.peer_registry.mark_banished(peer_id);
-                        ban_ref.banish(peer_id);
-                        return None;
-                    }
-                    // Verify the digest meets the PoW difficulty target for this denomination.
-                    let required_diff = vess_foundry::mint::difficulty_bits_for(iop_proof.denomination);
-                    if !vess_foundry::mint::meets_difficulty_pub(&og.digest, required_diff) {
-                        warn!("ownership genesis: digest does not meet difficulty ({required_diff} bits) — banishing peer");
-                        state.peer_registry.mark_banished(peer_id);
-                        ban_ref.banish(peer_id);
-                        return None;
-                    }
-                    proof_nonce = iop_proof.nonce;
-                } else if let Ok(agg) = vess_foundry::proof::AggregateProof::deserialize(&og.proof) {
-                    // ── Aggregate proof path ──
-                    if let Err(e) = vess_foundry::proof::verify_aggregate_proof(&agg, &og.digest, og.denomination_value) {
-                        warn!("ownership genesis: aggregate verification failed: {e:?} — banishing peer");
-                        state.peer_registry.mark_banished(peer_id);
-                        ban_ref.banish(peer_id);
-                        return None;
-                    }
-                    if agg.owner_vk_hash != og.owner_vk_hash {
-                        warn!("ownership genesis: aggregate owner_vk_hash mismatch — banishing peer");
-                        state.peer_registry.mark_banished(peer_id);
-                        ban_ref.banish(peer_id);
-                        return None;
-                    }
-                    // Derive aggregate nonce for mint_id verification.
-                    let mut h = blake3::Hasher::new();
-                    h.update(b"vess-aggregate-nonce-v0");
-                    for sub in &agg.d1_proofs {
-                        if let Ok(p) = vess_foundry::proof::deserialize_proof(sub) {
-                            h.update(&p.nonce);
+                match &og.genesis_proof {
+                    GenesisProof::Vess(proof_bytes) => {
+                        // Reject oversized native proofs before any deserialization attempt.
+                        const MAX_PROOF_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
+                        if proof_bytes.len() > MAX_PROOF_BYTES {
+                            warn!(
+                                "ownership genesis: proof exceeds size limit ({} bytes) — banishing peer",
+                                proof_bytes.len()
+                            );
+                            state.peer_registry.mark_banished(peer_id);
+                            ban_ref.banish(peer_id);
+                            return None;
+                        }
+                        proof_hash = blake3::hash(proof_bytes).into();
+
+                        if let Ok(iop_proof) = vess_foundry::proof::deserialize_proof(proof_bytes) {
+                            // ── Single STARK path ──
+                            if let Err(e) = vess_foundry::proof::verify_proof(&iop_proof, &og.digest) {
+                                warn!("ownership genesis: STARK verification failed: {e:?} — banishing peer");
+                                state.peer_registry.mark_banished(peer_id);
+                                ban_ref.banish(peer_id);
+                                return None;
+                            }
+                            if iop_proof.owner_vk_hash != og.owner_vk_hash {
+                                warn!("ownership genesis: proof owner_vk_hash mismatch — banishing peer");
+                                state.peer_registry.mark_banished(peer_id);
+                                ban_ref.banish(peer_id);
+                                return None;
+                            }
+                            if iop_proof.denomination.value() != og.denomination_value {
+                                warn!(
+                                    "ownership genesis: denomination mismatch (proof={}, claimed={}) — banishing peer",
+                                    iop_proof.denomination.value(),
+                                    og.denomination_value
+                                );
+                                state.peer_registry.mark_banished(peer_id);
+                                ban_ref.banish(peer_id);
+                                return None;
+                            }
+                            let required_diff = vess_foundry::mint::difficulty_bits_for(iop_proof.denomination);
+                            if !vess_foundry::mint::meets_difficulty_pub(&og.digest, required_diff) {
+                                warn!("ownership genesis: digest does not meet difficulty ({required_diff} bits) — banishing peer");
+                                state.peer_registry.mark_banished(peer_id);
+                                ban_ref.banish(peer_id);
+                                return None;
+                            }
+                            proof_nonce = iop_proof.nonce;
+                        } else if let Ok(agg) = vess_foundry::proof::AggregateProof::deserialize(proof_bytes) {
+                            // ── Aggregate proof path ──
+                            if let Err(e) = vess_foundry::proof::verify_aggregate_proof(&agg, &og.digest, og.denomination_value) {
+                                warn!("ownership genesis: aggregate verification failed: {e:?} — banishing peer");
+                                state.peer_registry.mark_banished(peer_id);
+                                ban_ref.banish(peer_id);
+                                return None;
+                            }
+                            if agg.owner_vk_hash != og.owner_vk_hash {
+                                warn!("ownership genesis: aggregate owner_vk_hash mismatch — banishing peer");
+                                state.peer_registry.mark_banished(peer_id);
+                                ban_ref.banish(peer_id);
+                                return None;
+                            }
+                            let mut h = blake3::Hasher::new();
+                            h.update(b"vess-aggregate-nonce-v0");
+                            for sub in &agg.d1_proofs {
+                                if let Ok(p) = vess_foundry::proof::deserialize_proof(sub) {
+                                    h.update(&p.nonce);
+                                }
+                            }
+                            proof_nonce = *h.finalize().as_bytes();
+                        } else if let Ok(sap) = vess_foundry::proof::SampledAggregateProof::deserialize(proof_bytes) {
+                            // ── Sampled aggregate proof path (>80 solves) ──
+                            if let Err(e) = vess_foundry::proof::verify_sampled_aggregate(&sap, &og.digest, og.denomination_value) {
+                                warn!("ownership genesis: sampled aggregate verification failed: {e:?} — banishing peer");
+                                state.peer_registry.mark_banished(peer_id);
+                                ban_ref.banish(peer_id);
+                                return None;
+                            }
+                            if sap.owner_vk_hash != og.owner_vk_hash {
+                                warn!("ownership genesis: sampled aggregate owner_vk_hash mismatch — banishing peer");
+                                state.peer_registry.mark_banished(peer_id);
+                                ban_ref.banish(peer_id);
+                                return None;
+                            }
+                            proof_nonce = sap.nonce_tree_root;
+                        } else if let Ok(rp) = vess_foundry::reforge::deserialize_reforge_proof(proof_bytes) {
+                            // ── Reforge output genesis (split / combine) ──────────────────
+                            let re_serialized = vess_foundry::reforge::serialize_reforge_proof(&rp);
+                            let compound_digest: [u8; 32] = {
+                                let mut h = blake3::Hasher::new();
+                                h.update(b"vess-reforge-digest-v0");
+                                h.update(&re_serialized);
+                                *h.finalize().as_bytes()
+                            };
+                            if compound_digest != og.digest {
+                                warn!("ownership genesis: reforge compound_digest mismatch — banishing peer");
+                                state.peer_registry.mark_banished(peer_id);
+                                ban_ref.banish(peer_id);
+                                return None;
+                            }
+
+                            let input_sum: u64 = rp.input_denominations.iter().map(|d| d.value()).sum();
+                            let output_sum: u64 = rp.output_denominations.iter().map(|d| d.value()).sum();
+                            if input_sum != output_sum {
+                                warn!("ownership genesis: reforge value not conserved (in={input_sum}, out={output_sum}) — banishing peer");
+                                state.peer_registry.mark_banished(peer_id);
+                                ban_ref.banish(peer_id);
+                                return None;
+                            }
+
+                            let output_index = og.output_index as usize;
+                            if output_index >= rp.output_denominations.len() {
+                                warn!("ownership genesis: output_index {output_index} out of bounds — banishing peer");
+                                state.peer_registry.mark_banished(peer_id);
+                                ban_ref.banish(peer_id);
+                                return None;
+                            }
+                            if rp.output_denominations[output_index].value() != og.denomination_value {
+                                warn!("ownership genesis: reforge denomination mismatch at index {output_index} — banishing peer");
+                                state.peer_registry.mark_banished(peer_id);
+                                ban_ref.banish(peer_id);
+                                return None;
+                            }
+
+                            let expected_mint_id = vess_foundry::reforge::reforge_mint_id(&compound_digest, output_index);
+                            if expected_mint_id != og.mint_id {
+                                warn!("ownership genesis: reforge mint_id derivation mismatch — banishing peer");
+                                state.peer_registry.mark_banished(peer_id);
+                                ban_ref.banish(peer_id);
+                                return None;
+                            }
+
+                            for (idx, input_mint_id) in rp.input_mint_ids.iter().enumerate() {
+                                if state.registry.is_active(input_mint_id) {
+                                    warn!(
+                                        "ownership genesis: reforge input {:?} still active — \
+                                         dropping (ReforgeAttestation may not have arrived yet)",
+                                        &input_mint_id[..4]
+                                    );
+                                    return None;
+                                }
+                                let tombstone = match state.registry.was_consumed(input_mint_id) {
+                                    Some(t) => t,
+                                    None => {
+                                        const MAX_PENDING_GENESIS_PER_KEY: usize = 200;
+                                        let global_total: usize = state
+                                            .pending_reforge_genesis
+                                            .values()
+                                            .map(|v| v.len())
+                                            .sum();
+                                        if global_total < MAX_PENDING_GENESIS_TOTAL {
+                                            let pending = state.pending_reforge_genesis
+                                                .entry(*input_mint_id)
+                                                .or_default();
+                                            if pending.len() < MAX_PENDING_GENESIS_PER_KEY {
+                                                pending.push((og.clone(), now_ts));
+                                            }
+                                        }
+                                        return None;
+                                    }
+                                };
+                                if tombstone.denomination_value != 0 {
+                                    if let Some(claimed_denom) = rp.input_denominations.get(idx) {
+                                        if claimed_denom.value() != tombstone.denomination_value {
+                                            warn!(
+                                                "ownership genesis: reforge input {:?} denomination \
+                                                 mismatch (claimed={}, stored={}) — inflation attack — \
+                                                 banishing peer",
+                                                &input_mint_id[..4],
+                                                claimed_denom.value(),
+                                                tombstone.denomination_value
+                                            );
+                                            state.peer_registry.mark_banished(peer_id);
+                                            ban_ref.banish(peer_id);
+                                            return None;
+                                        }
+                                    }
+                                }
+                                let zero = [0u8; 32];
+                                if tombstone.digest != zero {
+                                    if let Some(claimed_digest) = rp.input_digests.get(idx) {
+                                        if claimed_digest != &tombstone.digest {
+                                            warn!(
+                                                "ownership genesis: reforge input {:?} digest mismatch — \
+                                                 banishing peer",
+                                                &input_mint_id[..4]
+                                            );
+                                            state.peer_registry.mark_banished(peer_id);
+                                            ban_ref.banish(peer_id);
+                                            return None;
+                                        }
+                                    }
+                                }
+                            }
+
+                            proof_nonce = compound_digest;
+                            mint_id_pre_verified = true;
+                        } else {
+                            warn!("ownership genesis: malformed proof (neither STARK nor aggregate) — banishing peer");
+                            state.peer_registry.mark_banished(peer_id);
+                            ban_ref.banish(peer_id);
+                            return None;
                         }
                     }
-                    proof_nonce = *h.finalize().as_bytes();
-                } else if let Ok(sap) = vess_foundry::proof::SampledAggregateProof::deserialize(&og.proof) {
-                    // ── Sampled aggregate proof path (>80 solves) ──
-                    if let Err(e) = vess_foundry::proof::verify_sampled_aggregate(&sap, &og.digest, og.denomination_value) {
-                        warn!("ownership genesis: sampled aggregate verification failed: {e:?} — banishing peer");
-                        state.peer_registry.mark_banished(peer_id);
-                        ban_ref.banish(peer_id);
-                        return None;
-                    }
-                    if sap.owner_vk_hash != og.owner_vk_hash {
-                        warn!("ownership genesis: sampled aggregate owner_vk_hash mismatch — banishing peer");
-                        state.peer_registry.mark_banished(peer_id);
-                        ban_ref.banish(peer_id);
-                        return None;
-                    }
-                    // Sampled aggregate nonce = nonce_tree_root (deterministic
-                    // from proof, no need for all N individual nonces).
-                    proof_nonce = sap.nonce_tree_root;
-                } else if let Ok(rp) = vess_foundry::reforge::deserialize_reforge_proof(&og.proof) {
-                    // H3 needs to buffer `og` if an input tombstone is missing.
-                    // ReforgeProof owns all its data so no borrow conflict with `og`.
-                    // ── Reforge output genesis (split / combine) ──────────────────
-                    //
-                    // The proof is a `ReforgeProof` committed to:
-                    //   • all input mint_ids + digests + denominations
-                    //   • all output denominations
-                    // making it impossible to inflate the denomination of any output.
+                    GenesisProof::BitcoinBurn(burn) => {
+                        const MAX_BURN_OUTPUTS: usize = 64;
+                        const BURN_PAYLOAD_BYTES: usize = 32;
+                        const MAX_BURN_MERKLE_DEPTH: usize = 64;
+                        const MAX_OWNER_VK_BYTES: usize = 4096;
 
-                    // 1. Re-derive compound_digest and verify the committed proof.
-                    let re_serialized = vess_foundry::reforge::serialize_reforge_proof(&rp);
-                    let compound_digest: [u8; 32] = {
-                        let mut h = blake3::Hasher::new();
-                        h.update(b"vess-reforge-digest-v0");
-                        h.update(&re_serialized);
-                        *h.finalize().as_bytes()
-                    };
-                    if compound_digest != og.digest {
-                        warn!("ownership genesis: reforge compound_digest mismatch — banishing peer");
-                        state.peer_registry.mark_banished(peer_id);
-                        ban_ref.banish(peer_id);
-                        return None;
-                    }
-
-                    // 2. Value conservation check.
-                    let input_sum: u64 = rp.input_denominations.iter().map(|d| d.value()).sum();
-                    let output_sum: u64 = rp.output_denominations.iter().map(|d| d.value()).sum();
-                    if input_sum != output_sum {
-                        warn!("ownership genesis: reforge value not conserved (in={input_sum}, out={output_sum}) — banishing peer");
-                        state.peer_registry.mark_banished(peer_id);
-                        ban_ref.banish(peer_id);
-                        return None;
-                    }
-
-                    // 3. Verify the claimed denomination for this specific output index.
-                    let output_index = og.output_index as usize;
-                    if output_index >= rp.output_denominations.len() {
-                        warn!("ownership genesis: output_index {output_index} out of bounds — banishing peer");
-                        state.peer_registry.mark_banished(peer_id);
-                        ban_ref.banish(peer_id);
-                        return None;
-                    }
-                    if rp.output_denominations[output_index].value() != og.denomination_value {
-                        warn!("ownership genesis: reforge denomination mismatch at index {output_index} — banishing peer");
-                        state.peer_registry.mark_banished(peer_id);
-                        ban_ref.banish(peer_id);
-                        return None;
-                    }
-
-                    // 4. Derive and verify mint_id deterministically.
-                    let expected_mint_id = vess_foundry::reforge::reforge_mint_id(&compound_digest, output_index);
-                    if expected_mint_id != og.mint_id {
-                        warn!("ownership genesis: reforge mint_id derivation mismatch — banishing peer");
-                        state.peer_registry.mark_banished(peer_id);
-                        ban_ref.banish(peer_id);
-                        return None;
-                    }
-
-                    // 5. All input bills must be consumed (not active in registry).
-                    //    If inputs are still active, the ReforgeAttestation hasn't
-                    //    propagated yet — drop and let gossip retry (don't banish).
-                    //
-                    //    SECURITY: inputs must also have a tombstone (was_consumed)
-                    //    to prove they were legitimately minted and then consumed.
-                    //    An input that is neither active NOR tombstoned was never a
-                    //    real bill — accepting it would allow value inflation.
-                    for (idx, input_mint_id) in rp.input_mint_ids.iter().enumerate() {
-                        if state.registry.is_active(input_mint_id) {
+                        if burn.burn_amount_sats == 0 {
+                            warn!("ownership genesis: zero-value bitcoin burn — banishing peer");
+                            state.peer_registry.mark_banished(peer_id);
+                            ban_ref.banish(peer_id);
+                            return None;
+                        }
+                        let minimum_confirmations = min_bitcoin_burn_confirmations(burn.network);
+                        if burn.required_confirmations < minimum_confirmations
+                            || burn.confirmations < burn.required_confirmations
+                        {
                             warn!(
-                                "ownership genesis: reforge input {:?} still active — \
-                                 dropping (ReforgeAttestation may not have arrived yet)",
-                                &input_mint_id[..4]
+                                confirmations = burn.confirmations,
+                                required = burn.required_confirmations,
+                                minimum = minimum_confirmations,
+                                "ownership genesis: bitcoin burn confirmation depth insufficient — banishing peer"
+                            );
+                            state.peer_registry.mark_banished(peer_id);
+                            ban_ref.banish(peer_id);
+                            return None;
+                        }
+                        if burn.chain_work == [0u8; 32] {
+                            warn!("ownership genesis: bitcoin burn proof missing chainwork — banishing peer");
+                            state.peer_registry.mark_banished(peer_id);
+                            ban_ref.banish(peer_id);
+                            return None;
+                        }
+                        if burn.output_values.is_empty() || burn.output_values.len() > MAX_BURN_OUTPUTS {
+                            warn!("ownership genesis: invalid bitcoin burn output count {} — banishing peer", burn.output_values.len());
+                            state.peer_registry.mark_banished(peer_id);
+                            ban_ref.banish(peer_id);
+                            return None;
+                        }
+                        if burn.burn_commitment_payload.len() != BURN_PAYLOAD_BYTES
+                            || burn.merkle_proof.len() > MAX_BURN_MERKLE_DEPTH
+                            || burn.first_owner_vk.len() > MAX_OWNER_VK_BYTES
+                        {
+                            warn!("ownership genesis: bitcoin burn proof exceeds size limits — banishing peer");
+                            state.peer_registry.mark_banished(peer_id);
+                            ban_ref.banish(peer_id);
+                            return None;
+                        }
+                        if bitcoin_burn_merkle_root(burn) != burn.merkle_root {
+                            warn!("ownership genesis: bitcoin burn merkle proof mismatch — banishing peer");
+                            state.peer_registry.mark_banished(peer_id);
+                            ban_ref.banish(peer_id);
+                            return None;
+                        }
+                        if burn.first_owner_vk != og.owner_vk {
+                            warn!("ownership genesis: bitcoin burn first owner key mismatch — banishing peer");
+                            state.peer_registry.mark_banished(peer_id);
+                            ban_ref.banish(peer_id);
+                            return None;
+                        }
+                        let expected_payload = expected_bitcoin_burn_payload(burn);
+                        if burn.burn_commitment_payload.as_slice() != expected_payload {
+                            warn!("ownership genesis: bitcoin burn OP_RETURN payload mismatch — banishing peer");
+                            state.peer_registry.mark_banished(peer_id);
+                            ban_ref.banish(peer_id);
+                            return None;
+                        }
+                        if burn.first_owner_vk_hash != og.owner_vk_hash {
+                            warn!("ownership genesis: bitcoin burn owner_vk_hash mismatch — banishing peer");
+                            state.peer_registry.mark_banished(peer_id);
+                            ban_ref.banish(peer_id);
+                            return None;
+                        }
+
+                        let canonical_output_values = vess_foundry::bitcoin_burn_output_values(burn.burn_amount_sats);
+                        if burn.output_values != canonical_output_values {
+                            warn!("ownership genesis: bitcoin burn output decomposition is not canonical — banishing peer");
+                            state.peer_registry.mark_banished(peer_id);
+                            ban_ref.banish(peer_id);
+                            return None;
+                        }
+
+                        let output_index = og.output_index as usize;
+                        if output_index >= burn.output_values.len() {
+                            warn!("ownership genesis: bitcoin burn output_index {output_index} out of bounds — banishing peer");
+                            state.peer_registry.mark_banished(peer_id);
+                            ban_ref.banish(peer_id);
+                            return None;
+                        }
+                        if burn.output_values[output_index] != og.denomination_value {
+                            warn!("ownership genesis: bitcoin burn denomination mismatch at index {output_index} — banishing peer");
+                            state.peer_registry.mark_banished(peer_id);
+                            ban_ref.banish(peer_id);
+                            return None;
+                        }
+
+                        let bundle_commitment = bitcoin_burn_bundle_commitment(burn);
+                        if bundle_commitment != og.digest {
+                            warn!("ownership genesis: bitcoin burn commitment mismatch — banishing peer");
+                            state.peer_registry.mark_banished(peer_id);
+                            ban_ref.banish(peer_id);
+                            return None;
+                        }
+
+                        let expected_mint_id = vess_foundry::bitcoin_burn_mint_id(&burn.txid, og.output_index);
+                        if expected_mint_id != og.mint_id {
+                            warn!("ownership genesis: bitcoin burn mint_id derivation mismatch — banishing peer");
+                            state.peer_registry.mark_banished(peer_id);
+                            ban_ref.banish(peer_id);
+                            return None;
+                        }
+
+                        proof_nonce = bundle_commitment;
+                        proof_hash = bundle_commitment;
+                        mint_id_pre_verified = true;
+                    }
+                    GenesisProof::LocalTestFaucet(proof) => {
+                        if !local_test_faucet_enabled() {
+                            warn!(
+                                "ownership genesis: local test faucet proof ignored because {LOCAL_TEST_FAUCET_ENV}=1 is not set"
                             );
                             return None;
                         }
-                        // Anti-inflation: reject if no tombstone exists for this input.
-                        // A missing tombstone means the input was never a valid bill.
-                        let tombstone = match state.registry.was_consumed(input_mint_id) {
-                            Some(t) => t,
-                            None => {
-                                // H3: The ReforgeAttestation may not have arrived yet on this
-                                // node. Buffer the genesis keyed by the missing input so we
-                                // can retry when the RA (and its tombstone) materialises.
-                                // C1: Guard both per-key cap and global total to prevent
-                                // an attacker from exhausting memory with fake input keys.
-                                const MAX_PENDING_GENESIS_PER_KEY: usize = 200;
-                                let global_total: usize = state
-                                    .pending_reforge_genesis
-                                    .values()
-                                    .map(|v| v.len())
-                                    .sum();
-                                if global_total < MAX_PENDING_GENESIS_TOTAL {
-                                    let pending = state.pending_reforge_genesis
-                                        .entry(*input_mint_id)
-                                        .or_default();
-                                    if pending.len() < MAX_PENDING_GENESIS_PER_KEY {
-                                        pending.push((og.clone(), now_ts));
-                                    }
-                                }
-                                return None;
-                            }
-                        };
-                        // C1: verify input_denominations against the stored denomination.
-                        // tombstone.denomination_value == 0 means the tombstone was created
-                        // before this check existed (old data) — skip to avoid false positives.
-                        if tombstone.denomination_value != 0 {
-                            if let Some(claimed_denom) = rp.input_denominations.get(idx) {
-                                if claimed_denom.value() != tombstone.denomination_value {
-                                    warn!(
-                                        "ownership genesis: reforge input {:?} denomination \
-                                         mismatch (claimed={}, stored={}) — inflation attack — \
-                                         banishing peer",
-                                        &input_mint_id[..4],
-                                        claimed_denom.value(),
-                                        tombstone.denomination_value
-                                    );
-                                    state.peer_registry.mark_banished(peer_id);
-                                    ban_ref.banish(peer_id);
-                                    return None;
-                                }
-                            }
+                        if vess_foundry::Denomination::from_value(og.denomination_value).is_none() {
+                            warn!("ownership genesis: invalid local test faucet denomination — banishing peer");
+                            state.peer_registry.mark_banished(peer_id);
+                            ban_ref.banish(peer_id);
+                            return None;
                         }
-                        // M1: verify input_digests against the stored digest.
-                        // Zeroed digest == old tombstone without this field — skip.
-                        let zero = [0u8; 32];
-                        if tombstone.digest != zero {
-                            if let Some(claimed_digest) = rp.input_digests.get(idx) {
-                                if claimed_digest != &tombstone.digest {
-                                    warn!(
-                                        "ownership genesis: reforge input {:?} digest mismatch — \
-                                         banishing peer",
-                                        &input_mint_id[..4]
-                                    );
-                                    state.peer_registry.mark_banished(peer_id);
-                                    ban_ref.banish(peer_id);
-                                    return None;
-                                }
-                            }
+                        let expected_digest = local_test_faucet_digest(
+                            &proof.nonce,
+                            og.denomination_value,
+                            &og.owner_vk_hash,
+                        );
+                        if expected_digest != og.digest {
+                            warn!("ownership genesis: local test faucet digest mismatch — banishing peer");
+                            state.peer_registry.mark_banished(peer_id);
+                            ban_ref.banish(peer_id);
+                            return None;
                         }
+                        let mut h = blake3::Hasher::new();
+                        h.update(b"vess-local-test-faucet-proof-v0");
+                        h.update(&proof.nonce);
+                        proof_hash = *h.finalize().as_bytes();
+                        proof_nonce = proof.nonce;
                     }
-
-                    // Use compound_digest as the stored proof_nonce (identifies reforge in registry).
-                    proof_nonce = compound_digest;
-                    mint_id_pre_verified = true; // Already checked above via reforge_mint_id.
-                } else {
-                    warn!("ownership genesis: malformed proof (neither STARK nor aggregate) — banishing peer");
-                    state.peer_registry.mark_banished(peer_id);
-                    ban_ref.banish(peer_id);
-                    return None;
                 }
 
                 // 3. Verify owner_vk_hash matches the claimed verification key.
@@ -3343,7 +5210,6 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs();
-                    let proof_hash: [u8; 32] = blake3::hash(&og.proof).into();
                     state.registry.register(OwnershipRecord {
                         mint_id: og.mint_id,
                         chain_tip: og.chain_tip,

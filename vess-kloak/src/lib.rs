@@ -6,7 +6,7 @@
 //! - **BillFold**: Collection of owned Vess bills with denomination tracking.
 //! - **Selection**: Branch-and-bound bill selection with greedy fallback.
 //! - **Consolidation**: Automatic bill consolidation (e.g. five D1s → D5).
-//! - **Recovery**: 5 BIP39 words + 5-digit PIN → deterministic key derivation.
+//! - **Recovery**: 12-word BIP39 mnemonic → deterministic key derivation.
 //! - **Password Cache**: Fast daily unlock via Argon2id-encrypted seed cache.
 //!
 //! # Usage
@@ -29,7 +29,9 @@ pub mod tag_cache;
 
 pub use auto_reforge::ConsolidationScheduler;
 pub use billfold::BillFold;
-pub use payment::{cleanup_rejected_bills, derive_mailbox_key, extract_mint_ids_from_claims, PaymentTracker};
+pub use payment::{
+    cleanup_rejected_bills, derive_mailbox_key, extract_mint_ids_from_claims, PaymentTracker,
+};
 pub use persistence::WalletFile;
 pub use recovery::{EncryptedSecrets, RecoveryPhrase};
 pub use selection::select_bills;

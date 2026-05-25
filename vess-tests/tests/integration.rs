@@ -329,6 +329,7 @@ fn protocol_message_serialization() {
         created_at: 1000,
         bill_count: 0,
         mailbox_key: None,
+        direct_receipt_tag_hash: None,
     })];
 
     for msg in &messages {
@@ -750,6 +751,8 @@ fn artery_snapshot_save_load() {
         ownership_records: vec![record1, record2],
         consumed_records: std::collections::BTreeMap::new(),
         manifests: std::collections::BTreeMap::new(),
+        retained_ownership_records: vec![],
+        retained_consumed_records: std::collections::BTreeMap::new(),
         peer_endpoints: std::collections::BTreeMap::new(),
         limbo_payment_ids: vec![],
     };

@@ -92,8 +92,16 @@ pub fn verify_reforge_proof(
     }
 
     // Verify value conservation.
-    let input_sum: u64 = reforge_proof.input_denominations.iter().map(|d| d.value()).sum();
-    let output_sum: u64 = reforge_proof.output_denominations.iter().map(|d| d.value()).sum();
+    let input_sum: u64 = reforge_proof
+        .input_denominations
+        .iter()
+        .map(|d| d.value())
+        .sum();
+    let output_sum: u64 = reforge_proof
+        .output_denominations
+        .iter()
+        .map(|d| d.value())
+        .sum();
     if input_sum != output_sum {
         anyhow::bail!("reforge proof: value not conserved (in={input_sum}, out={output_sum})");
     }

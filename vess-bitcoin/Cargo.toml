@@ -1,0 +1,17 @@
+[package]
+name = "vess-bitcoin"
+version = "0.1.0"
+edition = "2021"
+license-file = "../LICENSE"
+
+[dependencies]
+anyhow = "1"
+bitcoin = "0.32"
+blake3 = "1"
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["sync", "time", "rt", "net", "io-util"] }
+tracing = "0.1"
+vess-foundry = { path = "../vess-foundry" }
+vess-mesh = { path = "../vess-mesh" }

@@ -228,6 +228,64 @@ pub fn derive_mint_id(digest: &[u8; 32], nonce: &[u8; 32]) -> [u8; 32] {
     *h.finalize().as_bytes()
 }
 
+/// Compute the canonical 1-2-5 output values for a Bitcoin burn amount.
+///
+/// This reuses the same optimal denomination breakdown already used by
+/// native Vess aggregation so there is exactly one canonical bill split
+/// policy in the protocol.
+pub fn bitcoin_burn_output_values(total_sats: u64) -> Vec<u64> {
+    mint::optimal_breakdown(total_sats)
+        .into_iter()
+        .map(Denomination::value)
+        .collect()
+}
+
+/// Hash the canonical output bundle for a Bitcoin burn.
+///
+/// `outputs_hash = Blake3("vess-burn-outputs-v1" || value_0_le || value_1_le || ...)`
+pub fn bitcoin_burn_outputs_hash(output_values: &[u64]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"vess-burn-outputs-v1");
+    for value in output_values {
+        h.update(&value.to_le_bytes());
+    }
+    *h.finalize().as_bytes()
+}
+
+/// Compute the 32-byte OP_RETURN commitment payload for a Bitcoin burn.
+///
+/// This commits to the first owner, the total burned sat amount, and the
+/// exact canonical denomination bundle.
+///
+/// `payload = Blake3("vess-burn-bundle-v2" || first_owner_vk_hash || burn_amount_sats_le || outputs_hash)`
+pub fn bitcoin_burn_payload_commitment(
+    first_owner_vk_hash: &[u8; 32],
+    burn_amount_sats: u64,
+    output_values: &[u64],
+) -> [u8; 32] {
+    let outputs_hash = bitcoin_burn_outputs_hash(output_values);
+    let mut h = blake3::Hasher::new();
+    h.update(b"vess-burn-bundle-v2");
+    h.update(first_owner_vk_hash);
+    h.update(&burn_amount_sats.to_le_bytes());
+    h.update(&outputs_hash);
+    *h.finalize().as_bytes()
+}
+
+/// Derive the deterministic mint_id for a Bitcoin-burn bundle output.
+///
+/// `mint_id = Blake3("vess-bitcoin-burn-mint-id-v1" || txid || output_index_le)`
+///
+/// The Bitcoin txid anchors the shared burn event, while `output_index`
+/// distinguishes sibling Vess bills derived from the same burn.
+pub fn bitcoin_burn_mint_id(txid: &[u8; 32], output_index: u32) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"vess-bitcoin-burn-mint-id-v1");
+    h.update(txid);
+    h.update(&output_index.to_le_bytes());
+    *h.finalize().as_bytes()
+}
+
 /// Compute the genesis ownership chain tip.
 ///
 /// `chain[0] = Blake3("vess-chain-v0" || mint_id || owner_vk_hash)`
@@ -260,4 +318,67 @@ pub fn advance_chain_tip(
     h.update(new_owner_vk_hash);
     h.update(sig_hash.as_bytes());
     *h.finalize().as_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        bitcoin_burn_mint_id, bitcoin_burn_output_values, bitcoin_burn_outputs_hash,
+        bitcoin_burn_payload_commitment,
+    };
+
+    #[test]
+    fn bitcoin_burn_uses_canonical_breakdown() {
+        assert_eq!(
+            bitcoin_burn_output_values(52_550),
+            vec![50_000, 2_000, 500, 50]
+        );
+        assert_eq!(bitcoin_burn_output_values(3), vec![2, 1]);
+    }
+
+    #[test]
+    fn bitcoin_burn_output_mint_ids_are_indexed() {
+        let txid = [0x42u8; 32];
+        let first = bitcoin_burn_mint_id(&txid, 0);
+        let second = bitcoin_burn_mint_id(&txid, 1);
+
+        assert_ne!(first, second);
+        assert_eq!(first, bitcoin_burn_mint_id(&txid, 0));
+    }
+
+    #[test]
+    fn bitcoin_burn_mint_ids_are_txid_anchored() {
+        let txid = [0x42u8; 32];
+        let other_txid = [0x24u8; 32];
+
+        assert_ne!(
+            bitcoin_burn_mint_id(&txid, 0),
+            bitcoin_burn_mint_id(&other_txid, 0)
+        );
+    }
+
+    #[test]
+    fn bitcoin_burn_payload_commits_to_owner_and_outputs() {
+        let owner_hash = [0x11u8; 32];
+        let burn_amount_sats = 52_550;
+        let outputs = vec![50_000, 2_000, 500, 50];
+
+        let payload = bitcoin_burn_payload_commitment(&owner_hash, burn_amount_sats, &outputs);
+        let outputs_hash = bitcoin_burn_outputs_hash(&outputs);
+
+        assert_eq!(payload.len(), 32);
+        assert_ne!(payload, outputs_hash);
+        assert_ne!(
+            payload,
+            bitcoin_burn_payload_commitment(&[0x22u8; 32], burn_amount_sats, &outputs)
+        );
+        assert_ne!(
+            payload,
+            bitcoin_burn_payload_commitment(&owner_hash, burn_amount_sats + 1, &outputs)
+        );
+        assert_ne!(
+            payload,
+            bitcoin_burn_payload_commitment(&owner_hash, burn_amount_sats, &[52_550])
+        );
+    }
 }

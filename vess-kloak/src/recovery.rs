@@ -1,17 +1,16 @@
-//! Wallet recovery via 5 BIP39 words + 5-digit PIN → argon2id → deterministic keys.
+//! Wallet recovery via a standard 12-word BIP39 mnemonic → deterministic keys.
 //!
 //! This implements Section J of the Vess protocol: human-memorable wallet
-//! protection that is resistant to brute-force.
+//! recovery with checksum-validated BIP39 words.
 //!
 //! # Derivation Flow
 //!
-//! 1. `passphrase = join(words, " ")`
-//! 2. `salt = "vess-recovery-v0:" || PIN`
-//! 3. `raw_seed = argon2id(passphrase, salt, t=4, m=2GiB, p=1)` → 64 bytes
-//! 4. `enc_key = Blake3(raw_seed || "vess-wallet-enc-v0")` → 32 bytes (AEAD key)
-//! 5. ML-KEM keypairs are derived deterministically from the raw seed via
+//! 1. `mnemonic = 12 English BIP39 words` (128 bits entropy + checksum)
+//! 2. `raw_seed = BIP39 PBKDF2-HMAC-SHA512(mnemonic, passphrase="")` → 64 bytes
+//! 3. `enc_key = Blake3(raw_seed || "vess-wallet-enc-v0")` → 32 bytes (AEAD key)
+//! 4. ML-KEM keypairs are derived deterministically from the raw seed via
 //!    domain-separated Blake3 → ChaCha20Rng → `ml-kem::generate()`.
-//! 6. The enc_key encrypts the ML-KEM secrets on disk for fast access.
+//! 5. The enc_key encrypts the ML-KEM secrets on disk for fast access.
 //!
 //! # Recovery Scenario
 //!
@@ -30,12 +29,8 @@ use chacha20poly1305::{
 use serde::{Deserialize, Serialize};
 use vess_stealth::{MasterStealthAddress, StealthSecretKey};
 
-/// Argon2id parameters per protocol spec Section J.
-const ARGON2_T_COST: u32 = 4;
-/// 2 GiB in KiB.
-const ARGON2_M_COST: u32 = 2 * 1024 * 1024;
-const ARGON2_P_COST: u32 = 1;
-const ARGON2_OUTPUT_LEN: usize = 64;
+/// Standard BIP39 wallet recovery phrase length.
+pub const RECOVERY_WORD_COUNT: usize = 12;
 
 /// Lighter Argon2id parameters for daily password-based unlock.
 /// 256 MiB memory, 3 iterations — practical for mobile/embedded
@@ -45,58 +40,64 @@ const PWD_ARGON2_M_COST: u32 = 256 * 1024; // 256 MiB in KiB
 const PWD_ARGON2_P_COST: u32 = 1;
 const PWD_ARGON2_OUTPUT_LEN: usize = 32;
 
-/// A wallet's recovery phrase: 5 BIP39 words + 5-digit PIN.
-#[derive(Clone, Serialize, Deserialize)]
+/// A wallet's recovery phrase: a checksum-validated 12-word English BIP39 mnemonic.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RecoveryPhrase {
-    pub words: [String; 5],
-    pub pin: String,
+    pub words: [String; RECOVERY_WORD_COUNT],
 }
 
 impl RecoveryPhrase {
     /// Generate a new random recovery phrase.
     pub fn generate() -> Self {
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
-        let lang = bip39::Language::English;
+        use rand::RngCore;
 
-        let words: [String; 5] = std::array::from_fn(|_| {
-            let idx = rng.gen_range(0..2048);
-            lang.word_list()[idx].to_string()
-        });
+        let mut entropy = [0u8; 16];
+        rand::thread_rng().fill_bytes(&mut entropy);
+        let mnemonic = bip39::Mnemonic::from_entropy_in(bip39::Language::English, &entropy)
+            .expect("16 bytes of entropy always yields a valid 12-word BIP39 mnemonic");
 
-        let pin_num: u32 = rng.gen_range(0..100_000);
-        let pin = format!("{pin_num:05}");
-
-        Self { words, pin }
+        Self::from_mnemonic(mnemonic).expect("generated BIP39 mnemonic should always have 12 words")
     }
 
     /// Parse from user input.
-    pub fn from_input(words_str: &str, pin: &str) -> Result<Self> {
-        let parts: Vec<&str> = words_str.split_whitespace().collect();
-        if parts.len() != 5 {
-            return Err(anyhow!("expected 5 words, got {}", parts.len()));
+    pub fn from_input(words_str: &str) -> Result<Self> {
+        let normalized = words_str
+            .split_whitespace()
+            .map(|word| word.to_ascii_lowercase())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let word_count = normalized.split_whitespace().count();
+        if word_count != RECOVERY_WORD_COUNT {
+            return Err(anyhow!(
+                "expected {RECOVERY_WORD_COUNT} words, got {word_count}"
+            ));
         }
 
-        let wl = bip39::Language::English.word_list();
-        for word in &parts {
-            if !wl.contains(word) {
-                return Err(anyhow!("unknown BIP39 word: {word}"));
-            }
-        }
-
-        if pin.len() != 5 || !pin.chars().all(|c| c.is_ascii_digit()) {
-            return Err(anyhow!("PIN must be exactly 5 digits"));
-        }
-
-        Ok(Self {
-            words: std::array::from_fn(|i| parts[i].to_string()),
-            pin: pin.to_string(),
-        })
+        let mnemonic = bip39::Mnemonic::parse_in(bip39::Language::English, normalized)
+            .map_err(|e| anyhow!("invalid 12-word BIP39 recovery phrase: {e}"))?;
+        Self::from_mnemonic(mnemonic)
     }
 
     /// Display the recovery phrase (for initial backup).
     pub fn display_phrase(&self) -> String {
-        format!("{} | PIN: {}", self.words.join(" "), self.pin)
+        self.words.join(" ")
+    }
+
+    fn from_mnemonic(mnemonic: bip39::Mnemonic) -> Result<Self> {
+        let words = mnemonic
+            .words()
+            .map(str::to_string)
+            .collect::<Vec<String>>();
+        let word_count = words.len();
+        let words = words
+            .try_into()
+            .map_err(|_| anyhow!("expected {RECOVERY_WORD_COUNT} BIP39 words, got {word_count}"))?;
+        Ok(Self { words })
+    }
+
+    fn to_mnemonic(&self) -> Result<bip39::Mnemonic> {
+        bip39::Mnemonic::parse_in(bip39::Language::English, self.display_phrase())
+            .map_err(|e| anyhow!("invalid 12-word BIP39 recovery phrase: {e}"))
     }
 }
 
@@ -115,8 +116,8 @@ pub struct EncryptedSecrets {
 
 /// Password-encrypted copy of the 64-byte raw seed (xPriv).
 ///
-/// After initial wallet creation (which uses the heavy 2 GiB Argon2id
-/// with the recovery phrase), the raw_seed is re-encrypted under a
+/// After initial wallet creation (which uses the BIP39 mnemonic to derive
+/// the recovery seed), the raw_seed is re-encrypted under a
 /// user-chosen password with lighter KDF parameters (256 MiB, ~1 s).
 /// On unlock the raw_seed is decrypted and all keys are derived from
 /// it instantly (Blake3 + ML-KEM keygen) — no further decryption needed.
@@ -130,56 +131,45 @@ pub struct PasswordCache {
     pub nonce: [u8; 12],
 }
 
-/// Derive the 64-byte raw seed from a recovery phrase using argon2id.
+/// Derive the 64-byte raw seed from a standard 12-word BIP39 recovery phrase.
 ///
 /// This raw seed is the root from which all keys are derived:
 /// - ML-KEM stealth keys (via domain-separated Blake3 + ChaCha20Rng)
 /// - Wallet encryption key (via `Blake3(seed || "vess-wallet-enc-v0")`)
-///
-/// **Warning**: With production params this allocates 2 GiB.
 pub fn derive_raw_seed(phrase: &RecoveryPhrase) -> Result<[u8; 64]> {
-    derive_raw_seed_with_params(phrase, ARGON2_T_COST, ARGON2_M_COST, ARGON2_P_COST)
+    Ok(phrase.to_mnemonic()?.to_seed(""))
 }
 
-/// Derive raw seed with custom argon2id parameters (for testing).
+/// Compatibility wrapper retained for older callers/tests.
+///
+/// Standard 12-word BIP39 recovery no longer uses Argon2id, so the
+/// parameters are ignored.
 pub fn derive_raw_seed_with_params(
     phrase: &RecoveryPhrase,
-    t_cost: u32,
-    m_cost_kib: u32,
-    p_cost: u32,
+    _t_cost: u32,
+    _m_cost_kib: u32,
+    _p_cost: u32,
 ) -> Result<[u8; 64]> {
-    let passphrase = phrase.words.join(" ");
-    let salt = format!("vess-recovery-v0:{}", phrase.pin);
-
-    let params = Params::new(m_cost_kib, t_cost, p_cost, Some(ARGON2_OUTPUT_LEN))
-        .map_err(|e| anyhow!("invalid argon2 params: {e}"))?;
-    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-
-    let mut seed = [0u8; 64];
-    argon2
-        .hash_password_into(passphrase.as_bytes(), salt.as_bytes(), &mut seed)
-        .map_err(|e| anyhow!("argon2id failed: {e}"))?;
-
-    Ok(seed)
+    derive_raw_seed(phrase)
 }
 
 /// Derive the 32-byte encryption key from a recovery phrase.
-///
-/// Uses argon2id with Section J parameters.
-/// **Warning**: With production params this allocates 2 GiB.
 pub fn derive_encryption_key(phrase: &RecoveryPhrase) -> Result<[u8; 32]> {
-    derive_encryption_key_with_params(phrase, ARGON2_T_COST, ARGON2_M_COST, ARGON2_P_COST)
+    let seed = derive_raw_seed(phrase)?;
+    Ok(encryption_key_from_seed(&seed))
 }
 
-/// Derive encryption key with custom argon2id parameters (for testing).
+/// Compatibility wrapper retained for older callers/tests.
+///
+/// Standard 12-word BIP39 recovery no longer uses Argon2id, so the
+/// parameters are ignored.
 pub fn derive_encryption_key_with_params(
     phrase: &RecoveryPhrase,
-    t_cost: u32,
-    m_cost_kib: u32,
-    p_cost: u32,
+    _t_cost: u32,
+    _m_cost_kib: u32,
+    _p_cost: u32,
 ) -> Result<[u8; 32]> {
-    let seed = derive_raw_seed_with_params(phrase, t_cost, m_cost_kib, p_cost)?;
-    Ok(encryption_key_from_seed(&seed))
+    derive_encryption_key(phrase)
 }
 
 /// Derive the encryption key from a raw seed (no argon2).
@@ -208,18 +198,21 @@ pub fn spend_seed_from_raw_seed(seed: &[u8; 64]) -> [u8; 32] {
 pub fn recover_master_keys(
     phrase: &RecoveryPhrase,
 ) -> Result<(StealthSecretKey, MasterStealthAddress)> {
-    recover_master_keys_with_params(phrase, ARGON2_T_COST, ARGON2_M_COST, ARGON2_P_COST)
+    let seed = derive_raw_seed(phrase)?;
+    Ok(vess_stealth::generate_master_keys_from_seed(&seed))
 }
 
-/// Recover master keys with custom argon2id parameters (for testing).
+/// Compatibility wrapper retained for older callers/tests.
+///
+/// Standard 12-word BIP39 recovery no longer uses Argon2id, so the
+/// parameters are ignored.
 pub fn recover_master_keys_with_params(
     phrase: &RecoveryPhrase,
-    t_cost: u32,
-    m_cost_kib: u32,
-    p_cost: u32,
+    _t_cost: u32,
+    _m_cost_kib: u32,
+    _p_cost: u32,
 ) -> Result<(StealthSecretKey, MasterStealthAddress)> {
-    let seed = derive_raw_seed_with_params(phrase, t_cost, m_cost_kib, p_cost)?;
-    Ok(vess_stealth::generate_master_keys_from_seed(&seed))
+    recover_master_keys(phrase)
 }
 
 /// Encrypt wallet secret keys with a recovery-derived key.
@@ -382,29 +375,33 @@ mod tests {
     use super::*;
     use vess_stealth::generate_master_keys;
 
+    const VALID_12_WORDS: &str =
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
     #[test]
     fn generate_recovery_phrase() {
         let phrase = RecoveryPhrase::generate();
-        assert_eq!(phrase.words.len(), 5);
-        assert_eq!(phrase.pin.len(), 5);
-        assert!(phrase.pin.chars().all(|c| c.is_ascii_digit()));
+        assert_eq!(phrase.words.len(), RECOVERY_WORD_COUNT);
+        assert!(RecoveryPhrase::from_input(&phrase.display_phrase()).is_ok());
     }
 
     #[test]
     fn parse_recovery_phrase() {
-        let phrase = RecoveryPhrase::from_input("abandon ability able about above", "12345");
+        let phrase = RecoveryPhrase::from_input(VALID_12_WORDS);
         assert!(phrase.is_ok());
     }
 
     #[test]
     fn invalid_word_count_rejected() {
-        let result = RecoveryPhrase::from_input("abandon ability", "12345");
+        let result = RecoveryPhrase::from_input("abandon ability");
         assert!(result.is_err());
     }
 
     #[test]
-    fn invalid_pin_rejected() {
-        let result = RecoveryPhrase::from_input("abandon ability able about above", "123");
+    fn invalid_checksum_rejected() {
+        let result = RecoveryPhrase::from_input(
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon",
+        );
         assert!(result.is_err());
     }
 
@@ -442,8 +439,16 @@ mod tests {
     fn display_phrase_format() {
         let phrase = RecoveryPhrase::generate();
         let display = phrase.display_phrase();
-        assert!(display.contains("PIN:"));
-        assert!(display.contains(&phrase.pin));
+        assert_eq!(display.split_whitespace().count(), RECOVERY_WORD_COUNT);
+        assert!(!display.contains("PIN:"));
+        assert_eq!(RecoveryPhrase::from_input(&display).unwrap(), phrase);
+    }
+
+    #[test]
+    fn raw_seed_matches_standard_bip39_seed() {
+        let phrase = RecoveryPhrase::from_input(VALID_12_WORDS).unwrap();
+        let mnemonic = bip39::Mnemonic::parse_in(bip39::Language::English, VALID_12_WORDS).unwrap();
+        assert_eq!(derive_raw_seed(&phrase).unwrap(), mnemonic.to_seed(""));
     }
 
     #[test]
