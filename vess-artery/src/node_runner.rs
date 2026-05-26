@@ -1354,6 +1354,11 @@ fn spawn_local_lan_discovery(local_contact: MeshCarrierContact, state: Arc<Mutex
                         if let Err(error) = crate::local_discovery::send_lan_announcement(&socket, &local_contact).await {
                             warn!(%error, "failed to send Vess LAN discovery announcement");
                         }
+                        if routing_table_has_capacity(&state) {
+                            if let Err(error) = crate::local_discovery::send_lan_probe(&socket).await {
+                                warn!(%error, "failed to send Vess LAN discovery probe");
+                            }
+                        }
                         for contact in crate::local_discovery::discover_local_file_contacts(Some(self_node_id)) {
                             queue_discovered_peer_contact(&state, contact, "local-file");
                         }
@@ -1393,12 +1398,22 @@ fn spawn_local_lan_discovery(local_contact: MeshCarrierContact, state: Arc<Mutex
     });
 }
 
+fn routing_table_has_capacity(state: &Arc<Mutex<ArteryState>>) -> bool {
+    let state = state.lock().unwrap();
+    state.routing_table.has_capacity()
+}
+
 fn spawn_bitcoin_vess_discovery(
     client: vess_bitcoin::BitcoinLightClient,
     state: Arc<Mutex<ArteryState>>,
 ) {
     tokio::spawn(async move {
         loop {
+            if !routing_table_has_capacity(&state) {
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                continue;
+            }
+
             let connected = client
                 .wait_for_peers(1, std::time::Duration::from_secs(30))
                 .await;
@@ -1437,11 +1452,6 @@ pub struct NodeConfig {
     pub state_dir: PathBuf,
     /// Bootstrap peer mesh contacts to connect to on startup.
     pub bootstrap: Vec<String>,
-    /// Whether to resolve legacy DNS seed domains from `seeds` as fallback.
-    pub use_dns_seeds: bool,
-    /// Legacy DNS seed domains. Normal bootstrap discovers Vess peers through
-    /// Bitcoin peers first; these are only optional fallback hints.
-    pub seeds: Vec<String>,
     /// Optional channel to signal the node's mesh node ID once online.
     /// Useful for tests that need to connect before `run_node` blocks.
     pub ready_tx: Option<tokio::sync::oneshot::Sender<String>>,
@@ -1467,8 +1477,6 @@ impl Default for NodeConfig {
             max_hops: 3,
             state_dir: NodeStorage::default_dir().unwrap_or_else(|_| PathBuf::from(".vess-artery")),
             bootstrap: Vec::new(),
-            use_dns_seeds: false,
-            seeds: Vec::new(),
             ready_tx: None,
             wallet_path: None,
             rpc_port: None,
@@ -1600,7 +1608,6 @@ pub(crate) struct ArteryState {
     pub(crate) wallet: Option<WalletState>,
     /// Background Bitcoin light client used for burn verification and
     /// transaction broadcast/onboarding.
-    #[allow(dead_code)]
     pub(crate) bitcoin_client: Option<vess_bitcoin::BitcoinLightClient>,
     /// Wallet file path (set from config even when wallet is locked).
     /// Used by the RPC `wallet_unlock` endpoint to load the file.
@@ -2066,15 +2073,6 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
         }
     };
     let bitcoin_seed_client = bitcoin_client.clone();
-    if let Some(client) = &bitcoin_seed_client {
-        let connected = client
-            .wait_for_peers(1, std::time::Duration::from_secs(5))
-            .await;
-        info!(
-            connected,
-            "initial Bitcoin peer discovery connection wait finished"
-        );
-    }
 
     let mesh_seed = load_or_create_mesh_seed(&config.state_dir)?;
     let node = MeshPulseNode::bind_from_seed(
@@ -2749,21 +2747,18 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
         all_bootstrap.extend(local_peers.iter().filter_map(bootstrap_string_from_contact));
     }
     if let Some(client) = &bitcoin_seed_client {
-        let discovered = client.discover_vess_nodes().await;
+        let discovered: Vec<String> = client
+            .discover_vess_nodes()
+            .await
+            .into_iter()
+            .map(|node| node.contact)
+            .collect();
         if !discovered.is_empty() {
             info!(
                 count = discovered.len(),
                 "discovered Vess bootstrap nodes via Bitcoin peers"
             );
-            all_bootstrap.extend(discovered.into_iter().map(|node| node.contact));
-        }
-    }
-    if config.use_dns_seeds {
-        for domain in &config.seeds {
-            match crate::dns_seed::resolve_seeds(domain).await {
-                Ok(peers) => all_bootstrap.extend(peers),
-                Err(e) => warn!(domain = %domain, "legacy DNS seed resolution failed: {e}"),
-            }
+            all_bootstrap.extend(discovered);
         }
     }
     all_bootstrap.sort_unstable();

@@ -163,13 +163,6 @@ enum Command {
         /// Optional manual bootstrap peer mesh contacts (comma-separated).
         #[arg(long, value_delimiter = ',')]
         bootstrap: Vec<String>,
-        /// Legacy DNS seed domains for fallback peer discovery (comma-separated).
-        /// Normal startup uses Bitcoin-side Vess peer discovery first.
-        #[arg(long, value_delimiter = ',')]
-        seed: Vec<String>,
-        /// Disable legacy DNS seed fallback.
-        #[arg(long, default_value = "false")]
-        no_seed: bool,
         /// Path to wallet file. Embeds wallet in node for auto-receive.
         /// Requires VESS_WALLET_PASSWORD (or --wallet-password) to unlock,
         /// or VESS_RECOVERY_PHRASE as fallback.
@@ -311,22 +304,19 @@ async fn dispatch_command(cli: &Cli) -> Result<()> {
             max_hops,
             state_dir,
             bootstrap,
-            seed,
-            no_seed,
             wallet,
             wallet_password,
             rpc_port,
         }) => {
+            let state_dir = match state_dir {
+                Some(d) => d.clone(),
+                None => vess_artery::persistence::NodeStorage::default_dir()?,
+            };
             let config = vess_artery::node_runner::NodeConfig {
                 k_neighbors: *k_neighbors,
                 max_hops: *max_hops,
-                state_dir: match state_dir {
-                    Some(d) => d.clone(),
-                    None => vess_artery::persistence::NodeStorage::default_dir()?,
-                },
+                state_dir,
                 bootstrap: bootstrap.clone(),
-                use_dns_seeds: !*no_seed && !seed.is_empty(),
-                seeds: if *no_seed { Vec::new() } else { seed.clone() },
                 ready_tx: None,
                 wallet_path: wallet.clone(),
                 rpc_port: *rpc_port,

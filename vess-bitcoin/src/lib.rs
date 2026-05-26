@@ -36,12 +36,26 @@ const READ_TIMEOUT: Duration = Duration::from_millis(500);
 const MAX_CACHED_TXS: usize = 1024;
 const MAX_CACHED_BLOCKS: usize = 64;
 const DEFAULT_VESS_SEED_PORT: u16 = 18349;
-const DEFAULT_VESS_SEED_SCAN_INTERVAL: Duration = Duration::from_secs(60);
+const DEFAULT_VESS_SEED_SCAN_INTERVAL: Duration = Duration::from_secs(20);
+const DEFAULT_VESS_SEED_SUCCESS_REPROBE_INTERVAL: Duration = Duration::from_secs(10 * 60);
+const DEFAULT_VESS_SEED_FAILURE_REPROBE_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const MAX_VESS_SEED_FAILURE_REPROBE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const VESS_SEED_PROTOCOL_VERSION: u8 = 1;
 const MAX_VESS_SEED_MESSAGE_BYTES: usize = 64 * 1024;
 const MAX_VESS_SEED_NODES: usize = 128;
-const MAX_VESS_SEED_PROBE_CANDIDATES: usize = 48;
 const VESS_SEED_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const DEFAULT_TARGET_PEERS: usize = 24;
+const DEFAULT_STABLE_TARGET_PEERS: usize = 4;
+const DEFAULT_PEER_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(15);
+const DEFAULT_BITCOIN_PEER_RETRY_INTERVAL: Duration = Duration::from_secs(60);
+const MAX_BITCOIN_PEER_RETRY_INTERVAL: Duration = Duration::from_secs(15 * 60);
+
+fn exponential_backoff_secs(base: Duration, exponent: u32, max: Duration) -> u64 {
+    let base_secs = base.as_secs().max(1);
+    let max_secs = max.as_secs().max(base_secs);
+    let factor = 1u64.checked_shl(exponent.min(20)).unwrap_or(u64::MAX);
+    base_secs.saturating_mul(factor).min(max_secs)
+}
 
 fn current_unix_timestamp() -> u64 {
     SystemTime::now()
@@ -320,7 +334,7 @@ impl Default for BitcoinConfig {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
-            target_peers: 2,
+            target_peers: DEFAULT_TARGET_PEERS,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             user_agent: "/vess-bitcoin:0.1.0/".to_string(),
             vess_seed_port: DEFAULT_VESS_SEED_PORT,
@@ -347,6 +361,7 @@ pub struct BitcoinLightClient {
     known_vess_nodes: Arc<Mutex<HashMap<String, VessSeedNode>>>,
     known_bitcoin_peers: Arc<Mutex<HashSet<SocketAddr>>>,
     local_vess_node: Arc<Mutex<Option<VessSeedNode>>>,
+    vess_probe_state: Arc<Mutex<HashMap<SocketAddr, VessSeedProbeState>>>,
     vess_seed_port: u16,
 }
 
@@ -371,6 +386,74 @@ enum PeerCommand {
     BroadcastTx(Transaction),
 }
 
+enum ManagerEvent {
+    PeerConnected(SocketAddr),
+    PeerExited(SocketAddr),
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct VessSeedProbeState {
+    last_attempt_unix: u64,
+    next_allowed_unix: u64,
+    last_success_unix: u64,
+    consecutive_failures: u32,
+}
+
+impl VessSeedProbeState {
+    fn eligible(&self, now: u64) -> bool {
+        now >= self.next_allowed_unix
+    }
+
+    fn mark_attempt(&mut self, now: u64) {
+        self.last_attempt_unix = now;
+        self.next_allowed_unix = now.saturating_add(VESS_SEED_PROBE_TIMEOUT.as_secs().max(1));
+    }
+
+    fn record_success(&mut self, now: u64) {
+        self.last_attempt_unix = now;
+        self.last_success_unix = now;
+        self.consecutive_failures = 0;
+        self.next_allowed_unix =
+            now.saturating_add(DEFAULT_VESS_SEED_SUCCESS_REPROBE_INTERVAL.as_secs());
+    }
+
+    fn record_failure(&mut self, now: u64) {
+        self.last_attempt_unix = now;
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        self.next_allowed_unix = now.saturating_add(exponential_backoff_secs(
+            DEFAULT_VESS_SEED_FAILURE_REPROBE_INTERVAL,
+            self.consecutive_failures.saturating_sub(1),
+            MAX_VESS_SEED_FAILURE_REPROBE_INTERVAL,
+        ));
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct BitcoinPeerRetryState {
+    next_allowed_unix: u64,
+    consecutive_failures: u32,
+}
+
+impl BitcoinPeerRetryState {
+    fn eligible(&self, now: u64) -> bool {
+        now >= self.next_allowed_unix
+    }
+
+    fn record_success(&mut self) {
+        self.next_allowed_unix = 0;
+        self.consecutive_failures = 0;
+    }
+
+    fn record_failure(&mut self, now: u64) {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        self.next_allowed_unix = now.saturating_add(exponential_backoff_secs(
+            DEFAULT_BITCOIN_PEER_RETRY_INTERVAL,
+            self.consecutive_failures.saturating_sub(1),
+            MAX_BITCOIN_PEER_RETRY_INTERVAL,
+        ));
+    }
+}
+
 struct SharedState {
     pending: Mutex<HashMap<Txid, Vec<oneshot::Sender<Result<Option<Transaction>>>>>>,
     cache: Arc<Mutex<HashMap<Txid, Transaction>>>,
@@ -392,6 +475,7 @@ impl BitcoinLightClient {
         let block_cache = Arc::new(Mutex::new(HashMap::new()));
         let header_chain = Arc::new(Mutex::new(HeaderChain::new(config.network)));
         let known_vess_nodes = Arc::new(Mutex::new(HashMap::new()));
+        let vess_probe_state = Arc::new(Mutex::new(HashMap::new()));
         let shared = Arc::new(SharedState {
             pending: Mutex::new(HashMap::new()),
             cache: cache.clone(),
@@ -423,6 +507,7 @@ impl BitcoinLightClient {
             known_bitcoin_peers.clone(),
             known_vess_nodes.clone(),
             local_vess_node.clone(),
+            vess_probe_state.clone(),
         ));
         tokio::spawn(run_manager(config, resolved_peers, command_rx, shared));
 
@@ -436,6 +521,7 @@ impl BitcoinLightClient {
             known_vess_nodes,
             known_bitcoin_peers,
             local_vess_node,
+            vess_probe_state,
             vess_seed_port,
         })
     }
@@ -463,6 +549,7 @@ impl BitcoinLightClient {
             self.known_bitcoin_peers.clone(),
             self.known_vess_nodes.clone(),
             self.local_vess_node.clone(),
+            self.vess_probe_state.clone(),
         )
         .await;
         self.known_vess_nodes()
@@ -623,6 +710,7 @@ async fn run_vess_seed_scanner(
     known_bitcoin_peers: Arc<Mutex<HashSet<SocketAddr>>>,
     known_vess_nodes: Arc<Mutex<HashMap<String, VessSeedNode>>>,
     local_vess_node: Arc<Mutex<Option<VessSeedNode>>>,
+    vess_probe_state: Arc<Mutex<HashMap<SocketAddr, VessSeedProbeState>>>,
 ) {
     let mut interval = tokio::time::interval(scan_interval);
     loop {
@@ -632,9 +720,63 @@ async fn run_vess_seed_scanner(
             known_bitcoin_peers.clone(),
             known_vess_nodes.clone(),
             local_vess_node.clone(),
+            vess_probe_state.clone(),
         )
         .await;
     }
+}
+
+fn due_vess_seed_probe_peers(
+    known_bitcoin_peers: &HashSet<SocketAddr>,
+    probe_state: &HashMap<SocketAddr, VessSeedProbeState>,
+    now: u64,
+) -> Vec<SocketAddr> {
+    let mut peers: Vec<_> = known_bitcoin_peers
+        .iter()
+        .copied()
+        .filter(|peer| probe_state.get(peer).copied().unwrap_or_default().eligible(now))
+        .collect();
+    peers.sort_by_key(|peer| {
+        let state = probe_state.get(peer).copied().unwrap_or_default();
+        (state.last_attempt_unix, state.last_success_unix, *peer)
+    });
+    peers
+}
+
+fn mark_vess_seed_probe_attempts(
+    probe_state: &mut HashMap<SocketAddr, VessSeedProbeState>,
+    peers: &[SocketAddr],
+    now: u64,
+) {
+    for peer in peers {
+        probe_state.entry(*peer).or_default().mark_attempt(now);
+    }
+}
+
+fn record_vess_seed_probe_success(
+    vess_probe_state: &Arc<Mutex<HashMap<SocketAddr, VessSeedProbeState>>>,
+    peer: SocketAddr,
+) {
+    let now = current_unix_timestamp();
+    vess_probe_state
+        .lock()
+        .unwrap()
+        .entry(peer)
+        .or_default()
+        .record_success(now);
+}
+
+fn record_vess_seed_probe_failure(
+    vess_probe_state: &Arc<Mutex<HashMap<SocketAddr, VessSeedProbeState>>>,
+    peer: SocketAddr,
+) {
+    let now = current_unix_timestamp();
+    vess_probe_state
+        .lock()
+        .unwrap()
+        .entry(peer)
+        .or_default()
+        .record_failure(now);
 }
 
 async fn probe_vess_seed_candidates(
@@ -642,15 +784,21 @@ async fn probe_vess_seed_candidates(
     known_bitcoin_peers: Arc<Mutex<HashSet<SocketAddr>>>,
     known_vess_nodes: Arc<Mutex<HashMap<String, VessSeedNode>>>,
     local_vess_node: Arc<Mutex<Option<VessSeedNode>>>,
+    vess_probe_state: Arc<Mutex<HashMap<SocketAddr, VessSeedProbeState>>>,
 ) {
-    let mut peers: Vec<_> = known_bitcoin_peers
-        .lock()
-        .unwrap()
-        .iter()
-        .copied()
-        .collect();
-    peers.sort_unstable();
-    peers.truncate(MAX_VESS_SEED_PROBE_CANDIDATES);
+    let known_peers = known_bitcoin_peers.lock().unwrap().clone();
+    let now = current_unix_timestamp();
+    let peers = {
+        let probe_state = vess_probe_state.lock().unwrap();
+        due_vess_seed_probe_peers(&known_peers, &probe_state, now)
+    };
+    if peers.is_empty() {
+        return;
+    }
+    {
+        let mut probe_state = vess_probe_state.lock().unwrap();
+        mark_vess_seed_probe_attempts(&mut probe_state, &peers, now);
+    }
     let request = VessSeedRequest {
         version: VESS_SEED_PROTOCOL_VERSION,
         requester_node: refreshed_local_vess_node(&local_vess_node),
@@ -681,13 +829,17 @@ async fn probe_vess_seed_candidates(
         };
         match result {
             Ok(response) if response.accepted => {
+                record_vess_seed_probe_success(&vess_probe_state, addr);
                 if let Some(node) = response.local_node {
                     upsert_known_vess_node(&known_vess_nodes, node);
                 }
                 merge_known_vess_nodes(&known_vess_nodes, response.known_nodes);
             }
-            Ok(_) => {}
+            Ok(_) => {
+                record_vess_seed_probe_failure(&vess_probe_state, addr);
+            }
             Err(e) => {
+                record_vess_seed_probe_failure(&vess_probe_state, addr);
                 warn!(peer = %addr, "Vess seed probe failed: {e}");
             }
         }
@@ -890,111 +1042,282 @@ async fn run_manager(
     mut command_rx: mpsc::UnboundedReceiver<ClientCommand>,
     shared: Arc<SharedState>,
 ) {
-    let mut peer_senders = Vec::new();
-    for peer in resolved_peers.into_iter().take(config.target_peers.max(1)) {
-        match spawn_peer(peer, &config, shared.clone()) {
-            Ok(sender) => peer_senders.push(sender),
-            Err(e) => warn!(peer = %peer, "bitcoin peer spawn failed: {e}"),
+    let (manager_event_tx, mut manager_event_rx) = mpsc::unbounded_channel();
+    let preferred_peers = resolved_peers;
+    let mut peer_senders: HashMap<SocketAddr, mpsc::UnboundedSender<PeerCommand>> =
+        HashMap::new();
+    let mut peer_order = Vec::new();
+    let mut peer_retry_state: HashMap<SocketAddr, BitcoinPeerRetryState> = HashMap::new();
+    let mut next_peer = 0usize;
+    let mut maintenance = tokio::time::interval(DEFAULT_PEER_MAINTENANCE_INTERVAL);
+
+    maintain_peer_pool(
+        &config,
+        &preferred_peers,
+        &shared,
+        &manager_event_tx,
+        &mut peer_senders,
+        &mut peer_order,
+        &mut peer_retry_state,
+    );
+
+    loop {
+        tokio::select! {
+            _ = maintenance.tick() => {
+                maintain_peer_pool(
+                    &config,
+                    &preferred_peers,
+                    &shared,
+                    &manager_event_tx,
+                    &mut peer_senders,
+                    &mut peer_order,
+                    &mut peer_retry_state,
+                );
+            }
+            Some(event) = manager_event_rx.recv() => {
+                match event {
+                    ManagerEvent::PeerConnected(peer) => {
+                        peer_retry_state.entry(peer).or_default().record_success();
+                    }
+                    ManagerEvent::PeerExited(peer) => {
+                        if drop_peer_sender(peer, &mut peer_senders, &mut peer_order) {
+                            peer_retry_state.entry(peer).or_default().record_failure(current_unix_timestamp());
+                        }
+                    }
+                }
+            }
+            command = command_rx.recv() => {
+                let Some(command) = command else {
+                    break;
+                };
+
+                if peer_order.is_empty() {
+                    match command {
+                        ClientCommand::RequestTx { reply, .. } => {
+                            let _ = reply.send(Err(anyhow!("no bitcoin peers connected")));
+                        }
+                        ClientCommand::RequestBlock { reply, .. } => {
+                            let _ = reply.send(Err(anyhow!("no bitcoin peers connected")));
+                        }
+                        ClientCommand::BroadcastTx { reply, .. } => {
+                            let _ = reply.send(Err(anyhow!("no bitcoin peers connected")));
+                        }
+                    }
+                    continue;
+                }
+
+                match command {
+                    ClientCommand::RequestTx { txid, reply } => {
+                        shared.pending.lock().unwrap().entry(txid).or_default().push(reply);
+                        if !send_to_available_peer(
+                            &mut peer_senders,
+                            &mut peer_order,
+                            &mut next_peer,
+                            &mut peer_retry_state,
+                            || PeerCommand::RequestTx(txid),
+                        ) {
+                            if let Some(waiters) = shared.pending.lock().unwrap().remove(&txid) {
+                                for waiter in waiters {
+                                    let _ = waiter.send(Err(anyhow!("bitcoin peer channel closed")));
+                                }
+                            }
+                        }
+                    }
+                    ClientCommand::RequestBlock { block_hash, reply } => {
+                        shared.pending_blocks.lock().unwrap().entry(block_hash).or_default().push(reply);
+                        if !send_to_available_peer(
+                            &mut peer_senders,
+                            &mut peer_order,
+                            &mut next_peer,
+                            &mut peer_retry_state,
+                            || PeerCommand::RequestBlock(block_hash),
+                        ) {
+                            if let Some(waiters) = shared.pending_blocks.lock().unwrap().remove(&block_hash) {
+                                for waiter in waiters {
+                                    let _ = waiter.send(Err(anyhow!("bitcoin peer channel closed")));
+                                }
+                            }
+                        }
+                    }
+                    ClientCommand::BroadcastTx { transaction, reply } => {
+                        let txid = transaction.compute_txid();
+                        let mut ok = false;
+                        for peer in peer_order.clone() {
+                            let Some(sender) = peer_senders.get(&peer).cloned() else {
+                                continue;
+                            };
+                            if sender.send(PeerCommand::BroadcastTx(transaction.clone())).is_ok() {
+                                ok = true;
+                            } else {
+                                drop_peer_sender(peer, &mut peer_senders, &mut peer_order);
+                                peer_retry_state.entry(peer).or_default().record_failure(current_unix_timestamp());
+                            }
+                        }
+                        let _ = if ok {
+                            reply.send(Ok(txid))
+                        } else {
+                            reply.send(Err(anyhow!("failed to forward bitcoin transaction to any peer")))
+                        };
+                    }
+                }
+
+                if peer_senders.len() < config.target_peers.max(1) {
+                    maintain_peer_pool(
+                        &config,
+                        &preferred_peers,
+                        &shared,
+                        &manager_event_tx,
+                        &mut peer_senders,
+                        &mut peer_order,
+                        &mut peer_retry_state,
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn collect_connection_candidates(
+    preferred_peers: &[SocketAddr],
+    known_peers: &HashSet<SocketAddr>,
+) -> Vec<SocketAddr> {
+    let mut out = Vec::with_capacity(preferred_peers.len() + known_peers.len());
+    let mut seen = HashSet::new();
+
+    for peer in preferred_peers {
+        if seen.insert(*peer) {
+            out.push(*peer);
         }
     }
 
-    let mut next_peer = 0usize;
-    while let Some(command) = command_rx.recv().await {
-        if peer_senders.is_empty() {
-            match command {
-                ClientCommand::RequestTx { reply, .. } => {
-                    let _ = reply.send(Err(anyhow!("no bitcoin peers connected")));
-                }
-                ClientCommand::RequestBlock { reply, .. } => {
-                    let _ = reply.send(Err(anyhow!("no bitcoin peers connected")));
-                }
-                ClientCommand::BroadcastTx { reply, .. } => {
-                    let _ = reply.send(Err(anyhow!("no bitcoin peers connected")));
-                }
-            }
+    let mut learned: Vec<_> = known_peers.iter().copied().collect();
+    learned.sort_unstable();
+    for peer in learned {
+        if seen.insert(peer) {
+            out.push(peer);
+        }
+    }
+
+    out
+}
+
+fn drop_peer_sender(
+    peer: SocketAddr,
+    peer_senders: &mut HashMap<SocketAddr, mpsc::UnboundedSender<PeerCommand>>,
+    peer_order: &mut Vec<SocketAddr>,
+) -> bool {
+    let removed = peer_senders.remove(&peer).is_some();
+    if removed {
+        peer_order.retain(|candidate| *candidate != peer);
+    }
+    removed
+}
+
+fn maintain_peer_pool(
+    config: &BitcoinConfig,
+    preferred_peers: &[SocketAddr],
+    shared: &Arc<SharedState>,
+    manager_event_tx: &mpsc::UnboundedSender<ManagerEvent>,
+    peer_senders: &mut HashMap<SocketAddr, mpsc::UnboundedSender<PeerCommand>>,
+    peer_order: &mut Vec<SocketAddr>,
+    peer_retry_state: &mut HashMap<SocketAddr, BitcoinPeerRetryState>,
+) {
+    let target = config.target_peers.max(1);
+    let stable_target = target.min(DEFAULT_STABLE_TARGET_PEERS.max(1));
+    let now = current_unix_timestamp();
+
+    for peer in preferred_peers.iter().copied().take(stable_target) {
+        if peer_senders.len() >= target {
+            return;
+        }
+        if peer_senders.contains_key(&peer) {
             continue;
         }
-
-        match command {
-            ClientCommand::RequestTx { txid, reply } => {
-                shared
-                    .pending
-                    .lock()
-                    .unwrap()
-                    .entry(txid)
-                    .or_default()
-                    .push(reply);
-                let idx = next_peer % peer_senders.len();
-                next_peer = next_peer.wrapping_add(1);
-                if peer_senders[idx]
-                    .send(PeerCommand::RequestTx(txid))
-                    .is_err()
-                {
-                    if let Some(waiters) = shared.pending.lock().unwrap().remove(&txid) {
-                        for waiter in waiters {
-                            let _ = waiter.send(Err(anyhow!("bitcoin peer channel closed")));
-                        }
-                    }
-                }
-            }
-            ClientCommand::RequestBlock { block_hash, reply } => {
-                shared
-                    .pending_blocks
-                    .lock()
-                    .unwrap()
-                    .entry(block_hash)
-                    .or_default()
-                    .push(reply);
-                let idx = next_peer % peer_senders.len();
-                next_peer = next_peer.wrapping_add(1);
-                if peer_senders[idx]
-                    .send(PeerCommand::RequestBlock(block_hash))
-                    .is_err()
-                {
-                    if let Some(waiters) = shared.pending_blocks.lock().unwrap().remove(&block_hash)
-                    {
-                        for waiter in waiters {
-                            let _ = waiter.send(Err(anyhow!("bitcoin peer channel closed")));
-                        }
-                    }
-                }
-            }
-            ClientCommand::BroadcastTx { transaction, reply } => {
-                let txid = transaction.compute_txid();
-                let mut ok = false;
-                for sender in &peer_senders {
-                    if sender
-                        .send(PeerCommand::BroadcastTx(transaction.clone()))
-                        .is_ok()
-                    {
-                        ok = true;
-                    }
-                }
-                let _ = if ok {
-                    reply.send(Ok(txid))
-                } else {
-                    reply.send(Err(anyhow!(
-                        "failed to forward bitcoin transaction to any peer"
-                    )))
-                };
-            }
+        if !peer_retry_state.get(&peer).copied().unwrap_or_default().eligible(now) {
+            continue;
+        }
+        if let Ok(sender) = spawn_peer(peer, config, shared.clone(), manager_event_tx.clone()) {
+            peer_senders.insert(peer, sender);
+            peer_order.push(peer);
         }
     }
+
+    if peer_senders.len() >= target {
+        return;
+    }
+
+    let known_peers = shared.known_bitcoin_peers.lock().unwrap().clone();
+    for peer in collect_connection_candidates(preferred_peers, &known_peers) {
+        if peer_senders.len() >= target {
+            return;
+        }
+        if peer_senders.contains_key(&peer) {
+            continue;
+        }
+        if !peer_retry_state.get(&peer).copied().unwrap_or_default().eligible(now) {
+            continue;
+        }
+        if let Ok(sender) = spawn_peer(peer, config, shared.clone(), manager_event_tx.clone()) {
+            peer_senders.insert(peer, sender);
+            peer_order.push(peer);
+        }
+    }
+}
+
+fn send_to_available_peer<F>(
+    peer_senders: &mut HashMap<SocketAddr, mpsc::UnboundedSender<PeerCommand>>,
+    peer_order: &mut Vec<SocketAddr>,
+    next_peer: &mut usize,
+    peer_retry_state: &mut HashMap<SocketAddr, BitcoinPeerRetryState>,
+    mut command: F,
+) -> bool
+where
+    F: FnMut() -> PeerCommand,
+{
+    let attempts = peer_order.len();
+    for _ in 0..attempts {
+        if peer_order.is_empty() {
+            break;
+        }
+        let idx = *next_peer % peer_order.len();
+        *next_peer = next_peer.wrapping_add(1);
+        let peer = peer_order[idx];
+        let Some(sender) = peer_senders.get(&peer).cloned() else {
+            drop_peer_sender(peer, peer_senders, peer_order);
+            continue;
+        };
+        if sender.send(command()).is_ok() {
+            return true;
+        }
+        drop_peer_sender(peer, peer_senders, peer_order);
+        peer_retry_state.entry(peer).or_default().record_failure(current_unix_timestamp());
+    }
+    false
 }
 
 fn spawn_peer(
     peer: SocketAddr,
     config: &BitcoinConfig,
     shared: Arc<SharedState>,
+    manager_event_tx: mpsc::UnboundedSender<ManagerEvent>,
 ) -> Result<mpsc::UnboundedSender<PeerCommand>> {
     let (peer_tx, peer_rx) = mpsc::unbounded_channel();
     let network = config.network;
     let connect_timeout = config.connect_timeout;
     let user_agent = config.user_agent.clone();
     tokio::task::spawn_blocking(move || {
-        if let Err(e) = peer_worker(peer, network, connect_timeout, &user_agent, peer_rx, shared) {
+        if let Err(e) = peer_worker(
+            peer,
+            network,
+            connect_timeout,
+            &user_agent,
+            peer_rx,
+            shared,
+            manager_event_tx.clone(),
+        ) {
             warn!(peer = %peer, "bitcoin peer worker exited: {e}");
         }
+        let _ = manager_event_tx.send(ManagerEvent::PeerExited(peer));
     });
     Ok(peer_tx)
 }
@@ -1006,6 +1329,7 @@ fn peer_worker(
     user_agent: &str,
     mut peer_rx: mpsc::UnboundedReceiver<PeerCommand>,
     shared: Arc<SharedState>,
+    manager_event_tx: mpsc::UnboundedSender<ManagerEvent>,
 ) -> Result<()> {
     let mut stream = TcpStream::connect_timeout(&peer, connect_timeout)
         .with_context(|| format!("connect to bitcoin peer {peer}"))?;
@@ -1020,6 +1344,7 @@ fn peer_worker(
     shared.known_bitcoin_peers.lock().unwrap().insert(peer);
     let _peer_guard = ConnectedPeerGuard::new(shared.connected_peers.clone());
     info!(peer = %peer, "bitcoin peer connected");
+    let _ = manager_event_tx.send(ManagerEvent::PeerConnected(peer));
 
     loop {
         while let Ok(command) = peer_rx.try_recv() {
@@ -1374,5 +1699,90 @@ mod tests {
         assert_eq!(snapshot[0].node_id, newer_node_id);
         assert_eq!(snapshot[0].last_seen_unix, 20);
         assert_eq!(snapshot[1].last_seen_unix, 10);
+    }
+
+    #[test]
+    fn probe_state_applies_backoff_and_success_reset() {
+        let mut state = VessSeedProbeState::default();
+
+        state.mark_attempt(10);
+        assert!(!state.eligible(10));
+
+        state.record_failure(10);
+        assert_eq!(state.consecutive_failures, 1);
+        assert_eq!(
+            state.next_allowed_unix,
+            10 + DEFAULT_VESS_SEED_FAILURE_REPROBE_INTERVAL.as_secs()
+        );
+
+        state.record_failure(20);
+        assert_eq!(state.consecutive_failures, 2);
+        assert_eq!(
+            state.next_allowed_unix,
+            20 + DEFAULT_VESS_SEED_FAILURE_REPROBE_INTERVAL.as_secs() * 2
+        );
+
+        state.record_success(30);
+        assert_eq!(state.consecutive_failures, 0);
+        assert_eq!(state.last_success_unix, 30);
+        assert_eq!(
+            state.next_allowed_unix,
+            30 + DEFAULT_VESS_SEED_SUCCESS_REPROBE_INTERVAL.as_secs()
+        );
+    }
+
+    #[test]
+    fn due_probe_peers_skip_backed_off_entries_and_order_oldest_first() {
+        let peer_a: SocketAddr = "127.0.0.1:8333".parse().unwrap();
+        let peer_b: SocketAddr = "127.0.0.2:8333".parse().unwrap();
+        let peer_c: SocketAddr = "127.0.0.3:8333".parse().unwrap();
+        let known = HashSet::from([peer_a, peer_b, peer_c]);
+
+        let mut states = HashMap::new();
+        states.insert(
+            peer_a,
+            VessSeedProbeState {
+                last_attempt_unix: 5,
+                next_allowed_unix: 0,
+                last_success_unix: 0,
+                consecutive_failures: 0,
+            },
+        );
+        states.insert(
+            peer_b,
+            VessSeedProbeState {
+                last_attempt_unix: 15,
+                next_allowed_unix: 0,
+                last_success_unix: 0,
+                consecutive_failures: 0,
+            },
+        );
+        states.insert(
+            peer_c,
+            VessSeedProbeState {
+                last_attempt_unix: 1,
+                next_allowed_unix: 60,
+                last_success_unix: 0,
+                consecutive_failures: 1,
+            },
+        );
+
+        let due = due_vess_seed_probe_peers(&known, &states, 30);
+        assert_eq!(due, vec![peer_a, peer_b]);
+    }
+
+    #[test]
+    fn collect_connection_candidates_prioritizes_preferred_peers_without_duplicates() {
+        let stable_a: SocketAddr = "127.0.0.1:8333".parse().unwrap();
+        let stable_b: SocketAddr = "127.0.0.2:8333".parse().unwrap();
+        let learned_a: SocketAddr = "127.0.0.3:8333".parse().unwrap();
+        let learned_b: SocketAddr = "127.0.0.4:8333".parse().unwrap();
+
+        let candidates = collect_connection_candidates(
+            &[stable_a, stable_b],
+            &HashSet::from([stable_b, learned_b, learned_a]),
+        );
+
+        assert_eq!(candidates, vec![stable_a, stable_b, learned_a, learned_b]);
     }
 }

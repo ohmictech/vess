@@ -78,7 +78,7 @@ Vess transfers are not published to a public ledger.
 - Ownership registries store current ownership state, not a public transfer history.
 - Bills are bearer instruments, not accounts.
 - Vess relies on a dual-layer stealth process, where both networking handshakes and value exchange are to one time addresses.
-- Vess is sent in common denominator bills in any 1,2,5 format (20, 500, 1000, and so on)
+- Vess is formatted in common denominator bills in any 1,2,5 format (20, 500, 1000, and so on), but any send amount is allowed. There is no change, only bill splitting and combining.
 
 ---
 
@@ -95,8 +95,6 @@ Vess ownership and privacy remain post-quantum even though issuance is Bitcoin-b
 | Hashing | Blake3 |
 | Wallet KDF | Argon2id |
 | Symmetric encryption | ChaCha20-Poly1305 |
-
-Bitcoin is used as the destroy-once reserve layer. Vess transfer ownership and privacy are post-quantum.
 
 ---
 
@@ -126,4 +124,4 @@ cargo test --workspace
 
 ## License
 
-BSL 1.1
+Apache 2.0

@@ -291,6 +291,21 @@ pub async fn send_lan_announcement(socket: &UdpSocket, contact: &MeshCarrierCont
     Ok(())
 }
 
+pub async fn send_lan_probe(socket: &UdpSocket) -> Result<()> {
+    let payload = probe_payload()?;
+    let targets = [
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::BROADCAST, LAN_DISCOVERY_PORT)),
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, LAN_DISCOVERY_PORT)),
+    ];
+    for target in targets {
+        socket
+            .send_to(&payload, target)
+            .await
+            .with_context(|| format!("send Vess LAN discovery probe to {target}"))?;
+    }
+    Ok(())
+}
+
 pub async fn send_probe_response(
     socket: &UdpSocket,
     target: SocketAddr,
@@ -317,16 +332,8 @@ pub async fn discover_lan_peer_contacts(
     let Ok(socket) = bind_lan_discovery_socket(0) else {
         return peers;
     };
-    let Ok(probe) = probe_payload() else {
+    if send_lan_probe(&socket).await.is_err() {
         return peers;
-    };
-
-    let targets = [
-        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::BROADCAST, LAN_DISCOVERY_PORT)),
-        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, LAN_DISCOVERY_PORT)),
-    ];
-    for target in targets {
-        let _ = socket.send_to(&probe, target).await;
     }
 
     let deadline = tokio::time::Instant::now() + timeout;

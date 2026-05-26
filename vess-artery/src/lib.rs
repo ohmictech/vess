@@ -21,7 +21,6 @@
 //! ```
 
 pub mod banishment;
-pub mod dns_seed;
 pub mod gossip;
 pub mod handshake;
 pub mod kademlia;

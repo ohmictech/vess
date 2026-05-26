@@ -19,6 +19,8 @@ use crate::gossip::xor_distance;
 /// We use 20 to ensure robust redundancy at scale while keeping
 /// memory bounded (256 buckets × 20 = 5120 entries max).
 pub const K_BUCKET_SIZE: usize = 20;
+pub const ROUTING_TABLE_BUCKETS: usize = 256;
+pub const MAX_ROUTING_TABLE_PEERS: usize = ROUTING_TABLE_BUCKETS * K_BUCKET_SIZE;
 
 /// Minimum peer age (in seconds) before a node is considered
 /// "established" for gossip forwarding priority. Peers younger
@@ -184,8 +186,8 @@ pub struct RoutingTable {
 impl RoutingTable {
     /// Create an empty routing table for the given node ID.
     pub fn new(node_id: [u8; 32]) -> Self {
-        let mut buckets = Vec::with_capacity(256);
-        for _ in 0..256 {
+        let mut buckets = Vec::with_capacity(ROUTING_TABLE_BUCKETS);
+        for _ in 0..ROUTING_TABLE_BUCKETS {
             buckets.push(KBucket::new());
         }
         Self { node_id, buckets }
@@ -285,6 +287,16 @@ impl RoutingTable {
     /// Total number of peers in the routing table.
     pub fn peer_count(&self) -> usize {
         self.buckets.iter().map(|b| b.len()).sum()
+    }
+
+    /// Maximum number of peer slots in the routing table.
+    pub fn max_peer_count(&self) -> usize {
+        MAX_ROUTING_TABLE_PEERS
+    }
+
+    /// Whether the routing table still has at least one free peer slot.
+    pub fn has_capacity(&self) -> bool {
+        self.peer_count() < self.max_peer_count()
     }
 
     /// Estimate the total network size from the routing table.

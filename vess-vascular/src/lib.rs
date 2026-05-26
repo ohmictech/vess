@@ -17,7 +17,7 @@ use vess_protocol::PulseMessage;
 
 const MESH_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Vess pulse node backed by the PQ mesh carrier instead of iroh identity.
+/// Vess pulse node backed by the PQ mesh carrier.
 #[derive(Clone)]
 pub struct MeshPulseNode {
     carrier: PqUdpMeshCarrier,
