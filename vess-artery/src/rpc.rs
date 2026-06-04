@@ -97,8 +97,14 @@ pub(crate) fn wallet_tag_store(
         let signature =
             vess_foundry::spend_auth::sign_spend(registrant_sk.as_slice(), &unsigned_record.digest())?;
 
-        wallet.set_tag_registration(pow_nonce, pow_hash.clone(), registered_at, signature.clone());
-        wallet.save(wallet_path)?;
+        wallet.set_tag_registration(
+            pow_nonce,
+            pow_hash.clone(),
+            registered_at,
+            signature.clone(),
+            enc_key,
+        )?;
+        wallet.save(wallet_path, enc_key)?;
         wallet
             .tag_registration
             .clone()
@@ -1823,6 +1829,9 @@ async fn handle_wallet_unlock(
     // Derive stealth keys and encryption key from raw_seed.
     let (stealth_secret, address) = vess_stealth::generate_master_keys_from_seed(&raw_seed);
     let enc_key = vess_kloak::recovery::encryption_key_from_seed(&raw_seed);
+    if let Err(e) = wallet.decrypt_private_metadata(&enc_key) {
+        return RpcResponse::err(format!("failed to decrypt wallet metadata: {e}"));
+    }
     let mailbox_key = vess_kloak::derive_mailbox_key(&address.spend_ek);
     let (bitcoin_wallet, bitcoin_receive_address) =
         match crate::node_runner::load_bitcoin_wallet_state(&wallet, &raw_seed, &enc_key) {
@@ -1986,7 +1995,8 @@ fn handle_wallet_set_password(
     if let Err(e) = wf.set_password_cache(&raw_seed, new_password) {
         return RpcResponse::err(format!("failed to create password cache: {e}"));
     }
-    if let Err(e) = wf.save(&wallet_path) {
+    let enc_key = vess_kloak::recovery::encryption_key_from_seed(&raw_seed);
+    if let Err(e) = wf.save(&wallet_path, &enc_key) {
         return RpcResponse::err(format!("failed to save wallet: {e}"));
     }
 
@@ -2518,7 +2528,7 @@ mod tests {
         let (registrant_vk, registrant_sk) = vess_foundry::spend_auth::generate_spend_keypair();
         wallet.tag_registrant_vk = registrant_vk;
         wallet.set_encrypted_tag_sk(&registrant_sk, &enc_key).unwrap();
-        wallet.save(&wallet_path).unwrap();
+        wallet.save(&wallet_path, &enc_key).unwrap();
 
         let built = wallet_tag_store(&mut wallet, &wallet_path, &enc_key)
             .unwrap()
@@ -2527,7 +2537,8 @@ mod tests {
         assert_eq!(built.0, "alice");
         assert_eq!(built.1.tag_hash, *blake3::hash(b"alice").as_bytes());
 
-        let reloaded = vess_kloak::WalletFile::load(&wallet_path).unwrap();
+        let mut reloaded = vess_kloak::WalletFile::load(&wallet_path).unwrap();
+        reloaded.decrypt_private_metadata(&enc_key).unwrap();
         assert!(reloaded.tag_registration.is_some());
     }
 }

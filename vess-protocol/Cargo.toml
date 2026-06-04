@@ -11,3 +11,4 @@ vess-compute = { path = "../vess-compute" }
 
 [dev-dependencies]
 blake3 = "1"
+proptest = "1"

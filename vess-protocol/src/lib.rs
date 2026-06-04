@@ -1231,6 +1231,7 @@ impl PulseMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn payment_round_trip() {
@@ -1325,6 +1326,41 @@ mod tests {
                 assert_eq!(req.prog_id, ProgramId([0x42; 32]));
             }
             _ => panic!("wrong variant"),
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn pulse_message_truncated_payloads_fail_cleanly(
+            stealth_payload in proptest::collection::vec(any::<u8>(), 0..256),
+            created_at in any::<u64>(),
+            bill_count in any::<u8>(),
+            cutoff in 0usize..256,
+        ) {
+            let msg = PulseMessage::Payment(Payment {
+                payment_id: [0xAB; 32],
+                stealth_payload,
+                view_tag: 0x42,
+                stealth_id: [0xCD; 32],
+                created_at,
+                bill_count,
+                mailbox_key: None,
+                direct_receipt_tag_hash: None,
+            });
+            let bytes = msg.to_bytes().unwrap();
+            prop_assume!(!bytes.is_empty());
+            let truncate_at = cutoff % bytes.len();
+            let truncated = &bytes[..truncate_at];
+
+            prop_assert!(PulseMessage::from_bytes(truncated).is_err());
+        }
+
+        #[test]
+        fn pulse_message_parser_handles_arbitrary_bytes(payload in proptest::collection::vec(any::<u8>(), 0..2048)) {
+            if let Ok(msg) = PulseMessage::from_bytes(&payload) {
+                let reencoded = msg.to_bytes().unwrap();
+                prop_assert!(PulseMessage::from_bytes(&reencoded).is_ok());
+            }
         }
     }
 }

@@ -493,6 +493,7 @@ async fn broadcast_pending_burns(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use std::collections::{HashMap, VecDeque};
     use std::sync::{Arc, Mutex};
 
@@ -628,6 +629,40 @@ mod tests {
             mailbox_fwd: HashMap::new(),
             mailbox_fwd_limiter: crate::gossip::PeerRateLimiter::new(5, 60),
         }))
+    }
+
+    fn sample_claim(
+        mint_id: [u8; 32],
+        prev_owner_vk: Vec<u8>,
+        new_owner_vk: Vec<u8>,
+        base_chain_tip: [u8; 32],
+        witness_seed: u8,
+        chain_depth: u64,
+        timestamp: u64,
+    ) -> OwnershipClaim {
+        let new_owner_vk_hash = vess_foundry::spend_auth::vk_hash(&new_owner_vk);
+        let transfer_sig = vec![witness_seed; 64];
+        let witness_hash = *blake3::hash(&transfer_sig).as_bytes();
+        OwnershipClaim {
+            mint_id,
+            stealth_id: [witness_seed.wrapping_add(1); 32],
+            prev_owner_vk,
+            prev_owner_program: None,
+            transfer_sig,
+            new_owner_vk_hash,
+            new_owner_vk,
+            new_owner_program: None,
+            new_chain_tip: vess_foundry::advance_chain_tip_with_hash(
+                &base_chain_tip,
+                &new_owner_vk_hash,
+                &witness_hash,
+            ),
+            timestamp,
+            hops_remaining: 0,
+            chain_depth,
+            encrypted_bill: Vec::new(),
+            program_spend_witness: None,
+        }
     }
 
     #[test]
@@ -820,6 +855,54 @@ mod tests {
     }
 
     #[test]
+    fn validated_seed_ownership_record_rejects_non_authoritative_source_peer() {
+        let state = sample_seed_state();
+        let locked = state.lock().unwrap();
+        let source_peer_id = [0x01; 32];
+        let closer_peer_id = [0x02; 32];
+        let mint_id = [0x03; 32];
+        let seeded_record = dht_seed_ownership_from_record(&sample_partition_record(
+            mint_id,
+            1,
+            Some([0x04; 32]),
+            [0x05; 32],
+            100,
+        ));
+
+        let record = validated_seed_ownership_record(
+            &locked.registry,
+            &[closer_peer_id],
+            1,
+            source_peer_id,
+            locked.node_id,
+            seeded_record,
+        );
+
+        assert!(record.is_none());
+    }
+
+    #[test]
+    fn validated_seed_consumed_record_rejects_non_authoritative_source_peer() {
+        let state = sample_seed_state();
+        let locked = state.lock().unwrap();
+        let source_peer_id = [0x11; 32];
+        let closer_peer_id = [0x12; 32];
+        let mint_id = [0x13; 32];
+        let seeded_record = dht_seed_consumed_from_record(mint_id, &sample_consumed_record(0x14, 200));
+
+        let record = validated_seed_consumed_record(
+            &locked.registry,
+            &[closer_peer_id],
+            1,
+            source_peer_id,
+            locked.node_id,
+            seeded_record,
+        );
+
+        assert!(record.is_none());
+    }
+
+    #[test]
     fn competing_claim_chain_tip_must_match_pretransfer_base() {
         let base_chain_tip = [0x71; 32];
         let wrong_base_chain_tip = [0x72; 32];
@@ -858,6 +941,150 @@ mod tests {
 
         claim.new_chain_tip = forged_tip;
         assert!(!verify_competing_claim_chain_tip(base_chain_tip, &claim, witness_hash));
+    }
+
+    #[test]
+    fn multi_hop_competing_claim_uses_immediate_parent_base_tip() {
+        let mint_id = [0x81; 32];
+        let genesis_owner_vk = vec![0x11; 64];
+        let hop_one_owner_vk = vec![0x22; 64];
+        let winning_hop_two_owner_vk = vec![0x33; 64];
+        let rival_hop_two_owner_vk = vec![0x44; 64];
+        let genesis_chain_tip = [0x90; 32];
+        let updated_at = 1_700_000_000;
+        let state = sample_seed_state();
+
+        {
+            let mut locked = state.lock().unwrap();
+            locked.retained_ownership_records.insert(
+                mint_id,
+                OwnershipRecord {
+                    mint_id,
+                    chain_tip: genesis_chain_tip,
+                    prev_transfer_chain_tip: None,
+                    current_owner_vk_hash: vess_foundry::spend_auth::vk_hash(&genesis_owner_vk),
+                    current_owner_vk: genesis_owner_vk.clone(),
+                    current_owner_program: None,
+                    denomination_value: 10,
+                    updated_at,
+                    proof_hash: [0x55; 32],
+                    digest: [0x66; 32],
+                    nonce: [0x77; 32],
+                    prev_claim_vk_hash: None,
+                    claim_hash: None,
+                    chain_depth: 0,
+                    encrypted_bill: Vec::new(),
+                },
+            );
+
+            let hop_one = sample_claim(
+                mint_id,
+                genesis_owner_vk.clone(),
+                hop_one_owner_vk.clone(),
+                genesis_chain_tip,
+                0xA1,
+                1,
+                updated_at + 1,
+            );
+            retain_local_ownership_claim(&mut locked, &hop_one, None, updated_at + 1);
+        }
+
+        let after_hop_one = state
+            .lock()
+            .unwrap()
+            .retained_ownership_records
+            .get(&mint_id)
+            .unwrap()
+            .clone();
+        assert_eq!(after_hop_one.prev_transfer_chain_tip, Some(genesis_chain_tip));
+
+        let winning_hop_two = sample_claim(
+            mint_id,
+            hop_one_owner_vk.clone(),
+            winning_hop_two_owner_vk,
+            after_hop_one.chain_tip,
+            0xB1,
+            2,
+            updated_at + 2,
+        );
+        let rival_same_depth = sample_claim(
+            mint_id,
+            hop_one_owner_vk,
+            rival_hop_two_owner_vk,
+            genesis_chain_tip,
+            0xC1,
+            2,
+            updated_at + 2,
+        );
+
+        {
+            let mut locked = state.lock().unwrap();
+            retain_local_ownership_claim(&mut locked, &winning_hop_two, None, updated_at + 2);
+        }
+
+        let after_hop_two = state
+            .lock()
+            .unwrap()
+            .retained_ownership_records
+            .get(&mint_id)
+            .unwrap()
+            .clone();
+        let winning_witness_hash = ownership_claim_witness_hash(&winning_hop_two).unwrap();
+        let rival_witness_hash = ownership_claim_witness_hash(&rival_same_depth).unwrap();
+
+        assert_eq!(after_hop_two.prev_transfer_chain_tip, Some(after_hop_one.chain_tip));
+        assert!(verify_competing_claim_chain_tip(
+            after_hop_two.prev_transfer_chain_tip.unwrap(),
+            &winning_hop_two,
+            winning_witness_hash,
+        ));
+        assert!(!verify_competing_claim_chain_tip(
+            after_hop_two.prev_transfer_chain_tip.unwrap(),
+            &rival_same_depth,
+            rival_witness_hash,
+        ));
+    }
+
+    proptest! {
+        #[test]
+        fn competing_claim_chain_tip_property_holds_across_random_inputs(
+            base_chain_tip in any::<[u8; 32]>(),
+            wrong_base_chain_tip in any::<[u8; 32]>(),
+            witness_hash in any::<[u8; 32]>(),
+            new_owner_vk_hash in any::<[u8; 32]>(),
+            timestamp in any::<u64>(),
+        ) {
+            let claim = OwnershipClaim {
+                mint_id: [0x01; 32],
+                stealth_id: [0x02; 32],
+                prev_owner_vk: Vec::new(),
+                prev_owner_program: None,
+                transfer_sig: Vec::new(),
+                new_owner_vk_hash,
+                new_owner_vk: Vec::new(),
+                new_owner_program: None,
+                new_chain_tip: vess_foundry::advance_chain_tip_with_hash(
+                    &base_chain_tip,
+                    &new_owner_vk_hash,
+                    &witness_hash,
+                ),
+                timestamp,
+                hops_remaining: 0,
+                chain_depth: 2,
+                encrypted_bill: Vec::new(),
+                program_spend_witness: None,
+            };
+
+            prop_assert!(verify_competing_claim_chain_tip(base_chain_tip, &claim, witness_hash));
+
+            if wrong_base_chain_tip != base_chain_tip {
+                prop_assert!(!verify_competing_claim_chain_tip(
+                    wrong_base_chain_tip,
+                    &claim,
+                    witness_hash,
+                ));
+            }
+        }
     }
 }
 
@@ -1073,6 +1300,7 @@ fn load_or_create_mesh_seed(state_dir: &std::path::Path) -> Result<[u8; 64]> {
     let path = state_dir.join(MESH_NODE_SEED_FILENAME);
     if let Ok(bytes) = std::fs::read(&path) {
         if bytes.len() == 64 {
+            ensure_owner_only_file_permissions(&path)?;
             let mut seed = [0u8; 64];
             seed.copy_from_slice(&bytes);
             return Ok(seed);
@@ -1082,8 +1310,51 @@ fn load_or_create_mesh_seed(state_dir: &std::path::Path) -> Result<[u8; 64]> {
     std::fs::create_dir_all(state_dir)?;
     let mut seed = [0u8; 64];
     rand::thread_rng().fill(&mut seed);
-    std::fs::write(&path, seed)?;
+    write_owner_only_seed_file(&path, &seed)?;
     Ok(seed)
+}
+
+fn write_owner_only_seed_file(path: &Path, seed: &[u8; 64]) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(seed)?;
+        file.sync_all()?;
+        ensure_owner_only_file_permissions(path)?;
+        return Ok(());
+    }
+
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, seed)?;
+        Ok(())
+    }
+}
+
+fn ensure_owner_only_file_permissions(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::fs::Permissions;
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(path, Permissions::from_mode(0o600))?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+
+    Ok(())
 }
 
 fn mirror_compute_receipt_text(state_dir: &Path, receipt: &vess_protocol::ComputeReceipt) {
@@ -1286,10 +1557,22 @@ fn validated_seed_ownership_record(
     registry: &OwnershipRegistry,
     peer_ids: &[[u8; 32]],
     replication: usize,
+    source_peer_id: [u8; 32],
+    local_node_id: [u8; 32],
     seeded_record: DhtSeedOwnershipRecord,
 ) -> Option<OwnershipRecord> {
     let mint_id = seeded_record.mint_id;
     if !registry.should_store(&mint_id, peer_ids, replication) {
+        return None;
+    }
+
+    if !node_should_store_seeded_key(
+        &mint_id,
+        &source_peer_id,
+        &local_node_id,
+        peer_ids,
+        replication,
+    ) {
         return None;
     }
 
@@ -1318,12 +1601,20 @@ fn validated_seed_consumed_record(
     registry: &OwnershipRegistry,
     peer_ids: &[[u8; 32]],
     replication: usize,
+    source_peer_id: [u8; 32],
+    local_node_id: [u8; 32],
     seeded_record: DhtSeedConsumedRecord,
 ) -> Option<([u8; 32], ConsumedRecord)> {
     let (mint_id, record) = consumed_record_from_dht_seed(seeded_record);
-    registry
-        .should_store(&mint_id, peer_ids, replication)
-        .then_some((mint_id, record))
+    (registry.should_store(&mint_id, peer_ids, replication)
+        && node_should_store_seeded_key(
+            &mint_id,
+            &source_peer_id,
+            &local_node_id,
+            peer_ids,
+            replication,
+        ))
+    .then_some((mint_id, record))
 }
 
 fn apply_quorum_seed_snapshots(state: &Arc<Mutex<ArteryState>>, snapshots: Vec<SeedSyncPeerSnapshot>) {
@@ -1900,6 +2191,7 @@ async fn request_dht_seed_catchup(
     const MAX_DHT_SEED_CATCHUP_ROUNDS: usize = 1024;
 
     let requester_node_id = *node.id().as_bytes();
+    let source_peer_id = contact_node_id_bytes(target)?;
     let mut cursor = DhtSeedCursor::default();
     let mut snapshot = SeedSyncPeerSnapshot::default();
 
@@ -1919,7 +2211,7 @@ async fn request_dht_seed_catchup(
 
         let empty_page = dht_seed_response_is_empty(&response);
         cursor.advance_from_response(&response);
-        let page_snapshot = ingest_dht_seed_response(state, state_dir, response);
+        let page_snapshot = ingest_dht_seed_response(state, state_dir, source_peer_id, response);
         for record in page_snapshot.ownership_records.into_values() {
             upsert_seed_ownership_record(&mut snapshot.ownership_records, record);
         }
@@ -1995,6 +2287,7 @@ pub(crate) async fn refresh_mailbox_forward_subscriptions(
 fn ingest_dht_seed_response(
     state: &Arc<Mutex<ArteryState>>,
     state_dir: &Path,
+    source_peer_id: [u8; 32],
     response: DhtSeedResponse,
 ) -> SeedSyncPeerSnapshot {
     let now = std::time::SystemTime::now()
@@ -2065,7 +2358,14 @@ fn ingest_dht_seed_response(
         .take(MAX_DHT_SEED_OWNERSHIP_RECORDS)
     {
         if let Some(record) =
-            validated_seed_ownership_record(&s.registry, &peer_ids, repl, seeded_record)
+            validated_seed_ownership_record(
+                &s.registry,
+                &peer_ids,
+                repl,
+                source_peer_id,
+                s.node_id,
+                seeded_record,
+            )
         {
             upsert_seed_ownership_record(&mut snapshot.ownership_records, record);
         }
@@ -2077,7 +2377,14 @@ fn ingest_dht_seed_response(
         .take(MAX_DHT_SEED_CONSUMED_RECORDS)
     {
         if let Some((mint_id, record)) =
-            validated_seed_consumed_record(&s.registry, &peer_ids, repl, seeded_record)
+            validated_seed_consumed_record(
+                &s.registry,
+                &peer_ids,
+                repl,
+                source_peer_id,
+                s.node_id,
+                seeded_record,
+            )
         {
             upsert_seed_consumed_record(&mut snapshot.consumed_records, mint_id, record);
         }
@@ -2652,7 +2959,7 @@ impl ArteryState {
                         tracing::warn!(error = %e, "failed to serialize bitcoin wallet state");
                     }
                 }
-                if let Err(e) = wf.save(&ws.wallet_path) {
+                if let Err(e) = wf.save(&ws.wallet_path, &ws.enc_key) {
                     tracing::warn!(error = %e, "failed to flush wallet to disk");
                 }
             }
@@ -2964,6 +3271,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
             vess_stealth::generate_master_keys_from_seed(&raw_seed);
         let mailbox_key = vess_kloak::derive_mailbox_key(&address.spend_ek);
         let enc_key = encryption_key_from_seed(&raw_seed);
+        wallet.decrypt_private_metadata(&enc_key)?;
         let startup_wallet_tag_store = match crate::rpc::wallet_tag_store(&mut wallet, wallet_path, &enc_key) {
             Ok(store) => store,
             Err(error) => {
@@ -7014,7 +7322,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 if let Err(e) = wf.encrypt_spend_credentials(&ws.billfold, &ws.enc_key) {
                     warn!(error = %e, "failed to encrypt spend credentials on shutdown");
                 }
-                if let Err(e) = wf.save(&ws.wallet_path) {
+                if let Err(e) = wf.save(&ws.wallet_path, &ws.enc_key) {
                     warn!(error = %e, "failed to save wallet on shutdown");
                 } else {
                     info!("wallet saved on shutdown");

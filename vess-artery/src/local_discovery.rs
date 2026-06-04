@@ -19,6 +19,7 @@ use ipconfig::{IfType, OperStatus};
 pub const LAN_DISCOVERY_PORT: u16 = 18348;
 const LOCAL_PEER_STALE_SECS: u64 = 120;
 const LAN_DISCOVERY_VERSION: u8 = 1;
+const MAX_LOCAL_PEER_RECORD_BYTES: usize = 64 * 1024;
 const MAX_LAN_DISCOVERY_MESSAGE_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,6 +98,13 @@ fn contact_node_id_string(contact: &MeshCarrierContact) -> Result<String> {
         .node_id()
         .map(|node_id| node_id.to_string())
         .ok_or_else(|| anyhow!("mesh contact is missing a node id"))
+}
+
+fn contact_matches_node_id(contact: &MeshCarrierContact, expected_node_id: &str) -> bool {
+    contact
+        .node_id()
+        .map(|node_id| node_id.to_string() == expected_node_id)
+        .unwrap_or(false)
 }
 
 fn peer_record_path(contact: &MeshCarrierContact) -> Result<PathBuf> {
@@ -260,6 +268,10 @@ pub fn discover_local_file_contacts(self_node_id: Option<[u8; 32]>) -> Vec<MeshC
         let Ok(bytes) = std::fs::read(&path) else {
             continue;
         };
+        if bytes.len() > MAX_LOCAL_PEER_RECORD_BYTES {
+            let _ = std::fs::remove_file(&path);
+            continue;
+        }
         let Ok(record) = serde_json::from_slice::<LocalPeerRecord>(&bytes) else {
             continue;
         };
@@ -273,7 +285,9 @@ pub fn discover_local_file_contacts(self_node_id: Option<[u8; 32]>) -> Vec<MeshC
         let Ok(contact) = decode_mesh_contact_string(&record.contact) else {
             continue;
         };
-        if validate_mesh_contact(&contact).is_err() {
+        if validate_mesh_contact(&contact).is_err()
+            || !contact_matches_node_id(&contact, record.node_id.trim())
+        {
             continue;
         }
         let Some(node_id) = contact.node_id().map(|node_id| *node_id.as_bytes()) else {
@@ -355,11 +369,19 @@ pub fn parse_lan_discovery_message(
     match envelope.kind {
         LanDiscoveryKind::Probe => Ok(ParsedLanDiscovery::Probe),
         LanDiscoveryKind::Announce | LanDiscoveryKind::ProbeResponse => {
+            let node_id = envelope
+                .node_id
+                .as_deref()
+                .ok_or_else(|| anyhow!("LAN discovery contact message missing node id"))?;
             let contact = envelope
                 .contact
                 .ok_or_else(|| anyhow!("LAN discovery contact message missing contact"))?;
             let contact = decode_mesh_contact_string(&contact)
                 .context("decode LAN discovery mesh contact")?;
+            validate_mesh_contact(&contact)?;
+            if !contact_matches_node_id(&contact, node_id.trim()) {
+                return Err(anyhow!("LAN discovery node id mismatch"));
+            }
             Ok(ParsedLanDiscovery::Contact(contact_from_lan_source(
                 &contact, source,
             )?))
@@ -453,6 +475,16 @@ pub fn log_publish_error(error: anyhow::Error) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    fn test_contact(seed_byte: u8, addr: &str) -> MeshCarrierContact {
+        let seed = [seed_byte; 64];
+        let (_, mesh_address) = vess_mesh::generate_mesh_keys_from_seed(&seed, 0);
+        MeshCarrierContact::UdpSocket {
+            addr: addr.to_string(),
+            mesh_address,
+        }
+    }
 
     #[test]
     fn ipv4_broadcast_addr_uses_prefix_length() {
@@ -466,5 +498,59 @@ mod tests {
         );
         assert_eq!(ipv4_broadcast_addr(Ipv4Addr::new(192, 168, 1, 0), 31), None);
         assert_eq!(ipv4_broadcast_addr(Ipv4Addr::new(192, 168, 1, 0), 32), None);
+    }
+
+    #[test]
+    fn lan_discovery_rejects_mismatched_node_id() {
+        let contact = test_contact(7, "10.0.0.7:19001");
+        let payload = serde_json::to_vec(&LanDiscoveryEnvelope {
+            version: LAN_DISCOVERY_VERSION,
+            kind: LanDiscoveryKind::Announce,
+            node_id: Some("wrong-node-id".to_string()),
+            contact: Some(encode_mesh_contact_string(&contact).unwrap()),
+        })
+        .unwrap();
+
+        let error = parse_lan_discovery_message(
+            &payload,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 8), LAN_DISCOVERY_PORT)),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("node id mismatch"));
+    }
+
+    #[test]
+    fn lan_discovery_preserves_contact_identity_but_uses_source_ip() {
+        let contact = test_contact(8, "203.0.113.8:19002");
+        let expected_node_id = contact.node_id().unwrap().to_string();
+        let payload = announcement_payload(&contact).unwrap();
+        let source = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 44), 55555));
+
+        let ParsedLanDiscovery::Contact(parsed) = parse_lan_discovery_message(&payload, source).unwrap() else {
+            panic!("expected LAN discovery contact");
+        };
+
+        assert_eq!(parsed.node_id().unwrap().to_string(), expected_node_id);
+        match parsed {
+            MeshCarrierContact::UdpSocket { addr, .. } => {
+                assert!(addr.starts_with("192.168.1.44:"));
+            }
+            other => panic!("expected udp contact, got {other:?}"),
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn lan_discovery_parser_handles_arbitrary_payloads(
+            payload in proptest::collection::vec(any::<u8>(), 0..(MAX_LAN_DISCOVERY_MESSAGE_BYTES + 512)),
+            octet in any::<u8>(),
+        ) {
+            let source = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, octet), LAN_DISCOVERY_PORT));
+            let result = parse_lan_discovery_message(&payload, source);
+            if payload.len() > MAX_LAN_DISCOVERY_MESSAGE_BYTES {
+                prop_assert!(result.is_err());
+            }
+        }
     }
 }

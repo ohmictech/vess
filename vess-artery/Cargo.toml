@@ -41,5 +41,6 @@ ipconfig = "0.3"
 blake3 = "1"
 
 [dev-dependencies]
+proptest = "1"
 tempfile = "3"
 vess-tag = { path = "../vess-tag", features = ["test-pow"] }

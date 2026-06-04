@@ -43,6 +43,9 @@ const MAX_VESS_SEED_FAILURE_REPROBE_INTERVAL: Duration = Duration::from_secs(60 
 const VESS_SEED_PROTOCOL_VERSION: u8 = 1;
 const MAX_VESS_SEED_MESSAGE_BYTES: usize = 64 * 1024;
 const MAX_VESS_SEED_NODES: usize = 128;
+const MAX_VESS_SEED_NODE_AGE_SECS: u64 = 24 * 60 * 60;
+const MAX_VESS_SEED_NODE_FUTURE_SKEW_SECS: u64 = 10 * 60;
+const MAX_VESS_SEED_REQUESTS_PER_MINUTE: u32 = 12;
 const VESS_SEED_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_TARGET_PEERS: usize = 24;
 const DEFAULT_STABLE_TARGET_PEERS: usize = 4;
@@ -62,6 +65,11 @@ fn current_unix_timestamp() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn seed_node_timestamp_is_reasonable(last_seen_unix: u64, now_unix: u64) -> bool {
+    last_seen_unix <= now_unix.saturating_add(MAX_VESS_SEED_NODE_FUTURE_SKEW_SECS)
+        && now_unix.saturating_sub(last_seen_unix) <= MAX_VESS_SEED_NODE_AGE_SECS
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -85,6 +93,12 @@ struct VessSeedResponse {
     accepted: bool,
     local_node: Option<VessSeedNode>,
     known_nodes: Vec<VessSeedNode>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct VessSeedClientWindow {
+    window_started_unix: u64,
+    requests_in_window: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -506,6 +520,7 @@ impl BitcoinLightClient {
         let local_vess_node = shared.local_vess_node.clone();
         tokio::spawn(run_vess_seed_listener(
             config.vess_seed_port,
+            known_bitcoin_peers.clone(),
             known_vess_nodes.clone(),
             local_vess_node.clone(),
             allow_private_vess_seed_contacts,
@@ -688,10 +703,12 @@ impl BitcoinLightClient {
 
 async fn run_vess_seed_listener(
     vess_seed_port: u16,
+    known_bitcoin_peers: Arc<Mutex<HashSet<SocketAddr>>>,
     known_vess_nodes: Arc<Mutex<HashMap<String, VessSeedNode>>>,
     local_vess_node: Arc<Mutex<Option<VessSeedNode>>>,
     allow_private_vess_seed_contacts: bool,
 ) {
+    let request_windows = Arc::new(Mutex::new(HashMap::<IpAddr, VessSeedClientWindow>::new()));
     let listener = match TcpListener::bind((Ipv4Addr::UNSPECIFIED, vess_seed_port)).await {
         Ok(listener) => listener,
         Err(e) => {
@@ -706,13 +723,18 @@ async fn run_vess_seed_listener(
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
+                let known_bitcoin_peers = known_bitcoin_peers.clone();
                 let known_vess_nodes = known_vess_nodes.clone();
                 let local_vess_node = local_vess_node.clone();
+                let request_windows = request_windows.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle_vess_seed_connection(
                         stream,
+                        peer,
+                        known_bitcoin_peers,
                         known_vess_nodes,
                         local_vess_node,
+                        request_windows,
                         allow_private_vess_seed_contacts,
                     )
                     .await
@@ -895,10 +917,31 @@ async fn probe_vess_seed_peer(
 
 async fn handle_vess_seed_connection(
     mut stream: TokioTcpStream,
+    peer: SocketAddr,
+    known_bitcoin_peers: Arc<Mutex<HashSet<SocketAddr>>>,
     known_vess_nodes: Arc<Mutex<HashMap<String, VessSeedNode>>>,
     local_vess_node: Arc<Mutex<Option<VessSeedNode>>>,
+    request_windows: Arc<Mutex<HashMap<IpAddr, VessSeedClientWindow>>>,
     allow_private_vess_seed_contacts: bool,
 ) -> Result<()> {
+    let now_unix = current_unix_timestamp();
+    let accepted = should_accept_vess_seed_request(
+        peer,
+        &known_bitcoin_peers.lock().unwrap(),
+        &mut request_windows.lock().unwrap(),
+        now_unix,
+    );
+    if !accepted {
+        let response = VessSeedResponse {
+            version: VESS_SEED_PROTOCOL_VERSION,
+            accepted: false,
+            local_node: None,
+            known_nodes: Vec::new(),
+        };
+        write_seed_message(&mut stream, &response).await?;
+        return Ok(());
+    }
+
     let request: VessSeedRequest = read_seed_message(&mut stream).await?;
     if request.version != VESS_SEED_PROTOCOL_VERSION {
         let response = VessSeedResponse {
@@ -932,6 +975,37 @@ async fn handle_vess_seed_connection(
     };
     write_seed_message(&mut stream, &response).await?;
     Ok(())
+}
+
+fn known_bitcoin_peer_matches_ip(peer: SocketAddr, known_bitcoin_peers: &HashSet<SocketAddr>) -> bool {
+    known_bitcoin_peers.iter().any(|known| known.ip() == peer.ip())
+}
+
+fn rate_limit_vess_seed_client(
+    peer: SocketAddr,
+    request_windows: &mut HashMap<IpAddr, VessSeedClientWindow>,
+    now_unix: u64,
+) -> bool {
+    let entry = request_windows.entry(peer.ip()).or_default();
+    if now_unix.saturating_sub(entry.window_started_unix) >= 60 {
+        entry.window_started_unix = now_unix;
+        entry.requests_in_window = 0;
+    }
+    if entry.requests_in_window >= MAX_VESS_SEED_REQUESTS_PER_MINUTE {
+        return false;
+    }
+    entry.requests_in_window += 1;
+    true
+}
+
+fn should_accept_vess_seed_request(
+    peer: SocketAddr,
+    known_bitcoin_peers: &HashSet<SocketAddr>,
+    request_windows: &mut HashMap<IpAddr, VessSeedClientWindow>,
+    now_unix: u64,
+) -> bool {
+    known_bitcoin_peer_matches_ip(peer, known_bitcoin_peers)
+        && rate_limit_vess_seed_client(peer, request_windows, now_unix)
 }
 
 fn refreshed_local_vess_node(
@@ -1020,30 +1094,39 @@ fn upsert_known_vess_node(
     mut node: VessSeedNode,
     allow_private_vess_seed_contacts: bool,
 ) {
-    let node_id = node.node_id.trim();
-    let contact = node.contact.trim();
+    let node_id = node.node_id.trim().to_string();
+    let contact = node.contact.trim().to_string();
     if node_id.is_empty() || contact.is_empty() {
         return;
     }
-    if !seed_contact_matches_node_id(node_id, contact, allow_private_vess_seed_contacts) {
+    if !seed_contact_matches_node_id(&node_id, &contact, allow_private_vess_seed_contacts) {
         warn!(
             node_id,
             "skipping Vess seed node with invalid or mismatched mesh contact"
         );
         return;
     }
+    let now_unix = current_unix_timestamp();
     if node.last_seen_unix == 0 {
-        node.last_seen_unix = current_unix_timestamp();
+        node.last_seen_unix = now_unix;
     }
-    node.node_id = node_id.to_string();
-    node.contact = contact.to_string();
+    if !seed_node_timestamp_is_reasonable(node.last_seen_unix, now_unix) {
+        warn!(node_id, last_seen_unix = node.last_seen_unix, "skipping stale or future-dated Vess seed node");
+        return;
+    }
+    node.node_id = node_id.clone();
+    node.contact = contact;
 
     let mut known = known_vess_nodes.lock().unwrap();
     match known.get(&node.node_id) {
+        Some(existing) if existing.last_seen_unix > node.last_seen_unix => {
+            return;
+        }
         Some(existing)
-            if existing.contact == node.contact
-                && existing.last_seen_unix > node.last_seen_unix =>
+            if existing.last_seen_unix == node.last_seen_unix
+                && existing.contact != node.contact =>
         {
+            warn!(node_id, "ignoring equal-timestamp Vess seed contact replacement");
             return;
         }
         _ => {
@@ -1752,21 +1835,61 @@ mod tests {
     fn snapshot_known_vess_nodes_orders_by_recency() {
         let known_vess_nodes = Arc::new(Mutex::new(HashMap::new()));
         let local_vess_node = Arc::new(Mutex::new(None));
+        let now = current_unix_timestamp();
 
         upsert_known_vess_node(
             &known_vess_nodes,
-            test_seed_node(1, "93.184.216.34:9001", 10),
+            test_seed_node(1, "93.184.216.34:9001", now.saturating_sub(20)),
             false,
         );
-        let newer = test_seed_node(2, "1.1.1.1:9002", 20);
+        let newer = test_seed_node(2, "1.1.1.1:9002", now.saturating_sub(10));
         let newer_node_id = newer.node_id.clone();
         upsert_known_vess_node(&known_vess_nodes, newer, false);
 
         let snapshot = snapshot_known_vess_nodes(&known_vess_nodes, &local_vess_node);
         assert_eq!(snapshot.len(), 2);
         assert_eq!(snapshot[0].node_id, newer_node_id);
-        assert_eq!(snapshot[0].last_seen_unix, 20);
-        assert_eq!(snapshot[1].last_seen_unix, 10);
+        assert_eq!(snapshot[0].last_seen_unix, now.saturating_sub(10));
+        assert_eq!(snapshot[1].last_seen_unix, now.saturating_sub(20));
+    }
+
+    #[test]
+    fn stale_and_future_dated_seed_nodes_are_rejected() {
+        let known_vess_nodes = Arc::new(Mutex::new(HashMap::new()));
+        let now = current_unix_timestamp();
+
+        upsert_known_vess_node(
+            &known_vess_nodes,
+            test_seed_node(3, "93.184.216.35:9003", now.saturating_sub(MAX_VESS_SEED_NODE_AGE_SECS + 1)),
+            false,
+        );
+        upsert_known_vess_node(
+            &known_vess_nodes,
+            test_seed_node(4, "93.184.216.36:9004", now.saturating_add(MAX_VESS_SEED_NODE_FUTURE_SKEW_SECS + 1)),
+            false,
+        );
+
+        assert!(known_vess_nodes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn equal_timestamp_seed_contact_conflict_does_not_replace_existing_node() {
+        let known_vess_nodes = Arc::new(Mutex::new(HashMap::new()));
+        let now = current_unix_timestamp();
+        let existing = test_seed_node(5, "93.184.216.37:9005", now);
+        let mut conflicting = test_seed_node(6, "93.184.216.38:9006", now);
+        conflicting.node_id = existing.node_id.clone();
+
+        upsert_known_vess_node(&known_vess_nodes, existing.clone(), false);
+        upsert_known_vess_node(&known_vess_nodes, conflicting, false);
+
+        let stored = known_vess_nodes
+            .lock()
+            .unwrap()
+            .get(&existing.node_id)
+            .cloned()
+            .unwrap();
+        assert_eq!(stored.contact, existing.contact);
     }
 
     #[test]
@@ -1852,5 +1975,36 @@ mod tests {
         );
 
         assert_eq!(candidates, vec![stable_a, stable_b, learned_a, learned_b]);
+    }
+
+    #[test]
+    fn known_bitcoin_peer_match_is_ip_based() {
+        let peer: SocketAddr = "203.0.113.9:42111".parse().unwrap();
+        let known = HashSet::from([
+            "203.0.113.9:8333".parse().unwrap(),
+            "198.51.100.4:8333".parse().unwrap(),
+        ]);
+
+        assert!(known_bitcoin_peer_matches_ip(peer, &known));
+    }
+
+    #[test]
+    fn seed_request_rejects_unknown_or_rate_limited_peers() {
+        let peer: SocketAddr = "203.0.113.10:42000".parse().unwrap();
+        let known = HashSet::from(["203.0.113.10:8333".parse().unwrap()]);
+        let mut windows = HashMap::new();
+
+        for _ in 0..MAX_VESS_SEED_REQUESTS_PER_MINUTE {
+            assert!(should_accept_vess_seed_request(peer, &known, &mut windows, 100));
+        }
+        assert!(!should_accept_vess_seed_request(peer, &known, &mut windows, 100));
+
+        let unknown_peer: SocketAddr = "203.0.113.11:42000".parse().unwrap();
+        assert!(!should_accept_vess_seed_request(
+            unknown_peer,
+            &known,
+            &mut HashMap::new(),
+            100,
+        ));
     }
 }

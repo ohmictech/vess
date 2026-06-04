@@ -284,11 +284,12 @@ fn wallet_create_backup_restore() {
     let path = dir.join("wallet.json");
     let backup_path = dir.join("backup.json");
 
-    wallet.save(&path).unwrap();
-    wallet.backup(&backup_path).unwrap();
+    wallet.save(&path, &enc_key).unwrap();
+    wallet.backup(&backup_path, &enc_key).unwrap();
 
     // Load from backup.
-    let loaded = WalletFile::load(&backup_path).unwrap();
+    let mut loaded = WalletFile::load(&backup_path).unwrap();
+    loaded.decrypt_private_metadata(&enc_key).unwrap();
     assert_eq!(loaded.billfold.balance(), 15);
 
     // Decrypt keys.

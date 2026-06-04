@@ -68,7 +68,7 @@ impl EncryptedBlob {
 }
 
 /// On-disk wallet file format.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct WalletFile {
     /// Format version for forward compatibility.
     pub version: u32,
@@ -83,6 +83,7 @@ pub struct WalletFile {
     pub encrypted_secrets: EncryptedSecrets,
     /// The billfold (bills are publicly visible post-mint, but spend
     /// credentials are stripped and stored encrypted separately).
+    #[serde(default)]
     pub billfold: BillFold,
     /// Encrypted spend seed (ChaCha20-Poly1305, keyed from recovery phrase).
     /// Replaces the old plaintext `spend_seed` field.
@@ -109,6 +110,11 @@ pub struct WalletFile {
     /// re-announced after a node restart.
     #[serde(default)]
     pub tag_registration: Option<StoredTagRegistration>,
+
+    /// Encrypted private wallet metadata: bill inventory, next DHT index,
+    /// and persisted tag-registration replay state.
+    #[serde(default)]
+    pub encrypted_private_metadata: Option<EncryptedBlob>,
 
     /// Encrypted spend credentials (ML-DSA-65 signing keys for each bill).
     /// Keyed by mint_id, serialized via serde_json then AEAD-encrypted.
@@ -146,6 +152,13 @@ pub struct StoredTagRegistration {
     pub registered_at: u64,
     /// ML-DSA-65 signature over the registration digest.
     pub signature: Vec<u8>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct WalletPrivateMetadata {
+    billfold: BillFold,
+    next_dht_index: u64,
+    tag_registration: Option<StoredTagRegistration>,
 }
 
 impl EncryptedSpendSeed {
@@ -195,7 +208,7 @@ impl EncryptedSpendSeed {
 
 impl WalletFile {
     /// Current file format version.
-    pub const CURRENT_VERSION: u32 = 1;
+    pub const CURRENT_VERSION: u32 = 2;
 
     /// Create a new wallet file with encrypted spend seed.
     pub fn new(
@@ -206,7 +219,7 @@ impl WalletFile {
         enc_key: &[u8; 32],
     ) -> Result<Self> {
         let encrypted_spend_seed = Some(EncryptedSpendSeed::encrypt(&spend_seed, enc_key)?);
-        Ok(Self {
+        let mut wallet = Self {
             version: Self::CURRENT_VERSION,
             name: None,
             master_address,
@@ -219,10 +232,13 @@ impl WalletFile {
             tag_registrant_sk: Vec::new(),
             encrypted_tag_sk: None,
             tag_registration: None,
+            encrypted_private_metadata: None,
             encrypted_spend_credentials: None,
             encrypted_bitcoin_wallet_state: None,
             password_cache: None,
-        })
+        };
+        wallet.refresh_encrypted_private_metadata(enc_key)?;
+        Ok(wallet)
     }
 
     /// Allocate the next DHT index and increment the counter.
@@ -230,6 +246,35 @@ impl WalletFile {
         let idx = self.next_dht_index;
         self.next_dht_index += 1;
         idx
+    }
+
+    fn private_metadata(&self) -> WalletPrivateMetadata {
+        WalletPrivateMetadata {
+            billfold: self.billfold.clone(),
+            next_dht_index: self.next_dht_index,
+            tag_registration: self.tag_registration.clone(),
+        }
+    }
+
+    fn refresh_encrypted_private_metadata(&mut self, enc_key: &[u8; 32]) -> Result<()> {
+        let json = Zeroizing::new(
+            serde_json::to_vec(&self.private_metadata()).context("serialize private wallet metadata")?,
+        );
+        self.encrypted_private_metadata = Some(EncryptedBlob::encrypt(json.as_slice(), enc_key)?);
+        Ok(())
+    }
+
+    pub fn decrypt_private_metadata(&mut self, enc_key: &[u8; 32]) -> Result<()> {
+        let Some(blob) = &self.encrypted_private_metadata else {
+            return Ok(());
+        };
+        let json = Zeroizing::new(blob.decrypt(enc_key)?);
+        let metadata: WalletPrivateMetadata =
+            serde_json::from_slice(json.as_slice()).context("deserialize private wallet metadata")?;
+        self.billfold = metadata.billfold;
+        self.next_dht_index = metadata.next_dht_index;
+        self.tag_registration = metadata.tag_registration;
+        Ok(())
     }
 
     /// Decrypt and return the spend seed.
@@ -340,13 +385,15 @@ impl WalletFile {
         pow_hash: Vec<u8>,
         registered_at: u64,
         signature: Vec<u8>,
-    ) {
+        enc_key: &[u8; 32],
+    ) -> Result<()> {
         self.tag_registration = Some(StoredTagRegistration {
             pow_nonce,
             pow_hash,
             registered_at,
             signature,
         });
+        self.refresh_encrypted_private_metadata(enc_key)
     }
 
     /// Set (or replace) the password cache for fast daily unlock.
@@ -392,13 +439,20 @@ impl WalletFile {
     }
 
     /// Save wallet to a JSON file with restrictive permissions.
-    pub fn save(&self, path: &Path) -> Result<()> {
+    pub fn save(&self, path: &Path, enc_key: &[u8; 32]) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("create wallet directory: {}", parent.display()))?;
         }
 
-        let json = serde_json::to_string_pretty(self).context("serialize wallet")?;
+        let mut serializable = self.clone();
+        serializable.version = Self::CURRENT_VERSION;
+        serializable.refresh_encrypted_private_metadata(enc_key)?;
+        serializable.billfold = BillFold::new();
+        serializable.next_dht_index = 0;
+        serializable.tag_registration = None;
+
+        let json = serde_json::to_string_pretty(&serializable).context("serialize wallet")?;
 
         std::fs::write(path, json.as_bytes())
             .with_context(|| format!("write wallet file: {}", path.display()))?;
@@ -434,8 +488,8 @@ impl WalletFile {
     }
 
     /// Create a backup copy of the wallet at the given path.
-    pub fn backup(&self, backup_path: &Path) -> Result<()> {
-        self.save(backup_path)
+    pub fn backup(&self, backup_path: &Path, enc_key: &[u8; 32]) -> Result<()> {
+        self.save(backup_path, enc_key)
     }
 }
 
@@ -658,8 +712,9 @@ mod tests {
         let dir = std::env::temp_dir().join("vess-test-persistence");
         let path = dir.join("wallet.json");
 
-        wallet.save(&path).unwrap();
-        let loaded = WalletFile::load(&path).unwrap();
+        wallet.save(&path, &enc_key).unwrap();
+        let mut loaded = WalletFile::load(&path).unwrap();
+        loaded.decrypt_private_metadata(&enc_key).unwrap();
 
         assert_eq!(loaded.version, WalletFile::CURRENT_VERSION);
         assert_eq!(loaded.billfold.balance(), 0);
@@ -681,8 +736,9 @@ mod tests {
         let dir = std::env::temp_dir().join("vess-test-backup");
         let backup_path = dir.join("backup.json");
 
-        wallet.backup(&backup_path).unwrap();
-        let loaded = WalletFile::load(&backup_path).unwrap();
+        wallet.backup(&backup_path, &enc_key).unwrap();
+        let mut loaded = WalletFile::load(&backup_path).unwrap();
+        loaded.decrypt_private_metadata(&enc_key).unwrap();
         assert_eq!(loaded.version, WalletFile::CURRENT_VERSION);
 
         let _ = std::fs::remove_dir_all(&dir);

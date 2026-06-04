@@ -169,12 +169,12 @@ enum Command {
     /// Show whether the background node is running and a wallet summary.
     Status,
 
-    /// Build dist/vess.exe, a release executable that opens the interactive CLI.
+    /// Build the Vess executable in Cargo's target directory by default.
     #[command(alias = "build-exe")]
     Compile {
-        /// Output executable path.
-        #[arg(long, default_value = "dist/vess.exe")]
-        output: PathBuf,
+        /// Optional output executable path.
+        #[arg(long)]
+        output: Option<PathBuf>,
         /// Build the debug profile instead of release.
         #[arg(long)]
         debug: bool,
@@ -352,7 +352,7 @@ async fn dispatch_command(cli: &Cli) -> Result<()> {
         Some(Command::Pulse { target, message }) => cmd_pulse(&cli, target, message).await,
         Some(Command::Listen) => cmd_listen(&cli).await,
         Some(Command::Status) => cmd_status(&cli).await,
-        Some(Command::Compile { output, debug }) => cmd_compile(&cli, output, *debug).await,
+        Some(Command::Compile { output, debug }) => cmd_compile(&cli, output.as_deref(), *debug).await,
         Some(Command::Node {
             k_neighbors,
             max_hops,
@@ -970,7 +970,8 @@ async fn cmd_init(cli: &Cli, tag_str: &str, wallet_name: Option<&str>) -> Result
             pow_hash.clone(),
             tmp_record.registered_at,
             signature.clone(),
-        );
+            &enc_key,
+        )?;
 
         let msg = PulseMessage::TagRegister(TagRegister {
             tag_hash,
@@ -992,7 +993,7 @@ async fn cmd_init(cli: &Cli, tag_str: &str, wallet_name: Option<&str>) -> Result
     }
 
     if cli.json {
-        wallet.save(&path)?;
+        wallet.save(&path, &enc_key)?;
         set_active_wallet_path(&path)?;
         println!(
             "{}",
@@ -1030,7 +1031,7 @@ async fn cmd_init(cli: &Cli, tag_str: &str, wallet_name: Option<&str>) -> Result
             );
         }
 
-        wallet.save(&path)?;
+        wallet.save(&path, &enc_key)?;
         set_active_wallet_path(&path)?;
         println!(
             "Recovery phrase verified. Wallet created at {}",
@@ -1057,7 +1058,8 @@ async fn cmd_recover(cli: &Cli, words: &str, wallet_name: Option<&str>) -> Resul
     let encrypted = encrypt_secrets(&secret, &enc_key)?;
 
     let mut billfold = if path.exists() {
-        let existing = WalletFile::load(&path)?;
+        let mut existing = WalletFile::load(&path)?;
+        existing.decrypt_private_metadata(&enc_key)?;
         existing.billfold
     } else {
         BillFold::new()
@@ -1198,7 +1200,7 @@ async fn cmd_recover(cli: &Cli, words: &str, wallet_name: Option<&str>) -> Resul
     let mut wallet = WalletFile::new(address, encrypted, billfold, spend_seed, &enc_key)?;
     wallet.name = wallet_name.clone();
     wallet.next_dht_index = max_dht_index;
-    wallet.save(&path)?;
+    wallet.save(&path, &enc_key)?;
     set_active_wallet_path(&path)?;
 
     if cli.json {
@@ -1239,7 +1241,10 @@ async fn cmd_balance(cli: &Cli) -> Result<()> {
     }
 
     let path = wallet_path(cli)?;
-    let wallet = WalletFile::load(&path)?;
+    let mut wallet = WalletFile::load(&path)?;
+    let raw_seed = derive_raw_seed_for_wallet(cli)?;
+    let enc_key = encryption_key_from_seed(&raw_seed);
+    wallet.decrypt_private_metadata(&enc_key)?;
 
     if cli.json {
         let breakdown: serde_json::Map<String, serde_json::Value> = wallet
@@ -1442,7 +1447,7 @@ async fn cmd_faucet(cli: &Cli, amount: u64) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_compile(cli: &Cli, output: &Path, debug: bool) -> Result<()> {
+async fn cmd_compile(cli: &Cli, output: Option<&Path>, debug: bool) -> Result<()> {
     let workspace_root = find_workspace_root()?;
     let profile = if debug { "debug" } else { "release" };
 
@@ -1473,22 +1478,24 @@ async fn cmd_compile(cli: &Cli, output: &Path, debug: bool) -> Result<()> {
         anyhow::bail!("built executable was not found at {}", built_exe.display());
     }
 
-    let output_path = if output.is_absolute() {
-        output.to_path_buf()
-    } else {
-        workspace_root.join(output)
+    let output_path = match output {
+        Some(path) if path.is_absolute() => path.to_path_buf(),
+        Some(path) => workspace_root.join(path),
+        None => built_exe.clone(),
     };
-    if let Some(parent) = output_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
+    if output_path != built_exe {
+        if let Some(parent) = output_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        std::fs::copy(&built_exe, &output_path).with_context(|| {
+            format!(
+                "failed to copy {} to {}",
+                built_exe.display(),
+                output_path.display()
+            )
+        })?;
     }
-    std::fs::copy(&built_exe, &output_path).with_context(|| {
-        format!(
-            "failed to copy {} to {}",
-            built_exe.display(),
-            output_path.display()
-        )
-    })?;
 
     if cli.json {
         println!(
@@ -1591,6 +1598,7 @@ async fn cmd_register_tag(cli: &Cli, tag_str: &str) -> Result<()> {
     })?;
     let raw_seed = wallet.unlock_with_password(&password)?;
     let enc_key = vess_kloak::recovery::encryption_key_from_seed(&raw_seed);
+    wallet.decrypt_private_metadata(&enc_key)?;
 
     let tag = VessTag::new(tag_str)?;
 
@@ -1614,7 +1622,7 @@ async fn cmd_register_tag(cli: &Cli, tag_str: &str) -> Result<()> {
     // Save the registrant keypair (encrypted) to the wallet.
     wallet.tag_registrant_vk = registrant_vk.clone();
     wallet.set_encrypted_tag_sk(&registrant_sk, &enc_key)?;
-    wallet.save(&path)?;
+    wallet.save(&path, &enc_key)?;
 
     // Construct a temporary TagRecord to compute the digest for signing.
     let tmp_record = vess_tag::TagRecord {
@@ -1637,8 +1645,9 @@ async fn cmd_register_tag(cli: &Cli, tag_str: &str) -> Result<()> {
         pow_hash.clone(),
         tmp_record.registered_at,
         signature.clone(),
-    );
-    wallet.save(&path)?;
+        &enc_key,
+    )?;
+    wallet.save(&path, &enc_key)?;
 
     // Send registration via RPC to local artery node.
     let port = rpc_port(cli);
@@ -1882,9 +1891,10 @@ async fn cmd_set_password(cli: &Cli, password: String) -> Result<()> {
 
     // Obtain the raw_seed — from existing password or recovery phrase.
     let raw_seed = derive_raw_seed_for_wallet(cli)?;
+    let enc_key = encryption_key_from_seed(&raw_seed);
 
     wallet.set_password_cache(&raw_seed, &password)?;
-    wallet.save(&path)?;
+    wallet.save(&path, &enc_key)?;
 
     if cli.json {
         println!(
@@ -2718,8 +2728,9 @@ async fn first_run_wizard(
     };
 
     let mut wf = WalletFile::load(&wallet_path)?;
+    let enc_key = encryption_key_from_seed(&raw_seed);
     wf.set_password_cache(&raw_seed, &password)?;
-    wf.save(&wallet_path)?;
+    wf.save(&wallet_path, &enc_key)?;
     println!("  Password set ✓\n");
     Ok((wallet_path, password))
 }
@@ -2810,7 +2821,8 @@ async fn wizard_new(
         pow_hash.clone(),
         tmp_record.registered_at,
         signature.clone(),
-    );
+        &enc_key,
+    )?;
     let msg = PulseMessage::TagRegister(TagRegister {
         tag_hash,
         scan_ek: wallet.master_address.scan_ek.clone(),
@@ -2847,7 +2859,7 @@ async fn wizard_new(
         println!("  That doesn't match. Please try again.\n");
     }
 
-    wallet.save(&wallet_path)?;
+    wallet.save(&wallet_path, &enc_key)?;
     Ok((wallet_path, raw_seed))
 }
 
@@ -2873,7 +2885,9 @@ async fn wizard_recover(
     let encrypted = encrypt_secrets(&secret, &enc_key)?;
 
     let mut billfold = if wallet_path.exists() {
-        WalletFile::load(&wallet_path)?.billfold
+        let mut wallet = WalletFile::load(&wallet_path)?;
+        wallet.decrypt_private_metadata(&enc_key)?;
+        wallet.billfold
     } else {
         BillFold::new()
     };
@@ -2964,7 +2978,7 @@ async fn wizard_recover(
     let mut wallet = WalletFile::new(address, encrypted, billfold, spend_seed, &enc_key)?;
     wallet.name = wallet_name;
     wallet.next_dht_index = max_dht_index;
-    wallet.save(&wallet_path)?;
+    wallet.save(&wallet_path, &enc_key)?;
     println!("  Wallet saved ✓\n");
     Ok((wallet_path, raw_seed))
 }
