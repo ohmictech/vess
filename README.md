@@ -1,3 +1,9 @@
+
+```
+Keep your lives free from the love of money and be content with what you have, because God has said, 'Never will I leave you; never will I forsake you.'
+Heb 13:5
+```
+
 # Vess
 
 Bitcoin-backed post-quantum digital cash.
@@ -49,8 +55,8 @@ This is not a Bitcoin sidechain, rollup, federated mint, or multisig bridge. It 
 
 ### Programmability
 
-Vess has a unique take on smart contracts. Programs can be deployed via a small POW and sent through the DHT.
-Bills can be locked in programs and spent only once somebody proves computation and submits a zero-knowledge proof, verified by other nodes in the mesh. This allows programmable spending logic that goes further than basic Bitcoin script.
+Vess has a unique take on smart contracts. Programs can be deployed via a small POW and published through the DHT.
+Bills can be locked to a program and later unlocked only when the claimant submits an `OwnershipClaim` carrying whatever witness or zero-knowledge proof that covenant requires. Other nodes verify that claim-path witness material before accepting the ownership rotation.
 
 Programs can be written using VessLogic, a simple, primitive scripting schema.
 Each deployed program is also published under a human-facing name such as `+vl_market1`. The client canonicalizes that to `vl_market1` and keys it on the DHT by `Blake3("vl_market1")`, matching the same name-hash style used for VessTags.
@@ -62,7 +68,7 @@ VessLogic is line-by-line and zero-format. A source file such as `progname.vess`
 - `[withdraw]` for bill-out logic.
 
 Programs are stateless covenants. Mutable state lives on bills via their ownership `state_commitment`, not inside the deployed program blob.
-The covenant is passive: another node or wallet proposes a deposit or withdraw, and the covenant only validates whether that proposed bill transition is allowed.
+The covenant is passive: a wallet or node proposes its own deposit or withdraw transition, and the covenant only validates whether that proposed bill transition is allowed.
 In practice, the main verification path is the normal bill `OwnershipClaim`. Deposits are regular ownership claims that rotate a bill into `new_owner_program`, and withdrawals are regular ownership claims that rotate a program-owned bill back out to a user key or another program. Nodes verify the attached compute witness while distributing that ownership claim.
 
 Each executable section is one instruction per line and must end in `approve`.
@@ -99,9 +105,9 @@ The recommended baseline pattern is:
 - use `after(...)`, `before(...)`, or `between(...)` when a withdraw path needs a timelock window
 - bind receipt-friendly public outputs before the final `approve`
 
-See `docs/vesslogic.md` for the schema and `examples/vesslogic/progname.vess` for a starting template.
+Deploys require a program name, for example `vess deploy ./my-program --name +vl_market1`.
 
-Deploys now require a program name, for example `vess deploy ./my-program --name +vl_market1`.
+The frozen V1 scope and invariants are documented in [`docs/v1-spec.md`](docs/v1-spec.md).
 
 ---
 
