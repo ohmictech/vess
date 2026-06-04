@@ -292,12 +292,19 @@ pub fn bitcoin_burn_mint_id(txid: &[u8; 32], output_index: u32) -> [u8; 32] {
 ///
 /// This is the first link in the ownership hash chain, binding the
 /// genesis miner's identity to the bill's permanent ID.
-pub fn genesis_chain_tip(mint_id: &[u8; 32], owner_vk_hash: &[u8; 32]) -> [u8; 32] {
+pub fn genesis_chain_tip_with_commitment(
+    mint_id: &[u8; 32],
+    owner_commitment: &[u8; 32],
+) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(b"vess-chain-v0");
     h.update(mint_id);
-    h.update(owner_vk_hash);
+    h.update(owner_commitment);
     *h.finalize().as_bytes()
+}
+
+pub fn genesis_chain_tip(mint_id: &[u8; 32], owner_vk_hash: &[u8; 32]) -> [u8; 32] {
+    genesis_chain_tip_with_commitment(mint_id, owner_vk_hash)
 }
 
 /// Advance the ownership chain by one transfer.
@@ -307,17 +314,25 @@ pub fn genesis_chain_tip(mint_id: &[u8; 32], owner_vk_hash: &[u8; 32]) -> [u8; 3
 /// The `transfer_sig_hash` is `Blake3(transfer_signature)` — we hash the
 /// large ML-DSA-65 signature (3293 bytes) down to 32 bytes before including
 /// it in the chain. This keeps the chain tip derivation constant-size.
+pub fn advance_chain_tip_with_hash(
+    prev_chain_tip: &[u8; 32],
+    new_owner_commitment: &[u8; 32],
+    witness_hash: &[u8; 32],
+) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(prev_chain_tip);
+    h.update(new_owner_commitment);
+    h.update(witness_hash);
+    *h.finalize().as_bytes()
+}
+
 pub fn advance_chain_tip(
     prev_chain_tip: &[u8; 32],
     new_owner_vk_hash: &[u8; 32],
     transfer_sig: &[u8],
 ) -> [u8; 32] {
     let sig_hash = blake3::hash(transfer_sig);
-    let mut h = blake3::Hasher::new();
-    h.update(prev_chain_tip);
-    h.update(new_owner_vk_hash);
-    h.update(sig_hash.as_bytes());
-    *h.finalize().as_bytes()
+    advance_chain_tip_with_hash(prev_chain_tip, new_owner_vk_hash, sig_hash.as_bytes())
 }
 
 #[cfg(test)]

@@ -15,6 +15,7 @@ vess-kloak = { path = "../vess-kloak" }
 vess-foundry = { path = "../vess-foundry" }
 vess-stealth = { path = "../vess-stealth" }
 vess-protocol = { path = "../vess-protocol" }
+vess-compute = { path = "../vess-compute" }
 vess-tag = { path = "../vess-tag" }
 vess-artery = { path = "../vess-artery" }
 vess-bitcoin = { path = "../vess-bitcoin" }

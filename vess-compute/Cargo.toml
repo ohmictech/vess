@@ -1,0 +1,15 @@
+[package]
+name = "vess-compute"
+version = "0.1.0"
+edition = "2021"
+license-file = "../LICENSE"
+
+[features]
+test-pow = []
+
+[dependencies]
+anyhow = "1"
+argon2 = "0.5"
+blake3 = "1"
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }

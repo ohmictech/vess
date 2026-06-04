@@ -498,6 +498,8 @@ pub struct PqTcpMeshCarrier {
 #[derive(Clone)]
 pub struct PqUdpMeshCarrier {
     socket: Arc<UdpSocket>,
+    request_socket: Arc<UdpSocket>,
+    request_lock: Arc<Mutex<()>>,
     local_addr: SocketAddr,
     local_secret: Arc<MeshSecretKey>,
     local_address: MeshAddress,
@@ -506,6 +508,8 @@ pub struct PqUdpMeshCarrier {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MeshClientHello {
     initiator_address: MeshAddress,
+    #[serde(default)]
+    initiator_contact_addr: Option<String>,
     route_to_responder: MeshRouteHandshake,
 }
 
@@ -556,6 +560,7 @@ enum MeshRendezvousMessage {
 struct UdpSessionState {
     transport_key: [u8; 32],
     remote_mesh_address: MeshAddress,
+    remote_contact_addr: SocketAddr,
 }
 
 #[derive(Clone)]
@@ -683,6 +688,22 @@ impl PqTcpMeshCarrier {
 }
 
 impl PqUdpMeshCarrier {
+    async fn bind_request_socket(bind_addr: SocketAddr) -> Result<UdpSocket> {
+        let request_bind_addr = match bind_addr {
+            SocketAddr::V4(_) => SocketAddr::V4(std::net::SocketAddrV4::new(
+                Ipv4Addr::UNSPECIFIED,
+                0,
+            )),
+            SocketAddr::V6(_) => SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+                0,
+            ),
+        };
+        UdpSocket::bind(request_bind_addr)
+            .await
+            .context("bind PQ mesh udp request socket")
+    }
+
     /// Bind a PQ mesh carrier on a UDP socket.
     pub async fn bind(
         bind_addr: SocketAddr,
@@ -702,11 +723,14 @@ impl PqUdpMeshCarrier {
             .await
             .context("bind PQ mesh udp socket")?;
         let local_addr = socket.local_addr().context("read PQ mesh udp local addr")?;
+        let request_socket = Self::bind_request_socket(bind_addr).await?;
 
         info!(addr = %local_addr, node_id = %local_address.node_id, "pq udp mesh carrier online");
 
         Ok(Self {
             socket: Arc::new(socket),
+            request_socket: Arc::new(request_socket),
+            request_lock: Arc::new(Mutex::new(())),
             local_addr,
             local_secret: Arc::new(local_secret),
             local_address,
@@ -761,16 +785,17 @@ impl PqUdpMeshCarrier {
         let (target_addr, _) = udp_contact_parts(target)?;
         let probe_id = random_id16();
         let started = Instant::now();
+        let _request_guard = self.request_lock.lock().await;
 
         send_udp_packet(
-            &self.socket,
+            &self.request_socket,
             target_addr,
             &MeshUdpPacket::PathProbe { probe_id },
         )
         .await?;
 
         let mut buffer = vec![0u8; MAX_MESH_UDP_PACKET_SIZE];
-        let recv = tokio::time::timeout(timeout, self.socket.recv_from(&mut buffer))
+        let recv = tokio::time::timeout(timeout, self.request_socket.recv_from(&mut buffer))
             .await
             .map_err(|_| anyhow!("PQ mesh path probe timed out"))?
             .context("receive PQ mesh path probe ack")?;
@@ -935,6 +960,7 @@ impl PqUdpMeshCarrier {
                 source_mesh_address: self.local_address.clone(),
                 packet: MeshUdpPacket::ClientHello(MeshClientHello {
                     initiator_address: self.local_address.clone(),
+                    initiator_contact_addr: Some(self.local_addr.to_string()),
                     route_to_responder: initiator_ctx.handshake,
                 }),
             },
@@ -1322,6 +1348,7 @@ impl MeshCarrier for PqTcpMeshCarrier {
         let initiator_ctx = generate_route_handshake(&target_mesh_address)?;
         let hello = MeshClientHello {
             initiator_address: self.local_address.clone(),
+            initiator_contact_addr: Some(self.local_addr.to_string()),
             route_to_responder: initiator_ctx.handshake,
         };
         write_json_blob(&mut stream, &hello)
@@ -1374,17 +1401,19 @@ impl MeshCarrier for PqUdpMeshCarrier {
         payload: &[u8],
     ) -> Result<Vec<u8>> {
         let (target_addr, target_mesh_address) = udp_contact_parts(target)?;
+        let _request_guard = self.request_lock.lock().await;
 
         let initiator_ctx = generate_route_handshake(&target_mesh_address)?;
         let hello = MeshUdpPacket::ClientHello(MeshClientHello {
             initiator_address: self.local_address.clone(),
+            initiator_contact_addr: Some(self.local_addr.to_string()),
             route_to_responder: initiator_ctx.handshake,
         });
-        send_udp_packet(&self.socket, target_addr, &hello).await?;
+        send_udp_packet(&self.request_socket, target_addr, &hello).await?;
 
         let mut buffer = vec![0u8; MAX_MESH_UDP_PACKET_SIZE];
         let (hello_len, hello_from) = self
-            .socket
+            .request_socket
             .recv_from(&mut buffer)
             .await
             .context("receive PQ mesh udp server hello")?;
@@ -1412,7 +1441,7 @@ impl MeshCarrier for PqUdpMeshCarrier {
 
         let encrypted_request = encrypt_transport_payload(&transport_key, b"request", payload)?;
         send_udp_packet(
-            &self.socket,
+            &self.request_socket,
             target_addr,
             &MeshUdpPacket::EncryptedRequest {
                 ciphertext: encrypted_request,
@@ -1421,7 +1450,7 @@ impl MeshCarrier for PqUdpMeshCarrier {
         .await?;
 
         let (response_len, response_from) = self
-            .socket
+            .request_socket
             .recv_from(&mut buffer)
             .await
             .context("receive PQ mesh udp encrypted response")?;
@@ -1836,6 +1865,11 @@ async fn process_udp_packet(
 ) -> Result<Option<(SocketAddr, MeshRelayMessage)>> {
     match packet {
         MeshUdpPacket::ClientHello(hello) => {
+            let remote_contact_addr = hello
+                .initiator_contact_addr
+                .as_deref()
+                .and_then(|addr| addr.parse::<SocketAddr>().ok())
+                .unwrap_or(peer_addr);
             let opened_inbound = open_route_handshake(local_secret, &hello.route_to_responder)?;
             let outbound = generate_route_handshake(&hello.initiator_address)?;
             let transport_key = derive_transport_key(
@@ -1849,6 +1883,7 @@ async fn process_udp_packet(
                 UdpSessionState {
                     transport_key,
                     remote_mesh_address: hello.initiator_address.clone(),
+                    remote_contact_addr,
                 },
             );
 
@@ -1894,7 +1929,7 @@ async fn process_udp_packet(
                 .unwrap_or(session.remote_mesh_address);
             let peer = MeshPeer {
                 contact: MeshCarrierContact::UdpSocket {
-                    addr: peer_addr.to_string(),
+                    addr: session.remote_contact_addr.to_string(),
                     mesh_address: effective_mesh_address,
                 },
             };
@@ -2196,6 +2231,56 @@ mod tests {
         assert_eq!(response, b"hello pq udp mesh");
 
         server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn pq_udp_carrier_round_trips_while_sender_is_listening() {
+        let seed_a = [11u8; 64];
+        let seed_b = [12u8; 64];
+        let bind_any = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+
+        let client = PqUdpMeshCarrier::bind_from_seed(bind_any, &seed_a, 17)
+            .await
+            .expect("bind udp client carrier");
+        let server = PqUdpMeshCarrier::bind_from_seed(bind_any, &seed_b, 17)
+            .await
+            .expect("bind udp server carrier");
+
+        let client_task = {
+            let client = client.clone();
+            tokio::spawn(async move {
+                let _ = client.listen_with_response(|_peer, payload| payload).await;
+            })
+        };
+
+        let server_task = {
+            let server = server.clone();
+            tokio::spawn(async move {
+                let _ = server.listen_with_response(|_peer, payload| payload).await;
+            })
+        };
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        for _ in 0..8 {
+            let response = tokio::time::timeout(
+                Duration::from_secs(2),
+                client.send_with_response(
+                    &server.local_contact(),
+                    b"hello pq udp full duplex",
+                ),
+            )
+            .await
+            .expect("client send should not be consumed by its listener")
+            .expect("send over PQ UDP mesh carrier");
+
+            assert_eq!(response, b"hello pq udp full duplex");
+        }
+
+        client_task.abort();
+        server_task.abort();
+        let _ = client_task.await;
         let _ = server_task.await;
     }
 

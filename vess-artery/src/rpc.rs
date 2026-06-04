@@ -17,6 +17,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 
+use vess_compute::{ProgramManifest, StoredProgram};
 use vess_foundry::reforge::{reforge, ReforgeRequest};
 use vess_foundry::spend_auth::{generate_spend_keypair, vk_hash};
 use vess_kloak::auto_reforge::ConsolidationScheduler;
@@ -24,7 +25,9 @@ use vess_kloak::billfold::SpendCredential;
 use vess_kloak::payment::{prepare_payment_from_bills, prepare_payment_with_transfer};
 use vess_kloak::selection::{decompose_amount, select_bills_filtered};
 use vess_mesh::MeshCarrierContact;
-use vess_protocol::{ManifestStore, PulseMessage, TagLookup, TagStore};
+use vess_protocol::{
+    ManifestStore, ProgramManifestStore, ProgramStore, PulseMessage, TagLookup, TagStore,
+};
 use vess_stealth::MasterStealthAddress;
 use vess_tag::{TagRecord, VessTag};
 use vess_vascular::MeshPulseNode;
@@ -38,10 +41,103 @@ use crate::node_runner::WalletState;
 use crate::persistence::hex_key;
 use crate::tag_resolver::{TagResolution, TagResolver};
 
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+pub(crate) fn wallet_tag_store(
+    wallet: &mut vess_kloak::WalletFile,
+    wallet_path: &std::path::Path,
+    enc_key: &[u8; 32],
+) -> Result<Option<(String, TagStore)>> {
+    let Some(wallet_name) = wallet.name.clone() else {
+        return Ok(None);
+    };
+    if wallet.tag_registrant_vk.is_empty() {
+        return Ok(None);
+    }
+
+    let tag = VessTag::new(&wallet_name)?;
+    let tag_hash = *blake3::hash(tag.as_str().as_bytes()).as_bytes();
+
+    let registration = if let Some(existing) = wallet.tag_registration.clone() {
+        existing
+    } else {
+        let registrant_sk = wallet.decrypt_tag_sk(enc_key)?;
+        #[cfg(any(test, feature = "test-pow"))]
+        let (pow_nonce, pow_hash) = vess_tag::compute_tag_pow_test(
+            &tag_hash,
+            &wallet.master_address.scan_ek,
+            &wallet.master_address.spend_ek,
+        )?;
+        #[cfg(not(any(test, feature = "test-pow")))]
+        let (pow_nonce, pow_hash) = vess_tag::compute_tag_pow(
+            &tag_hash,
+            &wallet.master_address.scan_ek,
+            &wallet.master_address.spend_ek,
+        )?;
+
+        let registered_at = now_unix();
+        let unsigned_record = TagRecord {
+            tag_hash,
+            master_address: wallet.master_address.clone(),
+            pow_nonce,
+            pow_hash: pow_hash.clone(),
+            registered_at,
+            registrant_vk: wallet.tag_registrant_vk.clone(),
+            signature: Vec::new(),
+            hardened_at: None,
+        };
+        let signature =
+            vess_foundry::spend_auth::sign_spend(&registrant_sk, &unsigned_record.digest())?;
+
+        wallet.set_tag_registration(pow_nonce, pow_hash.clone(), registered_at, signature.clone());
+        wallet.save(wallet_path)?;
+        wallet
+            .tag_registration
+            .clone()
+            .expect("tag registration metadata was just stored")
+    };
+
+    let record = TagRecord {
+        tag_hash,
+        master_address: wallet.master_address.clone(),
+        pow_nonce: registration.pow_nonce,
+        pow_hash: registration.pow_hash.clone(),
+        registered_at: registration.registered_at,
+        registrant_vk: wallet.tag_registrant_vk.clone(),
+        signature: registration.signature.clone(),
+        hardened_at: None,
+    };
+    if !vess_tag::verify_record_signature(&record).unwrap_or(false) {
+        anyhow::bail!("wallet tag registration signature is invalid")
+    }
+
+    Ok(Some((
+        tag.as_str().to_string(),
+        TagStore {
+            tag_hash,
+            scan_ek: wallet.master_address.scan_ek.clone(),
+            spend_ek: wallet.master_address.spend_ek.clone(),
+            pow_nonce: registration.pow_nonce,
+            pow_hash: registration.pow_hash,
+            registered_at: registration.registered_at,
+            hops_remaining: 8,
+            registrant_vk: wallet.tag_registrant_vk.clone(),
+            signature: registration.signature,
+        },
+    )))
+}
+
 /// Channel senders for gossip queues (shared with drain loops via mpsc).
 #[derive(Clone)]
 pub(crate) struct QueueSenders {
     pub manifest_tx: tokio::sync::mpsc::UnboundedSender<ManifestStore>,
+    pub program_tx: tokio::sync::mpsc::UnboundedSender<ProgramStore>,
+    pub program_manifest_tx: tokio::sync::mpsc::UnboundedSender<ProgramManifestStore>,
     pub tag_store_tx: tokio::sync::mpsc::UnboundedSender<TagStore>,
     pub tag_confirm_tx: tokio::sync::mpsc::UnboundedSender<vess_protocol::TagConfirm>,
     pub og_tx: tokio::sync::mpsc::UnboundedSender<vess_protocol::OwnershipGenesis>,
@@ -188,6 +284,11 @@ pub enum RpcRequest {
         dht_key_hex: String,
         encrypted_manifest_hex: String,
     },
+    ProgramDeploy {
+        program: StoredProgram,
+        #[serde(default)]
+        manifest: Option<ProgramManifest>,
+    },
     TagCacheList,
     TagCacheClear {
         /// Tag to remove (e.g. "alice" or "+alice"). Omit to clear all.
@@ -265,6 +366,10 @@ pub enum RpcData {
         amount: u64,
         bill_count: usize,
         balance: u64,
+    },
+    ProgramDeploy {
+        prog_id: String,
+        name: String,
     },
     TagCacheList {
         entries: Vec<crate::tag_cache::TagCacheEntryView>,
@@ -381,8 +486,15 @@ async fn handle_request(
             password,
             wallet_path,
         } => {
-            handle_wallet_unlock(state, node, &password, wallet_path.as_deref(), &senders.oc_tx)
-                .await
+            handle_wallet_unlock(
+                state,
+                node,
+                &password,
+                wallet_path.as_deref(),
+                &senders.oc_tx,
+                &senders.tag_store_tx,
+            )
+            .await
         }
         RpcRequest::WalletSetPassword {
             current_password,
@@ -453,6 +565,13 @@ async fn handle_request(
             &dht_key_hex,
             &encrypted_manifest_hex,
             &senders.manifest_tx,
+        ),
+        RpcRequest::ProgramDeploy { program, manifest } => handle_program_deploy(
+            state,
+            program,
+            manifest,
+            &senders.program_tx,
+            &senders.program_manifest_tx,
         ),
         RpcRequest::TagCacheList => handle_tag_cache_list(state),
         RpcRequest::TagCacheClear { tag } => handle_tag_cache_clear(state, tag.as_deref()),
@@ -948,6 +1067,7 @@ fn fire_opportunistic_consolidations(
                 chain_tip,
                 owner_vk_hash,
                 owner_vk: new_cred.spend_vk.clone(),
+                program_owner: None,
                 denomination_value: new_bill.denomination.value(),
                 genesis_proof: vess_protocol::GenesisProof::Vess(proof_bytes),
                 digest: new_bill.digest,
@@ -1191,6 +1311,7 @@ async fn handle_send(
                         chain_tip,
                         owner_vk_hash,
                         owner_vk: cred.spend_vk.clone(),
+                        program_owner: None,
                         denomination_value: bill.denomination.value(),
                         genesis_proof: vess_protocol::GenesisProof::Vess(proof_bytes.clone()),
                         digest: bill.digest,
@@ -1216,6 +1337,7 @@ async fn handle_send(
                         chain_tip,
                         owner_vk_hash,
                         owner_vk: cred.spend_vk.clone(),
+                        program_owner: None,
                         denomination_value: bill.denomination.value(),
                         genesis_proof: vess_protocol::GenesisProof::Vess(proof_bytes),
                         digest: bill.digest,
@@ -1507,6 +1629,7 @@ async fn handle_send_direct(
                             chain_tip,
                             owner_vk_hash,
                             owner_vk: cred.spend_vk.clone(),
+                            program_owner: None,
                             denomination_value: bill.denomination.value(),
                             genesis_proof: vess_protocol::GenesisProof::Vess(proof_bytes.clone()),
                             digest: bill.digest,
@@ -1531,6 +1654,7 @@ async fn handle_send_direct(
                             chain_tip,
                             owner_vk_hash,
                             owner_vk: cred.spend_vk.clone(),
+                            program_owner: None,
                             denomination_value: bill.denomination.value(),
                             genesis_proof: vess_protocol::GenesisProof::Vess(proof_bytes),
                             digest: bill.digest,
@@ -1685,6 +1809,7 @@ async fn handle_wallet_unlock(
     password: &str,
     wallet_path_override: Option<&str>,
     oc_tx: &tokio::sync::mpsc::UnboundedSender<vess_protocol::OwnershipClaim>,
+    tag_store_tx: &tokio::sync::mpsc::UnboundedSender<TagStore>,
 ) -> RpcResponse {
     use vess_kloak::billfold::SpendCredential;
     use vess_kloak::payment::receive_and_claim;
@@ -1710,7 +1835,7 @@ async fn handle_wallet_unlock(
     }
 
     // 3. Load wallet file and decrypt raw_seed (outside lock — password KDF takes ~1 s).
-    let wallet = match vess_kloak::WalletFile::load(&wallet_path) {
+    let mut wallet = match vess_kloak::WalletFile::load(&wallet_path) {
         Ok(w) => w,
         Err(e) => return RpcResponse::err(format!("failed to load wallet: {e}")),
     };
@@ -1734,6 +1859,13 @@ async fn handle_wallet_unlock(
     if let Err(e) = wallet.decrypt_spend_credentials_into(&mut billfold, &enc_key) {
         tracing::warn!(error = %e, "failed to decrypt spend credentials on unlock");
     }
+    let wallet_tag_store = match wallet_tag_store(&mut wallet, &wallet_path, &enc_key) {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::warn!(%error, "failed to prepare wallet tag announcement on unlock");
+            None
+        }
+    };
 
     // 4. Set wallet state + sweep limbo.
     let (balance, bill_count) = {
@@ -1748,6 +1880,38 @@ async fn handle_wallet_unlock(
             enc_key,
             mailbox_key,
         });
+
+        if let Some((tag_str, tag_store)) = wallet_tag_store.clone() {
+            let record = TagRecord {
+                tag_hash: tag_store.tag_hash,
+                master_address: MasterStealthAddress {
+                    scan_ek: tag_store.scan_ek.clone(),
+                    spend_ek: tag_store.spend_ek.clone(),
+                },
+                pow_nonce: tag_store.pow_nonce,
+                pow_hash: tag_store.pow_hash.clone(),
+                registered_at: tag_store.registered_at,
+                registrant_vk: tag_store.registrant_vk.clone(),
+                signature: tag_store.signature.clone(),
+                hardened_at: None,
+            };
+            let addr_fp = record.address_fingerprint();
+
+            if s.tag_dht.lookup(&tag_str).is_none() && !s.tag_dht.has_address(&addr_fp) {
+                if s.tag_dht.store(record) {
+                    let _ = tag_store_tx.send(tag_store);
+                    s.push_notification(crate::node_runner::WalletNotification {
+                        kind: "tag_announced".to_string(),
+                        created_at: now_unix(),
+                        payment_id: hex_key(&addr_fp),
+                        amount: None,
+                        bill_count: None,
+                        counterparty: Some(format!("+{tag_str}")),
+                        message: format!("Wallet tag +{tag_str} is available for sends."),
+                    });
+                }
+            }
+        }
 
         // Sweep existing limbo entries through the newly unlocked wallet.
         let all_sids: Vec<[u8; 32]> = s.limbo_buffer.stealth_ids_with_payments();
@@ -2139,6 +2303,7 @@ fn handle_local_test_faucet(
                         chain_tip,
                         owner_vk_hash,
                         owner_vk,
+                        program_owner: None,
                         denomination_value: denomination.value(),
                         genesis_proof: vess_protocol::GenesisProof::LocalTestFaucet(
                             vess_protocol::LocalTestFaucetProof { nonce },
@@ -2226,6 +2391,7 @@ fn handle_ownership_genesis(
             chain_tip,
             owner_vk_hash,
             owner_vk,
+            program_owner: None,
             denomination_value,
             genesis_proof: vess_protocol::GenesisProof::Vess(proof),
             digest,
@@ -2273,6 +2439,55 @@ fn handle_manifest_store(
     RpcResponse::ok(RpcData::Empty {})
 }
 
+fn handle_program_deploy(
+    state: &Arc<Mutex<ArteryState>>,
+    program: StoredProgram,
+    manifest: Option<ProgramManifest>,
+    program_tx: &tokio::sync::mpsc::UnboundedSender<ProgramStore>,
+    program_manifest_tx: &tokio::sync::mpsc::UnboundedSender<ProgramManifestStore>,
+) -> RpcResponse {
+    let prog_id = program.prog_id();
+    let Some(manifest) = manifest else {
+        return RpcResponse::err("program deploy requires a named program manifest");
+    };
+    if manifest.latest_prog_id != prog_id {
+        return RpcResponse::err("program manifest latest_prog_id must match the deployed program");
+    }
+    if !manifest.versions.iter().any(|version| version.prog_id == prog_id) {
+        return RpcResponse::err("program manifest versions must include the deployed program");
+    }
+
+    let name = manifest.name.to_string();
+    let mut s = state.lock().unwrap();
+    let stored_program = match s.compute_dht.store_program(program.clone()) {
+        Ok(inserted) => inserted,
+        Err(error) => return RpcResponse::err(format!("program deploy rejected: {error}")),
+    };
+    let stored_manifest = match s.compute_dht.store_manifest(manifest.clone()) {
+        Ok(inserted) => inserted,
+        Err(error) => return RpcResponse::err(format!("program manifest rejected: {error}")),
+    };
+    drop(s);
+
+    if stored_program {
+        let _ = program_tx.send(ProgramStore {
+            program,
+            hops_remaining: 8,
+        });
+    }
+    if stored_manifest {
+        let _ = program_manifest_tx.send(ProgramManifestStore {
+            manifest,
+            hops_remaining: 8,
+        });
+    }
+
+    RpcResponse::ok(RpcData::ProgramDeploy {
+        prog_id: hex_key(prog_id.as_bytes()),
+        name,
+    })
+}
+
 // ── Tag cache handlers ───────────────────────────────────────────────
 
 fn handle_tag_cache_list(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
@@ -2298,5 +2513,45 @@ fn handle_tag_cache_clear(state: &Arc<Mutex<ArteryState>>, tag: Option<&str>) ->
             s.tag_cache.clear_all();
             RpcResponse::ok(RpcData::Empty {})
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wallet_tag_store_generates_and_persists_missing_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let wallet_path = dir.path().join("alice.wallet");
+        let raw_seed = [7u8; 64];
+        let enc_key = vess_kloak::recovery::encryption_key_from_seed(&raw_seed);
+        let spend_seed = vess_kloak::recovery::spend_seed_from_raw_seed(&raw_seed);
+        let (secret, address) = vess_stealth::generate_master_keys_from_seed(&raw_seed);
+        let encrypted = vess_kloak::recovery::encrypt_secrets(&secret, &enc_key).unwrap();
+
+        let mut wallet = vess_kloak::WalletFile::new(
+            address,
+            encrypted,
+            vess_kloak::BillFold::new(),
+            spend_seed,
+            &enc_key,
+        )
+        .unwrap();
+        wallet.name = Some("alice".to_string());
+        let (registrant_vk, registrant_sk) = vess_foundry::spend_auth::generate_spend_keypair();
+        wallet.tag_registrant_vk = registrant_vk;
+        wallet.set_encrypted_tag_sk(&registrant_sk, &enc_key).unwrap();
+        wallet.save(&wallet_path).unwrap();
+
+        let built = wallet_tag_store(&mut wallet, &wallet_path, &enc_key)
+            .unwrap()
+            .expect("wallet tag store should be generated");
+
+        assert_eq!(built.0, "alice");
+        assert_eq!(built.1.tag_hash, *blake3::hash(b"alice").as_bytes());
+
+        let reloaded = vess_kloak::WalletFile::load(&wallet_path).unwrap();
+        assert!(reloaded.tag_registration.is_some());
     }
 }

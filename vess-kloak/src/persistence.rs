@@ -104,6 +104,10 @@ pub struct WalletFile {
     /// Encrypted ML-DSA-65 tag signing key.
     #[serde(default)]
     pub encrypted_tag_sk: Option<EncryptedBlob>,
+    /// Persisted tag registration metadata so the wallet's tag can be
+    /// re-announced after a node restart.
+    #[serde(default)]
+    pub tag_registration: Option<StoredTagRegistration>,
 
     /// Encrypted spend credentials (ML-DSA-65 signing keys for each bill).
     /// Keyed by mint_id, serialized via serde_json then AEAD-encrypted.
@@ -128,6 +132,19 @@ pub struct EncryptedSpendSeed {
     pub ciphertext: Vec<u8>,
     /// AEAD nonce.
     pub nonce: [u8; 12],
+}
+
+/// Persisted metadata for replaying a wallet tag registration.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct StoredTagRegistration {
+    /// Random 32-byte nonce used as salt for the Argon2id PoW.
+    pub pow_nonce: [u8; 32],
+    /// 32-byte Argon2id hash output proving the work.
+    pub pow_hash: Vec<u8>,
+    /// Unix timestamp of registration.
+    pub registered_at: u64,
+    /// ML-DSA-65 signature over the registration digest.
+    pub signature: Vec<u8>,
 }
 
 impl EncryptedSpendSeed {
@@ -200,6 +217,7 @@ impl WalletFile {
             tag_registrant_vk: Vec::new(),
             tag_registrant_sk: Vec::new(),
             encrypted_tag_sk: None,
+            tag_registration: None,
             encrypted_spend_credentials: None,
             encrypted_bitcoin_wallet_state: None,
             password_cache: None,
@@ -312,6 +330,22 @@ impl WalletFile {
         } else {
             anyhow::bail!("no tag registrant signing key (encrypted or plaintext)")
         }
+    }
+
+    /// Persist the metadata needed to replay this wallet's tag registration.
+    pub fn set_tag_registration(
+        &mut self,
+        pow_nonce: [u8; 32],
+        pow_hash: Vec<u8>,
+        registered_at: u64,
+        signature: Vec<u8>,
+    ) {
+        self.tag_registration = Some(StoredTagRegistration {
+            pow_nonce,
+            pow_hash,
+            registered_at,
+            signature,
+        });
     }
 
     /// Set (or replace) the password cache for fast daily unlock.

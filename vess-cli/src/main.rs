@@ -15,6 +15,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing_subscriber::EnvFilter;
 
+use vess_compute::{
+    compute_program_pow, ProgramDefinition, ProgramManifest, ProgramName, ProgramVersionPointer,
+    ProofSystem, StoredProgram, VessLogicProgram,
+};
 use vess_kloak::persistence::{
     list_wallets, named_wallet_path, read_active_wallet_path, set_active_wallet_path,
     WalletDescriptor, WalletFile,
@@ -122,6 +126,33 @@ enum Command {
     RegisterTag {
         /// Tag to register (e.g. "alice" or "+alice").
         tag: String,
+    },
+
+    /// Deploy a decentralized program from a local directory.
+    Deploy {
+        /// Program root directory, or a single `.vess` source file.
+        directory: PathBuf,
+        /// Human-facing program name to publish, for example `+vl_market1`.
+        #[arg(long)]
+        name: String,
+        /// Program entrypoints exposed by the artifact.
+        #[arg(long, value_delimiter = ',', default_value = "main")]
+        entrypoints: Vec<String>,
+        /// Proof system identifier.
+        #[arg(long, default_value = "vess-stark-v1")]
+        proof_system: String,
+        /// Maximum cycle budget expected by the program.
+        #[arg(long, default_value_t = 1_000_000)]
+        max_cycles: u64,
+        /// Maximum memory footprint expected by the program.
+        #[arg(long, default_value_t = 2_147_483_648u64)]
+        max_memory_bytes: u64,
+        /// Mark the program as allowed to own bills directly.
+        #[arg(long)]
+        supports_program_owned_bills: bool,
+        /// Manifest version number when publishing a named program.
+        #[arg(long, default_value_t = 1)]
+        version: u32,
     },
 
     /// Send a raw Pulse to a remote node (low-level).
@@ -295,6 +326,29 @@ async fn dispatch_command(cli: &Cli) -> Result<()> {
             .await
         }
         Some(Command::RegisterTag { tag }) => cmd_register_tag(&cli, tag).await,
+        Some(Command::Deploy {
+            directory,
+            name,
+            entrypoints,
+            proof_system,
+            max_cycles,
+            max_memory_bytes,
+            supports_program_owned_bills,
+            version,
+        }) => {
+            cmd_deploy(
+                &cli,
+                directory,
+                name,
+                entrypoints,
+                proof_system,
+                *max_cycles,
+                *max_memory_bytes,
+                *supports_program_owned_bills,
+                *version,
+            )
+            .await
+        }
         Some(Command::Pulse { target, message }) => cmd_pulse(&cli, target, message).await,
         Some(Command::Listen) => cmd_listen(&cli).await,
         Some(Command::Status) => cmd_status(&cli).await,
@@ -321,6 +375,9 @@ async fn dispatch_command(cli: &Cli) -> Result<()> {
                 wallet_path: wallet.clone(),
                 rpc_port: *rpc_port,
                 wallet_password: wallet_password.clone(),
+                bitcoin_config: None,
+                enable_local_discovery: true,
+                allow_private_bitcoin_seed_contact: false,
             };
             vess_artery::node_runner::run_node(config).await?;
             Ok(())
@@ -593,6 +650,233 @@ fn rpc_port(cli: &Cli) -> u16 {
         .unwrap_or(vess_artery::rpc::DEFAULT_RPC_PORT)
 }
 
+fn parse_proof_system(value: &str) -> Result<ProofSystem> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "vess-stark-v1" => Ok(ProofSystem::VessStarkV1),
+        "vess-stark-aggregate-v1" => Ok(ProofSystem::VessStarkAggregateV1),
+        other => anyhow::bail!(
+            "unsupported proof system {other}; use vess-stark-v1 or vess-stark-aggregate-v1"
+        ),
+    }
+}
+
+fn normalized_program_rel_path(root: &Path, path: &Path) -> Result<String> {
+    let rel = path
+        .strip_prefix(root)
+        .with_context(|| format!("{} is not inside {}", path.display(), root.display()))?;
+    Ok(rel
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/"))
+}
+
+fn collect_program_directory_entries(
+    root: &Path,
+    dir: &Path,
+    entries: &mut Vec<(String, Vec<u8>)>,
+) -> Result<()> {
+    for entry in std::fs::read_dir(dir)
+        .with_context(|| format!("read program directory {}", dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            collect_program_directory_entries(root, &path, entries)?;
+        } else if file_type.is_file() {
+            let rel = normalized_program_rel_path(root, &path)?;
+            let bytes = std::fs::read(&path)
+                .with_context(|| format!("read program file {}", path.display()))?;
+            entries.push((rel, bytes));
+        }
+    }
+    Ok(())
+}
+
+fn collect_program_source_files(dir: &Path, sources: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in std::fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            collect_program_source_files(&path, sources)?;
+        } else if file_type.is_file()
+            && path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.eq_ignore_ascii_case("vess"))
+                .unwrap_or(false)
+        {
+            sources.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn load_vesslogic_program(path: &Path) -> Result<Option<VessLogicProgram>> {
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("canonicalize {}", path.display()))?;
+    if canonical.is_file() {
+        let is_vess = canonical
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("vess"))
+            .unwrap_or(false);
+        if !is_vess {
+            return Ok(None);
+        }
+        let source = std::fs::read_to_string(&canonical)
+            .with_context(|| format!("read {}", canonical.display()))?;
+        return Ok(Some(VessLogicProgram::parse(&source)?));
+    }
+    if !canonical.is_dir() {
+        anyhow::bail!("program path {} is neither a file nor a directory", canonical.display());
+    }
+
+    let mut sources = Vec::new();
+    collect_program_source_files(&canonical, &mut sources)?;
+    match sources.len() {
+        0 => Ok(None),
+        1 => {
+            let source = std::fs::read_to_string(&sources[0])
+                .with_context(|| format!("read {}", sources[0].display()))?;
+            Ok(Some(VessLogicProgram::parse(&source)?))
+        }
+        _ => anyhow::bail!(
+            "program directory {} contains multiple .vess files; keep exactly one VessLogic source per deploy root",
+            canonical.display()
+        ),
+    }
+}
+
+fn program_bundle_from_directory(directory: &Path) -> Result<Vec<u8>> {
+    let directory = directory
+        .canonicalize()
+        .with_context(|| format!("canonicalize {}", directory.display()))?;
+    if !directory.is_dir() {
+        anyhow::bail!("program path {} is not a directory", directory.display());
+    }
+
+    let mut entries = Vec::new();
+    collect_program_directory_entries(&directory, &directory, &mut entries)?;
+    if entries.is_empty() {
+        anyhow::bail!("program directory {} is empty", directory.display());
+    }
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut bundle = Vec::new();
+    for (path, bytes) in entries {
+        bundle.extend_from_slice(&(path.len() as u64).to_le_bytes());
+        bundle.extend_from_slice(path.as_bytes());
+        bundle.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+        bundle.extend_from_slice(&bytes);
+    }
+    Ok(bundle)
+}
+
+fn tagged_program_hash(tag: &[u8], bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(tag);
+    hasher.update(&(bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+    *hasher.finalize().as_bytes()
+}
+
+fn load_optional_program_file(directory: &Path, name: &str) -> Result<Option<Vec<u8>>> {
+    let path = directory.join(name);
+    if !path.exists() {
+        return Ok(None);
+    }
+    if !path.is_file() {
+        anyhow::bail!("{} exists but is not a file", path.display());
+    }
+    Ok(Some(
+        std::fs::read(&path).with_context(|| format!("read program file {}", path.display()))?,
+    ))
+}
+
+fn build_program_definition_from_directory(
+    directory: &Path,
+    entrypoints: &[String],
+    proof_system: ProofSystem,
+    max_cycles: u64,
+    max_memory_bytes: u64,
+    supports_program_owned_bills: bool,
+) -> Result<ProgramDefinition> {
+    let canonical_dir = directory
+        .canonicalize()
+        .with_context(|| format!("canonicalize {}", directory.display()))?;
+    let base_dir = if canonical_dir.is_dir() {
+        canonical_dir.clone()
+    } else {
+        canonical_dir
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("{} has no parent directory", canonical_dir.display()))?
+            .to_path_buf()
+    };
+    let metadata_bytes = load_optional_program_file(&base_dir, "metadata.json")?;
+    let abi_bytes = load_optional_program_file(&base_dir, "abi.json")?;
+    let public_inputs_bytes = load_optional_program_file(&base_dir, "public_inputs.json")?;
+    let public_outputs_bytes = load_optional_program_file(&base_dir, "public_outputs.json")?;
+
+    if let Some(vesslogic_program) = load_vesslogic_program(&canonical_dir)? {
+        let compiled = vesslogic_program.compile();
+        return Ok(ProgramDefinition {
+            code: compiled.clone(),
+            proof_system,
+            public_input_schema_hash: tagged_program_hash(
+                b"vess-program-public-inputs-v1",
+                public_inputs_bytes.as_deref().unwrap_or(&compiled),
+            ),
+            public_output_schema_hash: tagged_program_hash(
+                b"vess-program-public-outputs-v1",
+                public_outputs_bytes.as_deref().unwrap_or(&compiled),
+            ),
+            metadata_hash: tagged_program_hash(
+                b"vess-program-metadata-v1",
+                metadata_bytes.as_deref().unwrap_or(&compiled),
+            ),
+            abi_hash: tagged_program_hash(
+                b"vess-program-abi-v1",
+                abi_bytes.as_deref().unwrap_or(&compiled),
+            ),
+            max_cycles,
+            max_memory_bytes,
+            supports_program_owned_bills,
+            entrypoints: vesslogic_program.entrypoints(),
+        });
+    }
+
+    let bundle = program_bundle_from_directory(&canonical_dir)?;
+
+    Ok(ProgramDefinition {
+        code: bundle.clone(),
+        proof_system,
+        public_input_schema_hash: tagged_program_hash(
+            b"vess-program-public-inputs-v1",
+            public_inputs_bytes.as_deref().unwrap_or(&bundle),
+        ),
+        public_output_schema_hash: tagged_program_hash(
+            b"vess-program-public-outputs-v1",
+            public_outputs_bytes.as_deref().unwrap_or(&bundle),
+        ),
+        metadata_hash: tagged_program_hash(
+            b"vess-program-metadata-v1",
+            metadata_bytes.as_deref().unwrap_or(&bundle),
+        ),
+        abi_hash: tagged_program_hash(
+            b"vess-program-abi-v1",
+            abi_bytes.as_deref().unwrap_or(&bundle),
+        ),
+        max_cycles,
+        max_memory_bytes,
+        supports_program_owned_bills,
+        entrypoints: entrypoints.to_vec(),
+    })
+}
+
 async fn cmd_init(cli: &Cli, tag_str: &str, wallet_name: Option<&str>) -> Result<()> {
     let verbose = !cli.json;
     let tag = VessTag::new(tag_str)?;
@@ -681,6 +965,12 @@ async fn cmd_init(cli: &Cli, tag_str: &str, wallet_name: Option<&str>) -> Result
         };
         let digest = tmp_record.digest();
         let signature = vess_foundry::spend_auth::sign_spend(&registrant_sk, &digest)?;
+        wallet.set_tag_registration(
+            pow_nonce,
+            pow_hash.clone(),
+            tmp_record.registered_at,
+            signature.clone(),
+        );
 
         let msg = PulseMessage::TagRegister(TagRegister {
             tag_hash,
@@ -1342,6 +1632,13 @@ async fn cmd_register_tag(cli: &Cli, tag_str: &str) -> Result<()> {
     };
     let digest = tmp_record.digest();
     let signature = vess_foundry::spend_auth::sign_spend(&registrant_sk, &digest)?;
+    wallet.set_tag_registration(
+        pow_nonce,
+        pow_hash.clone(),
+        tmp_record.registered_at,
+        signature.clone(),
+    );
+    wallet.save(&path)?;
 
     // Send registration via RPC to local artery node.
     let port = rpc_port(cli);
@@ -1432,6 +1729,87 @@ async fn cmd_register_tag(cli: &Cli, tag_str: &str) -> Result<()> {
                 "hardening_error": hardening_error,
             })
         );
+    }
+    Ok(())
+}
+
+async fn cmd_deploy(
+    cli: &Cli,
+    directory: &Path,
+    name: &str,
+    entrypoints: &[String],
+    proof_system: &str,
+    max_cycles: u64,
+    max_memory_bytes: u64,
+    supports_program_owned_bills: bool,
+    version: u32,
+) -> Result<()> {
+    let proof_system = parse_proof_system(proof_system)?;
+    let definition = build_program_definition_from_directory(
+        directory,
+        entrypoints,
+        proof_system,
+        max_cycles,
+        max_memory_bytes,
+        supports_program_owned_bills,
+    )?;
+    let prog_id = definition.prog_id();
+
+    if !cli.json {
+        println!("Deploying program from {}", directory.display());
+        println!("Computing Argon2id proof-of-work (this takes ~10 seconds and 2 GiB RAM)…");
+    }
+
+    let (pow_nonce, pow_hash) = compute_program_pow(&prog_id, None)?;
+    let published_at = now_unix();
+    let name = ProgramName::new(name)?;
+    let program = StoredProgram {
+        definition,
+        published_at,
+        pow_nonce,
+        pow_hash,
+        publisher_vk: None,
+        signature: Vec::new(),
+        last_bill_sent_at: None,
+    };
+    let manifest = ProgramManifest {
+        name,
+        latest_prog_id: prog_id,
+        versions: vec![ProgramVersionPointer {
+            version,
+            prog_id,
+            changelog_hash: [0u8; 32],
+        }],
+        created_at: published_at,
+        updated_at: published_at,
+        publisher_vk: None,
+        signature: Vec::new(),
+    };
+
+    let port = rpc_port(cli);
+    let resp = rpc_call(
+        port,
+        &json!({
+            "method": "program_deploy",
+            "program": program,
+            "manifest": manifest,
+        }),
+    )
+    .await?;
+
+    if resp["ok"] != true {
+        anyhow::bail!(
+            "{}",
+            resp["error"].as_str().unwrap_or("program deploy failed")
+        );
+    }
+
+    if cli.json {
+        println!("{resp}");
+    } else {
+        println!("Program deployed.");
+        println!("Program ID: {}", resp["prog_id"].as_str().unwrap_or("?"));
+        println!("Name:       {}", resp["name"].as_str().unwrap_or("?"));
     }
     Ok(())
 }
@@ -2427,6 +2805,12 @@ async fn wizard_new(
     };
     let digest = tmp_record.digest();
     let signature = vess_foundry::spend_auth::sign_spend(&registrant_sk, &digest)?;
+    wallet.set_tag_registration(
+        pow_nonce,
+        pow_hash.clone(),
+        tmp_record.registered_at,
+        signature.clone(),
+    );
     let msg = PulseMessage::TagRegister(TagRegister {
         tag_hash,
         scan_ek: wallet.master_address.scan_ek.clone(),
@@ -2684,7 +3068,7 @@ async fn cmd_interactive(cli: &Cli) -> Result<()> {
     use std::io::{BufRead, Write};
 
     println!("╔══════════════════════════════════════╗");
-    println!("║        Vess: True Digital Cash       ║");
+    println!("║          Vess: Quantum Cash          ║");
     println!("╚══════════════════════════════════════╝");
     println!();
 
@@ -2822,7 +3206,13 @@ async fn cmd_interactive(cli: &Cli) -> Result<()> {
                     }
                 }
             }
-            "notifications" | "notifs" => cmd_notifications(cli, false, 1_000, 64).await,
+            "notifications" | "notifs" => {
+                let follow = args
+                    .first()
+                    .map(|arg| matches!(*arg, "follow" | "-f" | "--follow"))
+                    .unwrap_or(false);
+                cmd_notifications(cli, follow, 1_000, 64).await
+            }
             _ => {
                 if matches!(cmd, "start" | "stop") {
                     println!(
@@ -2854,7 +3244,7 @@ fn print_interactive_help() {
     println!("  receive                Show BTC receive address + QR code");
     println!("  faucet <amount>        Add local-test bills (requires VESS_LOCAL_TEST_FAUCET=1)");
     println!("  send <amount> <+tag>   Send Vess to a recipient");
-    println!("  notifications          Show recent payment notifications");
+    println!("  notifications [follow] Show recent notifications or follow them live");
     println!("  help                   Show this help");
     println!("  exit                   Close Vess");
 }

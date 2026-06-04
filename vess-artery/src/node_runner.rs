@@ -4,10 +4,11 @@
 //! from the unified CLI binary (`vess node`) or any other host.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
@@ -32,13 +33,18 @@ use crate::{
     PeerState, ReputationTable, TagDht, ALLOWED_VERSIONS, PROTOCOL_VERSION_HASH,
 };
 
+use vess_compute::{ComputeDht, ProgramId, PROGRAM_PRUNE_SECS};
 use vess_mesh::MeshCarrierContact;
 use vess_protocol::{
-    BitcoinNetwork, DhtSeedConsumedRecord, DhtSeedOwnershipRecord, DhtSeedRequest,
-    DhtSeedResponse, DhtSeedTagRecord, FetchedRecord, FindNodeResponse, GenesisProof,
-    HandshakeChallenge, HandshakeResponse, MailboxCollectResponse, MailboxForwardAck,
-    MailboxSweepResponse, ManifestRecoverResponse, ManifestStore, OwnershipClaim,
-    OwnershipFetchResponse, OwnershipGenesis, PeerExchange, PeerExchangeResponse, PulseMessage,
+    BitcoinNetwork, ComputeReceiptFetch, ComputeReceiptFetchResponse, ComputeReceiptStore,
+    DhtSeedComputeReceiptRecord, DhtSeedConsumedRecord, DhtSeedOwnershipRecord,
+    DhtSeedProgramManifestRecord, DhtSeedProgramRecord, DhtSeedRequest, DhtSeedResponse,
+    DhtSeedTagRecord, FetchedRecord, FindNodeResponse, GenesisProof, HandshakeChallenge,
+    HandshakeResponse, MailboxCollectResponse, MailboxForwardAck, MailboxSweepResponse,
+    ManifestRecoverResponse, ManifestStore, OwnershipClaim, OwnershipFetchResponse,
+    OwnershipGenesis, PeerExchange, PeerExchangeResponse, ProgramFetch, ProgramFetchResponse,
+    ProgramManifestResolve, ProgramManifestResolveResponse, ProgramManifestStore,
+    ProgramReceiptList, ProgramReceiptListResponse, ProgramStore, PulseMessage,
     ReforgeAttestation, RegistryQueryResponse, TagConfirm, TagLookupResponse, TagLookupResult,
     TagStore,
 };
@@ -266,6 +272,7 @@ fn confirmed_burn_outputs(
             chain_tip,
             owner_vk_hash: pending.first_owner_vk_hash,
             owner_vk: pending.first_owner_vk.clone(),
+            program_owner: None,
             denomination_value,
             genesis_proof: GenesisProof::BitcoinBurn(burn.clone()),
             digest,
@@ -423,6 +430,9 @@ const MAX_DHT_SEED_TAGS: usize = 256;
 const MAX_DHT_SEED_MANIFESTS: usize = 64;
 const MAX_DHT_SEED_OWNERSHIP_RECORDS: usize = 256;
 const MAX_DHT_SEED_CONSUMED_RECORDS: usize = 256;
+const MAX_DHT_SEED_PROGRAMS: usize = 128;
+const MAX_DHT_SEED_PROGRAM_MANIFESTS: usize = 128;
+const MAX_DHT_SEED_COMPUTE_RECEIPTS: usize = 256;
 /// Maximum encrypted-manifest payload bytes returned by one seed sync response.
 const MAX_DHT_SEED_MANIFEST_BYTES: usize = 128 * 1024;
 
@@ -574,6 +584,18 @@ fn message_dedup_key(msg: &PulseMessage) -> [u8; 32] {
             h.update(b"ManifestStore");
             h.update(&ms.dht_key);
         }
+        PulseMessage::ProgramStore(ps) => {
+            h.update(b"ProgramStore");
+            h.update(ps.program.prog_id().as_bytes());
+        }
+        PulseMessage::ProgramManifestStore(pms) => {
+            h.update(b"ProgramManifestStore");
+            h.update(&pms.manifest.dht_key());
+        }
+        PulseMessage::ComputeReceiptStore(crs) => {
+            h.update(b"ComputeReceiptStore");
+            h.update(&crs.receipt.receipt_id);
+        }
         PulseMessage::LimboHold(lh) => {
             h.update(b"LimboHold");
             h.update(&lh.stealth_id);
@@ -613,6 +635,46 @@ fn load_or_create_mesh_seed(state_dir: &std::path::Path) -> Result<[u8; 64]> {
     Ok(seed)
 }
 
+fn mirror_compute_receipt_text(state_dir: &Path, receipt: &vess_protocol::ComputeReceipt) {
+    let receipts_dir = state_dir.join("receipts");
+    if let Err(error) = std::fs::create_dir_all(&receipts_dir) {
+        warn!(error = %error, path = %receipts_dir.display(), "failed to create receipts directory");
+        return;
+    }
+
+    let receipt_path = receipts_dir.join(format!("{}.txt", hex_key(&receipt.receipt_id)));
+    let parent_receipts = if receipt.parent_receipt_ids.is_empty() {
+        "none".to_string()
+    } else {
+        receipt
+            .parent_receipt_ids
+            .iter()
+            .map(hex_key)
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let json = match serde_json::to_string_pretty(receipt) {
+        Ok(json) => json,
+        Err(error) => {
+            warn!(error = %error, receipt_id = %hex_key(&receipt.receipt_id), "failed to serialize compute receipt text mirror");
+            return;
+        }
+    };
+    let contents = format!(
+        "Receipt ID: {}\nProgram ID: {}\nJob ID: {}\nCreated At: {}\nParent Receipts:\n{}\n\nJSON:\n{}\n",
+        hex_key(&receipt.receipt_id),
+        hex_key(receipt.prog_id.as_bytes()),
+        hex_key(&receipt.job_id),
+        receipt.created_at,
+        parent_receipts,
+        json,
+    );
+
+    if let Err(error) = std::fs::write(&receipt_path, contents) {
+        warn!(error = %error, path = %receipt_path.display(), "failed to write compute receipt text file");
+    }
+}
+
 fn peer_hash_from_contact_bytes(contact_bytes: &[u8]) -> Option<[u8; 32]> {
     if contact_bytes.len() > MAX_SERIALIZED_MESH_CONTACT_BYTES {
         return None;
@@ -648,12 +710,29 @@ fn queue_discovered_peer_contact(
     if peer_hash == s.node_id {
         return;
     }
+    let already_known = s.routing_table.contains_peer(&peer_hash);
     if s.routing_table.insert(RoutingPeer {
         id_hash: peer_hash,
         id_bytes: target_bytes,
         last_seen: now,
         first_seen: now,
-    }) && s.peer_registry.state(&peer_hash) != PeerState::Verified
+    }) {
+        if !already_known {
+            s.push_notification(WalletNotification {
+                kind: "vess_peer_discovered".to_string(),
+                created_at: now,
+                payment_id: hex_key(&peer_hash),
+                amount: None,
+                bill_count: None,
+                counterparty: Some(source.to_string()),
+                message: format!(
+                    "Discovered Vess peer via {source}: {}",
+                    hex_key(&peer_hash)
+                ),
+            });
+        }
+    }
+    if s.peer_registry.state(&peer_hash) != PeerState::Verified
         && !s.handshake_queue.contains(&peer_hash)
     {
         s.handshake_queue.push(peer_hash);
@@ -700,6 +779,7 @@ fn dht_seed_ownership_from_record(record: &OwnershipRecord) -> DhtSeedOwnershipR
         chain_tip: record.chain_tip,
         current_owner_vk_hash: record.current_owner_vk_hash,
         current_owner_vk: record.current_owner_vk.clone(),
+        current_owner_program: record.current_owner_program.clone(),
         denomination_value: record.denomination_value,
         updated_at: record.updated_at,
         proof_hash: record.proof_hash,
@@ -718,6 +798,7 @@ fn ownership_record_from_dht_seed(record: DhtSeedOwnershipRecord) -> OwnershipRe
         chain_tip: record.chain_tip,
         current_owner_vk_hash: record.current_owner_vk_hash,
         current_owner_vk: record.current_owner_vk,
+        current_owner_program: record.current_owner_program,
         denomination_value: record.denomination_value,
         updated_at: record.updated_at,
         proof_hash: record.proof_hash,
@@ -728,6 +809,27 @@ fn ownership_record_from_dht_seed(record: DhtSeedOwnershipRecord) -> OwnershipRe
         chain_depth: record.chain_depth,
         encrypted_bill: record.encrypted_bill,
     }
+}
+
+fn dht_seed_program_from_record(
+    prog_id: vess_protocol::ProgramId,
+    program: vess_protocol::StoredProgram,
+) -> DhtSeedProgramRecord {
+    DhtSeedProgramRecord { prog_id, program }
+}
+
+fn dht_seed_program_manifest_from_record(
+    dht_key: [u8; 32],
+    manifest: vess_protocol::ProgramManifest,
+) -> DhtSeedProgramManifestRecord {
+    DhtSeedProgramManifestRecord { dht_key, manifest }
+}
+
+fn dht_seed_compute_receipt_from_record(
+    receipt_id: [u8; 32],
+    receipt: vess_protocol::ComputeReceipt,
+) -> DhtSeedComputeReceiptRecord {
+    DhtSeedComputeReceiptRecord { receipt_id, receipt }
 }
 
 fn dht_seed_consumed_from_record(
@@ -814,14 +916,69 @@ fn collect_seed_consumed_records(state: &ArteryState) -> HashMap<[u8; 32], Consu
 }
 
 fn ownership_claim_hash(oc: &OwnershipClaim) -> [u8; 32] {
+    let prev_owner_commitment = ownership_claim_prev_owner_commitment(oc).unwrap_or([0u8; 32]);
+    let new_owner_commitment = ownership_claim_new_owner_commitment(oc).unwrap_or([0u8; 32]);
+    let witness_hash = ownership_claim_witness_hash(oc).unwrap_or([0u8; 32]);
     let mut h = blake3::Hasher::new();
     h.update(b"vess-claim-hash-v1");
     h.update(&oc.mint_id);
-    h.update(&vess_foundry::spend_auth::vk_hash(&oc.prev_owner_vk));
-    h.update(&oc.new_owner_vk_hash);
-    h.update(&oc.transfer_sig);
+    h.update(&prev_owner_commitment);
+    h.update(&new_owner_commitment);
+    h.update(&witness_hash);
     h.update(&(oc.timestamp / 60).to_le_bytes());
     *h.finalize().as_bytes()
+}
+
+fn ownership_genesis_owner_commitment(og: &OwnershipGenesis) -> [u8; 32] {
+    og.program_owner
+        .as_ref()
+        .map(|condition| condition.owner_commitment())
+        .unwrap_or_else(|| vess_foundry::spend_auth::vk_hash(&og.owner_vk))
+}
+
+fn ownership_claim_prev_owner_commitment(oc: &OwnershipClaim) -> Option<[u8; 32]> {
+    if let Some(condition) = &oc.prev_owner_program {
+        Some(condition.owner_commitment())
+    } else if !oc.prev_owner_vk.is_empty() {
+        Some(vess_foundry::spend_auth::vk_hash(&oc.prev_owner_vk))
+    } else {
+        None
+    }
+}
+
+fn ownership_claim_new_owner_commitment(oc: &OwnershipClaim) -> Option<[u8; 32]> {
+    if let Some(condition) = &oc.new_owner_program {
+        Some(condition.owner_commitment())
+    } else if !oc.new_owner_vk.is_empty() {
+        Some(vess_foundry::spend_auth::vk_hash(&oc.new_owner_vk))
+    } else if oc.new_owner_vk_hash != [0u8; 32] {
+        Some(oc.new_owner_vk_hash)
+    } else {
+        None
+    }
+}
+
+fn ownership_claim_witness_hash(oc: &OwnershipClaim) -> Option<[u8; 32]> {
+    if let Some(witness) = &oc.program_spend_witness {
+        Some(witness.witness_hash())
+    } else if !oc.transfer_sig.is_empty() {
+        Some(*blake3::hash(&oc.transfer_sig).as_bytes())
+    } else {
+        None
+    }
+}
+
+fn program_ids_with_live_owned_bills(state: &ArteryState) -> BTreeSet<ProgramId> {
+    state
+        .registry
+        .all_records()
+        .into_iter()
+        .filter_map(|record| record.current_owner_program.map(|owner| owner.controller.prog_id))
+        .collect()
+}
+
+fn note_program_bill_activity(state: &mut ArteryState, prog_id: ProgramId, sent_at: u64) {
+    let _ = state.compute_dht.mark_bill_sent_to_program(prog_id, sent_at);
 }
 
 fn proof_hash_and_nonce_from_genesis(og: &OwnershipGenesis) -> Option<([u8; 32], [u8; 32])> {
@@ -874,6 +1031,7 @@ pub(crate) fn retain_local_ownership_genesis(
             chain_tip: og.chain_tip,
             current_owner_vk_hash: og.owner_vk_hash,
             current_owner_vk: og.owner_vk.clone(),
+            current_owner_program: og.program_owner.clone(),
             denomination_value: og.denomination_value,
             updated_at,
             proof_hash,
@@ -898,6 +1056,7 @@ pub(crate) fn local_seed_record_from_claimed_bill(
         chain_tip: bill.chain_tip,
         current_owner_vk_hash: claim.new_owner_vk_hash,
         current_owner_vk: owner_vk.to_vec(),
+        current_owner_program: claim.new_owner_program.clone(),
         denomination_value: bill.denomination.value(),
         updated_at,
         proof_hash: [0u8; 32],
@@ -946,6 +1105,7 @@ pub(crate) fn retain_local_ownership_claim(
     record.chain_tip = oc.new_chain_tip;
     record.current_owner_vk_hash = oc.new_owner_vk_hash;
     record.current_owner_vk = oc.new_owner_vk.clone();
+    record.current_owner_program = oc.new_owner_program.clone();
     record.updated_at = updated_at;
     record.prev_claim_vk_hash = Some(vess_foundry::spend_auth::vk_hash(&oc.prev_owner_vk));
     record.claim_hash = Some(ownership_claim_hash(oc));
@@ -1050,6 +1210,9 @@ struct DhtSeedCursor {
     after_manifest_key: Option<[u8; 32]>,
     after_ownership_mint_id: Option<[u8; 32]>,
     after_consumed_mint_id: Option<[u8; 32]>,
+    after_program_id: Option<[u8; 32]>,
+    after_program_manifest_key: Option<[u8; 32]>,
+    after_compute_receipt_id: Option<[u8; 32]>,
 }
 
 impl DhtSeedCursor {
@@ -1060,10 +1223,16 @@ impl DhtSeedCursor {
             after_manifest_key: self.after_manifest_key,
             after_ownership_mint_id: self.after_ownership_mint_id,
             after_consumed_mint_id: self.after_consumed_mint_id,
+            after_program_id: self.after_program_id,
+            after_program_manifest_key: self.after_program_manifest_key,
+            after_compute_receipt_id: self.after_compute_receipt_id,
             max_tags: MAX_DHT_SEED_TAGS as u16,
             max_manifests: MAX_DHT_SEED_MANIFESTS as u16,
             max_ownership_records: MAX_DHT_SEED_OWNERSHIP_RECORDS as u16,
             max_consumed_records: MAX_DHT_SEED_CONSUMED_RECORDS as u16,
+            max_programs: MAX_DHT_SEED_PROGRAMS as u16,
+            max_program_manifests: MAX_DHT_SEED_PROGRAM_MANIFESTS as u16,
+            max_compute_receipts: MAX_DHT_SEED_COMPUTE_RECEIPTS as u16,
         }
     }
 
@@ -1080,6 +1249,15 @@ impl DhtSeedCursor {
         if let Some(last) = response.consumed_records.last() {
             self.after_consumed_mint_id = Some(last.mint_id);
         }
+        if let Some(last) = response.programs.last() {
+            self.after_program_id = Some(*last.prog_id.as_bytes());
+        }
+        if let Some(last) = response.program_manifests.last() {
+            self.after_program_manifest_key = Some(last.dht_key);
+        }
+        if let Some(last) = response.compute_receipts.last() {
+            self.after_compute_receipt_id = Some(last.receipt_id);
+        }
     }
 }
 
@@ -1088,6 +1266,9 @@ fn dht_seed_response_is_empty(response: &DhtSeedResponse) -> bool {
         && response.manifests.is_empty()
         && response.ownership_records.is_empty()
         && response.consumed_records.is_empty()
+        && response.programs.is_empty()
+        && response.program_manifests.is_empty()
+        && response.compute_receipts.is_empty()
 }
 
 fn dht_seed_cursor_allows_key(key: &[u8; 32], cursor: Option<[u8; 32]>) -> bool {
@@ -1098,6 +1279,7 @@ async fn request_dht_seed_catchup(
     node: &MeshPulseNode,
     target: &MeshCarrierContact,
     state: &Arc<Mutex<ArteryState>>,
+    state_dir: &Path,
 ) {
     const MAX_DHT_SEED_CATCHUP_ROUNDS: usize = 1024;
 
@@ -1120,7 +1302,7 @@ async fn request_dht_seed_catchup(
 
         let empty_page = dht_seed_response_is_empty(&response);
         cursor.advance_from_response(&response);
-        ingest_dht_seed_response(state, response);
+        ingest_dht_seed_response(state, state_dir, response);
         if empty_page {
             return;
         }
@@ -1186,7 +1368,11 @@ pub(crate) async fn refresh_mailbox_forward_subscriptions(
     }
 }
 
-fn ingest_dht_seed_response(state: &Arc<Mutex<ArteryState>>, response: DhtSeedResponse) {
+fn ingest_dht_seed_response(
+    state: &Arc<Mutex<ArteryState>>,
+    state_dir: &Path,
+    response: DhtSeedResponse,
+) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -1195,6 +1381,10 @@ fn ingest_dht_seed_response(state: &Arc<Mutex<ArteryState>>, response: DhtSeedRe
     let mut inserted_manifests = 0usize;
     let mut inserted_ownership_records = 0usize;
     let mut inserted_consumed_records = 0usize;
+    let mut inserted_programs = 0usize;
+    let mut inserted_program_manifests = 0usize;
+    let mut inserted_compute_receipts = 0usize;
+    let mut mirrored_receipts = Vec::new();
     let mut s = state.lock().unwrap();
     let peer_ids: Vec<[u8; 32]> = s
         .routing_table
@@ -1298,10 +1488,63 @@ fn ingest_dht_seed_response(state: &Arc<Mutex<ArteryState>>, response: DhtSeedRe
         inserted_consumed_records += 1;
     }
 
+    for seeded_program in response.programs.into_iter().take(MAX_DHT_SEED_PROGRAMS) {
+        if !s
+            .registry
+            .should_store(seeded_program.prog_id.as_bytes(), &peer_ids, repl)
+        {
+            continue;
+        }
+        if s.compute_dht.store_program(seeded_program.program).unwrap_or(false) {
+            inserted_programs += 1;
+        }
+    }
+
+    for seeded_manifest in response
+        .program_manifests
+        .into_iter()
+        .take(MAX_DHT_SEED_PROGRAM_MANIFESTS)
+    {
+        if !s
+            .registry
+            .should_store(&seeded_manifest.dht_key, &peer_ids, repl)
+        {
+            continue;
+        }
+        if s.compute_dht.store_manifest(seeded_manifest.manifest).unwrap_or(false) {
+            inserted_program_manifests += 1;
+        }
+    }
+
+    for seeded_receipt in response
+        .compute_receipts
+        .into_iter()
+        .take(MAX_DHT_SEED_COMPUTE_RECEIPTS)
+    {
+        if !s
+            .registry
+            .should_store(&seeded_receipt.receipt_id, &peer_ids, repl)
+        {
+            continue;
+        }
+        if s.compute_dht.store_receipt(seeded_receipt.receipt.clone()).unwrap_or(false) {
+            mirrored_receipts.push(seeded_receipt.receipt);
+            inserted_compute_receipts += 1;
+        }
+    }
+
+    drop(s);
+    for receipt in mirrored_receipts {
+        mirror_compute_receipt_text(state_dir, &receipt);
+    }
+
     if inserted_tags > 0
         || inserted_manifests > 0
         || inserted_ownership_records > 0
         || inserted_consumed_records > 0
+        || inserted_programs > 0
+        || inserted_program_manifests > 0
+        || inserted_compute_receipts > 0
     {
         info!(
             responder = ?&response.responder_node_id[..4],
@@ -1309,6 +1552,9 @@ fn ingest_dht_seed_response(state: &Arc<Mutex<ArteryState>>, response: DhtSeedRe
             inserted_manifests,
             inserted_ownership_records,
             inserted_consumed_records,
+            inserted_programs,
+            inserted_program_manifests,
+            inserted_compute_receipts,
             "seeded initial DHT shard data from peer"
         );
     }
@@ -1442,6 +1688,40 @@ fn spawn_bitcoin_vess_discovery(
     });
 }
 
+fn spawn_bitcoin_peer_notifications(
+    client: vess_bitcoin::BitcoinLightClient,
+    state: Arc<Mutex<ArteryState>>,
+) {
+    tokio::spawn(async move {
+        let mut announced = HashSet::new();
+        loop {
+            let current: HashSet<_> = client.active_peers().into_iter().collect();
+            let newly_connected: Vec<_> = current.difference(&announced).copied().collect();
+            if !newly_connected.is_empty() {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let mut s = state.lock().unwrap();
+                for peer in newly_connected {
+                    s.push_notification(WalletNotification {
+                        kind: "bitcoin_peer_connected".to_string(),
+                        created_at: now,
+                        payment_id: peer.to_string(),
+                        amount: None,
+                        bill_count: None,
+                        counterparty: Some(peer.to_string()),
+                        message: format!("Bitcoin peer connected: {peer}"),
+                    });
+                }
+            }
+            announced.retain(|peer| current.contains(peer));
+            announced.extend(current);
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    });
+}
+
 /// Configuration for running an artery node.
 pub struct NodeConfig {
     /// Number of gossip neighbors (K).
@@ -1468,6 +1748,14 @@ pub struct NodeConfig {
     /// phrase via environment variables.  Can also be provided via the
     /// `VESS_WALLET_PASSWORD` env var.
     pub wallet_password: Option<String>,
+    /// Optional override for the embedded Bitcoin light client configuration.
+    /// Useful for deterministic integration tests with local mock peers.
+    pub bitcoin_config: Option<vess_bitcoin::BitcoinConfig>,
+    /// Whether to enable LAN/local-file peer discovery.
+    pub enable_local_discovery: bool,
+    /// Allow advertising a non-public mesh contact into Bitcoin-side Vess seed discovery.
+    /// Intended for local integration tests that run all nodes on loopback.
+    pub allow_private_bitcoin_seed_contact: bool,
 }
 
 impl Default for NodeConfig {
@@ -1481,6 +1769,9 @@ impl Default for NodeConfig {
             wallet_path: None,
             rpc_port: None,
             wallet_password: None,
+            bitcoin_config: None,
+            enable_local_discovery: true,
+            allow_private_bitcoin_seed_contact: false,
         }
     }
 }
@@ -1557,6 +1848,7 @@ pub(crate) struct WalletState {
 pub(crate) struct ArteryState {
     pub(crate) registry: OwnershipRegistry,
     pub(crate) tag_dht: TagDht,
+    pub(crate) compute_dht: ComputeDht,
     pub(crate) node_id: [u8; 32],
     /// Kademlia routing table: 256 XOR-distance buckets of infrastructure
     /// relay peers. Never contains wallet users or payment recipients.
@@ -1782,6 +2074,25 @@ impl ArteryState {
             .map(|(k, (v, _))| (hex_key(k), v.clone()))
             .collect();
 
+        let compute_programs: BTreeMap<String, vess_protocol::StoredProgram> = self
+            .compute_dht
+            .all_programs()
+            .into_iter()
+            .map(|(prog_id, program)| (hex_key(prog_id.as_bytes()), program))
+            .collect();
+        let compute_program_manifests: BTreeMap<String, vess_protocol::ProgramManifest> = self
+            .compute_dht
+            .all_manifests()
+            .into_iter()
+            .map(|(dht_key, manifest)| (hex_key(&dht_key), manifest))
+            .collect();
+        let compute_receipts: BTreeMap<String, vess_protocol::ComputeReceipt> = self
+            .compute_dht
+            .all_receipts()
+            .into_iter()
+            .map(|(receipt_id, receipt)| (hex_key(&receipt_id), receipt))
+            .collect();
+
         ArterySnapshot {
             tags,
             bills: BTreeMap::new(), // legacy — kept for deserialization compat
@@ -1819,6 +2130,9 @@ impl ArteryState {
                 .map(|(k, v)| (hex_key(&k), v))
                 .collect(),
             manifests,
+            compute_programs,
+            compute_program_manifests,
+            compute_receipts,
             retained_ownership_records: self
                 .retained_ownership_records
                 .values()
@@ -1906,6 +2220,26 @@ impl ArteryState {
             .into_iter()
             .filter_map(|(k, v)| unhex_key(&k).ok().map(|key| (key, (v, 0u64))))
             .collect();
+
+        self.compute_dht = ComputeDht::new();
+        for (_, program) in snap.compute_programs.into_iter().filter_map(|(k, v)| {
+            unhex_key(&k)
+                .ok()
+                .map(vess_protocol::ProgramId)
+                .map(|key| (key, v))
+        }) {
+            let _ = self.compute_dht.store_program(program);
+        }
+        for (_, manifest) in snap.compute_program_manifests.into_iter().filter_map(|(k, v)| {
+            unhex_key(&k).ok().map(|key| (key, v))
+        }) {
+            let _ = self.compute_dht.store_manifest(manifest);
+        }
+        for (_, receipt) in snap.compute_receipts.into_iter().filter_map(|(k, v)| {
+            unhex_key(&k).ok().map(|key| (key, v))
+        }) {
+            let _ = self.compute_dht.store_receipt(receipt);
+        }
 
         // M5: Restore in-flight limbo payment IDs.
         for id in snap.limbo_payment_ids {
@@ -1998,11 +2332,11 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
     let snapshot = storage.load()?;
 
     // ── Load embedded wallet (if configured) ────────────────────────
-    let wallet_state = if let Some(ref wallet_path) = config.wallet_path {
+    let (wallet_state, startup_wallet_tag_store) = if let Some(ref wallet_path) = config.wallet_path {
         use vess_kloak::recovery::encryption_key_from_seed;
         use vess_kloak::WalletFile;
 
-        let wallet = WalletFile::load(wallet_path)?;
+        let mut wallet = WalletFile::load(wallet_path)?;
 
         // Try password-based unlock first (fast ~1 s, 256 MiB), then
         // fall back to the 12-word recovery phrase via env vars.
@@ -2030,6 +2364,13 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
         let (stealth_secret, address) = vess_stealth::generate_master_keys_from_seed(&raw_seed);
         let mailbox_key = vess_kloak::derive_mailbox_key(&address.spend_ek);
         let enc_key = encryption_key_from_seed(&raw_seed);
+        let startup_wallet_tag_store = match crate::rpc::wallet_tag_store(&mut wallet, wallet_path, &enc_key) {
+            Ok(store) => store,
+            Err(error) => {
+                warn!(%error, "failed to prepare wallet tag announcement on startup");
+                None
+            }
+        };
 
         // Load billfold and decrypt spend credentials into it.
         let mut billfold = wallet.billfold.clone();
@@ -2045,21 +2386,28 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
             bitcoin_receive_address = %bitcoin_receive_address,
             "wallet loaded — auto-receive enabled"
         );
-        Some(WalletState {
-            stealth_secret,
-            billfold,
-            bitcoin_wallet,
-            bitcoin_receive_address,
-            wallet_path: wallet_path.clone(),
-            enc_key,
-            mailbox_key,
-        })
+        (
+            Some(WalletState {
+                stealth_secret,
+                billfold,
+                bitcoin_wallet,
+                bitcoin_receive_address,
+                wallet_path: wallet_path.clone(),
+                enc_key,
+                mailbox_key,
+            }),
+            startup_wallet_tag_store,
+        )
     } else {
-        None
+        (None, None)
     };
 
     info!("Starting Bitcoin peer discovery before Vess mesh bootstrap...");
-    let bitcoin_client = match vess_bitcoin::BitcoinLightClient::spawn(Default::default()).await {
+    let bitcoin_client = match vess_bitcoin::BitcoinLightClient::spawn(
+        config.bitcoin_config.clone().unwrap_or_default(),
+    )
+    .await
+    {
         Ok(client) => {
             info!(
                 peers = client.connected_peers(),
@@ -2092,13 +2440,22 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
     let node_id_bytes: [u8; 32] = *node.id().as_bytes();
     if let Some(client) = &bitcoin_seed_client {
         let local_contact = node.contact();
+        let allow_private = config.allow_private_bitcoin_seed_contact;
         match vess_mesh::validate_public_mesh_contact(&local_contact) {
             Ok(()) => {
                 let local_contact = encode_contact_string(&local_contact)?;
                 client.set_local_vess_seed_node(node_id_str.clone(), local_contact);
             }
             Err(error) => {
-                warn!(%error, "local mesh contact is not public-routable; skipping Bitcoin seed advertisement");
+                if allow_private {
+                    let loopback_contact = crate::local_discovery::loopback_contact(&local_contact)
+                        .unwrap_or_else(|_| local_contact.clone());
+                    let local_contact = encode_contact_string(&loopback_contact)?;
+                    client.set_local_vess_seed_node(node_id_str.clone(), local_contact);
+                    warn!(%error, "local mesh contact is not public-routable; advertising it anyway for test-only Bitcoin seed discovery");
+                } else {
+                    warn!(%error, "local mesh contact is not public-routable; skipping Bitcoin seed advertisement");
+                }
             }
         }
     }
@@ -2113,6 +2470,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
     let state = Arc::new(Mutex::new(ArteryState {
         registry: OwnershipRegistry::new(node_id_bytes),
         tag_dht: TagDht::new(node_id_bytes, config.k_neighbors),
+        compute_dht: ComputeDht::new(),
         node_id: node_id_bytes,
         routing_table: RoutingTable::new(node_id_bytes),
         gossip_config,
@@ -2151,11 +2509,13 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
         // MailboxForwardRegister: 5 registrations per 60-second window per peer.
         mailbox_fwd_limiter: crate::gossip::PeerRateLimiter::new(5, 60),
     }));
+    let receipt_text_state_dir = config.state_dir.clone();
 
     if let Some(client) = {
         let s = state.lock().unwrap();
         s.bitcoin_client.clone()
     } {
+        spawn_bitcoin_peer_notifications(client.clone(), state.clone());
         let state_for_bitcoin = state.clone();
         let retry_state = state.clone();
         let retry_client = client.clone();
@@ -2329,6 +2689,11 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
     // state mutex for queue access.
     let (manifest_tx, mut manifest_rx) =
         tokio::sync::mpsc::unbounded_channel::<vess_protocol::ManifestStore>();
+    let (program_tx, mut program_rx) = tokio::sync::mpsc::unbounded_channel::<ProgramStore>();
+    let (program_manifest_tx, mut program_manifest_rx) =
+        tokio::sync::mpsc::unbounded_channel::<ProgramManifestStore>();
+    let (compute_receipt_tx, mut compute_receipt_rx) =
+        tokio::sync::mpsc::unbounded_channel::<ComputeReceiptStore>();
     let (tag_store_tx, mut tag_store_rx) = tokio::sync::mpsc::unbounded_channel::<TagStore>();
     let (tag_confirm_tx, mut tag_confirm_rx) = tokio::sync::mpsc::unbounded_channel::<TagConfirm>();
     let (og_tx, mut og_rx) = tokio::sync::mpsc::unbounded_channel::<OwnershipGenesis>();
@@ -2342,6 +2707,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
 
     // Restore persisted state.
     {
+        let restored_receipts = snapshot.compute_receipts.values().cloned().collect::<Vec<_>>();
         let mut s = state.lock().unwrap();
         let tag_count = snapshot.tags.len();
         let manifest_count = snapshot.manifests.len();
@@ -2356,6 +2722,43 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
             banned = banned_count,
             "restored state from disk"
         );
+        drop(s);
+        for receipt in restored_receipts {
+            mirror_compute_receipt_text(&receipt_text_state_dir, &receipt);
+        }
+    }
+
+    if let Some((tag_str, tag_store)) = startup_wallet_tag_store.clone() {
+        let mut s = state.lock().unwrap();
+        let record = vess_tag::TagRecord {
+            tag_hash: tag_store.tag_hash,
+            master_address: vess_stealth::MasterStealthAddress {
+                scan_ek: tag_store.scan_ek.clone(),
+                spend_ek: tag_store.spend_ek.clone(),
+            },
+            pow_nonce: tag_store.pow_nonce,
+            pow_hash: tag_store.pow_hash.clone(),
+            registered_at: tag_store.registered_at,
+            registrant_vk: tag_store.registrant_vk.clone(),
+            signature: tag_store.signature.clone(),
+            hardened_at: None,
+        };
+        let addr_fp = record.address_fingerprint();
+
+        if s.tag_dht.lookup(&tag_str).is_none() && !s.tag_dht.has_address(&addr_fp) {
+            if s.tag_dht.store(record) {
+                let _ = tag_store_tx.send(tag_store);
+                s.push_notification(WalletNotification {
+                    kind: "tag_announced".to_string(),
+                    created_at: ArteryState::now_unix(),
+                    payment_id: hex_key(&addr_fp),
+                    amount: None,
+                    bill_count: None,
+                    counterparty: Some(format!("+{tag_str}")),
+                    message: format!("Wallet tag +{tag_str} is available for sends."),
+                });
+            }
+        }
     }
 
     // ── Auto-sweep existing limbo entries through wallet ────────────
@@ -2413,7 +2816,9 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
     }
 
     info!(node_id = %node.id(), state = %config.state_dir.display(), version = %hex_key(&PROTOCOL_VERSION_HASH), k = config.k_neighbors, max_hops = config.max_hops, "Artery node online");
-    spawn_local_lan_discovery(node.contact(), state.clone());
+    if config.enable_local_discovery {
+        spawn_local_lan_discovery(node.contact(), state.clone());
+    }
     if let Some(client) = bitcoin_seed_client.clone() {
         spawn_bitcoin_vess_discovery(client, state.clone());
     }
@@ -2446,6 +2851,8 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
         let rpc_state = state.clone();
         let rpc_senders = crate::rpc::QueueSenders {
             manifest_tx: manifest_tx.clone(),
+            program_tx: program_tx.clone(),
+            program_manifest_tx: program_manifest_tx.clone(),
             tag_store_tx: tag_store_tx.clone(),
             tag_confirm_tx: tag_confirm_tx.clone(),
             og_tx: og_tx.clone(),
@@ -2643,6 +3050,19 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 if pruned_tags > 0 {
                     info!(count = pruned_tags, "pruned unhardened tags");
                 }
+                let active_program_ids = program_ids_with_live_owned_bills(&s);
+                let pruned_programs = s
+                    .compute_dht
+                    .prune_inactive_programs(now, &active_program_ids);
+                if !pruned_programs.pruned_program_ids.is_empty() {
+                    info!(
+                        count = pruned_programs.pruned_program_ids.len(),
+                        pruned_manifest_count = pruned_programs.pruned_manifest_count,
+                        pruned_receipt_count = pruned_programs.pruned_receipt_count,
+                        ttl_secs = PROGRAM_PRUNE_SECS,
+                        "pruned inactive programs"
+                    );
+                }
                 // Evict expired mailbox forwarding subscriptions.
                 let before_fwd = s.mailbox_fwd.len();
                 s.mailbox_fwd.retain(|_, r| r.expires_at > now);
@@ -2744,21 +3164,29 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
             count = local_peers.len(),
             "discovered Vess bootstrap nodes via LAN/local discovery"
         );
+        for contact in &local_peers {
+            queue_discovered_peer_contact(&state, contact.clone(), "lan");
+        }
         all_bootstrap.extend(local_peers.iter().filter_map(bootstrap_string_from_contact));
     }
     if let Some(client) = &bitcoin_seed_client {
-        let discovered: Vec<String> = client
+        let discovered = client
             .discover_vess_nodes()
-            .await
-            .into_iter()
-            .map(|node| node.contact)
-            .collect();
+            .await;
         if !discovered.is_empty() {
             info!(
                 count = discovered.len(),
                 "discovered Vess bootstrap nodes via Bitcoin peers"
             );
-            all_bootstrap.extend(discovered);
+            for node in discovered {
+                all_bootstrap.push(node.contact.clone());
+                match parse_contact_string(&node.contact) {
+                    Ok(contact) => queue_discovered_peer_contact(&state, contact, "bitcoin"),
+                    Err(error) => {
+                        warn!(node_id = %node.node_id, "Bitcoin-discovered Vess contact rejected: {error}")
+                    }
+                }
+            }
         }
     }
     all_bootstrap.sort_unstable();
@@ -2769,6 +3197,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
         let boot_node = node.clone();
         let boot_state = state.clone();
         let boot_ban = banishment.clone();
+        let boot_receipt_text_state_dir = receipt_text_state_dir.clone();
         let bootstrap_peers = all_bootstrap;
         tokio::spawn(async move {
             for peer_str in &bootstrap_peers {
@@ -2902,7 +3331,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     Err(e) => warn!("bootstrap peer {peer_str} unreachable: {e}"),
                 }
 
-                request_dht_seed_catchup(&boot_node, &target, &boot_state).await;
+                request_dht_seed_catchup(&boot_node, &target, &boot_state, &boot_receipt_text_state_dir).await;
             }
         });
     }
@@ -2968,6 +3397,194 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
             }
             batch_forward_bytes_to_peers(&manifest_drain_node, &routable_peers, per_peer).await;
             info!(count = manifests.len(), "manifest store batch forwarded");
+        }
+    });
+
+    // ── Program store drain task ────────────────────────────────────
+    let program_drain_state = state.clone();
+    let program_drain_node = node.clone();
+    tokio::spawn(async move {
+        while let Some(first) = program_rx.recv().await {
+            let mut programs = vec![first];
+            while let Ok(item) = program_rx.try_recv() {
+                programs.push(item);
+            }
+
+            let (peer_hashes, routable_peers, age_factors, peer_scores, k, net_size) = {
+                let s = program_drain_state.lock().unwrap();
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let (ph, rp, af) = s
+                    .routing_table
+                    .routable_peer_vecs(|id| s.peer_registry.state(id) == PeerState::Verified, now);
+                let scores = s.reputation.snapshot_scores_for(&ph);
+                (
+                    ph,
+                    rp,
+                    af,
+                    scores,
+                    s.gossip_config.k_neighbors,
+                    s.estimated_network_size,
+                )
+            };
+            if routable_peers.is_empty() {
+                continue;
+            }
+
+            let fan = dynamic_fan_out(net_size, RANDOM_FAN_OUT, RANDOM_FAN_OUT * 3);
+            let mut per_peer: HashMap<usize, Vec<Arc<Vec<u8>>>> = HashMap::new();
+            for ps in &programs {
+                let bytes = match PulseMessage::ProgramStore(ps.clone()).to_bytes() {
+                    Ok(b) => Arc::new(b),
+                    Err(e) => {
+                        warn!(error = %e, "serialize ProgramStore failed");
+                        continue;
+                    }
+                };
+                let indices = compute_gossip_targets_scored(
+                    ps.program.prog_id().as_bytes(),
+                    &peer_hashes,
+                    &peer_scores,
+                    &age_factors,
+                    k,
+                    fan,
+                    routable_peers.len(),
+                );
+                for idx in indices {
+                    per_peer.entry(idx).or_default().push(Arc::clone(&bytes));
+                }
+            }
+            batch_forward_bytes_to_peers(&program_drain_node, &routable_peers, per_peer).await;
+            info!(count = programs.len(), "program store batch forwarded");
+        }
+    });
+
+    // ── Program manifest store drain task ──────────────────────────
+    let program_manifest_drain_state = state.clone();
+    let program_manifest_drain_node = node.clone();
+    tokio::spawn(async move {
+        while let Some(first) = program_manifest_rx.recv().await {
+            let mut manifests = vec![first];
+            while let Ok(item) = program_manifest_rx.try_recv() {
+                manifests.push(item);
+            }
+
+            let (peer_hashes, routable_peers, age_factors, peer_scores, k, net_size) = {
+                let s = program_manifest_drain_state.lock().unwrap();
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let (ph, rp, af) = s
+                    .routing_table
+                    .routable_peer_vecs(|id| s.peer_registry.state(id) == PeerState::Verified, now);
+                let scores = s.reputation.snapshot_scores_for(&ph);
+                (
+                    ph,
+                    rp,
+                    af,
+                    scores,
+                    s.gossip_config.k_neighbors,
+                    s.estimated_network_size,
+                )
+            };
+            if routable_peers.is_empty() {
+                continue;
+            }
+
+            let fan = dynamic_fan_out(net_size, RANDOM_FAN_OUT, RANDOM_FAN_OUT * 3);
+            let mut per_peer: HashMap<usize, Vec<Arc<Vec<u8>>>> = HashMap::new();
+            for pms in &manifests {
+                let dht_key = pms.manifest.dht_key();
+                let bytes = match PulseMessage::ProgramManifestStore(pms.clone()).to_bytes() {
+                    Ok(b) => Arc::new(b),
+                    Err(e) => {
+                        warn!(error = %e, "serialize ProgramManifestStore failed");
+                        continue;
+                    }
+                };
+                let indices = compute_gossip_targets_scored(
+                    &dht_key,
+                    &peer_hashes,
+                    &peer_scores,
+                    &age_factors,
+                    k,
+                    fan,
+                    routable_peers.len(),
+                );
+                for idx in indices {
+                    per_peer.entry(idx).or_default().push(Arc::clone(&bytes));
+                }
+            }
+            batch_forward_bytes_to_peers(&program_manifest_drain_node, &routable_peers, per_peer)
+                .await;
+            info!(count = manifests.len(), "program manifest store batch forwarded");
+        }
+    });
+
+    // ── Compute receipt store drain task ────────────────────────────
+    let compute_receipt_drain_state = state.clone();
+    let compute_receipt_drain_node = node.clone();
+    let compute_receipt_text_dir = receipt_text_state_dir.clone();
+    tokio::spawn(async move {
+        while let Some(first) = compute_receipt_rx.recv().await {
+            let mut receipts = vec![first];
+            while let Ok(item) = compute_receipt_rx.try_recv() {
+                receipts.push(item);
+            }
+
+            let (peer_hashes, routable_peers, age_factors, peer_scores, k, net_size) = {
+                let s = compute_receipt_drain_state.lock().unwrap();
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let (ph, rp, af) = s
+                    .routing_table
+                    .routable_peer_vecs(|id| s.peer_registry.state(id) == PeerState::Verified, now);
+                let scores = s.reputation.snapshot_scores_for(&ph);
+                (
+                    ph,
+                    rp,
+                    af,
+                    scores,
+                    s.gossip_config.k_neighbors,
+                    s.estimated_network_size,
+                )
+            };
+            if routable_peers.is_empty() {
+                continue;
+            }
+
+            let fan = dynamic_fan_out(net_size, RANDOM_FAN_OUT, RANDOM_FAN_OUT * 3);
+            let mut per_peer: HashMap<usize, Vec<Arc<Vec<u8>>>> = HashMap::new();
+            for crs in &receipts {
+                mirror_compute_receipt_text(&compute_receipt_text_dir, &crs.receipt);
+                let bytes = match PulseMessage::ComputeReceiptStore(crs.clone()).to_bytes() {
+                    Ok(b) => Arc::new(b),
+                    Err(e) => {
+                        warn!(error = %e, "serialize ComputeReceiptStore failed");
+                        continue;
+                    }
+                };
+                let indices = compute_gossip_targets_scored(
+                    &crs.receipt.receipt_id,
+                    &peer_hashes,
+                    &peer_scores,
+                    &age_factors,
+                    k,
+                    fan,
+                    routable_peers.len(),
+                );
+                for idx in indices {
+                    per_peer.entry(idx).or_default().push(Arc::clone(&bytes));
+                }
+            }
+            batch_forward_bytes_to_peers(&compute_receipt_drain_node, &routable_peers, per_peer)
+                .await;
+            info!(count = receipts.len(), "compute receipt batch forwarded");
         }
     });
 
@@ -3439,6 +4056,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
     let hs_node = node.clone();
     let hs_state = state.clone();
     let hs_ban = banishment.clone();
+    let hs_receipt_text_state_dir = receipt_text_state_dir.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
         loop {
@@ -3509,7 +4127,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     };
 
                     if verified {
-                        request_dht_seed_catchup(&hs_node, &target, &hs_state).await;
+                        request_dht_seed_catchup(&hs_node, &target, &hs_state, &hs_receipt_text_state_dir).await;
                         refresh_mailbox_forward_subscriptions(&hs_node, &hs_state).await;
                     }
                 }
@@ -3694,6 +4312,9 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
     let st = state.clone();
     let ban_ref = banishment.clone();
     let h_manifest_tx = manifest_tx.clone();
+    let h_program_tx = program_tx.clone();
+    let h_program_manifest_tx = program_manifest_tx.clone();
+    let h_compute_receipt_tx = compute_receipt_tx.clone();
     let h_tag_store_tx = tag_store_tx.clone();
     let h_tag_confirm_tx = tag_confirm_tx.clone();
     let h_og_tx = og_tx.clone();
@@ -3743,7 +4364,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 let hmac = compute_handshake_hmac(&PROTOCOL_VERSION_HASH, &hc.nonce);
                 // Compute Argon2id PoW over (our node_id, nonce) to prove we invested
                 // real resources. This makes Sybil node creation expensive.
-                let pow_hash = compute_handshake_pow(&peer_id, &hc.nonce);
+                let pow_hash = compute_handshake_pow(&state.node_id, &hc.nonce);
                 return Some(PulseMessage::HandshakeResponse(HandshakeResponse {
                     hmac,
                     pow_hash,
@@ -3822,6 +4443,9 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
             &msg,
             PulseMessage::PeerExchange(_)
                 | PulseMessage::ManifestStore(_)
+                | PulseMessage::ProgramStore(_)
+                | PulseMessage::ProgramManifestStore(_)
+                | PulseMessage::ComputeReceiptStore(_)
                 | PulseMessage::OwnershipGenesis(_)
                 | PulseMessage::OwnershipClaim(_)
                 | PulseMessage::ReforgeAttestation(_)
@@ -4273,6 +4897,11 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     .min(MAX_DHT_SEED_OWNERSHIP_RECORDS);
                 let max_consumed_records = usize::from(req.max_consumed_records)
                     .min(MAX_DHT_SEED_CONSUMED_RECORDS);
+                let max_programs = usize::from(req.max_programs).min(MAX_DHT_SEED_PROGRAMS);
+                let max_program_manifests = usize::from(req.max_program_manifests)
+                    .min(MAX_DHT_SEED_PROGRAM_MANIFESTS);
+                let max_compute_receipts = usize::from(req.max_compute_receipts)
+                    .min(MAX_DHT_SEED_COMPUTE_RECEIPTS);
 
                 let tags: Vec<DhtSeedTagRecord> = state
                     .tag_dht
@@ -4372,12 +5001,79 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     .map(|(mint_id, record)| dht_seed_consumed_from_record(mint_id, &record))
                     .collect();
 
+                let mut programs = state.compute_dht.all_programs();
+                programs.sort_by_key(|(prog_id, _)| *prog_id.as_bytes());
+                let programs: Vec<DhtSeedProgramRecord> = programs
+                    .into_iter()
+                    .filter(|(prog_id, _)| {
+                        dht_seed_cursor_allows_key(prog_id.as_bytes(), req.after_program_id)
+                    })
+                    .filter(|(prog_id, _)| {
+                        node_should_store_seeded_key(
+                            prog_id.as_bytes(),
+                            &req.requester_node_id,
+                            &state.node_id,
+                            &peer_ids,
+                            repl,
+                        )
+                    })
+                    .take(max_programs)
+                    .map(|(prog_id, program)| dht_seed_program_from_record(prog_id, program))
+                    .collect();
+
+                let mut program_manifests = state.compute_dht.all_manifests();
+                program_manifests.sort_by_key(|(dht_key, _)| *dht_key);
+                let program_manifests: Vec<DhtSeedProgramManifestRecord> = program_manifests
+                    .into_iter()
+                    .filter(|(dht_key, _)| {
+                        dht_seed_cursor_allows_key(dht_key, req.after_program_manifest_key)
+                    })
+                    .filter(|(dht_key, _)| {
+                        node_should_store_seeded_key(
+                            dht_key,
+                            &req.requester_node_id,
+                            &state.node_id,
+                            &peer_ids,
+                            repl,
+                        )
+                    })
+                    .take(max_program_manifests)
+                    .map(|(dht_key, manifest)| {
+                        dht_seed_program_manifest_from_record(dht_key, manifest)
+                    })
+                    .collect();
+
+                let mut compute_receipts = state.compute_dht.all_receipts();
+                compute_receipts.sort_by_key(|(receipt_id, _)| *receipt_id);
+                let compute_receipts: Vec<DhtSeedComputeReceiptRecord> = compute_receipts
+                    .into_iter()
+                    .filter(|(receipt_id, _)| {
+                        dht_seed_cursor_allows_key(receipt_id, req.after_compute_receipt_id)
+                    })
+                    .filter(|(receipt_id, _)| {
+                        node_should_store_seeded_key(
+                            receipt_id,
+                            &req.requester_node_id,
+                            &state.node_id,
+                            &peer_ids,
+                            repl,
+                        )
+                    })
+                    .take(max_compute_receipts)
+                    .map(|(receipt_id, receipt)| {
+                        dht_seed_compute_receipt_from_record(receipt_id, receipt)
+                    })
+                    .collect();
+
                 info!(
                     %peer,
                     tags = tags.len(),
                     manifests = manifests.len(),
                     ownership_records = ownership_records.len(),
                     consumed_records = consumed_records.len(),
+                    programs = programs.len(),
+                    program_manifests = program_manifests.len(),
+                    compute_receipts = compute_receipts.len(),
                     "serving DHT seed shard sync"
                 );
                 Some(PulseMessage::DhtSeedResponse(DhtSeedResponse {
@@ -4386,10 +5082,115 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     manifests,
                     ownership_records,
                     consumed_records,
+                    programs,
+                    program_manifests,
+                    compute_receipts,
                 }))
             }
 
             PulseMessage::DhtSeedResponse(_) => None,
+
+            PulseMessage::ProgramStore(ps) => {
+                let prog_id = ps.program.prog_id();
+                let peer_ids: Vec<[u8; 32]> = state.routing_table.routable_peers(|_| true)
+                    .iter().map(|p| p.id_hash).collect();
+                let repl = dht_replication_factor(state.estimated_network_size);
+                if state.registry.should_store(prog_id.as_bytes(), &peer_ids, repl) {
+                    let _ = state.compute_dht.store_program(ps.program.clone());
+                }
+                if ps.hops_remaining > 0 {
+                    let mut fwd = ps.clone();
+                    fwd.hops_remaining -= 1;
+                    let _ = h_program_tx.send(fwd);
+                }
+                None
+            }
+
+            PulseMessage::ProgramFetch(ProgramFetch { prog_id }) => {
+                Some(PulseMessage::ProgramFetchResponse(ProgramFetchResponse {
+                    program: state.compute_dht.fetch_program(prog_id).cloned(),
+                }))
+            }
+
+            PulseMessage::ProgramFetchResponse(_) => None,
+
+            PulseMessage::ProgramManifestStore(pms) => {
+                let dht_key = pms.manifest.dht_key();
+                let peer_ids: Vec<[u8; 32]> = state.routing_table.routable_peers(|_| true)
+                    .iter().map(|p| p.id_hash).collect();
+                let repl = dht_replication_factor(state.estimated_network_size);
+                if state.registry.should_store(&dht_key, &peer_ids, repl) {
+                    let _ = state.compute_dht.store_manifest(pms.manifest.clone());
+                }
+                if pms.hops_remaining > 0 {
+                    let mut fwd = pms.clone();
+                    fwd.hops_remaining -= 1;
+                    let _ = h_program_manifest_tx.send(fwd);
+                }
+                None
+            }
+
+            PulseMessage::ProgramManifestResolve(ProgramManifestResolve { name }) => {
+                Some(PulseMessage::ProgramManifestResolveResponse(
+                    ProgramManifestResolveResponse {
+                        manifest: state.compute_dht.resolve_manifest(&name).cloned(),
+                    },
+                ))
+            }
+
+            PulseMessage::ProgramManifestResolveResponse(_) => None,
+
+            PulseMessage::ComputeJobRequest(req) => Some(PulseMessage::ComputeJobResult(
+                vess_protocol::ComputeJobResult {
+                    job_id: req.job_id,
+                    accepted: false,
+                    output_bytes: Vec::new(),
+                    receipt: None,
+                    error: Some(
+                        "delegated compute execution is not implemented on artery nodes yet"
+                            .to_string(),
+                    ),
+                },
+            )),
+
+            PulseMessage::ComputeJobResult(_) => None,
+
+            PulseMessage::ComputeReceiptStore(crs) => {
+                let peer_ids: Vec<[u8; 32]> = state.routing_table.routable_peers(|_| true)
+                    .iter().map(|p| p.id_hash).collect();
+                let repl = dht_replication_factor(state.estimated_network_size);
+                if state.registry.should_store(&crs.receipt.receipt_id, &peer_ids, repl) {
+                    if state.compute_dht.store_receipt(crs.receipt.clone()).is_ok() {
+                        mirror_compute_receipt_text(&receipt_text_state_dir, &crs.receipt);
+                    }
+                }
+                if crs.hops_remaining > 0 {
+                    let mut fwd = crs.clone();
+                    fwd.hops_remaining -= 1;
+                    let _ = h_compute_receipt_tx.send(fwd);
+                }
+                None
+            }
+
+            PulseMessage::ComputeReceiptFetch(ComputeReceiptFetch { receipt_id }) => {
+                Some(PulseMessage::ComputeReceiptFetchResponse(
+                    ComputeReceiptFetchResponse {
+                        receipt: state.compute_dht.fetch_receipt(&receipt_id).cloned(),
+                    },
+                ))
+            }
+
+            PulseMessage::ComputeReceiptFetchResponse(_) => None,
+
+            PulseMessage::ProgramReceiptList(ProgramReceiptList { prog_id }) => {
+                Some(PulseMessage::ProgramReceiptListResponse(
+                    ProgramReceiptListResponse {
+                        receipt_ids: state.compute_dht.receipts_for_program(prog_id),
+                    },
+                ))
+            }
+
+            PulseMessage::ProgramReceiptListResponse(_) => None,
 
             PulseMessage::FindNode(fn_req) => {
                 // Kademlia FIND_NODE: return K-closest peers to the target.
@@ -5168,9 +5969,9 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 }
 
                 // 3. Verify owner_vk_hash matches the claimed verification key.
-                let claimed_vk_hash = vess_foundry::spend_auth::vk_hash(&og.owner_vk);
-                if claimed_vk_hash != og.owner_vk_hash {
-                    warn!("ownership genesis: vk_hash mismatch — banishing peer");
+                let owner_commitment = ownership_genesis_owner_commitment(&og);
+                if owner_commitment != og.owner_vk_hash {
+                    warn!("ownership genesis: owner commitment mismatch — banishing peer");
                     state.peer_registry.mark_banished(peer_id);
                     ban_ref.banish(peer_id);
                     return None;
@@ -5188,7 +5989,8 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 }
 
                 // 5. Verify genesis chain_tip.
-                let expected_tip = vess_foundry::genesis_chain_tip(&og.mint_id, &og.owner_vk_hash);
+                let expected_tip =
+                    vess_foundry::genesis_chain_tip_with_commitment(&og.mint_id, &owner_commitment);
                 if expected_tip != og.chain_tip {
                     warn!("ownership genesis: chain_tip mismatch — banishing peer");
                     state.peer_registry.mark_banished(peer_id);
@@ -5210,6 +6012,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                         chain_tip: og.chain_tip,
                         current_owner_vk_hash: og.owner_vk_hash,
                         current_owner_vk: og.owner_vk.clone(),
+                        current_owner_program: og.program_owner.clone(),
                         denomination_value: og.denomination_value,
                         updated_at: now,
                         proof_hash,
@@ -5221,6 +6024,13 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                         encrypted_bill: vec![],
                     });
                     info!("ownership genesis stored for mint_id {:?}", &og.mint_id[..4]);
+                }
+                if let Some(program_owner) = &og.program_owner {
+                    note_program_bill_activity(
+                        &mut state,
+                        program_owner.controller.prog_id,
+                        now_ts,
+                    );
                 }
 
                 // 7. Forward to K-nearest peers if hops remain.
@@ -5258,69 +6068,125 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 // DHT node), we still validate and forward.
                 let record_opt = state.registry.get(&oc.mint_id).cloned();
 
-                // 2. Verify prev_owner_vk hashes to the expected current_owner_vk_hash
-                // (only if we hold the record locally). A mismatch may indicate
-                // a competing claim (same previous owner, record already updated)
-                // rather than a malicious claim — so we don't banish here.
-                // The conflict resolution in step 7 handles it.
-                if let Some(ref record) = record_opt {
-                    let prev_vk_hash = vess_foundry::spend_auth::vk_hash(&oc.prev_owner_vk);
-                    if prev_vk_hash != record.current_owner_vk_hash
-                        && record.prev_claim_vk_hash != Some(prev_vk_hash)
-                    {
-                        // prev_owner doesn't match current or previous owner — truly invalid.
-                        warn!("ownership claim: prev_owner_vk doesn't match current or previous owner — banishing");
-                        state.peer_registry.mark_banished(peer_id);
-                        ban_ref.banish(peer_id);
-                        return None;
-                    }
-                }
-
-                // 3. Verify transfer signature (can be checked even without the local record).
-                let transfer_msg = vess_foundry::spend_auth::transfer_message(
-                    &oc.mint_id,
-                    &oc.stealth_id,
-                    oc.timestamp,
-                );
-                match vess_foundry::spend_auth::verify_spend(
-                    &oc.prev_owner_vk,
-                    &transfer_msg,
-                    &oc.transfer_sig,
-                ) {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        warn!("ownership claim: invalid transfer signature — banishing");
-                        state.peer_registry.mark_banished(peer_id);
-                        ban_ref.banish(peer_id);
-                        return None;
-                    }
-                    Err(e) => {
-                        warn!("ownership claim: signature error: {e} — banishing");
-                        state.peer_registry.mark_banished(peer_id);
-                        ban_ref.banish(peer_id);
-                        return None;
-                    }
-                }
-
-                // 4. Verify new_owner_vk_hash matches new_owner_vk.
-                let computed_new_hash = vess_foundry::spend_auth::vk_hash(&oc.new_owner_vk);
-                if computed_new_hash != oc.new_owner_vk_hash {
-                    warn!("ownership claim: new_owner_vk_hash mismatch — banishing");
+                let Some(prev_owner_commitment) = ownership_claim_prev_owner_commitment(&oc) else {
+                    warn!("ownership claim: missing previous owner authorization path — banishing");
+                    state.peer_registry.mark_banished(peer_id);
+                    ban_ref.banish(peer_id);
+                    return None;
+                };
+                let Some(new_owner_commitment) = ownership_claim_new_owner_commitment(&oc) else {
+                    warn!("ownership claim: missing new owner authorization path — banishing");
+                    state.peer_registry.mark_banished(peer_id);
+                    ban_ref.banish(peer_id);
+                    return None;
+                };
+                if new_owner_commitment != oc.new_owner_vk_hash {
+                    warn!("ownership claim: new owner commitment mismatch — banishing");
                     state.peer_registry.mark_banished(peer_id);
                     ban_ref.banish(peer_id);
                     return None;
                 }
 
+                if let Some(ref record) = record_opt {
+                    if prev_owner_commitment != record.current_owner_vk_hash
+                        && record.prev_claim_vk_hash != Some(prev_owner_commitment)
+                    {
+                        warn!("ownership claim: previous owner commitment doesn't match current or previous owner — banishing");
+                        state.peer_registry.mark_banished(peer_id);
+                        ban_ref.banish(peer_id);
+                        return None;
+                    }
+                    if let Some(program_owner) = &record.current_owner_program {
+                        if prev_owner_commitment == record.current_owner_vk_hash
+                            && oc.prev_owner_program.as_ref() != Some(program_owner)
+                        {
+                            warn!("ownership claim: previous program owner mismatch — banishing");
+                            state.peer_registry.mark_banished(peer_id);
+                            ban_ref.banish(peer_id);
+                            return None;
+                        }
+                    }
+                }
+
+                let witness_hash = if let Some(witness) = &oc.program_spend_witness {
+                    let Some(prev_program) = oc.prev_owner_program.as_ref() else {
+                        warn!("ownership claim: program witness missing prev_owner_program — banishing");
+                        state.peer_registry.mark_banished(peer_id);
+                        ban_ref.banish(peer_id);
+                        return None;
+                    };
+                    if witness.receipt.prog_id != prev_program.controller.prog_id {
+                        warn!("ownership claim: program witness receipt targets wrong program — banishing");
+                        state.peer_registry.mark_banished(peer_id);
+                        ban_ref.banish(peer_id);
+                        return None;
+                    }
+                    if !witness.authorized_mint_ids.contains(&oc.mint_id) {
+                        warn!("ownership claim: program witness does not authorize mint_id — banishing");
+                        state.peer_registry.mark_banished(peer_id);
+                        ban_ref.banish(peer_id);
+                        return None;
+                    }
+                    if witness.next_owner_commitment != oc.new_owner_vk_hash {
+                        warn!("ownership claim: program witness next owner mismatch — banishing");
+                        state.peer_registry.mark_banished(peer_id);
+                        ban_ref.banish(peer_id);
+                        return None;
+                    }
+                    if let Some(proof) = &witness.receipt.proof {
+                        if proof.proof_hash() != witness.receipt.proof_hash {
+                            warn!("ownership claim: program witness proof hash mismatch — banishing");
+                            state.peer_registry.mark_banished(peer_id);
+                            ban_ref.banish(peer_id);
+                            return None;
+                        }
+                    }
+                    if let Some(program) = state.compute_dht.fetch_program(witness.receipt.prog_id) {
+                        if let Err(error) = witness.validates_condition(prev_program, &program.definition)
+                        {
+                            warn!(error = %error, "ownership claim: invalid program witness — banishing");
+                            state.peer_registry.mark_banished(peer_id);
+                            ban_ref.banish(peer_id);
+                            return None;
+                        }
+                    }
+                    witness.witness_hash()
+                } else {
+                    let transfer_msg = vess_foundry::spend_auth::transfer_message(
+                        &oc.mint_id,
+                        &oc.stealth_id,
+                        oc.timestamp,
+                    );
+                    match vess_foundry::spend_auth::verify_spend(
+                        &oc.prev_owner_vk,
+                        &transfer_msg,
+                        &oc.transfer_sig,
+                    ) {
+                        Ok(true) => *blake3::hash(&oc.transfer_sig).as_bytes(),
+                        Ok(false) => {
+                            warn!("ownership claim: invalid transfer signature — banishing");
+                            state.peer_registry.mark_banished(peer_id);
+                            ban_ref.banish(peer_id);
+                            return None;
+                        }
+                        Err(e) => {
+                            warn!("ownership claim: signature error: {e} — banishing");
+                            state.peer_registry.mark_banished(peer_id);
+                            ban_ref.banish(peer_id);
+                            return None;
+                        }
+                    }
+                };
+
                 // 5. Verify the claimed new_chain_tip (only if we hold the record
                 //    AND the claim is from the current owner — skip for competing
                 //    claims where the record was already updated by a rival).
                 if let Some(ref record) = record_opt {
-                    let prev_vk_hash = vess_foundry::spend_auth::vk_hash(&oc.prev_owner_vk);
-                    if prev_vk_hash == record.current_owner_vk_hash {
-                        let expected_tip = vess_foundry::advance_chain_tip(
+                    if prev_owner_commitment == record.current_owner_vk_hash {
+                        let expected_tip = vess_foundry::advance_chain_tip_with_hash(
                             &record.chain_tip,
                             &oc.new_owner_vk_hash,
-                            &oc.transfer_sig,
+                            &witness_hash,
                         );
                         if expected_tip != oc.new_chain_tip {
                             warn!("ownership claim: chain_tip mismatch — banishing");
@@ -5329,7 +6195,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                             return None;
                         }
                     }
-                    // For competing claims (prev_vk_hash == prev_claim_vk_hash),
+                    // For competing claims (prev_owner_commitment == prev_claim_vk_hash),
                     // chain_tip verification is deferred to conflict resolution.
                 }
 
@@ -5348,35 +6214,13 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 //    - At equal depth, lowest claim_hash wins.
                 //    All K replicas converge on the same winner independently.
                 if record_opt.is_some() {
-                    let claim_hash = {
-                        let mut h = blake3::Hasher::new();
-                        h.update(b"vess-claim-hash-v1");
-                        h.update(&oc.mint_id);
-                        // L1: bind the previous owner vk_hash so an attacker
-                        // cannot grind claim_hashes across different candidate
-                        // predecessors for the same (mint_id, timestamp-bucket)
-                        // — any change to prev_owner_vk produces a different
-                        // claim_hash, and transfer_sig already authenticates
-                        // prev_owner_vk. Defense-in-depth alongside the
-                        // prev_claim_vk_hash gate.
-                        h.update(&vess_foundry::spend_auth::vk_hash(&oc.prev_owner_vk));
-                        h.update(&oc.new_owner_vk_hash);
-                        h.update(&oc.transfer_sig);
-                        // Include the transfer timestamp so pre-ground
-                        // claim hashes expire with the 5-minute window.
-                        // M4: bucket to 60-second resolution to reduce grinding
-                        // surface without breaking legitimate use.
-                        h.update(&(oc.timestamp / 60).to_le_bytes());
-                        *h.finalize().as_bytes()
-                    };
+                    let claim_hash = ownership_claim_hash(&oc);
 
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs();
                     if let Some(rec) = state.registry.get_mut(&oc.mint_id) {
-                        let prev_vk_hash = vess_foundry::spend_auth::vk_hash(&oc.prev_owner_vk);
-
                         // Validate chain_depth: must be exactly one more than the
                         // current record. This prevents depth-inflation attacks where
                         // an attacker claims an arbitrary depth to override legitimate
@@ -5385,7 +6229,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                             // Exception: competing claim at the same depth is allowed
                             // (two recipients of a double-spend racing for the same slot).
                             if oc.chain_depth != rec.chain_depth
-                                || vess_foundry::spend_auth::vk_hash(&oc.prev_owner_vk) == rec.current_owner_vk_hash
+                                || prev_owner_commitment == rec.current_owner_vk_hash
                             {
                                 warn!("ownership claim: chain_depth {} is not current+1 ({}) — rejecting",
                                       oc.chain_depth, rec.chain_depth);
@@ -5395,12 +6239,13 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
 
                         if oc.chain_depth == rec.chain_depth + 1 {
                             // Normal transfer: depth is exactly current + 1.
-                            rec.prev_claim_vk_hash = Some(vess_foundry::spend_auth::vk_hash(&oc.prev_owner_vk));
+                            rec.prev_claim_vk_hash = Some(prev_owner_commitment);
                             rec.claim_hash = Some(claim_hash);
                             rec.chain_depth = oc.chain_depth;
                             rec.chain_tip = oc.new_chain_tip;
                             rec.current_owner_vk_hash = oc.new_owner_vk_hash;
                             rec.current_owner_vk = oc.new_owner_vk.clone();
+                            rec.current_owner_program = oc.new_owner_program.clone();
                             rec.updated_at = now;
                             rec.encrypted_bill = oc.encrypted_bill.clone();
                             info!("ownership transferred (depth {}) for mint_id {:?}", oc.chain_depth, &oc.mint_id[..4]);
@@ -5427,12 +6272,19 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                                 }
                             }
                             state.finalize_outbound_mint_if_complete(&oc.mint_id);
+                            if let Some(new_owner_program) = &oc.new_owner_program {
+                                note_program_bill_activity(
+                                    &mut state,
+                                    new_owner_program.controller.prog_id,
+                                    oc.timestamp,
+                                );
+                            }
                         } else if oc.chain_depth == rec.chain_depth {
                             // Same depth — check if this is a competing claim
                             // for the same transfer slot.
-                            if prev_vk_hash != rec.current_owner_vk_hash {
+                            if prev_owner_commitment != rec.current_owner_vk_hash {
                                 // Competing claim at same depth — lowest hash wins.
-                                if rec.prev_claim_vk_hash == Some(prev_vk_hash) {
+                                if rec.prev_claim_vk_hash == Some(prev_owner_commitment) {
                                     // Verify chain_tip for the competing claim:
                                     // we need the *previous* chain_tip (before the
                                     // first claim updated it). Since both claims
@@ -5456,9 +6308,17 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                                             rec.chain_tip = oc.new_chain_tip;
                                             rec.current_owner_vk_hash = oc.new_owner_vk_hash;
                                             rec.current_owner_vk = oc.new_owner_vk.clone();
+                                            rec.current_owner_program = oc.new_owner_program.clone();
                                             rec.updated_at = now;
                                             rec.claim_hash = Some(claim_hash);
                                             rec.encrypted_bill = oc.encrypted_bill.clone();
+                                            if let Some(new_owner_program) = &oc.new_owner_program {
+                                                note_program_bill_activity(
+                                                    &mut state,
+                                                    new_owner_program.controller.prog_id,
+                                                    oc.timestamp,
+                                                );
+                                            }
                                             info!("ownership conflict at depth {} resolved (lower hash wins) for mint_id {:?}", oc.chain_depth, &oc.mint_id[..4]);
                                         } else {
                                             info!("ownership conflict at depth {}: existing claim has lower hash for mint_id {:?}", oc.chain_depth, &oc.mint_id[..4]);

@@ -321,6 +321,7 @@ pub struct BitcoinConfig {
     pub user_agent: String,
     pub vess_seed_port: u16,
     pub vess_seed_scan_interval: Duration,
+    pub allow_private_vess_seed_contacts: bool,
 }
 
 impl Default for BitcoinConfig {
@@ -339,6 +340,7 @@ impl Default for BitcoinConfig {
             user_agent: "/vess-bitcoin:0.1.0/".to_string(),
             vess_seed_port: DEFAULT_VESS_SEED_PORT,
             vess_seed_scan_interval: DEFAULT_VESS_SEED_SCAN_INTERVAL,
+            allow_private_vess_seed_contacts: false,
         }
     }
 }
@@ -355,6 +357,7 @@ pub struct BitcoinLightClient {
     command_tx: mpsc::UnboundedSender<ClientCommand>,
     incoming_txs: broadcast::Sender<ObservedTransaction>,
     connected_peers: Arc<AtomicUsize>,
+    active_peers: Arc<Mutex<HashSet<SocketAddr>>>,
     cache: Arc<Mutex<HashMap<Txid, Transaction>>>,
     block_cache: Arc<Mutex<HashMap<BlockHash, Block>>>,
     header_chain: Arc<Mutex<HeaderChain>>,
@@ -363,6 +366,7 @@ pub struct BitcoinLightClient {
     local_vess_node: Arc<Mutex<Option<VessSeedNode>>>,
     vess_probe_state: Arc<Mutex<HashMap<SocketAddr, VessSeedProbeState>>>,
     vess_seed_port: u16,
+    allow_private_vess_seed_contacts: bool,
 }
 
 enum ClientCommand {
@@ -462,6 +466,7 @@ struct SharedState {
     header_chain: Arc<Mutex<HeaderChain>>,
     incoming_txs: broadcast::Sender<ObservedTransaction>,
     connected_peers: Arc<AtomicUsize>,
+    active_peers: Arc<Mutex<HashSet<SocketAddr>>>,
     known_bitcoin_peers: Arc<Mutex<HashSet<SocketAddr>>>,
     local_vess_node: Arc<Mutex<Option<VessSeedNode>>>,
 }
@@ -471,6 +476,7 @@ impl BitcoinLightClient {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (incoming_txs, _) = broadcast::channel(256);
         let connected_peers = Arc::new(AtomicUsize::new(0));
+        let active_peers = Arc::new(Mutex::new(HashSet::new()));
         let cache = Arc::new(Mutex::new(HashMap::new()));
         let block_cache = Arc::new(Mutex::new(HashMap::new()));
         let header_chain = Arc::new(Mutex::new(HeaderChain::new(config.network)));
@@ -484,12 +490,14 @@ impl BitcoinLightClient {
             header_chain: header_chain.clone(),
             incoming_txs: incoming_txs.clone(),
             connected_peers: connected_peers.clone(),
+            active_peers: active_peers.clone(),
             known_bitcoin_peers: Arc::new(Mutex::new(HashSet::new())),
             local_vess_node: Arc::new(Mutex::new(None)),
         });
 
         let resolved_peers = resolve_peers(&config).await?;
         let vess_seed_port = config.vess_seed_port;
+        let allow_private_vess_seed_contacts = config.allow_private_vess_seed_contacts;
         {
             let mut known_peers = shared.known_bitcoin_peers.lock().unwrap();
             known_peers.extend(resolved_peers.iter().copied());
@@ -500,6 +508,7 @@ impl BitcoinLightClient {
             config.vess_seed_port,
             known_vess_nodes.clone(),
             local_vess_node.clone(),
+            allow_private_vess_seed_contacts,
         ));
         tokio::spawn(run_vess_seed_scanner(
             config.vess_seed_port,
@@ -508,6 +517,7 @@ impl BitcoinLightClient {
             known_vess_nodes.clone(),
             local_vess_node.clone(),
             vess_probe_state.clone(),
+            allow_private_vess_seed_contacts,
         ));
         tokio::spawn(run_manager(config, resolved_peers, command_rx, shared));
 
@@ -515,6 +525,7 @@ impl BitcoinLightClient {
             command_tx,
             incoming_txs,
             connected_peers,
+            active_peers,
             cache,
             block_cache,
             header_chain,
@@ -523,6 +534,7 @@ impl BitcoinLightClient {
             local_vess_node,
             vess_probe_state,
             vess_seed_port,
+            allow_private_vess_seed_contacts,
         })
     }
 
@@ -536,7 +548,7 @@ impl BitcoinLightClient {
             let mut local = self.local_vess_node.lock().unwrap();
             *local = Some(seed.clone());
         }
-        upsert_known_vess_node(&self.known_vess_nodes, seed);
+        upsert_known_vess_node(&self.known_vess_nodes, seed, true);
     }
 
     pub fn known_vess_nodes(&self) -> Vec<VessSeedNode> {
@@ -550,6 +562,7 @@ impl BitcoinLightClient {
             self.known_vess_nodes.clone(),
             self.local_vess_node.clone(),
             self.vess_probe_state.clone(),
+            self.allow_private_vess_seed_contacts,
         )
         .await;
         self.known_vess_nodes()
@@ -638,6 +651,12 @@ impl BitcoinLightClient {
         self.connected_peers.load(Ordering::Relaxed)
     }
 
+    pub fn active_peers(&self) -> Vec<SocketAddr> {
+        let mut peers: Vec<_> = self.active_peers.lock().unwrap().iter().copied().collect();
+        peers.sort_unstable();
+        peers
+    }
+
     pub async fn wait_for_peers(&self, min_peers: usize, timeout: Duration) -> usize {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
@@ -671,6 +690,7 @@ async fn run_vess_seed_listener(
     vess_seed_port: u16,
     known_vess_nodes: Arc<Mutex<HashMap<String, VessSeedNode>>>,
     local_vess_node: Arc<Mutex<Option<VessSeedNode>>>,
+    allow_private_vess_seed_contacts: bool,
 ) {
     let listener = match TcpListener::bind((Ipv4Addr::UNSPECIFIED, vess_seed_port)).await {
         Ok(listener) => listener,
@@ -689,8 +709,13 @@ async fn run_vess_seed_listener(
                 let known_vess_nodes = known_vess_nodes.clone();
                 let local_vess_node = local_vess_node.clone();
                 tokio::spawn(async move {
-                    if let Err(e) =
-                        handle_vess_seed_connection(stream, known_vess_nodes, local_vess_node).await
+                    if let Err(e) = handle_vess_seed_connection(
+                        stream,
+                        known_vess_nodes,
+                        local_vess_node,
+                        allow_private_vess_seed_contacts,
+                    )
+                    .await
                     {
                         warn!(peer = %peer, "Vess seed connection failed: {e}");
                     }
@@ -711,6 +736,7 @@ async fn run_vess_seed_scanner(
     known_vess_nodes: Arc<Mutex<HashMap<String, VessSeedNode>>>,
     local_vess_node: Arc<Mutex<Option<VessSeedNode>>>,
     vess_probe_state: Arc<Mutex<HashMap<SocketAddr, VessSeedProbeState>>>,
+    allow_private_vess_seed_contacts: bool,
 ) {
     let mut interval = tokio::time::interval(scan_interval);
     loop {
@@ -721,6 +747,7 @@ async fn run_vess_seed_scanner(
             known_vess_nodes.clone(),
             local_vess_node.clone(),
             vess_probe_state.clone(),
+            allow_private_vess_seed_contacts,
         )
         .await;
     }
@@ -785,6 +812,7 @@ async fn probe_vess_seed_candidates(
     known_vess_nodes: Arc<Mutex<HashMap<String, VessSeedNode>>>,
     local_vess_node: Arc<Mutex<Option<VessSeedNode>>>,
     vess_probe_state: Arc<Mutex<HashMap<SocketAddr, VessSeedProbeState>>>,
+    allow_private_vess_seed_contacts: bool,
 ) {
     let known_peers = known_bitcoin_peers.lock().unwrap().clone();
     let now = current_unix_timestamp();
@@ -831,9 +859,17 @@ async fn probe_vess_seed_candidates(
             Ok(response) if response.accepted => {
                 record_vess_seed_probe_success(&vess_probe_state, addr);
                 if let Some(node) = response.local_node {
-                    upsert_known_vess_node(&known_vess_nodes, node);
+                    upsert_known_vess_node(
+                        &known_vess_nodes,
+                        node,
+                        allow_private_vess_seed_contacts,
+                    );
                 }
-                merge_known_vess_nodes(&known_vess_nodes, response.known_nodes);
+                merge_known_vess_nodes(
+                    &known_vess_nodes,
+                    response.known_nodes,
+                    allow_private_vess_seed_contacts,
+                );
             }
             Ok(_) => {
                 record_vess_seed_probe_failure(&vess_probe_state, addr);
@@ -861,6 +897,7 @@ async fn handle_vess_seed_connection(
     mut stream: TokioTcpStream,
     known_vess_nodes: Arc<Mutex<HashMap<String, VessSeedNode>>>,
     local_vess_node: Arc<Mutex<Option<VessSeedNode>>>,
+    allow_private_vess_seed_contacts: bool,
 ) -> Result<()> {
     let request: VessSeedRequest = read_seed_message(&mut stream).await?;
     if request.version != VESS_SEED_PROTOCOL_VERSION {
@@ -875,9 +912,17 @@ async fn handle_vess_seed_connection(
     }
 
     if let Some(node) = request.requester_node {
-        upsert_known_vess_node(&known_vess_nodes, node);
+        upsert_known_vess_node(
+            &known_vess_nodes,
+            node,
+            allow_private_vess_seed_contacts,
+        );
     }
-    merge_known_vess_nodes(&known_vess_nodes, request.known_nodes);
+    merge_known_vess_nodes(
+        &known_vess_nodes,
+        request.known_nodes,
+        allow_private_vess_seed_contacts,
+    );
 
     let response = VessSeedResponse {
         version: VESS_SEED_PROTOCOL_VERSION,
@@ -963,22 +1008,24 @@ fn snapshot_known_vess_nodes(
 fn merge_known_vess_nodes(
     known_vess_nodes: &Arc<Mutex<HashMap<String, VessSeedNode>>>,
     nodes: Vec<VessSeedNode>,
+    allow_private_vess_seed_contacts: bool,
 ) {
     for node in nodes {
-        upsert_known_vess_node(known_vess_nodes, node);
+        upsert_known_vess_node(known_vess_nodes, node, allow_private_vess_seed_contacts);
     }
 }
 
 fn upsert_known_vess_node(
     known_vess_nodes: &Arc<Mutex<HashMap<String, VessSeedNode>>>,
     mut node: VessSeedNode,
+    allow_private_vess_seed_contacts: bool,
 ) {
     let node_id = node.node_id.trim();
     let contact = node.contact.trim();
     if node_id.is_empty() || contact.is_empty() {
         return;
     }
-    if !seed_contact_matches_node_id(node_id, contact) {
+    if !seed_contact_matches_node_id(node_id, contact, allow_private_vess_seed_contacts) {
         warn!(
             node_id,
             "skipping Vess seed node with invalid or mismatched mesh contact"
@@ -1005,11 +1052,15 @@ fn upsert_known_vess_node(
     }
 }
 
-fn seed_contact_matches_node_id(node_id: &str, contact: &str) -> bool {
+fn seed_contact_matches_node_id(
+    node_id: &str,
+    contact: &str,
+    allow_private_vess_seed_contacts: bool,
+) -> bool {
     let Ok(contact) = decode_mesh_contact_string(contact) else {
         return false;
     };
-    if validate_public_mesh_contact(&contact).is_err() {
+    if !allow_private_vess_seed_contacts && validate_public_mesh_contact(&contact).is_err() {
         return false;
     }
     contact
@@ -1342,7 +1393,11 @@ fn peer_worker(
 
     handshake(&mut stream, network, peer, user_agent)?;
     shared.known_bitcoin_peers.lock().unwrap().insert(peer);
-    let _peer_guard = ConnectedPeerGuard::new(shared.connected_peers.clone());
+    let _peer_guard = ConnectedPeerGuard::new(
+        shared.connected_peers.clone(),
+        shared.active_peers.clone(),
+        peer,
+    );
     info!(peer = %peer, "bitcoin peer connected");
     let _ = manager_event_tx.send(ManagerEvent::PeerConnected(peer));
 
@@ -1637,18 +1692,30 @@ fn send_message(
 
 struct ConnectedPeerGuard {
     connected_peers: Arc<AtomicUsize>,
+    active_peers: Arc<Mutex<HashSet<SocketAddr>>>,
+    peer: SocketAddr,
 }
 
 impl ConnectedPeerGuard {
-    fn new(connected_peers: Arc<AtomicUsize>) -> Self {
+    fn new(
+        connected_peers: Arc<AtomicUsize>,
+        active_peers: Arc<Mutex<HashSet<SocketAddr>>>,
+        peer: SocketAddr,
+    ) -> Self {
         connected_peers.fetch_add(1, Ordering::Relaxed);
-        Self { connected_peers }
+        active_peers.lock().unwrap().insert(peer);
+        Self {
+            connected_peers,
+            active_peers,
+            peer,
+        }
     }
 }
 
 impl Drop for ConnectedPeerGuard {
     fn drop(&mut self) {
         self.connected_peers.fetch_sub(1, Ordering::Relaxed);
+        self.active_peers.lock().unwrap().remove(&self.peer);
     }
 }
 
@@ -1689,10 +1756,11 @@ mod tests {
         upsert_known_vess_node(
             &known_vess_nodes,
             test_seed_node(1, "93.184.216.34:9001", 10),
+            false,
         );
         let newer = test_seed_node(2, "1.1.1.1:9002", 20);
         let newer_node_id = newer.node_id.clone();
-        upsert_known_vess_node(&known_vess_nodes, newer);
+        upsert_known_vess_node(&known_vess_nodes, newer, false);
 
         let snapshot = snapshot_known_vess_nodes(&known_vess_nodes, &local_vess_node);
         assert_eq!(snapshot.len(), 2);

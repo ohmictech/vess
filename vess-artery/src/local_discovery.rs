@@ -13,6 +13,9 @@ use vess_mesh::{
     MeshCarrierContact,
 };
 
+#[cfg(windows)]
+use ipconfig::{IfType, OperStatus};
+
 pub const LAN_DISCOVERY_PORT: u16 = 18348;
 const LOCAL_PEER_STALE_SECS: u64 = 120;
 const LAN_DISCOVERY_VERSION: u8 = 1;
@@ -137,6 +140,91 @@ fn contact_from_lan_source(
     source: SocketAddr,
 ) -> Result<MeshCarrierContact> {
     contact_with_ip(contact, source.ip())
+}
+
+fn ipv4_broadcast_addr(network: Ipv4Addr, prefix_len: u32) -> Option<Ipv4Addr> {
+    if !(1..=30).contains(&prefix_len) {
+        return None;
+    }
+    let mask = u32::MAX << (32 - prefix_len);
+    Some(Ipv4Addr::from(u32::from(network) | !mask))
+}
+
+#[cfg(windows)]
+fn lan_broadcast_targets() -> Vec<SocketAddr> {
+    let mut targets = HashSet::from([SocketAddr::V4(SocketAddrV4::new(
+        Ipv4Addr::BROADCAST,
+        LAN_DISCOVERY_PORT,
+    ))]);
+
+    if let Ok(adapters) = ipconfig::get_adapters() {
+        for adapter in adapters {
+            if adapter.oper_status() != OperStatus::IfOperStatusUp
+                || adapter.if_type() == IfType::SoftwareLoopback
+            {
+                continue;
+            }
+            for (network, prefix_len) in adapter.prefixes() {
+                let std::net::IpAddr::V4(network) = network else {
+                    continue;
+                };
+                if let Some(broadcast) = ipv4_broadcast_addr(*network, *prefix_len) {
+                    targets.insert(SocketAddr::V4(SocketAddrV4::new(
+                        broadcast,
+                        LAN_DISCOVERY_PORT,
+                    )));
+                }
+            }
+        }
+    }
+
+    let mut targets: Vec<_> = targets.into_iter().collect();
+    targets.sort_unstable();
+    targets
+}
+
+#[cfg(not(windows))]
+fn lan_broadcast_targets() -> Vec<SocketAddr> {
+    vec![SocketAddr::V4(SocketAddrV4::new(
+        Ipv4Addr::BROADCAST,
+        LAN_DISCOVERY_PORT,
+    ))]
+}
+
+fn lan_probe_targets() -> Vec<SocketAddr> {
+    let mut targets = lan_broadcast_targets();
+    let loopback = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, LAN_DISCOVERY_PORT));
+    if !targets.contains(&loopback) {
+        targets.push(loopback);
+    }
+    targets
+}
+
+async fn send_lan_payload(
+    socket: &UdpSocket,
+    payload: &[u8],
+    targets: &[SocketAddr],
+    context: &str,
+) -> Result<()> {
+    let mut sent_any = false;
+    let mut first_error = None;
+
+    for target in targets {
+        match socket.send_to(payload, *target).await {
+            Ok(_) => sent_any = true,
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(anyhow!("{context} to {target}: {error}"));
+                }
+            }
+        }
+    }
+
+    if sent_any {
+        Ok(())
+    } else {
+        Err(first_error.unwrap_or_else(|| anyhow!("{context}: no LAN discovery targets available")))
+    }
 }
 
 pub fn publish_local_contact(contact: &MeshCarrierContact) -> Result<()> {
@@ -281,28 +369,21 @@ pub fn parse_lan_discovery_message(
 
 pub async fn send_lan_announcement(socket: &UdpSocket, contact: &MeshCarrierContact) -> Result<()> {
     let payload = announcement_payload(contact)?;
-    socket
-        .send_to(
-            &payload,
-            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::BROADCAST, LAN_DISCOVERY_PORT)),
-        )
-        .await
-        .context("send Vess LAN discovery announcement")?;
+    let targets = lan_broadcast_targets();
+    send_lan_payload(
+        socket,
+        &payload,
+        &targets,
+        "send Vess LAN discovery announcement",
+    )
+    .await?;
     Ok(())
 }
 
 pub async fn send_lan_probe(socket: &UdpSocket) -> Result<()> {
     let payload = probe_payload()?;
-    let targets = [
-        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::BROADCAST, LAN_DISCOVERY_PORT)),
-        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, LAN_DISCOVERY_PORT)),
-    ];
-    for target in targets {
-        socket
-            .send_to(&payload, target)
-            .await
-            .with_context(|| format!("send Vess LAN discovery probe to {target}"))?;
-    }
+    let targets = lan_probe_targets();
+    send_lan_payload(&socket, &payload, &targets, "send Vess LAN discovery probe").await?;
     Ok(())
 }
 
@@ -367,4 +448,23 @@ pub async fn discover_lan_peer_contacts(
 
 pub fn log_publish_error(error: anyhow::Error) {
     warn!(%error, "failed to publish local Vess peer contact");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ipv4_broadcast_addr_uses_prefix_length() {
+        assert_eq!(
+            ipv4_broadcast_addr(Ipv4Addr::new(192, 168, 1, 0), 24),
+            Some(Ipv4Addr::new(192, 168, 1, 255))
+        );
+        assert_eq!(
+            ipv4_broadcast_addr(Ipv4Addr::new(10, 42, 0, 0), 16),
+            Some(Ipv4Addr::new(10, 42, 255, 255))
+        );
+        assert_eq!(ipv4_broadcast_addr(Ipv4Addr::new(192, 168, 1, 0), 31), None);
+        assert_eq!(ipv4_broadcast_addr(Ipv4Addr::new(192, 168, 1, 0), 32), None);
+    }
 }

@@ -13,8 +13,15 @@
 //! - [`MailboxCollect`] / [`MailboxSweep`] — Offline payment delivery.
 //! - [`RegistryQuery`] / [`RegistryQueryResponse`] — Ownership status lookup.
 //! - [`ManifestStore`] / [`ManifestRecover`] — Wallet recovery manifests.
+//! - Compute program / receipt records — programmable DHT-published compute.
 
 use serde::{Deserialize, Serialize};
+
+pub use vess_compute::{
+    ComputeJobRequest, ComputeJobResult, ComputeReceipt, ProgramAddress, ProgramDefinition,
+    ProgramId, ProgramManifest, ProgramName, ProgramOwnershipCondition,
+    ProgramSpendWitness, ProofSystem, StarkProofEnvelope, StoredProgram,
+};
 
 /// Bitcoin network identifier used by burn-backed bill genesis proofs.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -183,6 +190,45 @@ pub enum PulseMessage {
 
     /// Store an encrypted wallet manifest in the DHT for recovery.
     ManifestStore(ManifestStore),
+
+    /// Store an immutable compute program in the DHT.
+    ProgramStore(ProgramStore),
+
+    /// Fetch an immutable compute program by `prog_id`.
+    ProgramFetch(ProgramFetch),
+
+    /// Response to a [`ProgramFetch`] request.
+    ProgramFetchResponse(ProgramFetchResponse),
+
+    /// Store a mutable compute program manifest / name record in the DHT.
+    ProgramManifestStore(ProgramManifestStore),
+
+    /// Resolve a human-facing program name.
+    ProgramManifestResolve(ProgramManifestResolve),
+
+    /// Response to a [`ProgramManifestResolve`] request.
+    ProgramManifestResolveResponse(ProgramManifestResolveResponse),
+
+    /// Submit delegated compute work to a peer or worker.
+    ComputeJobRequest(ComputeJobRequest),
+
+    /// Response to a delegated compute request.
+    ComputeJobResult(ComputeJobResult),
+
+    /// Store a compute receipt in the DHT.
+    ComputeReceiptStore(ComputeReceiptStore),
+
+    /// Fetch a compute receipt by receipt ID.
+    ComputeReceiptFetch(ComputeReceiptFetch),
+
+    /// Response to a [`ComputeReceiptFetch`] request.
+    ComputeReceiptFetchResponse(ComputeReceiptFetchResponse),
+
+    /// List receipt IDs tied to one immutable program.
+    ProgramReceiptList(ProgramReceiptList),
+
+    /// Response to a [`ProgramReceiptList`] request.
+    ProgramReceiptListResponse(ProgramReceiptListResponse),
 
     /// Recover an encrypted wallet manifest from the DHT.
     ManifestRecover(ManifestRecover),
@@ -431,6 +477,66 @@ pub struct MailboxForwardAck {
     pub queued_forwarded: u32,
 }
 
+// ── Compute ─────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProgramStore {
+    pub program: StoredProgram,
+    pub hops_remaining: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProgramFetch {
+    pub prog_id: ProgramId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProgramFetchResponse {
+    pub program: Option<StoredProgram>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProgramManifestStore {
+    pub manifest: ProgramManifest,
+    pub hops_remaining: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProgramManifestResolve {
+    pub name: ProgramName,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProgramManifestResolveResponse {
+    pub manifest: Option<ProgramManifest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComputeReceiptStore {
+    pub receipt: ComputeReceipt,
+    pub hops_remaining: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComputeReceiptFetch {
+    pub receipt_id: [u8; 32],
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComputeReceiptFetchResponse {
+    pub receipt: Option<ComputeReceipt>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProgramReceiptList {
+    pub prog_id: ProgramId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProgramReceiptListResponse {
+    pub receipt_ids: Vec<[u8; 32]>,
+}
+
 // ── Registry Query ───────────────────────────────────────────────────
 
 /// Query whether specific mint_ids are active in the ownership registry.
@@ -494,6 +600,15 @@ pub struct DhtSeedRequest {
     /// Exclusive cursor for paginating consumed tombstones by mint_id.
     #[serde(default)]
     pub after_consumed_mint_id: Option<[u8; 32]>,
+    /// Exclusive cursor for paginating immutable compute programs by `prog_id`.
+    #[serde(default)]
+    pub after_program_id: Option<[u8; 32]>,
+    /// Exclusive cursor for paginating program manifests by alias DHT key.
+    #[serde(default)]
+    pub after_program_manifest_key: Option<[u8; 32]>,
+    /// Exclusive cursor for paginating compute receipts by receipt ID.
+    #[serde(default)]
+    pub after_compute_receipt_id: Option<[u8; 32]>,
     /// Maximum tag records to return.
     pub max_tags: u16,
     /// Maximum encrypted manifest records to return.
@@ -504,6 +619,15 @@ pub struct DhtSeedRequest {
     /// Maximum consumed-record tombstones to return.
     #[serde(default)]
     pub max_consumed_records: u16,
+    /// Maximum immutable compute programs to return.
+    #[serde(default)]
+    pub max_programs: u16,
+    /// Maximum mutable program manifests to return.
+    #[serde(default)]
+    pub max_program_manifests: u16,
+    /// Maximum compute receipts to return.
+    #[serde(default)]
+    pub max_compute_receipts: u16,
 }
 
 /// A tag DHT record transferred during seed sync.
@@ -541,6 +665,9 @@ pub struct DhtSeedOwnershipRecord {
     pub current_owner_vk_hash: [u8; 32],
     /// Full current owner verification key.
     pub current_owner_vk: Vec<u8>,
+    /// Optional program predicate that currently owns the bill.
+    #[serde(default)]
+    pub current_owner_program: Option<ProgramOwnershipCondition>,
     /// Denomination value for supply tracking.
     pub denomination_value: u64,
     /// Unix timestamp when this record was last updated.
@@ -584,6 +711,27 @@ pub struct DhtSeedConsumedRecord {
     pub digest: [u8; 32],
 }
 
+/// An immutable program record transferred during seed sync.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DhtSeedProgramRecord {
+    pub prog_id: ProgramId,
+    pub program: StoredProgram,
+}
+
+/// A program manifest record transferred during seed sync.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DhtSeedProgramManifestRecord {
+    pub dht_key: [u8; 32],
+    pub manifest: ProgramManifest,
+}
+
+/// A compute receipt record transferred during seed sync.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DhtSeedComputeReceiptRecord {
+    pub receipt_id: [u8; 32],
+    pub receipt: ComputeReceipt,
+}
+
 /// Initial DHT data returned by a seed/bootstrap peer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DhtSeedResponse {
@@ -599,6 +747,15 @@ pub struct DhtSeedResponse {
     /// Consumed-bill tombstones the requester should store.
     #[serde(default)]
     pub consumed_records: Vec<DhtSeedConsumedRecord>,
+    /// Immutable compute programs the requester should store.
+    #[serde(default)]
+    pub programs: Vec<DhtSeedProgramRecord>,
+    /// Program manifests the requester should store.
+    #[serde(default)]
+    pub program_manifests: Vec<DhtSeedProgramManifestRecord>,
+    /// Compute receipts the requester should store.
+    #[serde(default)]
+    pub compute_receipts: Vec<DhtSeedComputeReceiptRecord>,
 }
 
 // ── Kademlia FIND_NODE ───────────────────────────────────────────────
@@ -775,6 +932,9 @@ pub struct OwnershipGenesis {
     pub owner_vk_hash: [u8; 32],
     /// Full ML-DSA-65 verification key of the minter (for future transfer verification).
     pub owner_vk: Vec<u8>,
+    /// Optional program predicate that owns the bill from genesis.
+    #[serde(default)]
+    pub program_owner: Option<ProgramOwnershipCondition>,
     /// Denomination value for supply tracking.
     pub denomination_value: u64,
     /// Typed genesis proof for this bill.
@@ -800,7 +960,10 @@ pub struct OwnershipGenesis {
 ///
 /// The receiver broadcasts this to rotate ownership in the artery registry.
 /// The artery verifies the previous owner's transfer signature, computes
-/// the expected new chain tip, and updates the registry.
+/// the expected new chain tip, and updates the registry. For program-owned
+/// bills this is also the main proof-verification path: the claim carries
+/// `prev_owner_program` plus an optional `program_spend_witness`, and nodes
+/// verify that witness while distributing the claim.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OwnershipClaim {
     /// Permanent bill identity.
@@ -809,14 +972,23 @@ pub struct OwnershipClaim {
     pub stealth_id: [u8; 32],
     /// Full ML-DSA-65 verification key of the PREVIOUS owner.
     /// The artery checks `Blake3(prev_owner_vk) == stored current_owner_vk_hash`.
+    #[serde(default)]
     pub prev_owner_vk: Vec<u8>,
+    /// Optional program predicate that currently owns the bill.
+    #[serde(default)]
+    pub prev_owner_program: Option<ProgramOwnershipCondition>,
     /// Transfer authorization signature from the previous owner.
     /// Signs `transfer_message(mint_id, stealth_id, timestamp)`.
+    #[serde(default)]
     pub transfer_sig: Vec<u8>,
     /// Blake3 hash of the NEW owner's ML-DSA-65 verification key.
     pub new_owner_vk_hash: [u8; 32],
     /// Full ML-DSA-65 verification key of the new owner (stored for next transfer).
+    #[serde(default)]
     pub new_owner_vk: Vec<u8>,
+    /// Optional program predicate that becomes the new owner.
+    #[serde(default)]
+    pub new_owner_program: Option<ProgramOwnershipCondition>,
     /// Expected new chain tip: `Blake3(prev_chain_tip || new_owner_vk_hash || sig_hash)`.
     pub new_chain_tip: [u8; 32],
     /// Unix timestamp (must match the signed transfer message).
@@ -834,6 +1006,11 @@ pub struct OwnershipClaim {
     /// the DHT if they lose their local copy.
     #[serde(default)]
     pub encrypted_bill: Vec<u8>,
+    /// Optional compute receipt witness authorizing a program-owned bill move.
+    /// When present, nodes validate it as part of `OwnershipClaim`
+    /// distribution before accepting the ownership rotation.
+    #[serde(default)]
+    pub program_spend_witness: Option<ProgramSpendWitness>,
 }
 
 // ── Reforge Attestation ──────────────────────────────────────────────
@@ -1098,10 +1275,16 @@ mod tests {
             after_manifest_key: Some([0x33; 32]),
             after_ownership_mint_id: Some([0x44; 32]),
             after_consumed_mint_id: Some([0x55; 32]),
+            after_program_id: Some([0x66; 32]),
+            after_program_manifest_key: Some([0x77; 32]),
+            after_compute_receipt_id: Some([0x88; 32]),
             max_tags: 10,
             max_manifests: 11,
             max_ownership_records: 12,
             max_consumed_records: 13,
+            max_programs: 14,
+            max_program_manifests: 15,
+            max_compute_receipts: 16,
         });
         let bytes = msg.to_bytes().unwrap();
         let decoded = PulseMessage::from_bytes(&bytes).unwrap();
@@ -1112,10 +1295,31 @@ mod tests {
                 assert_eq!(req.after_manifest_key, Some([0x33; 32]));
                 assert_eq!(req.after_ownership_mint_id, Some([0x44; 32]));
                 assert_eq!(req.after_consumed_mint_id, Some([0x55; 32]));
+                assert_eq!(req.after_program_id, Some([0x66; 32]));
+                assert_eq!(req.after_program_manifest_key, Some([0x77; 32]));
+                assert_eq!(req.after_compute_receipt_id, Some([0x88; 32]));
                 assert_eq!(req.max_tags, 10);
                 assert_eq!(req.max_manifests, 11);
                 assert_eq!(req.max_ownership_records, 12);
                 assert_eq!(req.max_consumed_records, 13);
+                assert_eq!(req.max_programs, 14);
+                assert_eq!(req.max_program_manifests, 15);
+                assert_eq!(req.max_compute_receipts, 16);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn program_fetch_round_trip() {
+        let msg = PulseMessage::ProgramFetch(ProgramFetch {
+            prog_id: ProgramId([0x42; 32]),
+        });
+        let bytes = msg.to_bytes().unwrap();
+        let decoded = PulseMessage::from_bytes(&bytes).unwrap();
+        match decoded {
+            PulseMessage::ProgramFetch(req) => {
+                assert_eq!(req.prog_id, ProgramId([0x42; 32]));
             }
             _ => panic!("wrong variant"),
         }

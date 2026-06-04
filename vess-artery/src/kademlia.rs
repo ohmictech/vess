@@ -253,6 +253,13 @@ impl RoutingTable {
         }
     }
 
+    /// Whether the routing table already contains this peer.
+    pub fn contains_peer(&self, peer_id: &[u8; 32]) -> bool {
+        self.bucket_index(peer_id)
+            .and_then(|idx| self.buckets[idx].position(peer_id))
+            .is_some()
+    }
+
     /// Find the K closest peers to a target (which can be any 32-byte
     /// key — a `mint_id`, a `stealth_id`, a `dht_key`, etc.).
     ///

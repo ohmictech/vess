@@ -19,6 +19,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use vess_compute::ProgramOwnershipCondition;
 use vess_foundry::merkle::MerkleTree;
 
 use crate::gossip::xor_distance;
@@ -51,6 +52,9 @@ pub struct OwnershipRecord {
     pub current_owner_vk_hash: [u8; 32],
     /// Full ML-DSA-65 verification key of the current owner.
     pub current_owner_vk: Vec<u8>,
+    /// Optional program predicate that currently owns the bill.
+    #[serde(default)]
+    pub current_owner_program: Option<ProgramOwnershipCondition>,
     /// Denomination value for supply tracking.
     pub denomination_value: u64,
     /// Unix timestamp when this record was last updated.
@@ -359,6 +363,7 @@ mod tests {
             chain_tip: [0x11; 32],
             current_owner_vk_hash: [0x22; 32],
             current_owner_vk: vec![0x33; 64],
+            current_owner_program: None,
             denomination_value: denom,
             updated_at: 1000,
             proof_hash: blake3::hash(&[0x44; 16]).into(),

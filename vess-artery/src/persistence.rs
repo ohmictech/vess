@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use vess_compute::{ComputeReceipt, ProgramManifest, StoredProgram};
 use vess_tag::TagRecord;
 
 use crate::limbo_buffer::LimboEntry;
@@ -61,6 +62,15 @@ pub struct ArterySnapshot {
     /// Encrypted wallet manifests keyed by hex-encoded DHT key.
     #[serde(default)]
     pub manifests: BTreeMap<String, Vec<u8>>,
+    /// Immutable compute programs keyed by hex-encoded prog_id.
+    #[serde(default)]
+    pub compute_programs: BTreeMap<String, StoredProgram>,
+    /// Program manifests keyed by hex-encoded program-name DHT key.
+    #[serde(default)]
+    pub compute_program_manifests: BTreeMap<String, ProgramManifest>,
+    /// Compute receipts keyed by hex-encoded receipt_id.
+    #[serde(default)]
+    pub compute_receipts: BTreeMap<String, ComputeReceipt>,
     /// Locally-retained ownership records kept for future seed sync even when
     /// this node is not currently in the active shard for those mint_ids.
     #[serde(default)]
@@ -91,6 +101,9 @@ impl ArterySnapshot {
             ownership_records: Vec::new(),
             consumed_records: BTreeMap::new(),
             manifests: BTreeMap::new(),
+            compute_programs: BTreeMap::new(),
+            compute_program_manifests: BTreeMap::new(),
+            compute_receipts: BTreeMap::new(),
             retained_ownership_records: Vec::new(),
             retained_consumed_records: BTreeMap::new(),
             limbo_payment_ids: Vec::new(),
