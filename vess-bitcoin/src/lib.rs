@@ -15,6 +15,7 @@ use bitcoin::p2p::message::{NetworkMessage, RawNetworkMessage};
 use bitcoin::p2p::message_blockdata::{GetHeadersMessage, Inventory};
 use bitcoin::p2p::message_network::VersionMessage;
 use bitcoin::p2p::{Magic, ServiceFlags};
+use bitcoin::secp256k1::{ecdsa::Signature as EcdsaSignature, Message, PublicKey, Secp256k1, SecretKey};
 use bitcoin::pow::{CompactTarget, Work};
 use bitcoin::{BlockHash, Transaction, TxMerkleNode, Txid};
 use rand::Rng;
@@ -46,6 +47,10 @@ const MAX_VESS_SEED_NODES: usize = 128;
 const MAX_VESS_SEED_NODE_AGE_SECS: u64 = 24 * 60 * 60;
 const MAX_VESS_SEED_NODE_FUTURE_SKEW_SECS: u64 = 10 * 60;
 const MAX_VESS_SEED_REQUESTS_PER_MINUTE: u32 = 12;
+const VESS_SEED_CHALLENGE_TTL_SECS: u64 = 60;
+const VESS_SEED_FIRST_CONTACT_POW_BITS: u8 = 14;
+const VESS_SEED_AUTH_BAN_THRESHOLD: u32 = 3;
+const VESS_SEED_AUTH_BAN_SECS: u64 = 10 * 60;
 const VESS_SEED_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_TARGET_PEERS: usize = 24;
 const DEFAULT_STABLE_TARGET_PEERS: usize = 4;
@@ -78,27 +83,89 @@ pub struct VessSeedNode {
     pub contact: String,
     #[serde(default = "current_unix_timestamp")]
     pub last_seen_unix: u64,
+    #[serde(default)]
+    pub auth_vk: Vec<u8>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct VessSeedRequest {
+struct VessSeedChallengeRequest {
     version: u8,
+    requester_node_id: Option<String>,
+    requester_auth_vk: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct VessSeedChallenge {
+    version: u8,
+    server_node_id: String,
+    server_auth_vk: Vec<u8>,
+    nonce: [u8; 32],
+    expires_unix: u64,
+    pow_difficulty_bits: u8,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct VessSeedRequestPayload {
     requester_node: Option<VessSeedNode>,
     known_nodes: Vec<VessSeedNode>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct VessSeedResponse {
+struct VessSeedAuthenticatedRequest {
     version: u8,
+    requester_auth_vk: Vec<u8>,
+    challenge_nonce: [u8; 32],
+    challenge_expires_unix: u64,
+    pow_nonce: Option<[u8; 32]>,
+    payload: VessSeedRequestPayload,
+    signature: Vec<u8>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct VessSeedResponsePayload {
     accepted: bool,
     local_node: Option<VessSeedNode>,
     known_nodes: Vec<VessSeedNode>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct VessSeedSignedResponse {
+    version: u8,
+    server_node_id: String,
+    server_auth_vk: Vec<u8>,
+    timestamp_unix: u64,
+    nonce: [u8; 32],
+    payload_hash: [u8; 32],
+    payload: VessSeedResponsePayload,
+    signature: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
 struct VessSeedClientWindow {
     window_started_unix: u64,
     requests_in_window: u32,
+}
+
+#[derive(Debug, Clone)]
+struct LocalVessSeedIdentity {
+    node: VessSeedNode,
+    auth_sk: [u8; 32],
+}
+
+#[derive(Debug, Clone)]
+struct PendingVessSeedChallenge {
+    nonce: [u8; 32],
+    expires_unix: u64,
+    pow_difficulty_bits: u8,
+    requester_node_id: Option<String>,
+    requester_auth_vk: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct VessSeedAuthReputation {
+    recent_failures: u32,
+    banned_until_unix: u64,
+    successful_requests: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -377,7 +444,7 @@ pub struct BitcoinLightClient {
     header_chain: Arc<Mutex<HeaderChain>>,
     known_vess_nodes: Arc<Mutex<HashMap<String, VessSeedNode>>>,
     known_bitcoin_peers: Arc<Mutex<HashSet<SocketAddr>>>,
-    local_vess_node: Arc<Mutex<Option<VessSeedNode>>>,
+    local_vess_node: Arc<Mutex<Option<LocalVessSeedIdentity>>>,
     vess_probe_state: Arc<Mutex<HashMap<SocketAddr, VessSeedProbeState>>>,
     vess_seed_port: u16,
     allow_private_vess_seed_contacts: bool,
@@ -482,7 +549,7 @@ struct SharedState {
     connected_peers: Arc<AtomicUsize>,
     active_peers: Arc<Mutex<HashSet<SocketAddr>>>,
     known_bitcoin_peers: Arc<Mutex<HashSet<SocketAddr>>>,
-    local_vess_node: Arc<Mutex<Option<VessSeedNode>>>,
+    local_vess_node: Arc<Mutex<Option<LocalVessSeedIdentity>>>,
 }
 
 impl BitcoinLightClient {
@@ -553,15 +620,25 @@ impl BitcoinLightClient {
         })
     }
 
-    pub fn set_local_vess_seed_node(&self, node_id: impl Into<String>, contact: impl Into<String>) {
+    pub fn set_local_vess_seed_node(
+        &self,
+        node_id: impl Into<String>,
+        contact: impl Into<String>,
+        auth_sk: [u8; 32],
+        auth_vk: Vec<u8>,
+    ) {
         let seed = VessSeedNode {
             node_id: node_id.into(),
             contact: contact.into(),
             last_seen_unix: current_unix_timestamp(),
+            auth_vk,
         };
         {
             let mut local = self.local_vess_node.lock().unwrap();
-            *local = Some(seed.clone());
+            *local = Some(LocalVessSeedIdentity {
+                node: seed.clone(),
+                auth_sk,
+            });
         }
         upsert_known_vess_node(&self.known_vess_nodes, seed, true);
     }
@@ -705,10 +782,12 @@ async fn run_vess_seed_listener(
     vess_seed_port: u16,
     known_bitcoin_peers: Arc<Mutex<HashSet<SocketAddr>>>,
     known_vess_nodes: Arc<Mutex<HashMap<String, VessSeedNode>>>,
-    local_vess_node: Arc<Mutex<Option<VessSeedNode>>>,
+    local_vess_node: Arc<Mutex<Option<LocalVessSeedIdentity>>>,
     allow_private_vess_seed_contacts: bool,
 ) {
     let request_windows = Arc::new(Mutex::new(HashMap::<IpAddr, VessSeedClientWindow>::new()));
+    let pending_challenges = Arc::new(Mutex::new(HashMap::<IpAddr, PendingVessSeedChallenge>::new()));
+    let auth_reputation = Arc::new(Mutex::new(HashMap::<Vec<u8>, VessSeedAuthReputation>::new()));
     let listener = match TcpListener::bind((Ipv4Addr::UNSPECIFIED, vess_seed_port)).await {
         Ok(listener) => listener,
         Err(e) => {
@@ -727,6 +806,8 @@ async fn run_vess_seed_listener(
                 let known_vess_nodes = known_vess_nodes.clone();
                 let local_vess_node = local_vess_node.clone();
                 let request_windows = request_windows.clone();
+                let pending_challenges = pending_challenges.clone();
+                let auth_reputation = auth_reputation.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle_vess_seed_connection(
                         stream,
@@ -735,6 +816,8 @@ async fn run_vess_seed_listener(
                         known_vess_nodes,
                         local_vess_node,
                         request_windows,
+                        pending_challenges,
+                        auth_reputation,
                         allow_private_vess_seed_contacts,
                     )
                     .await
@@ -756,7 +839,7 @@ async fn run_vess_seed_scanner(
     scan_interval: Duration,
     known_bitcoin_peers: Arc<Mutex<HashSet<SocketAddr>>>,
     known_vess_nodes: Arc<Mutex<HashMap<String, VessSeedNode>>>,
-    local_vess_node: Arc<Mutex<Option<VessSeedNode>>>,
+    local_vess_node: Arc<Mutex<Option<LocalVessSeedIdentity>>>,
     vess_probe_state: Arc<Mutex<HashMap<SocketAddr, VessSeedProbeState>>>,
     allow_private_vess_seed_contacts: bool,
 ) {
@@ -832,7 +915,7 @@ async fn probe_vess_seed_candidates(
     vess_seed_port: u16,
     known_bitcoin_peers: Arc<Mutex<HashSet<SocketAddr>>>,
     known_vess_nodes: Arc<Mutex<HashMap<String, VessSeedNode>>>,
-    local_vess_node: Arc<Mutex<Option<VessSeedNode>>>,
+    local_vess_node: Arc<Mutex<Option<LocalVessSeedIdentity>>>,
     vess_probe_state: Arc<Mutex<HashMap<SocketAddr, VessSeedProbeState>>>,
     allow_private_vess_seed_contacts: bool,
 ) {
@@ -849,9 +932,11 @@ async fn probe_vess_seed_candidates(
         let mut probe_state = vess_probe_state.lock().unwrap();
         mark_vess_seed_probe_attempts(&mut probe_state, &peers, now);
     }
-    let request = VessSeedRequest {
-        version: VESS_SEED_PROTOCOL_VERSION,
-        requester_node: refreshed_local_vess_node(&local_vess_node),
+    let Some(local_identity) = refreshed_local_vess_identity(&local_vess_node) else {
+        return;
+    };
+    let request = VessSeedRequestPayload {
+        requester_node: Some(local_identity.node.clone()),
         known_nodes: snapshot_known_vess_nodes(&known_vess_nodes, &local_vess_node),
     };
 
@@ -859,10 +944,12 @@ async fn probe_vess_seed_candidates(
     for peer in peers {
         let addr = SocketAddr::new(peer.ip(), vess_seed_port);
         let request = request.clone();
+        let local_identity = local_identity.clone();
+        let known_vess_nodes = known_vess_nodes.clone();
         tasks.spawn(async move {
             let result = match tokio::time::timeout(
                 VESS_SEED_PROBE_TIMEOUT,
-                probe_vess_seed_peer(addr, &request),
+                probe_vess_seed_peer(addr, &local_identity, &known_vess_nodes, &request),
             )
             .await
             {
@@ -878,9 +965,9 @@ async fn probe_vess_seed_candidates(
             continue;
         };
         match result {
-            Ok(response) if response.accepted => {
+            Ok(response) if response.payload.accepted => {
                 record_vess_seed_probe_success(&vess_probe_state, addr);
-                if let Some(node) = response.local_node {
+                if let Some(node) = response.payload.local_node {
                     upsert_known_vess_node(
                         &known_vess_nodes,
                         node,
@@ -889,7 +976,7 @@ async fn probe_vess_seed_candidates(
                 }
                 merge_known_vess_nodes(
                     &known_vess_nodes,
-                    response.known_nodes,
+                    response.payload.known_nodes,
                     allow_private_vess_seed_contacts,
                 );
             }
@@ -906,13 +993,52 @@ async fn probe_vess_seed_candidates(
 
 async fn probe_vess_seed_peer(
     addr: SocketAddr,
-    request: &VessSeedRequest,
-) -> Result<VessSeedResponse> {
+    local_identity: &LocalVessSeedIdentity,
+    known_vess_nodes: &Arc<Mutex<HashMap<String, VessSeedNode>>>,
+    request: &VessSeedRequestPayload,
+) -> Result<VessSeedSignedResponse> {
     let mut stream = tokio::time::timeout(DEFAULT_CONNECT_TIMEOUT, TokioTcpStream::connect(addr))
         .await
         .with_context(|| format!("timed out connecting to Vess seed peer {addr}"))??;
-    write_seed_message(&mut stream, request).await?;
-    read_seed_message(&mut stream).await
+    let challenge_request = VessSeedChallengeRequest {
+        version: VESS_SEED_PROTOCOL_VERSION,
+        requester_node_id: Some(local_identity.node.node_id.clone()),
+        requester_auth_vk: Some(local_identity.node.auth_vk.clone()),
+    };
+    write_seed_message(&mut stream, &challenge_request).await?;
+    let challenge: VessSeedChallenge = read_seed_message(&mut stream).await?;
+    anyhow::ensure!(
+        challenge.version == VESS_SEED_PROTOCOL_VERSION,
+        "Vess seed challenge version mismatch"
+    );
+
+    let payload_hash = hash_seed_request_payload(request)?;
+    let pow_nonce = solve_vess_seed_pow(
+        challenge.nonce,
+        challenge.expires_unix,
+        &local_identity.node.auth_vk,
+        payload_hash,
+        challenge.pow_difficulty_bits,
+    );
+    let authenticated_request = VessSeedAuthenticatedRequest {
+        version: VESS_SEED_PROTOCOL_VERSION,
+        requester_auth_vk: local_identity.node.auth_vk.clone(),
+        challenge_nonce: challenge.nonce,
+        challenge_expires_unix: challenge.expires_unix,
+        pow_nonce,
+        payload: request.clone(),
+        signature: sign_vess_seed_request(
+            &local_identity.auth_sk,
+            challenge.nonce,
+            challenge.expires_unix,
+            pow_nonce,
+            payload_hash,
+        )?,
+    };
+    write_seed_message(&mut stream, &authenticated_request).await?;
+    let response: VessSeedSignedResponse = read_seed_message(&mut stream).await?;
+    verify_seed_response(&response, &challenge, known_vess_nodes)?;
+    Ok(response)
 }
 
 async fn handle_vess_seed_connection(
@@ -920,59 +1046,122 @@ async fn handle_vess_seed_connection(
     peer: SocketAddr,
     known_bitcoin_peers: Arc<Mutex<HashSet<SocketAddr>>>,
     known_vess_nodes: Arc<Mutex<HashMap<String, VessSeedNode>>>,
-    local_vess_node: Arc<Mutex<Option<VessSeedNode>>>,
+    local_vess_node: Arc<Mutex<Option<LocalVessSeedIdentity>>>,
     request_windows: Arc<Mutex<HashMap<IpAddr, VessSeedClientWindow>>>,
+    pending_challenges: Arc<Mutex<HashMap<IpAddr, PendingVessSeedChallenge>>>,
+    auth_reputation: Arc<Mutex<HashMap<Vec<u8>, VessSeedAuthReputation>>>,
     allow_private_vess_seed_contacts: bool,
 ) -> Result<()> {
     let now_unix = current_unix_timestamp();
     let accepted = should_accept_vess_seed_request(
         peer,
-        &known_bitcoin_peers.lock().unwrap(),
         &mut request_windows.lock().unwrap(),
         now_unix,
     );
     if !accepted {
-        let response = VessSeedResponse {
-            version: VESS_SEED_PROTOCOL_VERSION,
-            accepted: false,
-            local_node: None,
-            known_nodes: Vec::new(),
-        };
+        let response = unsigned_seed_response(None, [0u8; 32], false, Vec::new());
         write_seed_message(&mut stream, &response).await?;
         return Ok(());
     }
 
-    let request: VessSeedRequest = read_seed_message(&mut stream).await?;
+    let challenge_request: VessSeedChallengeRequest = read_seed_message(&mut stream).await?;
+    if challenge_request.version != VESS_SEED_PROTOCOL_VERSION {
+        let response = unsigned_seed_response(refreshed_local_vess_node(&local_vess_node), [0u8; 32], false, Vec::new());
+        write_seed_message(&mut stream, &response).await?;
+        return Ok(());
+    }
+
+    let Some(local_identity) = refreshed_local_vess_identity(&local_vess_node) else {
+        let response = unsigned_seed_response(None, [0u8; 32], false, Vec::new());
+        write_seed_message(&mut stream, &response).await?;
+        return Ok(());
+    };
+    let pow_difficulty_bits = challenge_pow_difficulty_bits(
+        peer,
+        challenge_request.requester_node_id.as_deref(),
+        challenge_request.requester_auth_vk.as_deref(),
+        &known_bitcoin_peers.lock().unwrap(),
+        &known_vess_nodes.lock().unwrap(),
+        &auth_reputation.lock().unwrap(),
+    );
+    let challenge_nonce: [u8; 32] = rand::random();
+    let challenge_expires_unix = now_unix.saturating_add(VESS_SEED_CHALLENGE_TTL_SECS);
+    pending_challenges.lock().unwrap().insert(
+        peer.ip(),
+        PendingVessSeedChallenge {
+            nonce: challenge_nonce,
+            expires_unix: challenge_expires_unix,
+            pow_difficulty_bits,
+            requester_node_id: challenge_request.requester_node_id.clone(),
+            requester_auth_vk: challenge_request.requester_auth_vk.clone(),
+        },
+    );
+    let challenge = VessSeedChallenge {
+        version: VESS_SEED_PROTOCOL_VERSION,
+        server_node_id: local_identity.node.node_id.clone(),
+        server_auth_vk: local_identity.node.auth_vk.clone(),
+        nonce: challenge_nonce,
+        expires_unix: challenge_expires_unix,
+        pow_difficulty_bits,
+    };
+    write_seed_message(&mut stream, &challenge).await?;
+
+    let request: VessSeedAuthenticatedRequest = read_seed_message(&mut stream).await?;
+    let Some(pending) = pending_challenges.lock().unwrap().remove(&peer.ip()) else {
+        let response = signed_seed_response(&local_identity, [0u8; 32], false, Vec::new())?;
+        write_seed_message(&mut stream, &response).await?;
+        return Ok(());
+    };
     if request.version != VESS_SEED_PROTOCOL_VERSION {
-        let response = VessSeedResponse {
-            version: VESS_SEED_PROTOCOL_VERSION,
-            accepted: false,
-            local_node: refreshed_local_vess_node(&local_vess_node),
-            known_nodes: Vec::new(),
-        };
+        let response = signed_seed_response(&local_identity, pending.nonce, false, Vec::new())?;
         write_seed_message(&mut stream, &response).await?;
         return Ok(());
     }
 
-    if let Some(node) = request.requester_node {
-        upsert_known_vess_node(
-            &known_vess_nodes,
-            node,
-            allow_private_vess_seed_contacts,
-        );
+    let Some(requester_node) = request.payload.requester_node.as_ref() else {
+        let response = signed_seed_response(&local_identity, pending.nonce, false, Vec::new())?;
+        write_seed_message(&mut stream, &response).await?;
+        return Ok(());
+    };
+    if auth_key_is_banned(&request.requester_auth_vk, &auth_reputation.lock().unwrap(), now_unix) {
+        let response = signed_seed_response(&local_identity, pending.nonce, false, Vec::new())?;
+        write_seed_message(&mut stream, &response).await?;
+        return Ok(());
     }
+    if !verify_vess_seed_request(
+        &request,
+        requester_node,
+        &pending,
+        now_unix,
+        peer,
+        &known_bitcoin_peers.lock().unwrap(),
+        &known_vess_nodes.lock().unwrap(),
+    )? {
+        record_vess_seed_auth_failure(
+            &request.requester_auth_vk,
+            &mut auth_reputation.lock().unwrap(),
+            now_unix,
+        );
+        let response = signed_seed_response(&local_identity, pending.nonce, false, Vec::new())?;
+        write_seed_message(&mut stream, &response).await?;
+        return Ok(());
+    }
+
+    record_vess_seed_auth_success(&request.requester_auth_vk, &mut auth_reputation.lock().unwrap());
+
+    upsert_known_vess_node(&known_vess_nodes, requester_node.clone(), allow_private_vess_seed_contacts);
     merge_known_vess_nodes(
         &known_vess_nodes,
-        request.known_nodes,
+        request.payload.known_nodes,
         allow_private_vess_seed_contacts,
     );
 
-    let response = VessSeedResponse {
-        version: VESS_SEED_PROTOCOL_VERSION,
-        accepted: true,
-        local_node: refreshed_local_vess_node(&local_vess_node),
-        known_nodes: snapshot_known_vess_nodes(&known_vess_nodes, &local_vess_node),
-    };
+    let response = signed_seed_response(
+        &local_identity,
+        pending.nonce,
+        true,
+        snapshot_known_vess_nodes(&known_vess_nodes, &local_vess_node),
+    )?;
     write_seed_message(&mut stream, &response).await?;
     Ok(())
 }
@@ -1000,20 +1189,460 @@ fn rate_limit_vess_seed_client(
 
 fn should_accept_vess_seed_request(
     peer: SocketAddr,
-    known_bitcoin_peers: &HashSet<SocketAddr>,
     request_windows: &mut HashMap<IpAddr, VessSeedClientWindow>,
     now_unix: u64,
 ) -> bool {
-    known_bitcoin_peer_matches_ip(peer, known_bitcoin_peers)
-        && rate_limit_vess_seed_client(peer, request_windows, now_unix)
+    rate_limit_vess_seed_client(peer, request_windows, now_unix)
+}
+
+fn challenge_pow_difficulty_bits(
+    peer: SocketAddr,
+    requester_node_id: Option<&str>,
+    requester_auth_vk: Option<&[u8]>,
+    known_bitcoin_peers: &HashSet<SocketAddr>,
+    known_vess_nodes: &HashMap<String, VessSeedNode>,
+    auth_reputation: &HashMap<Vec<u8>, VessSeedAuthReputation>,
+) -> u8 {
+    if known_bitcoin_peer_matches_ip(peer, known_bitcoin_peers) {
+        return 0;
+    }
+    if requester_node_id
+        .and_then(|node_id| known_vess_nodes.get(node_id))
+        .is_some()
+    {
+        return 0;
+    }
+    if requester_auth_vk
+        .and_then(|auth_vk| auth_reputation.get(auth_vk))
+        .map(|state| state.successful_requests > 0)
+        .unwrap_or(false)
+    {
+        return 0;
+    }
+    VESS_SEED_FIRST_CONTACT_POW_BITS
+}
+
+fn auth_key_is_banned(
+    requester_auth_vk: &[u8],
+    auth_reputation: &HashMap<Vec<u8>, VessSeedAuthReputation>,
+    now_unix: u64,
+) -> bool {
+    auth_reputation
+        .get(requester_auth_vk)
+        .map(|state| state.banned_until_unix > now_unix)
+        .unwrap_or(false)
+}
+
+fn record_vess_seed_auth_failure(
+    requester_auth_vk: &[u8],
+    auth_reputation: &mut HashMap<Vec<u8>, VessSeedAuthReputation>,
+    now_unix: u64,
+) {
+    let entry = auth_reputation
+        .entry(requester_auth_vk.to_vec())
+        .or_default();
+    entry.recent_failures = entry.recent_failures.saturating_add(1);
+    if entry.recent_failures >= VESS_SEED_AUTH_BAN_THRESHOLD {
+        entry.banned_until_unix = now_unix.saturating_add(VESS_SEED_AUTH_BAN_SECS);
+        entry.recent_failures = 0;
+    }
+}
+
+fn record_vess_seed_auth_success(
+    requester_auth_vk: &[u8],
+    auth_reputation: &mut HashMap<Vec<u8>, VessSeedAuthReputation>,
+) {
+    let entry = auth_reputation
+        .entry(requester_auth_vk.to_vec())
+        .or_default();
+    entry.recent_failures = 0;
+    entry.banned_until_unix = 0;
+    entry.successful_requests = entry.successful_requests.saturating_add(1);
+}
+
+fn hash_seed_payload<T: serde::Serialize>(payload: &T) -> Result<[u8; 32]> {
+    Ok(*blake3::hash(&serde_json::to_vec(payload).context("serialize Vess seed payload")?).as_bytes())
+}
+
+fn hash_seed_request_payload(payload: &VessSeedRequestPayload) -> Result<[u8; 32]> {
+    hash_seed_payload(payload)
+}
+
+fn hash_seed_response_payload(payload: &VessSeedResponsePayload) -> Result<[u8; 32]> {
+    hash_seed_payload(payload)
+}
+
+fn vess_seed_request_digest(
+    challenge_nonce: [u8; 32],
+    challenge_expires_unix: u64,
+    pow_nonce: Option<[u8; 32]>,
+    payload_hash: [u8; 32],
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"vess-seed-request-v1");
+    hasher.update(&challenge_nonce);
+    hasher.update(&challenge_expires_unix.to_le_bytes());
+    match pow_nonce {
+        Some(pow_nonce) => {
+            hasher.update(&[1]);
+            hasher.update(&pow_nonce);
+        }
+        None => {
+            hasher.update(&[0]);
+        }
+    }
+    hasher.update(&payload_hash);
+    *hasher.finalize().as_bytes()
+}
+
+fn vess_seed_pow_digest(
+    challenge_nonce: [u8; 32],
+    challenge_expires_unix: u64,
+    requester_auth_vk: &[u8],
+    payload_hash: [u8; 32],
+    pow_nonce: [u8; 32],
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"vess-seed-request-pow-v1");
+    hasher.update(&challenge_nonce);
+    hasher.update(&challenge_expires_unix.to_le_bytes());
+    hasher.update(requester_auth_vk);
+    hasher.update(&payload_hash);
+    hasher.update(&pow_nonce);
+    *hasher.finalize().as_bytes()
+}
+
+fn leading_zero_bits(hash: &[u8; 32]) -> u32 {
+    let mut total = 0u32;
+    for byte in hash {
+        let zeros = byte.leading_zeros();
+        total += zeros;
+        if zeros != 8 {
+            break;
+        }
+    }
+    total
+}
+
+fn solve_vess_seed_pow(
+    challenge_nonce: [u8; 32],
+    challenge_expires_unix: u64,
+    requester_auth_vk: &[u8],
+    payload_hash: [u8; 32],
+    difficulty_bits: u8,
+) -> Option<[u8; 32]> {
+    if difficulty_bits == 0 {
+        return None;
+    }
+    let mut counter = 0u64;
+    loop {
+        let mut pow_nonce = [0u8; 32];
+        pow_nonce[..8].copy_from_slice(&counter.to_le_bytes());
+        let digest = vess_seed_pow_digest(
+            challenge_nonce,
+            challenge_expires_unix,
+            requester_auth_vk,
+            payload_hash,
+            pow_nonce,
+        );
+        if leading_zero_bits(&digest) >= difficulty_bits as u32 {
+            return Some(pow_nonce);
+        }
+        counter = counter.wrapping_add(1);
+    }
+}
+
+fn verify_vess_seed_pow(
+    challenge_nonce: [u8; 32],
+    challenge_expires_unix: u64,
+    requester_auth_vk: &[u8],
+    payload_hash: [u8; 32],
+    difficulty_bits: u8,
+    pow_nonce: Option<[u8; 32]>,
+) -> bool {
+    if difficulty_bits == 0 {
+        return true;
+    }
+    let Some(pow_nonce) = pow_nonce else {
+        return false;
+    };
+    let digest = vess_seed_pow_digest(
+        challenge_nonce,
+        challenge_expires_unix,
+        requester_auth_vk,
+        payload_hash,
+        pow_nonce,
+    );
+    leading_zero_bits(&digest) >= difficulty_bits as u32
+}
+
+fn vess_seed_response_digest(
+    server_node_id: &str,
+    timestamp_unix: u64,
+    nonce: [u8; 32],
+    payload_hash: [u8; 32],
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"vess-seed-response-v1");
+    hasher.update(server_node_id.as_bytes());
+    hasher.update(&timestamp_unix.to_le_bytes());
+    hasher.update(&nonce);
+    hasher.update(&payload_hash);
+    *hasher.finalize().as_bytes()
+}
+
+fn derive_vess_seed_auth_secret(mesh_seed: &[u8; 64]) -> [u8; 32] {
+    for counter in 0u64..=u64::MAX {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"vess-seed-auth-sk-v1");
+        hasher.update(mesh_seed);
+        hasher.update(&counter.to_le_bytes());
+        let candidate = *hasher.finalize().as_bytes();
+        if SecretKey::from_slice(&candidate).is_ok() {
+            return candidate;
+        }
+    }
+    unreachable!("exhausted Vess seed auth key derivation attempts")
+}
+
+pub fn derive_vess_seed_auth_keypair(mesh_seed: &[u8; 64]) -> ([u8; 32], Vec<u8>) {
+    let auth_sk = derive_vess_seed_auth_secret(mesh_seed);
+    let secret_key = SecretKey::from_slice(&auth_sk).expect("derived Vess seed auth secret must be valid");
+    let auth_vk = PublicKey::from_secret_key(&Secp256k1::new(), &secret_key)
+        .serialize()
+        .to_vec();
+    (auth_sk, auth_vk)
+}
+
+fn sign_seed_digest(auth_sk: &[u8; 32], digest: [u8; 32]) -> Result<Vec<u8>> {
+    let secret_key = SecretKey::from_slice(auth_sk).context("invalid Vess seed auth secret")?;
+    let message = Message::from_digest_slice(&digest).context("invalid Vess seed digest")?;
+    Ok(Secp256k1::new()
+        .sign_ecdsa(&message, &secret_key)
+        .serialize_compact()
+        .to_vec())
+}
+
+fn verify_seed_digest(auth_vk: &[u8], digest: [u8; 32], signature: &[u8]) -> Result<bool> {
+    let public_key = PublicKey::from_slice(auth_vk).context("invalid Vess seed auth public key")?;
+    let signature = EcdsaSignature::from_compact(signature).context("invalid Vess seed signature")?;
+    let message = Message::from_digest_slice(&digest).context("invalid Vess seed digest")?;
+    Ok(Secp256k1::verification_only()
+        .verify_ecdsa(&message, &signature, &public_key)
+        .is_ok())
+}
+
+fn sign_vess_seed_request(
+    auth_sk: &[u8; 32],
+    challenge_nonce: [u8; 32],
+    challenge_expires_unix: u64,
+    pow_nonce: Option<[u8; 32]>,
+    payload_hash: [u8; 32],
+) -> Result<Vec<u8>> {
+    sign_seed_digest(
+        auth_sk,
+        vess_seed_request_digest(challenge_nonce, challenge_expires_unix, pow_nonce, payload_hash),
+    )
+}
+
+fn verify_vess_seed_request(
+    request: &VessSeedAuthenticatedRequest,
+    requester_node: &VessSeedNode,
+    pending: &PendingVessSeedChallenge,
+    now_unix: u64,
+    peer: SocketAddr,
+    known_bitcoin_peers: &HashSet<SocketAddr>,
+    known_vess_nodes: &HashMap<String, VessSeedNode>,
+) -> Result<bool> {
+    if request.challenge_nonce != pending.nonce
+        || request.challenge_expires_unix != pending.expires_unix
+        || now_unix > pending.expires_unix
+    {
+        return Ok(false);
+    }
+    if pending.requester_node_id.as_deref() != Some(requester_node.node_id.as_str()) {
+        return Ok(false);
+    }
+    if pending.requester_auth_vk.as_deref() != Some(request.requester_auth_vk.as_slice()) {
+        return Ok(false);
+    }
+    if !seed_contact_matches_node_id(&requester_node.node_id, &requester_node.contact, true) {
+        return Ok(false);
+    }
+    if requester_node.auth_vk.is_empty() || request.requester_auth_vk.is_empty() {
+        return Ok(false);
+    }
+    if requester_node.auth_vk != request.requester_auth_vk {
+        return Ok(false);
+    }
+    if let Some(known) = known_vess_nodes.get(&requester_node.node_id) {
+        if !known.auth_vk.is_empty() && known.auth_vk != request.requester_auth_vk {
+            return Ok(false);
+        }
+    }
+    let payload_hash = hash_seed_request_payload(&request.payload)?;
+    if !verify_vess_seed_pow(
+        request.challenge_nonce,
+        request.challenge_expires_unix,
+        &request.requester_auth_vk,
+        payload_hash,
+        pending.pow_difficulty_bits,
+        request.pow_nonce,
+    ) {
+        return Ok(false);
+    }
+    let _ = peer;
+    let _ = known_bitcoin_peers;
+    verify_seed_digest(
+        &request.requester_auth_vk,
+        vess_seed_request_digest(
+            request.challenge_nonce,
+            request.challenge_expires_unix,
+            request.pow_nonce,
+            payload_hash,
+        ),
+        &request.signature,
+    )
+}
+
+fn verify_seed_response(
+    response: &VessSeedSignedResponse,
+    challenge: &VessSeedChallenge,
+    known_vess_nodes: &Arc<Mutex<HashMap<String, VessSeedNode>>>,
+) -> Result<()> {
+    anyhow::ensure!(
+        response.version == VESS_SEED_PROTOCOL_VERSION,
+        "Vess seed response version mismatch"
+    );
+    anyhow::ensure!(
+        response.nonce == challenge.nonce,
+        "Vess seed response nonce mismatch"
+    );
+    anyhow::ensure!(
+        response.server_node_id == challenge.server_node_id,
+        "Vess seed response server node mismatch"
+    );
+    anyhow::ensure!(
+        response.server_auth_vk == challenge.server_auth_vk,
+        "Vess seed response server auth key mismatch"
+    );
+    let actual_payload_hash = hash_seed_response_payload(&response.payload)?;
+    anyhow::ensure!(
+        actual_payload_hash == response.payload_hash,
+        "Vess seed response payload hash mismatch"
+    );
+    anyhow::ensure!(
+        verify_seed_digest(
+            &response.server_auth_vk,
+            vess_seed_response_digest(
+                &response.server_node_id,
+                response.timestamp_unix,
+                response.nonce,
+                response.payload_hash,
+            ),
+            &response.signature,
+        )?,
+        "Vess seed response signature invalid"
+    );
+    if let Some(local_node) = response.payload.local_node.as_ref() {
+        anyhow::ensure!(
+            local_node.node_id == response.server_node_id,
+            "Vess seed response local node mismatch"
+        );
+        anyhow::ensure!(
+            local_node.auth_vk == response.server_auth_vk,
+            "Vess seed response local auth key mismatch"
+        );
+        anyhow::ensure!(
+            seed_contact_matches_node_id(&local_node.node_id, &local_node.contact, true),
+            "Vess seed response local contact mismatch"
+        );
+        if let Some(known) = known_vess_nodes.lock().unwrap().get(&local_node.node_id) {
+            if !known.auth_vk.is_empty() {
+                anyhow::ensure!(
+                    known.auth_vk == response.server_auth_vk,
+                    "Vess seed response broke pinned auth key"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn signed_seed_response(
+    local_identity: &LocalVessSeedIdentity,
+    nonce: [u8; 32],
+    accepted: bool,
+    known_nodes: Vec<VessSeedNode>,
+) -> Result<VessSeedSignedResponse> {
+    let payload = VessSeedResponsePayload {
+        accepted,
+        local_node: Some(local_identity.node.clone()),
+        known_nodes,
+    };
+    let payload_hash = hash_seed_response_payload(&payload)?;
+    let timestamp_unix = current_unix_timestamp();
+    let signature = sign_seed_digest(
+        &local_identity.auth_sk,
+        vess_seed_response_digest(
+            &local_identity.node.node_id,
+            timestamp_unix,
+            nonce,
+            payload_hash,
+        ),
+    )?;
+    Ok(VessSeedSignedResponse {
+        version: VESS_SEED_PROTOCOL_VERSION,
+        server_node_id: local_identity.node.node_id.clone(),
+        server_auth_vk: local_identity.node.auth_vk.clone(),
+        timestamp_unix,
+        nonce,
+        payload_hash,
+        payload,
+        signature,
+    })
+}
+
+fn unsigned_seed_response(
+    local_node: Option<VessSeedNode>,
+    nonce: [u8; 32],
+    accepted: bool,
+    known_nodes: Vec<VessSeedNode>,
+) -> VessSeedSignedResponse {
+    let payload = VessSeedResponsePayload {
+        accepted,
+        local_node,
+        known_nodes,
+    };
+    let payload_hash = hash_seed_response_payload(&payload).unwrap_or([0u8; 32]);
+    VessSeedSignedResponse {
+        version: VESS_SEED_PROTOCOL_VERSION,
+        server_node_id: String::new(),
+        server_auth_vk: Vec::new(),
+        timestamp_unix: current_unix_timestamp(),
+        nonce,
+        payload_hash,
+        payload,
+        signature: Vec::new(),
+    }
 }
 
 fn refreshed_local_vess_node(
-    local_vess_node: &Arc<Mutex<Option<VessSeedNode>>>,
+    local_vess_node: &Arc<Mutex<Option<LocalVessSeedIdentity>>>,
 ) -> Option<VessSeedNode> {
-    local_vess_node.lock().unwrap().clone().map(|mut node| {
+    local_vess_node.lock().unwrap().clone().map(|identity| {
+        let mut node = identity.node;
         node.last_seen_unix = current_unix_timestamp();
         node
+    })
+}
+
+fn refreshed_local_vess_identity(
+    local_vess_node: &Arc<Mutex<Option<LocalVessSeedIdentity>>>,
+) -> Option<LocalVessSeedIdentity> {
+    local_vess_node.lock().unwrap().clone().map(|mut identity| {
+        identity.node.last_seen_unix = current_unix_timestamp();
+        identity
     })
 }
 
@@ -1060,7 +1689,7 @@ async fn write_seed_message<T: serde::Serialize>(
 
 fn snapshot_known_vess_nodes(
     known_vess_nodes: &Arc<Mutex<HashMap<String, VessSeedNode>>>,
-    local_vess_node: &Arc<Mutex<Option<VessSeedNode>>>,
+    local_vess_node: &Arc<Mutex<Option<LocalVessSeedIdentity>>>,
 ) -> Vec<VessSeedNode> {
     let mut nodes = known_vess_nodes.lock().unwrap().clone();
     if let Some(node) = refreshed_local_vess_node(local_vess_node) {
@@ -1808,6 +2437,7 @@ mod tests {
 
     fn test_seed_node(seed_byte: u8, addr: &str, last_seen_unix: u64) -> VessSeedNode {
         let seed = [seed_byte; 64];
+        let (_auth_sk, auth_vk) = derive_vess_seed_auth_keypair(&seed);
         let (_, mesh_address) = vess_mesh::generate_mesh_keys_from_seed(&seed, 0);
         let contact = vess_mesh::MeshCarrierContact::UdpSocket {
             addr: addr.to_string(),
@@ -1817,6 +2447,7 @@ mod tests {
             node_id: contact.node_id().unwrap().to_string(),
             contact: vess_mesh::encode_mesh_contact_string(&contact).unwrap(),
             last_seen_unix,
+            auth_vk,
         }
     }
 
@@ -1890,6 +2521,130 @@ mod tests {
             .cloned()
             .unwrap();
         assert_eq!(stored.contact, existing.contact);
+    }
+
+    #[test]
+    fn seed_auth_key_derivation_is_stable() {
+        let seed = [0xAB; 64];
+        let (sk_a, vk_a) = derive_vess_seed_auth_keypair(&seed);
+        let (sk_b, vk_b) = derive_vess_seed_auth_keypair(&seed);
+
+        assert_eq!(sk_a, sk_b);
+        assert_eq!(vk_a, vk_b);
+    }
+
+    #[test]
+    fn signed_seed_request_rejects_pinned_key_mismatch() {
+        let now = current_unix_timestamp();
+        let peer: SocketAddr = "203.0.113.10:42000".parse().unwrap();
+        let known_bitcoin_peers = HashSet::from(["203.0.113.10:8333".parse().unwrap()]);
+        let known_node = test_seed_node(7, "203.0.113.10:18349", now);
+        let mut known_vess_nodes = HashMap::new();
+        known_vess_nodes.insert(known_node.node_id.clone(), known_node.clone());
+
+        let bad_seed = [0xCD; 64];
+        let (bad_sk, bad_vk) = derive_vess_seed_auth_keypair(&bad_seed);
+        let payload = VessSeedRequestPayload {
+            requester_node: Some(VessSeedNode {
+                auth_vk: bad_vk.clone(),
+                ..known_node.clone()
+            }),
+            known_nodes: Vec::new(),
+        };
+        let payload_hash = hash_seed_request_payload(&payload).unwrap();
+        let request = VessSeedAuthenticatedRequest {
+            version: VESS_SEED_PROTOCOL_VERSION,
+            requester_auth_vk: bad_vk,
+            challenge_nonce: [0x11; 32],
+            challenge_expires_unix: now + 30,
+            pow_nonce: None,
+            payload,
+            signature: sign_vess_seed_request(&bad_sk, [0x11; 32], now + 30, None, payload_hash).unwrap(),
+        };
+
+        let verified = verify_vess_seed_request(
+            &request,
+            request.payload.requester_node.as_ref().unwrap(),
+            &PendingVessSeedChallenge {
+                nonce: [0x11; 32],
+                expires_unix: now + 30,
+                pow_difficulty_bits: 0,
+                requester_node_id: Some(known_node.node_id.clone()),
+                requester_auth_vk: Some(known_node.auth_vk.clone()),
+            },
+            now,
+            peer,
+            &known_bitcoin_peers,
+            &known_vess_nodes,
+        )
+        .unwrap();
+
+        assert!(!verified);
+    }
+
+    #[test]
+    fn signed_seed_response_round_trip_verifies() {
+        let seed = [0x5A; 64];
+        let (auth_sk, auth_vk) = derive_vess_seed_auth_keypair(&seed);
+        let identity = LocalVessSeedIdentity {
+            node: VessSeedNode {
+                auth_vk: auth_vk.clone(),
+                ..test_seed_node(8, "203.0.113.8:18349", current_unix_timestamp())
+            },
+            auth_sk,
+        };
+        let challenge = VessSeedChallenge {
+            version: VESS_SEED_PROTOCOL_VERSION,
+            server_node_id: identity.node.node_id.clone(),
+            server_auth_vk: auth_vk,
+            nonce: [0x42; 32],
+            expires_unix: current_unix_timestamp() + 30,
+            pow_difficulty_bits: 0,
+        };
+        let response = signed_seed_response(&identity, challenge.nonce, true, vec![identity.node.clone()]).unwrap();
+
+        verify_seed_response(&response, &challenge, &Arc::new(Mutex::new(HashMap::new()))).unwrap();
+    }
+
+    #[test]
+    fn first_contact_pow_round_trip_verifies() {
+        let peer: SocketAddr = "203.0.113.20:42000".parse().unwrap();
+        let now = current_unix_timestamp();
+        let node = test_seed_node(9, "203.0.113.20:18349", now);
+        let payload = VessSeedRequestPayload {
+            requester_node: Some(node.clone()),
+            known_nodes: Vec::new(),
+        };
+        let payload_hash = hash_seed_request_payload(&payload).unwrap();
+        let seed = [9u8; 64];
+        let (auth_sk, auth_vk) = derive_vess_seed_auth_keypair(&seed);
+        let pow_nonce = solve_vess_seed_pow([0x22; 32], now + 30, &auth_vk, payload_hash, 8);
+        let request = VessSeedAuthenticatedRequest {
+            version: VESS_SEED_PROTOCOL_VERSION,
+            requester_auth_vk: auth_vk.clone(),
+            challenge_nonce: [0x22; 32],
+            challenge_expires_unix: now + 30,
+            pow_nonce,
+            payload,
+            signature: sign_vess_seed_request(&auth_sk, [0x22; 32], now + 30, pow_nonce, payload_hash).unwrap(),
+        };
+
+        assert!(verify_vess_seed_request(
+            &request,
+            request.payload.requester_node.as_ref().unwrap(),
+            &PendingVessSeedChallenge {
+                nonce: [0x22; 32],
+                expires_unix: now + 30,
+                pow_difficulty_bits: 8,
+                requester_node_id: Some(node.node_id.clone()),
+                requester_auth_vk: Some(auth_vk),
+            },
+            now,
+            peer,
+            &HashSet::new(),
+            &HashMap::new(),
+        )
+        .unwrap());
     }
 
     #[test]
@@ -1989,22 +2744,32 @@ mod tests {
     }
 
     #[test]
-    fn seed_request_rejects_unknown_or_rate_limited_peers() {
+    fn seed_request_rate_limit_is_ip_based() {
         let peer: SocketAddr = "203.0.113.10:42000".parse().unwrap();
-        let known = HashSet::from(["203.0.113.10:8333".parse().unwrap()]);
         let mut windows = HashMap::new();
 
         for _ in 0..MAX_VESS_SEED_REQUESTS_PER_MINUTE {
-            assert!(should_accept_vess_seed_request(peer, &known, &mut windows, 100));
+            assert!(should_accept_vess_seed_request(peer, &mut windows, 100));
         }
-        assert!(!should_accept_vess_seed_request(peer, &known, &mut windows, 100));
+        assert!(!should_accept_vess_seed_request(peer, &mut windows, 100));
 
         let unknown_peer: SocketAddr = "203.0.113.11:42000".parse().unwrap();
-        assert!(!should_accept_vess_seed_request(
+        assert!(should_accept_vess_seed_request(
             unknown_peer,
-            &known,
             &mut HashMap::new(),
             100,
         ));
+    }
+
+    #[test]
+    fn auth_reputation_bans_after_repeated_failures() {
+        let auth_vk = vec![0xAA; 33];
+        let mut reputation = HashMap::new();
+
+        for _ in 0..VESS_SEED_AUTH_BAN_THRESHOLD {
+            record_vess_seed_auth_failure(&auth_vk, &mut reputation, 100);
+        }
+
+        assert!(auth_key_is_banned(&auth_vk, &reputation, 101));
     }
 }

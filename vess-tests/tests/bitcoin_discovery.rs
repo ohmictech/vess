@@ -11,6 +11,7 @@ use bitcoin::p2p::address::Address;
 use bitcoin::p2p::message::{NetworkMessage, RawNetworkMessage};
 use bitcoin::p2p::message_network::VersionMessage;
 use bitcoin::p2p::{Magic, ServiceFlags};
+use bitcoin::secp256k1::{ecdsa::Signature as EcdsaSignature, Message, PublicKey, Secp256k1, SecretKey};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tempfile::TempDir;
@@ -29,21 +30,61 @@ struct SeedNode {
     contact: String,
     #[serde(default)]
     last_seen_unix: u64,
+    #[serde(default)]
+    auth_vk: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct SeedRequest {
+struct SeedChallengeRequest {
     version: u8,
+    requester_node_id: Option<String>,
+    requester_auth_vk: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SeedChallenge {
+    version: u8,
+    server_node_id: String,
+    server_auth_vk: Vec<u8>,
+    nonce: [u8; 32],
+    expires_unix: u64,
+    pow_difficulty_bits: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SeedRequestPayload {
     requester_node: Option<SeedNode>,
     known_nodes: Vec<SeedNode>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct SeedResponse {
+struct AuthenticatedSeedRequest {
     version: u8,
+    requester_auth_vk: Vec<u8>,
+    challenge_nonce: [u8; 32],
+    challenge_expires_unix: u64,
+    pow_nonce: Option<[u8; 32]>,
+    payload: SeedRequestPayload,
+    signature: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SeedResponsePayload {
     accepted: bool,
     local_node: Option<SeedNode>,
     known_nodes: Vec<SeedNode>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SignedSeedResponse {
+    version: u8,
+    server_node_id: String,
+    server_auth_vk: Vec<u8>,
+    timestamp_unix: u64,
+    nonce: [u8; 32],
+    payload_hash: [u8; 32],
+    payload: SeedResponsePayload,
+    signature: Vec<u8>,
 }
 
 struct NodeHarness {
@@ -200,6 +241,8 @@ async fn spawn_vess_seed_server() -> anyhow::Result<(SocketAddr, tokio::task::Jo
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let addr = listener.local_addr()?;
     let known_nodes = Arc::new(Mutex::new(HashMap::<String, SeedNode>::new()));
+    let (server_auth_sk, server_auth_vk) = vess_bitcoin::derive_vess_seed_auth_keypair(&[0xA5; 64]);
+    let server_node_id = Arc::new("mock-vess-seed".to_string());
 
     let task = tokio::spawn(async move {
         loop {
@@ -207,23 +250,82 @@ async fn spawn_vess_seed_server() -> anyhow::Result<(SocketAddr, tokio::task::Jo
                 break;
             };
             let known_nodes = known_nodes.clone();
+            let server_auth_vk = server_auth_vk.clone();
+            let server_node_id = server_node_id.clone();
             tokio::spawn(async move {
-                let Ok(request) = read_seed_message::<SeedRequest>(&mut stream).await else {
+                let Ok(request) = read_seed_message::<SeedChallengeRequest>(&mut stream).await else {
                     return;
                 };
-
-                if let Some(node) = request.requester_node {
-                    known_nodes.lock().unwrap().insert(node.node_id.clone(), node);
-                }
-                for node in request.known_nodes {
-                    known_nodes.lock().unwrap().insert(node.node_id.clone(), node);
+                if request.version != 1 {
+                    return;
                 }
 
-                let response = SeedResponse {
-                    version: request.version,
+                let nonce = [0x42; 32];
+                let expires_unix = now_unix() + 60;
+                let challenge = SeedChallenge {
+                    version: 1,
+                    server_node_id: (*server_node_id).clone(),
+                    server_auth_vk: server_auth_vk.clone(),
+                    nonce,
+                    expires_unix,
+                    pow_difficulty_bits: 8,
+                };
+                if write_seed_message(&mut stream, &challenge).await.is_err() {
+                    return;
+                }
+
+                let Ok(request) = read_seed_message::<AuthenticatedSeedRequest>(&mut stream).await else {
+                    return;
+                };
+                if request.version != 1
+                    || request.challenge_nonce != nonce
+                    || request.challenge_expires_unix != expires_unix
+                    || !verify_seed_pow(
+                        request.challenge_nonce,
+                        request.challenge_expires_unix,
+                        &request.requester_auth_vk,
+                        hash_seed_payload(&request.payload),
+                        challenge.pow_difficulty_bits,
+                        request.pow_nonce,
+                    )
+                    || !verify_seed_request_digest(
+                        &request.requester_auth_vk,
+                        request.challenge_nonce,
+                        request.challenge_expires_unix,
+                        request.pow_nonce,
+                        &request.payload,
+                        &request.signature,
+                    )
+                {
+                    return;
+                }
+
+                if let Some(node) = request.payload.requester_node {
+                    known_nodes.lock().unwrap().insert(node.node_id.clone(), node);
+                }
+                for node in request.payload.known_nodes {
+                    known_nodes.lock().unwrap().insert(node.node_id.clone(), node);
+                }
+
+                let payload = SeedResponsePayload {
                     accepted: true,
                     local_node: None,
                     known_nodes: known_nodes.lock().unwrap().values().cloned().collect(),
+                };
+                let payload_hash = hash_seed_payload(&payload);
+                let timestamp_unix = now_unix();
+                let response = SignedSeedResponse {
+                    version: 1,
+                    server_node_id: (*server_node_id).clone(),
+                    server_auth_vk: server_auth_vk.clone(),
+                    timestamp_unix,
+                    nonce,
+                    payload_hash,
+                    payload,
+                    signature: sign_seed_digest(
+                        &server_auth_sk,
+                        seed_response_digest(&server_node_id, timestamp_unix, nonce, payload_hash),
+                    ),
                 };
                 let _ = write_seed_message(&mut stream, &response).await;
             });
@@ -476,4 +578,125 @@ async fn five_nodes_discover_via_bitcoin_seed_and_register_tags() {
     peer_b_shutdown.store(true, Ordering::Relaxed);
     peer_a_task.abort();
     peer_b_task.abort();
+}
+
+fn hash_seed_payload<T: Serialize>(payload: &T) -> [u8; 32] {
+    *blake3::hash(&serde_json::to_vec(payload).unwrap()).as_bytes()
+}
+
+fn seed_response_digest(
+    server_node_id: &str,
+    timestamp_unix: u64,
+    nonce: [u8; 32],
+    payload_hash: [u8; 32],
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"vess-seed-response-v1");
+    hasher.update(server_node_id.as_bytes());
+    hasher.update(&timestamp_unix.to_le_bytes());
+    hasher.update(&nonce);
+    hasher.update(&payload_hash);
+    *hasher.finalize().as_bytes()
+}
+
+fn seed_request_digest(
+    challenge_nonce: [u8; 32],
+    challenge_expires_unix: u64,
+    pow_nonce: Option<[u8; 32]>,
+    payload_hash: [u8; 32],
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"vess-seed-request-v1");
+    hasher.update(&challenge_nonce);
+    hasher.update(&challenge_expires_unix.to_le_bytes());
+    match pow_nonce {
+        Some(pow_nonce) => {
+            hasher.update(&[1]);
+            hasher.update(&pow_nonce);
+        }
+        None => {
+            hasher.update(&[0]);
+        }
+    }
+    hasher.update(&payload_hash);
+    *hasher.finalize().as_bytes()
+}
+
+fn seed_pow_digest(
+    challenge_nonce: [u8; 32],
+    challenge_expires_unix: u64,
+    requester_auth_vk: &[u8],
+    payload_hash: [u8; 32],
+    pow_nonce: [u8; 32],
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"vess-seed-request-pow-v1");
+    hasher.update(&challenge_nonce);
+    hasher.update(&challenge_expires_unix.to_le_bytes());
+    hasher.update(requester_auth_vk);
+    hasher.update(&payload_hash);
+    hasher.update(&pow_nonce);
+    *hasher.finalize().as_bytes()
+}
+
+fn leading_zero_bits(hash: &[u8; 32]) -> u32 {
+    let mut total = 0u32;
+    for byte in hash {
+        let zeros = byte.leading_zeros();
+        total += zeros;
+        if zeros != 8 {
+            break;
+        }
+    }
+    total
+}
+
+fn verify_seed_pow(
+    challenge_nonce: [u8; 32],
+    challenge_expires_unix: u64,
+    requester_auth_vk: &[u8],
+    payload_hash: [u8; 32],
+    difficulty_bits: u8,
+    pow_nonce: Option<[u8; 32]>,
+) -> bool {
+    if difficulty_bits == 0 {
+        return true;
+    }
+    let Some(pow_nonce) = pow_nonce else {
+        return false;
+    };
+    leading_zero_bits(&seed_pow_digest(
+        challenge_nonce,
+        challenge_expires_unix,
+        requester_auth_vk,
+        payload_hash,
+        pow_nonce,
+    )) >= difficulty_bits as u32
+}
+
+fn verify_seed_request_digest(
+    auth_vk: &[u8],
+    challenge_nonce: [u8; 32],
+    challenge_expires_unix: u64,
+    pow_nonce: Option<[u8; 32]>,
+    payload: &SeedRequestPayload,
+    signature: &[u8],
+) -> bool {
+    let payload_hash = hash_seed_payload(payload);
+    let digest = seed_request_digest(challenge_nonce, challenge_expires_unix, pow_nonce, payload_hash);
+    let public_key = PublicKey::from_slice(auth_vk).unwrap();
+    let signature = EcdsaSignature::from_compact(signature).unwrap();
+    let message = Message::from_digest_slice(&digest).unwrap();
+    Secp256k1::verification_only()
+        .verify_ecdsa(&message, &signature, &public_key)
+        .is_ok()
+}
+
+fn sign_seed_digest(auth_sk: &[u8; 32], digest: [u8; 32]) -> Vec<u8> {
+    let secret_key = SecretKey::from_slice(auth_sk).unwrap();
+    let message = Message::from_digest_slice(&digest).unwrap();
+    Secp256k1::new()
+        .sign_ecdsa(&message, &secret_key)
+        .serialize_compact()
+        .to_vec()
 }

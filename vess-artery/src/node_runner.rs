@@ -3352,14 +3352,16 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
         match vess_mesh::validate_public_mesh_contact(&local_contact) {
             Ok(()) => {
                 let local_contact = encode_contact_string(&local_contact)?;
-                client.set_local_vess_seed_node(node_id_str.clone(), local_contact);
+                let (seed_auth_sk, seed_auth_vk) = vess_bitcoin::derive_vess_seed_auth_keypair(&mesh_seed);
+                client.set_local_vess_seed_node(node_id_str.clone(), local_contact, seed_auth_sk, seed_auth_vk);
             }
             Err(error) => {
                 if allow_private {
                     let loopback_contact = crate::local_discovery::loopback_contact(&local_contact)
                         .unwrap_or_else(|_| local_contact.clone());
                     let local_contact = encode_contact_string(&loopback_contact)?;
-                    client.set_local_vess_seed_node(node_id_str.clone(), local_contact);
+                    let (seed_auth_sk, seed_auth_vk) = vess_bitcoin::derive_vess_seed_auth_keypair(&mesh_seed);
+                    client.set_local_vess_seed_node(node_id_str.clone(), local_contact, seed_auth_sk, seed_auth_vk);
                     warn!(%error, "local mesh contact is not public-routable; advertising it anyway for test-only Bitcoin seed discovery");
                 } else {
                     warn!(%error, "local mesh contact is not public-routable; skipping Bitcoin seed advertisement");
