@@ -57,9 +57,9 @@ This is not a Bitcoin sidechain, rollup, federated mint, or multisig bridge. It 
 ### Programmability
 
 Vess has a unique take on smart contracts. Programs can be deployed via a small POW and published through the DHT.
-Bills can be locked to a program and later unlocked only when the claimant submits an `OwnershipClaim` carrying whatever witness or zero-knowledge proof that covenant requires. Other nodes verify that claim-path witness material before accepting the ownership rotation.
+Bills can be locked to a program and later unlocked only when the claimant submits an `OwnershipClaim` carrying whatever witness that covenant requires. In the current model, other nodes verify the attached compute receipt and proof material on that normal ownership-claim path before accepting the ownership rotation.
 
-Programs can be written using VessLogic, a simple, primitive scripting schema.
+Programs can be written using VessLogic, a simple deterministic covenant language.
 Each deployed program is also published under a human-facing name such as `+vl_market1`. The client canonicalizes that to `vl_market1` and keys it on the DHT by `Blake3("vl_market1")`, matching the same name-hash style used for VessTags.
 
 VessLogic is line-by-line and zero-format. A source file such as `progname.vess` is split into sections:
@@ -70,7 +70,7 @@ VessLogic is line-by-line and zero-format. A source file such as `progname.vess`
 
 Programs are stateless covenants. Mutable state lives on bills via their ownership `state_commitment`, not inside the deployed program blob.
 The covenant is passive: a wallet or node proposes its own deposit or withdraw transition, and the covenant only validates whether that proposed bill transition is allowed.
-In practice, the main verification path is the normal bill `OwnershipClaim`. Deposits are regular ownership claims that rotate a bill into `new_owner_program`, and withdrawals are regular ownership claims that rotate a program-owned bill back out to a user key or another program. Nodes verify the attached compute witness while distributing that ownership claim.
+In practice, the main verification path is the normal bill `OwnershipClaim`. Deposits are regular ownership claims that rotate a bill into `new_owner_program`, and withdrawals are regular ownership claims that rotate a program-owned bill back out to a user key or another program. The VessLogic program defines the predicate, while the surrounding compute layer binds the claim to a receipt whose proof system can be Vess STARKs or another configured verifier family.
 
 Each executable section is one instruction per line and must end in `approve`.
 
@@ -122,7 +122,7 @@ Each bill has:
 - an owner verification key hash.
 
 Genesis binds the first owner to the bill. Transfers advance the ownership chain with post-quantum signatures. Nodes replicate ownership records through the deterministic DHT location instead of global block production. Double spending is prohibitively difficult due to deterministic consensus rules rather than probabilistic chains.
-When a bill is program-owned, the claim path still stays the same: the broadcaster submits an `OwnershipClaim`, but it carries `prev_owner_program` and a `program_spend_witness` so nodes can verify the receipt and ZK/STARK proof before accepting and forwarding the ownership rotation.
+When a bill is program-owned, the claim path still stays the same: the broadcaster submits an `OwnershipClaim`, but it carries `prev_owner_program` and a `program_spend_witness` so nodes can verify the receipt and its configured proof system before accepting and forwarding the ownership rotation.
 
 ### Payment model
 
