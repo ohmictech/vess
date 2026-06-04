@@ -958,6 +958,48 @@ mod tests {
     }
 
     #[test]
+    fn record_transaction_evicts_conflicting_pending_burn() {
+        let mut wallet = BitcoinWallet::from_vess_seed(BitcoinNetwork::Testnet, &seed()).unwrap();
+        let receive = wallet.issue_receive_address().unwrap();
+        let funding_tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_000),
+                script_pubkey: receive.script_pubkey.clone(),
+            }],
+        };
+        wallet.record_transaction(&funding_tx);
+
+        let pending = wallet.queue_auto_burn_if_needed(500, 123).unwrap().unwrap();
+        assert_eq!(wallet.pending_burn_count(), 1);
+
+        let conflicting_tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: pending
+                .consumed_utxos
+                .iter()
+                .map(|utxo| TxIn {
+                    previous_output: utxo.outpoint,
+                    script_sig: ScriptBuf::default(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: Witness::default(),
+                })
+                .collect(),
+            output: vec![TxOut {
+                value: Amount::from_sat(49_000),
+                script_pubkey: ScriptBuf::new_op_return([0xAB; 32]),
+            }],
+        };
+
+        let update = wallet.record_transaction(&conflicting_tx);
+        assert_eq!(update.conflicted_pending_burns, vec![pending.txid]);
+        assert_eq!(wallet.pending_burn_count(), 0);
+    }
+
+    #[test]
     fn txid_type_stays_constructible_in_tests() {
         let _ = Txid::all_zeros();
     }

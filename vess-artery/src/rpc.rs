@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tracing::{info, warn};
+use zeroize::Zeroizing;
 
 use vess_compute::{ProgramManifest, StoredProgram};
 use vess_foundry::reforge::{reforge, ReforgeRequest};
@@ -53,6 +54,8 @@ pub(crate) fn wallet_tag_store(
     wallet_path: &std::path::Path,
     enc_key: &[u8; 32],
 ) -> Result<Option<(String, TagStore)>> {
+    use zeroize::Zeroizing;
+
     let Some(wallet_name) = wallet.name.clone() else {
         return Ok(None);
     };
@@ -66,7 +69,7 @@ pub(crate) fn wallet_tag_store(
     let registration = if let Some(existing) = wallet.tag_registration.clone() {
         existing
     } else {
-        let registrant_sk = wallet.decrypt_tag_sk(enc_key)?;
+        let registrant_sk = Zeroizing::new(wallet.decrypt_tag_sk(enc_key)?);
         #[cfg(any(test, feature = "test-pow"))]
         let (pow_nonce, pow_hash) = vess_tag::compute_tag_pow_test(
             &tag_hash,
@@ -92,7 +95,7 @@ pub(crate) fn wallet_tag_store(
             hardened_at: None,
         };
         let signature =
-            vess_foundry::spend_auth::sign_spend(&registrant_sk, &unsigned_record.digest())?;
+            vess_foundry::spend_auth::sign_spend(registrant_sk.as_slice(), &unsigned_record.digest())?;
 
         wallet.set_tag_registration(pow_nonce, pow_hash.clone(), registered_at, signature.clone());
         wallet.save(wallet_path)?;
@@ -914,6 +917,7 @@ async fn handle_tag_lookup(
 /// finds groups whose combined value equals a valid denomination, and reforges
 /// up to 2 groups (highest combined value first). Each consolidation is
 /// completely independent of the payment — failures are silently skipped.
+#[allow(dead_code)]
 fn fire_opportunistic_consolidations(
     s: &mut ArteryState,
     cred_map: &HashMap<[u8; 32], SpendCredential>,
@@ -1123,17 +1127,7 @@ async fn handle_send(
 
     // ── Build credential map ────────────────────────────────────────
     let ws = s.wallet.as_ref().unwrap();
-    let cred_map: HashMap<[u8; 32], SpendCredential> = ws
-        .billfold
-        .bills()
-        .iter()
-        .filter_map(|b| {
-            ws.billfold
-                .get_credentials(&b.mint_id)
-                .cloned()
-                .map(|c| (b.mint_id, c))
-        })
-        .collect();
+    let cred_map = ws.billfold.export_credentials();
 
     if !ws.billfold.can_afford(amount) {
         return RpcResponse::err(format!(
@@ -1222,30 +1216,7 @@ async fn handle_send(
             Err(e) => return RpcResponse::err(format!("prepare payment failed: {e}")),
         };
 
-        let ws_mut = s.wallet.as_mut().unwrap();
-
-        // Withdraw consumed originals and deposit change bills.
-        for mid in &result.consumed_mint_ids {
-            ws_mut.billfold.withdraw(mid);
-        }
-        for (bill, _) in &change_bills {
-            if let Some(cred) = reforged_creds.get(&bill.mint_id) {
-                ws_mut
-                    .billfold
-                    .deposit_with_credentials(bill.clone(), cred.clone());
-            }
-        }
-
-        // Reserve sent bills so they can't be accidentally re-spent.
-        // They stay in a pending state until the recipient claims them
-        // (at which point the OwnershipClaim handler removes them) or
-        // until the limbo TTL expires (periodic release task).
         let sent_mints: Vec<[u8; 32]> = send_bills.iter().map(|b| b.mint_id).collect();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        ws_mut.billfold.reserve(&sent_mints, now);
 
         // ── Broadcast reforge to the network ────────────────────────
         // ReforgeAttestation: tell artery nodes to delete consumed mint_ids.
@@ -1287,7 +1258,7 @@ async fn handle_send(
                 &mut s,
                 &senders.ra_tx,
                 vess_protocol::ReforgeAttestation {
-                    consumed_mint_ids: result.consumed_mint_ids,
+                    consumed_mint_ids: result.consumed_mint_ids.clone(),
                     owner_vk: owner_vk_for_ra,
                     consume_sigs,
                     reforge_id,
@@ -1349,6 +1320,30 @@ async fn handle_send(
             }
         }
 
+        let ws_mut = s.wallet.as_mut().unwrap();
+
+        // Withdraw consumed originals and deposit change bills.
+        for mid in &result.consumed_mint_ids {
+            ws_mut.billfold.withdraw(mid);
+        }
+        for (bill, _) in &change_bills {
+            if let Some(cred) = reforged_creds.remove(&bill.mint_id) {
+                ws_mut
+                    .billfold
+                    .deposit_with_credentials(bill.clone(), cred);
+            }
+        }
+
+        // Reserve sent bills so they can't be accidentally re-spent.
+        // They stay in a pending state until the recipient claims them
+        // (at which point the OwnershipClaim handler removes them) or
+        // until the limbo TTL expires (periodic release task).
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        ws_mut.billfold.reserve(&sent_mints, now);
+
         (msg, pid, sent_mints)
     } else {
         // === EXACT MATCH PATH ===
@@ -1398,9 +1393,6 @@ async fn handle_send(
         counterparty: Some(recipient_tag.to_string()),
         message: format!("Payment to {recipient_tag} queued for delivery."),
     });
-
-    // Opportunistically consolidate other bills while keys are unlocked.
-    fire_opportunistic_consolidations(&mut s, &cred_map, &sent_mints, senders);
 
     // Persist wallet immediately so bill withdrawals/reservations survive a crash.
     s.flush_wallet();
@@ -1454,17 +1446,7 @@ async fn handle_send_direct(
         }
 
         let ws = s.wallet.as_ref().unwrap();
-        let cred_map: HashMap<[u8; 32], SpendCredential> = ws
-            .billfold
-            .bills()
-            .iter()
-            .filter_map(|b| {
-                ws.billfold
-                    .get_credentials(&b.mint_id)
-                    .cloned()
-                    .map(|c| (b.mint_id, c))
-            })
-            .collect();
+        let cred_map = ws.billfold.export_credentials();
 
         if !ws.billfold.can_afford(amount) {
             return RpcResponse::err(format!(
@@ -1549,25 +1531,6 @@ async fn handle_send_direct(
                 Err(e) => return RpcResponse::err(format!("prepare payment failed: {e}")),
             };
 
-            let ws_mut = s.wallet.as_mut().unwrap();
-
-            for mid in &result.consumed_mint_ids {
-                ws_mut.billfold.withdraw(mid);
-            }
-            for (bill, _) in &change_bills {
-                if let Some(cred) = reforged_creds.get(&bill.mint_id) {
-                    ws_mut
-                        .billfold
-                        .deposit_with_credentials(bill.clone(), cred.clone());
-                }
-            }
-
-            let sent_mints: Vec<[u8; 32]> = send_bills.iter().map(|b| b.mint_id).collect();
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            ws_mut.billfold.reserve(&sent_mints, now);
 
             // Broadcast reforge attestation + ownership genesis.
             let mut sorted_consumed = result.consumed_mint_ids.clone();
@@ -1607,7 +1570,7 @@ async fn handle_send_direct(
                     &mut s,
                     &senders.ra_tx,
                     vess_protocol::ReforgeAttestation {
-                        consumed_mint_ids: result.consumed_mint_ids,
+                        consumed_mint_ids: result.consumed_mint_ids.clone(),
                         owner_vk: owner_vk_for_ra,
                         consume_sigs,
                         reforge_id,
@@ -1666,8 +1629,23 @@ async fn handle_send_direct(
                 }
             }
 
-            // Consolidate other bills while spend keys are unlocked.
-            fire_opportunistic_consolidations(&mut s, &cred_map, &sent_mints, senders);
+            let sent_mints: Vec<[u8; 32]> = send_bills.iter().map(|bill| bill.mint_id).collect();
+            let ws_mut = s.wallet.as_mut().unwrap();
+            for mid in &result.consumed_mint_ids {
+                ws_mut.billfold.withdraw(mid);
+            }
+            for (bill, _) in &change_bills {
+                if let Some(cred) = reforged_creds.remove(&bill.mint_id) {
+                    ws_mut
+                        .billfold
+                        .deposit_with_credentials(bill.clone(), cred);
+                }
+            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            ws_mut.billfold.reserve(&sent_mints, now);
             s.flush_wallet();
             (msg, pid, sent_mints)
         } else {
@@ -1694,8 +1672,6 @@ async fn handle_send_direct(
                 .unwrap_or_default()
                 .as_secs();
             ws_mut.billfold.reserve(&mint_ids, now);
-            // Consolidate other bills while spend keys are unlocked.
-            fire_opportunistic_consolidations(&mut s, &cred_map, &mint_ids, senders);
             s.flush_wallet();
 
             (msg, pid, mint_ids)
@@ -1840,7 +1816,7 @@ async fn handle_wallet_unlock(
         Err(e) => return RpcResponse::err(format!("failed to load wallet: {e}")),
     };
     let raw_seed = match wallet.unlock_with_password(password) {
-        Ok(s) => s,
+        Ok(s) => Zeroizing::new(s),
         Err(e) => return RpcResponse::err(format!("{e}")),
     };
 
@@ -1872,7 +1848,7 @@ async fn handle_wallet_unlock(
         let mut s = state.lock().unwrap();
         s.wallet_path = Some(wallet_path.clone());
         s.wallet = Some(WalletState {
-            stealth_secret: stealth_secret.clone(),
+            stealth_secret,
             billfold,
             bitcoin_wallet,
             bitcoin_receive_address,
@@ -2002,7 +1978,7 @@ fn handle_wallet_set_password(
         Err(e) => return RpcResponse::err(format!("failed to load wallet file: {e}")),
     };
     let raw_seed = match wf.unlock_with_password(current_password) {
-        Ok(s) => s,
+        Ok(s) => Zeroizing::new(s),
         Err(e) => return RpcResponse::err(format!("current password incorrect: {e}")),
     };
 

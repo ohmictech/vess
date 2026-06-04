@@ -67,7 +67,7 @@ pub enum PaymentState {
 }
 
 /// A tracked payment in the wallet.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct TrackedPayment {
     pub payment_id: [u8; 32],
     pub amount: u64,
@@ -79,7 +79,7 @@ pub struct TrackedPayment {
 }
 
 /// Outbound payment manager — tracks in-flight and finalized payments.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct PaymentTracker {
     payments: HashMap<[u8; 32], TrackedPayment>,
 }

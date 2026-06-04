@@ -678,7 +678,10 @@ pub struct ProgramManifestResolveResponse {
     pub manifest: Option<ProgramManifest>,
 }
 
-/// Request delegated compute from a worker or mesh peer.
+/// Reserved request shape for program execution jobs.
+///
+/// V1 nodes execute program interactions locally while constructing their own
+/// ownership transitions rather than delegating work to mesh peers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ComputeJobRequest {
     pub job_id: [u8; 32],
@@ -693,7 +696,7 @@ pub struct ComputeJobRequest {
     pub include_proof: bool,
 }
 
-/// Response shape for delegated compute.
+/// Reserved response shape for [`ComputeJobRequest`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ComputeJobResult {
     pub job_id: [u8; 32],

@@ -209,10 +209,10 @@ pub enum PulseMessage {
     /// Response to a [`ProgramManifestResolve`] request.
     ProgramManifestResolveResponse(ProgramManifestResolveResponse),
 
-    /// Submit delegated compute work to a peer or worker.
+    /// Reserved program-execution job request message.
     ComputeJobRequest(ComputeJobRequest),
 
-    /// Response to a delegated compute request.
+    /// Reserved response to a [`ComputeJobRequest`] message.
     ComputeJobResult(ComputeJobResult),
 
     /// Store a compute receipt in the DHT.
@@ -684,6 +684,9 @@ pub struct DhtSeedOwnershipRecord {
     /// Deterministic hash of the winning claim, if any.
     #[serde(default)]
     pub claim_hash: Option<[u8; 32]>,
+    /// Pre-transfer chain tip for the current transfer slot, if known.
+    #[serde(default)]
+    pub prev_transfer_chain_tip: Option<[u8; 32]>,
     /// Number of transfers since genesis.
     #[serde(default)]
     pub chain_depth: u64,

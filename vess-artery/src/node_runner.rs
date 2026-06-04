@@ -16,6 +16,7 @@ use bitcoin::hashes::Hash;
 use rand::Rng;
 use serde::Serialize;
 use tracing::{info, warn};
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::gossip::{
     dynamic_fan_out, k_nearest, random_fan_out, GossipConfig, OWNERSHIP_FAN_OUT, RANDOM_FAN_OUT,
@@ -296,17 +297,96 @@ fn confirmed_burn_outputs(
     Ok((genesis_records, bills))
 }
 
+fn validate_bitcoin_burn_genesis(
+    og: &OwnershipGenesis,
+    burn: &vess_protocol::BitcoinBurnBundleProof,
+) -> std::result::Result<[u8; 32], &'static str> {
+    const MAX_BURN_OUTPUTS: usize = 64;
+    const BURN_PAYLOAD_BYTES: usize = 32;
+    const MAX_BURN_MERKLE_DEPTH: usize = 64;
+    const MAX_OWNER_VK_BYTES: usize = 4096;
+
+    if burn.burn_amount_sats == 0 {
+        return Err("zero-value bitcoin burn");
+    }
+
+    let minimum_confirmations = min_bitcoin_burn_confirmations(burn.network);
+    if burn.required_confirmations < minimum_confirmations
+        || burn.confirmations < burn.required_confirmations
+    {
+        return Err("bitcoin burn confirmation depth insufficient");
+    }
+
+    if burn.chain_work == [0u8; 32] {
+        return Err("bitcoin burn proof missing chainwork");
+    }
+
+    if burn.output_values.is_empty() || burn.output_values.len() > MAX_BURN_OUTPUTS {
+        return Err("invalid bitcoin burn output count");
+    }
+
+    if burn.burn_commitment_payload.len() != BURN_PAYLOAD_BYTES
+        || burn.merkle_proof.len() > MAX_BURN_MERKLE_DEPTH
+        || burn.first_owner_vk.len() > MAX_OWNER_VK_BYTES
+    {
+        return Err("bitcoin burn proof exceeds size limits");
+    }
+
+    if bitcoin_burn_merkle_root(burn) != burn.merkle_root {
+        return Err("bitcoin burn merkle proof mismatch");
+    }
+
+    if burn.first_owner_vk != og.owner_vk {
+        return Err("bitcoin burn first owner key mismatch");
+    }
+
+    let expected_payload = expected_bitcoin_burn_payload(burn);
+    if burn.burn_commitment_payload.as_slice() != expected_payload {
+        return Err("bitcoin burn OP_RETURN payload mismatch");
+    }
+
+    if burn.first_owner_vk_hash != og.owner_vk_hash {
+        return Err("bitcoin burn owner_vk_hash mismatch");
+    }
+
+    let canonical_output_values = vess_foundry::bitcoin_burn_output_values(burn.burn_amount_sats);
+    if burn.output_values != canonical_output_values {
+        return Err("bitcoin burn output decomposition is not canonical");
+    }
+
+    let output_index = og.output_index as usize;
+    if output_index >= burn.output_values.len() {
+        return Err("bitcoin burn output_index out of bounds");
+    }
+
+    if burn.output_values[output_index] != og.denomination_value {
+        return Err("bitcoin burn denomination mismatch");
+    }
+
+    let bundle_commitment = bitcoin_burn_bundle_commitment(burn);
+    if bundle_commitment != og.digest {
+        return Err("bitcoin burn commitment mismatch");
+    }
+
+    let expected_mint_id = vess_foundry::bitcoin_burn_mint_id(&burn.txid, og.output_index);
+    if expected_mint_id != og.mint_id {
+        return Err("bitcoin burn mint_id derivation mismatch");
+    }
+
+    Ok(bundle_commitment)
+}
+
 pub(crate) fn load_bitcoin_wallet_state(
     wallet: &vess_kloak::WalletFile,
     raw_seed: &[u8; 64],
     enc_key: &[u8; 32],
 ) -> Result<(vess_bitcoin::BitcoinWallet, String)> {
-    let persisted_state = wallet.decrypt_bitcoin_wallet_state(enc_key)?;
-    let mut bitcoin_wallet = vess_bitcoin::BitcoinWallet::from_vess_seed_with_state(
-        vess_bitcoin::BitcoinNetwork::Mainnet,
-        raw_seed,
-        persisted_state.as_deref(),
-    )?;
+    let persisted_state = Zeroizing::new(wallet.decrypt_bitcoin_wallet_state(enc_key)?);
+        let mut bitcoin_wallet = vess_bitcoin::BitcoinWallet::from_vess_seed_with_state(
+            vess_bitcoin::BitcoinNetwork::Mainnet,
+            raw_seed,
+            persisted_state.as_deref(),
+        )?;
     let bitcoin_receive_address = bitcoin_wallet.ensure_receive_address()?.address.to_string();
     Ok((bitcoin_wallet, bitcoin_receive_address))
 }
@@ -407,6 +487,377 @@ async fn broadcast_pending_burns(
                 s.flush_wallet();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::{Arc, Mutex};
+
+    fn sample_burn_bundle() -> (vess_protocol::BitcoinBurnBundleProof, OwnershipGenesis) {
+        let txid = [0x11; 32];
+        let owner_vk = vec![0x42; 64];
+        let owner_vk_hash = vess_foundry::spend_auth::vk_hash(&owner_vk);
+        let burn_amount_sats = 17;
+        let output_values = vess_foundry::bitcoin_burn_output_values(burn_amount_sats);
+        let burn = vess_protocol::BitcoinBurnBundleProof {
+            network: BitcoinNetwork::Regtest,
+            txid,
+            block_hash: [0x22; 32],
+            block_height: 12,
+            confirmations: 1,
+            required_confirmations: 1,
+            chain_work: [0x33; 32],
+            merkle_root: txid,
+            merkle_proof: Vec::new(),
+            merkle_index: 0,
+            burn_amount_sats,
+            first_owner_vk: owner_vk.clone(),
+            first_owner_vk_hash: owner_vk_hash,
+            output_values: output_values.clone(),
+            burn_commitment_payload: vess_foundry::bitcoin_burn_payload_commitment(
+                &owner_vk_hash,
+                burn_amount_sats,
+                &output_values,
+            )
+            .to_vec(),
+        };
+        let digest = bitcoin_burn_bundle_commitment(&burn);
+        let mint_id = vess_foundry::bitcoin_burn_mint_id(&txid, 0);
+        let og = OwnershipGenesis {
+            mint_id,
+            chain_tip: vess_foundry::genesis_chain_tip(&mint_id, &owner_vk_hash),
+            owner_vk_hash,
+            owner_vk,
+            program_owner: None,
+            denomination_value: output_values[0],
+            genesis_proof: GenesisProof::BitcoinBurn(burn.clone()),
+            digest,
+            hops_remaining: 0,
+            chain_depth: 0,
+            output_index: 0,
+        };
+        (burn, og)
+    }
+
+    fn sample_partition_record(
+        mint_id: [u8; 32],
+        chain_depth: u64,
+        claim_hash: Option<[u8; 32]>,
+        chain_tip: [u8; 32],
+        updated_at: u64,
+    ) -> OwnershipRecord {
+        OwnershipRecord {
+            mint_id,
+            chain_tip,
+            prev_transfer_chain_tip: None,
+            current_owner_vk_hash: [0x44; 32],
+            current_owner_vk: vec![0x55; 64],
+            current_owner_program: None,
+            denomination_value: 10,
+            updated_at,
+            proof_hash: [0x66; 32],
+            digest: [0x77; 32],
+            nonce: [0x88; 32],
+            prev_claim_vk_hash: Some([0x99; 32]),
+            claim_hash,
+            chain_depth,
+            encrypted_bill: Vec::new(),
+        }
+    }
+
+    fn sample_consumed_record(tag: u8, consumed_at: u64) -> ConsumedRecord {
+        ConsumedRecord {
+            reforge_id: [tag; 32],
+            output_mint_ids: vec![[tag.wrapping_add(1); 32], [tag.wrapping_add(2); 32]],
+            consumed_at,
+            denomination_value: 10,
+            digest: [tag.wrapping_add(3); 32],
+        }
+    }
+
+    fn sample_seed_state() -> Arc<Mutex<ArteryState>> {
+        let node_id = [0xAB; 32];
+        let tag_cache_path = std::env::temp_dir().join(format!(
+            "vess-seed-sync-test-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+
+        Arc::new(Mutex::new(ArteryState {
+            registry: OwnershipRegistry::new(node_id),
+            tag_dht: TagDht::new(node_id, 4),
+            compute_dht: ComputeDht::new(),
+            node_id,
+            routing_table: RoutingTable::new(node_id),
+            gossip_config: GossipConfig {
+                k_neighbors: 4,
+                max_hops: 6,
+            },
+            peer_registry: PeerRegistry::new(std::time::Duration::from_secs(30)),
+            handshake_queue: Vec::new(),
+            limbo_buffer: LimboBuffer::new(),
+            reputation: ReputationTable::new(),
+            rate_limiter: crate::gossip::PeerRateLimiter::with_defaults(),
+            mailbox_collect_limiter: crate::gossip::PeerRateLimiter::new(10, 60),
+            tag_lookup_limiter: crate::gossip::PeerRateLimiter::new(30, 60),
+            registry_query_limiter: crate::gossip::PeerRateLimiter::new(20, 60),
+            duplicate_tracker: DuplicateTracker::new(),
+            estimated_network_size: 0,
+            limbo_mint_ids: std::collections::HashSet::new(),
+            limbo_payment_ids: std::collections::HashSet::new(),
+            manifest_store: HashMap::new(),
+            retained_ownership_records: HashMap::new(),
+            retained_consumed_records: HashMap::new(),
+            limbo_entry_times: HashMap::new(),
+            payment_latency: PaymentLatencyTracker::new(1000),
+            pending_reforge_genesis: HashMap::new(),
+            wallet: None,
+            bitcoin_client: None,
+            wallet_path: None,
+            notifications: VecDeque::new(),
+            outbound_payments: HashMap::new(),
+            outbound_by_mint_id: HashMap::new(),
+            banishment: Arc::new(BanishmentManager::new()),
+            tag_cache: crate::tag_cache::TagCache::load_or_create(tag_cache_path),
+            mailbox_fwd: HashMap::new(),
+            mailbox_fwd_limiter: crate::gossip::PeerRateLimiter::new(5, 60),
+        }))
+    }
+
+    #[test]
+    fn bitcoin_burn_bundle_accepts_canonical_genesis_binding() {
+        let (burn, og) = sample_burn_bundle();
+        let bundle_commitment = validate_bitcoin_burn_genesis(&og, &burn).unwrap();
+        assert_eq!(bundle_commitment, og.digest);
+    }
+
+    #[test]
+    fn bitcoin_burn_bundle_rejects_reorg_like_confirmation_regression() {
+        let (mut burn, og) = sample_burn_bundle();
+        burn.network = BitcoinNetwork::Testnet;
+        burn.required_confirmations = 6;
+        burn.confirmations = 5;
+
+        let error = validate_bitcoin_burn_genesis(&og, &burn).unwrap_err();
+        assert_eq!(error, "bitcoin burn confirmation depth insufficient");
+    }
+
+    #[test]
+    fn bitcoin_burn_bundle_rejects_payload_mismatch() {
+        let (mut burn, og) = sample_burn_bundle();
+        burn.burn_commitment_payload[0] ^= 0xff;
+
+        let error = validate_bitcoin_burn_genesis(&og, &burn).unwrap_err();
+        assert_eq!(error, "bitcoin burn OP_RETURN payload mismatch");
+    }
+
+    #[test]
+    fn seed_merge_prefers_deeper_chain_across_partition_replay_order() {
+        let mint_id = [0xA1; 32];
+        let shallow = sample_partition_record(mint_id, 1, Some([0x10; 32]), [0x01; 32], 2_000);
+        let deep = sample_partition_record(mint_id, 2, Some([0xF0; 32]), [0x02; 32], 1_000);
+
+        let mut left = HashMap::new();
+        upsert_seed_ownership_record(&mut left, shallow.clone());
+        upsert_seed_ownership_record(&mut left, deep.clone());
+
+        let mut right = HashMap::new();
+        upsert_seed_ownership_record(&mut right, deep.clone());
+        upsert_seed_ownership_record(&mut right, shallow);
+
+        assert_eq!(left.get(&mint_id).unwrap().chain_depth, 2);
+        assert_eq!(right.get(&mint_id).unwrap().chain_depth, 2);
+        assert_eq!(left.get(&mint_id).unwrap().chain_tip, deep.chain_tip);
+        assert_eq!(right.get(&mint_id).unwrap().chain_tip, deep.chain_tip);
+    }
+
+    #[test]
+    fn seed_merge_prefers_lower_claim_hash_at_equal_depth_across_partition_replay_order() {
+        let mint_id = [0xB2; 32];
+        let higher_hash = sample_partition_record(
+            mint_id,
+            3,
+            Some([0xAA; 32]),
+            [0x10; 32],
+            9_000,
+        );
+        let lower_hash = sample_partition_record(
+            mint_id,
+            3,
+            Some([0x11; 32]),
+            [0x20; 32],
+            1,
+        );
+
+        let mut left = HashMap::new();
+        upsert_seed_ownership_record(&mut left, higher_hash.clone());
+        upsert_seed_ownership_record(&mut left, lower_hash.clone());
+
+        let mut right = HashMap::new();
+        upsert_seed_ownership_record(&mut right, lower_hash.clone());
+        upsert_seed_ownership_record(&mut right, higher_hash);
+
+        assert_eq!(left.get(&mint_id).unwrap().claim_hash, lower_hash.claim_hash);
+        assert_eq!(right.get(&mint_id).unwrap().claim_hash, lower_hash.claim_hash);
+        assert_eq!(left.get(&mint_id).unwrap().chain_tip, lower_hash.chain_tip);
+        assert_eq!(right.get(&mint_id).unwrap().chain_tip, lower_hash.chain_tip);
+    }
+
+    #[test]
+    fn seed_sync_rejects_single_peer_overwrite_without_quorum() {
+        let state = sample_seed_state();
+        let ownership_mint = [0xC1; 32];
+        let consumed_mint = [0xC2; 32];
+
+        let mut snapshot = SeedSyncPeerSnapshot::default();
+        snapshot.ownership_records.insert(
+            ownership_mint,
+            sample_partition_record(ownership_mint, 2, Some([0x01; 32]), [0x11; 32], 100),
+        );
+        snapshot
+            .consumed_records
+            .insert(consumed_mint, sample_consumed_record(0x21, 200));
+
+        apply_quorum_seed_snapshots(&state, vec![snapshot]);
+
+        let locked = state.lock().unwrap();
+        assert!(locked.registry.get(&ownership_mint).is_none());
+        assert!(locked.registry.was_consumed(&consumed_mint).is_none());
+    }
+
+    #[test]
+    fn seed_sync_rejects_split_vote_snapshots_without_majority() {
+        let state = sample_seed_state();
+        let ownership_mint = [0xD1; 32];
+        let consumed_mint = [0xD2; 32];
+
+        let mut left = SeedSyncPeerSnapshot::default();
+        left.ownership_records.insert(
+            ownership_mint,
+            sample_partition_record(ownership_mint, 2, Some([0x10; 32]), [0x12; 32], 100),
+        );
+        left.consumed_records
+            .insert(consumed_mint, sample_consumed_record(0x31, 300));
+
+        let mut right = SeedSyncPeerSnapshot::default();
+        right.ownership_records.insert(
+            ownership_mint,
+            sample_partition_record(ownership_mint, 2, Some([0x20; 32]), [0x13; 32], 101),
+        );
+        right
+            .consumed_records
+            .insert(consumed_mint, sample_consumed_record(0x41, 301));
+
+        apply_quorum_seed_snapshots(&state, vec![left, right]);
+
+        let locked = state.lock().unwrap();
+        assert!(locked.registry.get(&ownership_mint).is_none());
+        assert!(locked.registry.was_consumed(&consumed_mint).is_none());
+    }
+
+    #[test]
+    fn seed_sync_installs_majority_matched_ownership_and_tombstones() {
+        let state = sample_seed_state();
+        let ownership_mint = [0xE1; 32];
+        let consumed_mint = [0xE2; 32];
+        let winning_record = sample_partition_record(
+            ownership_mint,
+            3,
+            Some([0x05; 32]),
+            [0x55; 32],
+            400,
+        );
+        let losing_record = sample_partition_record(
+            ownership_mint,
+            3,
+            Some([0xAA; 32]),
+            [0x77; 32],
+            401,
+        );
+        let winning_consumed = sample_consumed_record(0x51, 500);
+        let losing_consumed = sample_consumed_record(0x61, 501);
+
+        let mut first = SeedSyncPeerSnapshot::default();
+        first
+            .ownership_records
+            .insert(ownership_mint, winning_record.clone());
+        first
+            .consumed_records
+            .insert(consumed_mint, winning_consumed.clone());
+
+        let mut second = SeedSyncPeerSnapshot::default();
+        second
+            .ownership_records
+            .insert(ownership_mint, winning_record.clone());
+        second
+            .consumed_records
+            .insert(consumed_mint, winning_consumed.clone());
+
+        let mut third = SeedSyncPeerSnapshot::default();
+        third
+            .ownership_records
+            .insert(ownership_mint, losing_record);
+        third
+            .consumed_records
+            .insert(consumed_mint, losing_consumed);
+
+        apply_quorum_seed_snapshots(&state, vec![first, second, third]);
+
+        let locked = state.lock().unwrap();
+        let installed = locked.registry.get(&ownership_mint).unwrap();
+        assert_eq!(installed.chain_tip, winning_record.chain_tip);
+        assert_eq!(installed.claim_hash, winning_record.claim_hash);
+
+        let consumed = locked.registry.was_consumed(&consumed_mint).unwrap();
+        assert_eq!(consumed.reforge_id, winning_consumed.reforge_id);
+        assert_eq!(consumed.output_mint_ids, winning_consumed.output_mint_ids);
+    }
+
+    #[test]
+    fn competing_claim_chain_tip_must_match_pretransfer_base() {
+        let base_chain_tip = [0x71; 32];
+        let wrong_base_chain_tip = [0x72; 32];
+        let witness_hash = [0x73; 32];
+        let new_owner_vk_hash = [0x74; 32];
+
+        let valid_tip = vess_foundry::advance_chain_tip_with_hash(
+            &base_chain_tip,
+            &new_owner_vk_hash,
+            &witness_hash,
+        );
+        let forged_tip = vess_foundry::advance_chain_tip_with_hash(
+            &wrong_base_chain_tip,
+            &new_owner_vk_hash,
+            &witness_hash,
+        );
+
+        let mut claim = OwnershipClaim {
+            mint_id: [0x75; 32],
+            stealth_id: [0x76; 32],
+            prev_owner_vk: Vec::new(),
+            prev_owner_program: None,
+            transfer_sig: Vec::new(),
+            new_owner_vk_hash,
+            new_owner_vk: Vec::new(),
+            new_owner_program: None,
+            new_chain_tip: valid_tip,
+            timestamp: 1_700_000_000,
+            hops_remaining: 0,
+            chain_depth: 2,
+            encrypted_bill: Vec::new(),
+            program_spend_witness: None,
+        };
+
+        assert!(verify_competing_claim_chain_tip(base_chain_tip, &claim, witness_hash));
+
+        claim.new_chain_tip = forged_tip;
+        assert!(!verify_competing_claim_chain_tip(base_chain_tip, &claim, witness_hash));
     }
 }
 
@@ -787,6 +1238,7 @@ fn dht_seed_ownership_from_record(record: &OwnershipRecord) -> DhtSeedOwnershipR
         nonce: record.nonce,
         prev_claim_vk_hash: record.prev_claim_vk_hash,
         claim_hash: record.claim_hash,
+        prev_transfer_chain_tip: record.prev_transfer_chain_tip,
         chain_depth: record.chain_depth,
         encrypted_bill: record.encrypted_bill.clone(),
     }
@@ -806,8 +1258,158 @@ fn ownership_record_from_dht_seed(record: DhtSeedOwnershipRecord) -> OwnershipRe
         nonce: record.nonce,
         prev_claim_vk_hash: record.prev_claim_vk_hash,
         claim_hash: record.claim_hash,
+        prev_transfer_chain_tip: record.prev_transfer_chain_tip,
         chain_depth: record.chain_depth,
         encrypted_bill: record.encrypted_bill,
+    }
+}
+
+#[derive(Debug, Default)]
+struct SeedSyncPeerSnapshot {
+    ownership_records: HashMap<[u8; 32], OwnershipRecord>,
+    consumed_records: HashMap<[u8; 32], ConsumedRecord>,
+}
+
+fn ownership_record_vote_key(record: &OwnershipRecord) -> [u8; 32] {
+    serde_json::to_vec(record)
+        .map(|bytes| *blake3::hash(&bytes).as_bytes())
+        .unwrap_or([0u8; 32])
+}
+
+fn consumed_record_vote_key(record: &ConsumedRecord) -> [u8; 32] {
+    serde_json::to_vec(record)
+        .map(|bytes| *blake3::hash(&bytes).as_bytes())
+        .unwrap_or([0u8; 32])
+}
+
+fn validated_seed_ownership_record(
+    registry: &OwnershipRegistry,
+    peer_ids: &[[u8; 32]],
+    replication: usize,
+    seeded_record: DhtSeedOwnershipRecord,
+) -> Option<OwnershipRecord> {
+    let mint_id = seeded_record.mint_id;
+    if !registry.should_store(&mint_id, peer_ids, replication) {
+        return None;
+    }
+
+    let record = ownership_record_from_dht_seed(seeded_record);
+    if registry.was_consumed(&mint_id).is_some() {
+        return None;
+    }
+
+    if let Some(program_owner) = &record.current_owner_program {
+        if record.current_owner_vk_hash != program_owner.owner_commitment() {
+            return None;
+        }
+    } else {
+        if record.current_owner_vk.is_empty() {
+            return None;
+        }
+        if vess_foundry::spend_auth::vk_hash(&record.current_owner_vk) != record.current_owner_vk_hash {
+            return None;
+        }
+    }
+
+    Some(record)
+}
+
+fn validated_seed_consumed_record(
+    registry: &OwnershipRegistry,
+    peer_ids: &[[u8; 32]],
+    replication: usize,
+    seeded_record: DhtSeedConsumedRecord,
+) -> Option<([u8; 32], ConsumedRecord)> {
+    let (mint_id, record) = consumed_record_from_dht_seed(seeded_record);
+    registry
+        .should_store(&mint_id, peer_ids, replication)
+        .then_some((mint_id, record))
+}
+
+fn apply_quorum_seed_snapshots(state: &Arc<Mutex<ArteryState>>, snapshots: Vec<SeedSyncPeerSnapshot>) {
+    if snapshots.len() < 2 {
+        info!(peers = snapshots.len(), "skipping ownership seed sync install because quorum is unavailable");
+        return;
+    }
+
+    let quorum = snapshots.len() / 2 + 1;
+    let mut ownership_votes: HashMap<[u8; 32], HashMap<[u8; 32], (usize, OwnershipRecord)>> =
+        HashMap::new();
+    let mut consumed_votes: HashMap<[u8; 32], HashMap<[u8; 32], (usize, ConsumedRecord)>> =
+        HashMap::new();
+
+    for snapshot in snapshots {
+        for record in snapshot.ownership_records.into_values() {
+            let key = ownership_record_vote_key(&record);
+            let entry = ownership_votes
+                .entry(record.mint_id)
+                .or_default()
+                .entry(key)
+                .or_insert_with(|| (0, record));
+            entry.0 += 1;
+        }
+        for (mint_id, record) in snapshot.consumed_records {
+            let key = consumed_record_vote_key(&record);
+            let entry = consumed_votes
+                .entry(mint_id)
+                .or_default()
+                .entry(key)
+                .or_insert_with(|| (0, record));
+            entry.0 += 1;
+        }
+    }
+
+    let mut inserted_ownership_records = 0usize;
+    let mut inserted_consumed_records = 0usize;
+    let mut s = state.lock().unwrap();
+
+    for (mint_id, variants) in ownership_votes {
+        let mut ranked: Vec<(usize, OwnershipRecord)> = variants.into_values().collect();
+        ranked.sort_by(|left, right| right.0.cmp(&left.0));
+        let Some((best_votes, best_record)) = ranked.into_iter().next() else {
+            continue;
+        };
+        if best_votes < quorum || s.registry.was_consumed(&mint_id).is_some() {
+            continue;
+        }
+        if let Some(existing) = s.registry.get(&mint_id).cloned() {
+            if !ownership_record_supersedes(&best_record, &existing) {
+                continue;
+            }
+            if let Some(existing_mut) = s.registry.get_mut(&mint_id) {
+                *existing_mut = best_record;
+                inserted_ownership_records += 1;
+            }
+        } else if s.registry.register(best_record) {
+            inserted_ownership_records += 1;
+        }
+    }
+
+    for (mint_id, variants) in consumed_votes {
+        let mut ranked: Vec<(usize, ConsumedRecord)> = variants.into_values().collect();
+        ranked.sort_by(|left, right| right.0.cmp(&left.0));
+        let Some((best_votes, best_record)) = ranked.into_iter().next() else {
+            continue;
+        };
+        if best_votes < quorum {
+            continue;
+        }
+        if let Some(existing) = s.registry.was_consumed(&mint_id).cloned() {
+            if !consumed_record_supersedes(&best_record, &existing) {
+                continue;
+            }
+        }
+        s.registry.insert_consumed_record(mint_id, best_record);
+        inserted_consumed_records += 1;
+    }
+
+    if inserted_ownership_records > 0 || inserted_consumed_records > 0 {
+        info!(
+            quorum,
+            inserted_ownership_records,
+            inserted_consumed_records,
+            "installed quorum-validated ownership state from seed sync"
+        );
     }
 }
 
@@ -862,10 +1464,11 @@ fn consumed_record_from_dht_seed(record: DhtSeedConsumedRecord) -> ([u8; 32], Co
 fn ownership_record_supersedes(candidate: &OwnershipRecord, incumbent: &OwnershipRecord) -> bool {
     candidate.chain_depth > incumbent.chain_depth
         || (candidate.chain_depth == incumbent.chain_depth
-            && (candidate.updated_at > incumbent.updated_at
-                || (candidate.updated_at == incumbent.updated_at
-                    && candidate.claim_hash.unwrap_or([0xff; 32])
-                        < incumbent.claim_hash.unwrap_or([0xff; 32]))))
+            && (candidate.claim_hash.unwrap_or([0xff; 32])
+                < incumbent.claim_hash.unwrap_or([0xff; 32])
+                || (candidate.claim_hash.unwrap_or([0xff; 32])
+                    == incumbent.claim_hash.unwrap_or([0xff; 32])
+                    && candidate.chain_tip < incumbent.chain_tip)))
 }
 
 fn consumed_record_supersedes(candidate: &ConsumedRecord, incumbent: &ConsumedRecord) -> bool {
@@ -913,6 +1516,15 @@ fn collect_seed_consumed_records(state: &ArteryState) -> HashMap<[u8; 32], Consu
         upsert_seed_consumed_record(&mut records, mint_id, record);
     }
     records
+}
+
+fn verify_competing_claim_chain_tip(
+    base_chain_tip: [u8; 32],
+    oc: &OwnershipClaim,
+    witness_hash: [u8; 32],
+) -> bool {
+    vess_foundry::advance_chain_tip_with_hash(&base_chain_tip, &oc.new_owner_vk_hash, &witness_hash)
+        == oc.new_chain_tip
 }
 
 fn ownership_claim_hash(oc: &OwnershipClaim) -> [u8; 32] {
@@ -1039,6 +1651,7 @@ pub(crate) fn retain_local_ownership_genesis(
             nonce: proof_nonce,
             prev_claim_vk_hash: None,
             claim_hash: None,
+            prev_transfer_chain_tip: None,
             chain_depth: og.chain_depth,
             encrypted_bill: Vec::new(),
         },
@@ -1064,6 +1677,7 @@ pub(crate) fn local_seed_record_from_claimed_bill(
         nonce: [0u8; 32],
         prev_claim_vk_hash: Some(vess_foundry::spend_auth::vk_hash(&claim.prev_owner_vk)),
         claim_hash: Some(ownership_claim_hash(claim)),
+        prev_transfer_chain_tip: None,
         chain_depth: bill.chain_depth,
         encrypted_bill: claim.encrypted_bill.clone(),
     }
@@ -1102,15 +1716,17 @@ pub(crate) fn retain_local_ownership_claim(
         return;
     };
 
+    let previous_chain_tip = record.chain_tip;
+    record.updated_at = updated_at;
+    record.prev_claim_vk_hash = Some(vess_foundry::spend_auth::vk_hash(&oc.prev_owner_vk));
+    record.claim_hash = Some(ownership_claim_hash(oc));
+    record.prev_transfer_chain_tip = Some(previous_chain_tip);
+    record.chain_depth = oc.chain_depth;
+    record.encrypted_bill = oc.encrypted_bill.clone();
     record.chain_tip = oc.new_chain_tip;
     record.current_owner_vk_hash = oc.new_owner_vk_hash;
     record.current_owner_vk = oc.new_owner_vk.clone();
     record.current_owner_program = oc.new_owner_program.clone();
-    record.updated_at = updated_at;
-    record.prev_claim_vk_hash = Some(vess_foundry::spend_auth::vk_hash(&oc.prev_owner_vk));
-    record.claim_hash = Some(ownership_claim_hash(oc));
-    record.chain_depth = oc.chain_depth;
-    record.encrypted_bill = oc.encrypted_bill.clone();
     state.retained_consumed_records.remove(&oc.mint_id);
     upsert_seed_ownership_record(&mut state.retained_ownership_records, record);
 }
@@ -1280,11 +1896,12 @@ async fn request_dht_seed_catchup(
     target: &MeshCarrierContact,
     state: &Arc<Mutex<ArteryState>>,
     state_dir: &Path,
-) {
+) -> Option<SeedSyncPeerSnapshot> {
     const MAX_DHT_SEED_CATCHUP_ROUNDS: usize = 1024;
 
     let requester_node_id = *node.id().as_bytes();
     let mut cursor = DhtSeedCursor::default();
+    let mut snapshot = SeedSyncPeerSnapshot::default();
 
     for round in 0..MAX_DHT_SEED_CATCHUP_ROUNDS {
         let dht_seed_request = PulseMessage::DhtSeedRequest(cursor.into_request(requester_node_id));
@@ -1292,23 +1909,30 @@ async fn request_dht_seed_catchup(
             Ok(Some(PulseMessage::DhtSeedResponse(response))) => response,
             Ok(_) => {
                 warn!(round, "unexpected DHT seed response from peer");
-                return;
+                return None;
             }
             Err(error) => {
                 warn!(round, %error, "DHT seed catch-up failed");
-                return;
+                return None;
             }
         };
 
         let empty_page = dht_seed_response_is_empty(&response);
         cursor.advance_from_response(&response);
-        ingest_dht_seed_response(state, state_dir, response);
+        let page_snapshot = ingest_dht_seed_response(state, state_dir, response);
+        for record in page_snapshot.ownership_records.into_values() {
+            upsert_seed_ownership_record(&mut snapshot.ownership_records, record);
+        }
+        for (mint_id, record) in page_snapshot.consumed_records {
+            upsert_seed_consumed_record(&mut snapshot.consumed_records, mint_id, record);
+        }
         if empty_page {
-            return;
+            return Some(snapshot);
         }
     }
 
     warn!("DHT seed catch-up hit round limit before reaching an empty page");
+    Some(snapshot)
 }
 
 pub(crate) async fn refresh_mailbox_forward_subscriptions(
@@ -1372,19 +1996,18 @@ fn ingest_dht_seed_response(
     state: &Arc<Mutex<ArteryState>>,
     state_dir: &Path,
     response: DhtSeedResponse,
-) {
+) -> SeedSyncPeerSnapshot {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
     let mut inserted_tags = 0usize;
     let mut inserted_manifests = 0usize;
-    let mut inserted_ownership_records = 0usize;
-    let mut inserted_consumed_records = 0usize;
     let mut inserted_programs = 0usize;
     let mut inserted_program_manifests = 0usize;
     let mut inserted_compute_receipts = 0usize;
     let mut mirrored_receipts = Vec::new();
+    let mut snapshot = SeedSyncPeerSnapshot::default();
     let mut s = state.lock().unwrap();
     let peer_ids: Vec<[u8; 32]> = s
         .routing_table
@@ -1441,32 +2064,10 @@ fn ingest_dht_seed_response(
         .into_iter()
         .take(MAX_DHT_SEED_OWNERSHIP_RECORDS)
     {
-        let mint_id = seeded_record.mint_id;
-        if !s.registry.should_store(&mint_id, &peer_ids, repl) {
-            continue;
-        }
-        let record = ownership_record_from_dht_seed(seeded_record);
-        if !record.current_owner_vk.is_empty()
-            && vess_foundry::spend_auth::vk_hash(&record.current_owner_vk)
-                != record.current_owner_vk_hash
+        if let Some(record) =
+            validated_seed_ownership_record(&s.registry, &peer_ids, repl, seeded_record)
         {
-            continue;
-        }
-        if s.registry.was_consumed(&mint_id).is_some() {
-            continue;
-        }
-        if let Some(existing) = s.registry.get(&mint_id).cloned() {
-            if !ownership_record_supersedes(&record, &existing) {
-                continue;
-            }
-            if let Some(existing_mut) = s.registry.get_mut(&mint_id) {
-                *existing_mut = record;
-                inserted_ownership_records += 1;
-            }
-            continue;
-        }
-        if s.registry.register(record) {
-            inserted_ownership_records += 1;
+            upsert_seed_ownership_record(&mut snapshot.ownership_records, record);
         }
     }
 
@@ -1475,17 +2076,11 @@ fn ingest_dht_seed_response(
         .into_iter()
         .take(MAX_DHT_SEED_CONSUMED_RECORDS)
     {
-        let (mint_id, record) = consumed_record_from_dht_seed(seeded_record);
-        if !s.registry.should_store(&mint_id, &peer_ids, repl) {
-            continue;
+        if let Some((mint_id, record)) =
+            validated_seed_consumed_record(&s.registry, &peer_ids, repl, seeded_record)
+        {
+            upsert_seed_consumed_record(&mut snapshot.consumed_records, mint_id, record);
         }
-        if let Some(existing) = s.registry.was_consumed(&mint_id).cloned() {
-            if !consumed_record_supersedes(&record, &existing) {
-                continue;
-            }
-        }
-        s.registry.insert_consumed_record(mint_id, record);
-        inserted_consumed_records += 1;
     }
 
     for seeded_program in response.programs.into_iter().take(MAX_DHT_SEED_PROGRAMS) {
@@ -1540,8 +2135,6 @@ fn ingest_dht_seed_response(
 
     if inserted_tags > 0
         || inserted_manifests > 0
-        || inserted_ownership_records > 0
-        || inserted_consumed_records > 0
         || inserted_programs > 0
         || inserted_program_manifests > 0
         || inserted_compute_receipts > 0
@@ -1550,14 +2143,14 @@ fn ingest_dht_seed_response(
             responder = ?&response.responder_node_id[..4],
             inserted_tags,
             inserted_manifests,
-            inserted_ownership_records,
-            inserted_consumed_records,
             inserted_programs,
             inserted_program_manifests,
             inserted_compute_receipts,
             "seeded initial DHT shard data from peer"
         );
     }
+
+    snapshot
 }
 
 fn spawn_local_lan_discovery(local_contact: MeshCarrierContact, state: Arc<Mutex<ArteryState>>) {
@@ -1842,6 +2435,12 @@ pub(crate) struct WalletState {
     /// Mailbox shard key derived from our spend encapsulation key.
     /// Used for targeted [`MailboxSweep`] and automatic forwarding subscription.
     pub(crate) mailbox_key: [u8; 32],
+}
+
+impl Drop for WalletState {
+    fn drop(&mut self) {
+        self.enc_key.zeroize();
+    }
 }
 
 /// Shared artery node state behind a mutex.
@@ -2346,7 +2945,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
             .or_else(|| std::env::var("VESS_WALLET_PASSWORD").ok());
 
         let raw_seed = if let Some(ref pwd) = password {
-            wallet.unlock_with_password(pwd)?
+            Zeroizing::new(wallet.unlock_with_password(pwd)?)
         } else {
             // Fallback: 12-word recovery phrase from VESS_RECOVERY_PHRASE.
             use vess_kloak::recovery::{derive_raw_seed, RecoveryPhrase};
@@ -2357,11 +2956,12 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 )
             })?;
             let phrase = RecoveryPhrase::from_input(&phrase_words)?;
-            derive_raw_seed(&phrase)?
+            Zeroizing::new(derive_raw_seed(&phrase)?)
         };
 
         // Derive stealth keys and encryption key from the raw seed.
-        let (stealth_secret, address) = vess_stealth::generate_master_keys_from_seed(&raw_seed);
+        let (stealth_secret, address) =
+            vess_stealth::generate_master_keys_from_seed(&raw_seed);
         let mailbox_key = vess_kloak::derive_mailbox_key(&address.spend_ek);
         let enc_key = encryption_key_from_seed(&raw_seed);
         let startup_wallet_tag_store = match crate::rpc::wallet_tag_store(&mut wallet, wallet_path, &enc_key) {
@@ -2940,7 +3540,10 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                                 for bill in &bills {
                                     ws.billfold.deposit_with_credentials(
                                         bill.clone(),
-                                        spend_credential.clone(),
+                                        SpendCredential {
+                                            spend_vk: spend_credential.spend_vk.clone(),
+                                            spend_sk: spend_credential.spend_sk.clone(),
+                                        },
                                     );
                                 }
                                 true
@@ -3200,6 +3803,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
         let boot_receipt_text_state_dir = receipt_text_state_dir.clone();
         let bootstrap_peers = all_bootstrap;
         tokio::spawn(async move {
+            let mut seed_snapshots = Vec::new();
             for peer_str in &bootstrap_peers {
                 let peer_str = peer_str.trim();
                 if peer_str.is_empty() {
@@ -3331,7 +3935,15 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     Err(e) => warn!("bootstrap peer {peer_str} unreachable: {e}"),
                 }
 
-                request_dht_seed_catchup(&boot_node, &target, &boot_state, &boot_receipt_text_state_dir).await;
+                if let Some(snapshot) =
+                    request_dht_seed_catchup(&boot_node, &target, &boot_state, &boot_receipt_text_state_dir).await
+                {
+                    seed_snapshots.push(snapshot);
+                }
+            }
+
+            if !seed_snapshots.is_empty() {
+                apply_quorum_seed_snapshots(&boot_state, seed_snapshots);
             }
         });
     }
@@ -5147,7 +5759,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     output_bytes: Vec::new(),
                     receipt: None,
                     error: Some(
-                        "delegated compute execution is not implemented on artery nodes yet"
+                        "remote compute jobs are not supported; program interaction is self-submitted via ownership-claim witnesses"
                             .to_string(),
                     ),
                 },
@@ -5821,121 +6433,19 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                             return None;
                         }
                     }
-                    GenesisProof::BitcoinBurn(burn) => {
-                        const MAX_BURN_OUTPUTS: usize = 64;
-                        const BURN_PAYLOAD_BYTES: usize = 32;
-                        const MAX_BURN_MERKLE_DEPTH: usize = 64;
-                        const MAX_OWNER_VK_BYTES: usize = 4096;
-
-                        if burn.burn_amount_sats == 0 {
-                            warn!("ownership genesis: zero-value bitcoin burn — banishing peer");
+                    GenesisProof::BitcoinBurn(burn) => match validate_bitcoin_burn_genesis(&og, burn) {
+                        Ok(bundle_commitment) => {
+                            proof_nonce = bundle_commitment;
+                            proof_hash = bundle_commitment;
+                            mint_id_pre_verified = true;
+                        }
+                        Err(reason) => {
+                            warn!("ownership genesis: {reason} — banishing peer");
                             state.peer_registry.mark_banished(peer_id);
                             ban_ref.banish(peer_id);
                             return None;
                         }
-                        let minimum_confirmations = min_bitcoin_burn_confirmations(burn.network);
-                        if burn.required_confirmations < minimum_confirmations
-                            || burn.confirmations < burn.required_confirmations
-                        {
-                            warn!(
-                                confirmations = burn.confirmations,
-                                required = burn.required_confirmations,
-                                minimum = minimum_confirmations,
-                                "ownership genesis: bitcoin burn confirmation depth insufficient — banishing peer"
-                            );
-                            state.peer_registry.mark_banished(peer_id);
-                            ban_ref.banish(peer_id);
-                            return None;
-                        }
-                        if burn.chain_work == [0u8; 32] {
-                            warn!("ownership genesis: bitcoin burn proof missing chainwork — banishing peer");
-                            state.peer_registry.mark_banished(peer_id);
-                            ban_ref.banish(peer_id);
-                            return None;
-                        }
-                        if burn.output_values.is_empty() || burn.output_values.len() > MAX_BURN_OUTPUTS {
-                            warn!("ownership genesis: invalid bitcoin burn output count {} — banishing peer", burn.output_values.len());
-                            state.peer_registry.mark_banished(peer_id);
-                            ban_ref.banish(peer_id);
-                            return None;
-                        }
-                        if burn.burn_commitment_payload.len() != BURN_PAYLOAD_BYTES
-                            || burn.merkle_proof.len() > MAX_BURN_MERKLE_DEPTH
-                            || burn.first_owner_vk.len() > MAX_OWNER_VK_BYTES
-                        {
-                            warn!("ownership genesis: bitcoin burn proof exceeds size limits — banishing peer");
-                            state.peer_registry.mark_banished(peer_id);
-                            ban_ref.banish(peer_id);
-                            return None;
-                        }
-                        if bitcoin_burn_merkle_root(burn) != burn.merkle_root {
-                            warn!("ownership genesis: bitcoin burn merkle proof mismatch — banishing peer");
-                            state.peer_registry.mark_banished(peer_id);
-                            ban_ref.banish(peer_id);
-                            return None;
-                        }
-                        if burn.first_owner_vk != og.owner_vk {
-                            warn!("ownership genesis: bitcoin burn first owner key mismatch — banishing peer");
-                            state.peer_registry.mark_banished(peer_id);
-                            ban_ref.banish(peer_id);
-                            return None;
-                        }
-                        let expected_payload = expected_bitcoin_burn_payload(burn);
-                        if burn.burn_commitment_payload.as_slice() != expected_payload {
-                            warn!("ownership genesis: bitcoin burn OP_RETURN payload mismatch — banishing peer");
-                            state.peer_registry.mark_banished(peer_id);
-                            ban_ref.banish(peer_id);
-                            return None;
-                        }
-                        if burn.first_owner_vk_hash != og.owner_vk_hash {
-                            warn!("ownership genesis: bitcoin burn owner_vk_hash mismatch — banishing peer");
-                            state.peer_registry.mark_banished(peer_id);
-                            ban_ref.banish(peer_id);
-                            return None;
-                        }
-
-                        let canonical_output_values = vess_foundry::bitcoin_burn_output_values(burn.burn_amount_sats);
-                        if burn.output_values != canonical_output_values {
-                            warn!("ownership genesis: bitcoin burn output decomposition is not canonical — banishing peer");
-                            state.peer_registry.mark_banished(peer_id);
-                            ban_ref.banish(peer_id);
-                            return None;
-                        }
-
-                        let output_index = og.output_index as usize;
-                        if output_index >= burn.output_values.len() {
-                            warn!("ownership genesis: bitcoin burn output_index {output_index} out of bounds — banishing peer");
-                            state.peer_registry.mark_banished(peer_id);
-                            ban_ref.banish(peer_id);
-                            return None;
-                        }
-                        if burn.output_values[output_index] != og.denomination_value {
-                            warn!("ownership genesis: bitcoin burn denomination mismatch at index {output_index} — banishing peer");
-                            state.peer_registry.mark_banished(peer_id);
-                            ban_ref.banish(peer_id);
-                            return None;
-                        }
-
-                        let bundle_commitment = bitcoin_burn_bundle_commitment(burn);
-                        if bundle_commitment != og.digest {
-                            warn!("ownership genesis: bitcoin burn commitment mismatch — banishing peer");
-                            state.peer_registry.mark_banished(peer_id);
-                            ban_ref.banish(peer_id);
-                            return None;
-                        }
-
-                        let expected_mint_id = vess_foundry::bitcoin_burn_mint_id(&burn.txid, og.output_index);
-                        if expected_mint_id != og.mint_id {
-                            warn!("ownership genesis: bitcoin burn mint_id derivation mismatch — banishing peer");
-                            state.peer_registry.mark_banished(peer_id);
-                            ban_ref.banish(peer_id);
-                            return None;
-                        }
-
-                        proof_nonce = bundle_commitment;
-                        proof_hash = bundle_commitment;
-                        mint_id_pre_verified = true;
-                    }
+                    },
                     GenesisProof::LocalTestFaucet(proof) => {
                         if !local_test_faucet_enabled() {
                             warn!(
@@ -6010,6 +6520,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     state.registry.register(OwnershipRecord {
                         mint_id: og.mint_id,
                         chain_tip: og.chain_tip,
+                        prev_transfer_chain_tip: None,
                         current_owner_vk_hash: og.owner_vk_hash,
                         current_owner_vk: og.owner_vk.clone(),
                         current_owner_program: og.program_owner.clone(),
@@ -6239,8 +6750,10 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
 
                         if oc.chain_depth == rec.chain_depth + 1 {
                             // Normal transfer: depth is exactly current + 1.
+                            let previous_chain_tip = rec.chain_tip;
                             rec.prev_claim_vk_hash = Some(prev_owner_commitment);
                             rec.claim_hash = Some(claim_hash);
+                            rec.prev_transfer_chain_tip = Some(previous_chain_tip);
                             rec.chain_depth = oc.chain_depth;
                             rec.chain_tip = oc.new_chain_tip;
                             rec.current_owner_vk_hash = oc.new_owner_vk_hash;
@@ -6285,24 +6798,16 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                             if prev_owner_commitment != rec.current_owner_vk_hash {
                                 // Competing claim at same depth — lowest hash wins.
                                 if rec.prev_claim_vk_hash == Some(prev_owner_commitment) {
-                                    // Verify chain_tip for the competing claim:
-                                    // we need the *previous* chain_tip (before the
-                                    // first claim updated it). Since both claims
-                                    // share the same prev_owner, we can recompute
-                                    // from the record's stored chain_tip only if the
-                                    // record still holds the pre-transfer tip. For
-                                    // competing claims the prev_vk_hash was already
-                                    // validated against prev_claim_vk_hash, so we
-                                    // verify the chain_tip is derivable from the
-                                    // signature + new_owner_vk_hash. This prevents
-                                    // fabricated chain_tips from corrupting the chain.
-                                    // NOTE: we cannot re-derive from the original
-                                    // tip (it was overwritten), but we CAN verify
-                                    // the competing claim's tip is consistent with
-                                    // the existing winner's tip derivation base.
-                                    // For now, both claims were validated in step 5
-                                    // when prev_vk matched current_owner at arrival
-                                    // time, so the chain_tip was verified then.
+                                    let Some(base_chain_tip) = rec.prev_transfer_chain_tip else {
+                                        warn!("ownership claim: competing claim missing pre-transfer base tip — rejecting");
+                                        return None;
+                                    };
+                                    if !verify_competing_claim_chain_tip(base_chain_tip, &oc, witness_hash) {
+                                        warn!("ownership claim: competing claim chain_tip mismatch — banishing");
+                                        state.peer_registry.mark_banished(peer_id);
+                                        ban_ref.banish(peer_id);
+                                        return None;
+                                    }
                                     if let Some(existing_hash) = rec.claim_hash {
                                         if claim_hash < existing_hash {
                                             rec.chain_tip = oc.new_chain_tip;
@@ -6311,6 +6816,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                                             rec.current_owner_program = oc.new_owner_program.clone();
                                             rec.updated_at = now;
                                             rec.claim_hash = Some(claim_hash);
+                                            rec.prev_transfer_chain_tip = Some(base_chain_tip);
                                             rec.encrypted_bill = oc.encrypted_bill.clone();
                                             if let Some(new_owner_program) = &oc.new_owner_program {
                                                 note_program_bill_activity(

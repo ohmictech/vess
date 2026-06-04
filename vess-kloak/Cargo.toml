@@ -20,3 +20,4 @@ postcard = { version = "1", features = ["alloc"] }
 rand = "0.8"
 anyhow = "1"
 tracing = "0.1"
+zeroize = { version = "1", features = ["zeroize_derive"] }

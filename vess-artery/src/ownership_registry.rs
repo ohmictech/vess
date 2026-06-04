@@ -78,6 +78,9 @@ pub struct OwnershipRecord {
     /// depth-first (longest chain wins), then lowest claim_hash as tiebreaker.
     #[serde(default)]
     pub claim_hash: Option<[u8; 32]>,
+    /// Pre-transfer chain tip for the current transfer slot.
+    #[serde(default)]
+    pub prev_transfer_chain_tip: Option<[u8; 32]>,
     /// Number of ownership transfers since genesis. Genesis = 0, first
     /// transfer = 1, etc. Deeper chains win in conflict resolution —
     /// a bill that has been forwarded twice (depth 2) beats a fraudulent
@@ -371,6 +374,7 @@ mod tests {
             nonce: [0x66; 32],
             prev_claim_vk_hash: None,
             claim_hash: None,
+            prev_transfer_chain_tip: None,
             chain_depth: 0,
             encrypted_bill: vec![],
         }

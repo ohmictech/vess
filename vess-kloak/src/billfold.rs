@@ -7,16 +7,23 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use vess_foundry::{Denomination, VessBill};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// ML-DSA-65 spend credentials for a bill, indexed by mint_id.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct SpendCredential {
     pub spend_vk: Vec<u8>,
     pub spend_sk: Vec<u8>,
 }
 
+impl std::fmt::Debug for SpendCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SpendCredential(<redacted>)")
+    }
+}
+
 /// A wallet's collection of Vess bills.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct BillFold {
     bills: Vec<VessBill>,
     /// Mint IDs of bills currently in-flight or limbo.
@@ -33,6 +40,17 @@ pub struct BillFold {
     /// Never written to disk as plaintext — encrypted separately in WalletFile.
     #[serde(skip_serializing, default)]
     spend_credentials: HashMap<[u8; 32], SpendCredential>,
+}
+
+impl Clone for BillFold {
+    fn clone(&self) -> Self {
+        Self {
+            bills: self.bills.clone(),
+            reserved: self.reserved.clone(),
+            reserve_times: self.reserve_times.clone(),
+            spend_credentials: HashMap::new(),
+        }
+    }
 }
 
 impl BillFold {

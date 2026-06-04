@@ -28,6 +28,7 @@ use chacha20poly1305::{
 };
 use serde::{Deserialize, Serialize};
 use vess_stealth::{MasterStealthAddress, StealthSecretKey};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 /// Standard BIP39 wallet recovery phrase length.
 pub const RECOVERY_WORD_COUNT: usize = 12;
@@ -41,9 +42,15 @@ const PWD_ARGON2_P_COST: u32 = 1;
 const PWD_ARGON2_OUTPUT_LEN: usize = 32;
 
 /// A wallet's recovery phrase: a checksum-validated 12-word English BIP39 mnemonic.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
 pub struct RecoveryPhrase {
     pub words: [String; RECOVERY_WORD_COUNT],
+}
+
+impl std::fmt::Debug for RecoveryPhrase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RecoveryPhrase(<redacted>)")
+    }
 }
 
 impl RecoveryPhrase {
@@ -312,10 +319,15 @@ pub fn create_password_cache_with_params(
     use rand::Rng;
     let mut salt = [0u8; 16];
     rand::thread_rng().fill(&mut salt);
-    let pwd_key =
-        derive_key_from_password_with_params(password, &salt, t_cost, m_cost_kib, p_cost)?;
+    let pwd_key = Zeroizing::new(derive_key_from_password_with_params(
+        password,
+        &salt,
+        t_cost,
+        m_cost_kib,
+        p_cost,
+    )?);
 
-    let cipher = ChaCha20Poly1305::new(GenericArray::from_slice(&pwd_key));
+    let cipher = ChaCha20Poly1305::new(GenericArray::from_slice(pwd_key.as_ref()));
     let nonce_bytes = random_nonce();
     let nonce = GenericArray::from_slice(&nonce_bytes);
     let ciphertext = cipher
@@ -348,18 +360,25 @@ pub fn decrypt_password_cache_with_params(
     m_cost_kib: u32,
     p_cost: u32,
 ) -> Result<[u8; 64]> {
-    let pwd_key =
-        derive_key_from_password_with_params(password, &cache.salt, t_cost, m_cost_kib, p_cost)?;
+    let pwd_key = Zeroizing::new(derive_key_from_password_with_params(
+        password,
+        &cache.salt,
+        t_cost,
+        m_cost_kib,
+        p_cost,
+    )?);
 
-    let cipher = ChaCha20Poly1305::new(GenericArray::from_slice(&pwd_key));
+    let cipher = ChaCha20Poly1305::new(GenericArray::from_slice(pwd_key.as_ref()));
     let nonce = GenericArray::from_slice(&cache.nonce);
-    let plaintext = cipher
+    let plaintext = Zeroizing::new(cipher
         .decrypt(nonce, cache.ciphertext.as_slice())
-        .map_err(|_| anyhow!("wrong password or corrupted password cache"))?;
+        .map_err(|_| anyhow!("wrong password or corrupted password cache"))?);
 
-    let seed: [u8; 64] = plaintext
-        .try_into()
-        .map_err(|_| anyhow!("decrypted password cache has wrong length"))?;
+    let mut seed = [0u8; 64];
+    if plaintext.len() != seed.len() {
+        return Err(anyhow!("decrypted password cache has wrong length"));
+    }
+    seed.copy_from_slice(plaintext.as_slice());
     Ok(seed)
 }
 

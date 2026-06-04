@@ -399,6 +399,7 @@ async fn program_lock_receipt_unlock_propagates_across_live_nodes() {
                             let record = OwnershipRecord {
                                 mint_id: og.mint_id,
                                 chain_tip: og.chain_tip,
+                                prev_transfer_chain_tip: None,
                                 current_owner_vk_hash: og.owner_vk_hash,
                                 current_owner_vk: og.owner_vk,
                                 current_owner_program: og.program_owner,

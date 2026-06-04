@@ -98,6 +98,7 @@ fn full_payment_lifecycle() {
         let record = OwnershipRecord {
             mint_id: bill.mint_id,
             chain_tip: bill.chain_tip,
+            prev_transfer_chain_tip: None,
             current_owner_vk_hash: *blake3::hash(&vk).as_bytes(),
             current_owner_vk: vk.clone(),
             current_owner_program: None,
@@ -132,6 +133,7 @@ fn ownership_registry_double_registration() {
     let record1 = OwnershipRecord {
         mint_id: mint_id1,
         chain_tip: rand::random(),
+        prev_transfer_chain_tip: None,
         current_owner_vk_hash: *blake3::hash(&vk).as_bytes(),
         current_owner_vk: vk.clone(),
         current_owner_program: None,
@@ -148,6 +150,7 @@ fn ownership_registry_double_registration() {
     let record2 = OwnershipRecord {
         mint_id: mint_id2,
         chain_tip: rand::random(),
+        prev_transfer_chain_tip: None,
         current_owner_vk_hash: *blake3::hash(&vk).as_bytes(),
         current_owner_vk: vk.clone(),
         current_owner_program: None,
@@ -180,6 +183,7 @@ fn ownership_registry_consume_and_merkle() {
     let record = OwnershipRecord {
         mint_id,
         chain_tip: rand::random(),
+        prev_transfer_chain_tip: None,
         current_owner_vk_hash: *blake3::hash(&vk).as_bytes(),
         current_owner_vk: vk.clone(),
         current_owner_program: None,
@@ -524,6 +528,7 @@ fn ownership_registry_persistence_roundtrip() {
         let record = OwnershipRecord {
             mint_id: mid,
             chain_tip: rand::random(),
+            prev_transfer_chain_tip: None,
             current_owner_vk_hash: *blake3::hash(&vk).as_bytes(),
             current_owner_vk: vk.clone(),
             current_owner_program: None,
@@ -566,6 +571,7 @@ fn ownership_registry_total_supply() {
         let record = OwnershipRecord {
             mint_id: rand::random(),
             chain_tip: rand::random(),
+            prev_transfer_chain_tip: None,
             current_owner_vk_hash: *blake3::hash(&vk).as_bytes(),
             current_owner_vk: vk.clone(),
             current_owner_program: None,
@@ -717,6 +723,7 @@ fn artery_snapshot_save_load() {
     let record1 = OwnershipRecord {
         mint_id: rand::random(),
         chain_tip: rand::random(),
+        prev_transfer_chain_tip: None,
         current_owner_vk_hash: *blake3::hash(&vk).as_bytes(),
         current_owner_vk: vk.clone(),
         current_owner_program: None,
@@ -733,6 +740,7 @@ fn artery_snapshot_save_load() {
     let record2 = OwnershipRecord {
         mint_id: rand::random(),
         chain_tip: rand::random(),
+        prev_transfer_chain_tip: None,
         current_owner_vk_hash: *blake3::hash(&vk).as_bytes(),
         current_owner_vk: vk.clone(),
         current_owner_program: None,
@@ -914,6 +922,7 @@ fn full_send_receive_attest_finalize() {
         let record = OwnershipRecord {
             mint_id: bill.mint_id,
             chain_tip: bill.chain_tip,
+            prev_transfer_chain_tip: None,
             current_owner_vk_hash: *blake3::hash(&vk).as_bytes(),
             current_owner_vk: vk.clone(),
             current_owner_program: None,
@@ -938,6 +947,7 @@ fn full_send_receive_attest_finalize() {
         let record = OwnershipRecord {
             mint_id: bill.mint_id,
             chain_tip: bill.chain_tip,
+            prev_transfer_chain_tip: None,
             current_owner_vk_hash: *blake3::hash(&vk).as_bytes(),
             current_owner_vk: vk.clone(),
             current_owner_program: None,

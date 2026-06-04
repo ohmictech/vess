@@ -45,6 +45,7 @@ use ml_kem::{Encoded, EncodedSizeUser, KemCore, MlKem768};
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 use serde::{Deserialize, Serialize};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 // Concrete ML-KEM-768 type aliases for readability.
 type Ek = <MlKem768 as KemCore>::EncapsulationKey;
@@ -69,10 +70,16 @@ pub struct MasterStealthAddress {
 }
 
 /// The secret half of a master stealth address, held only by the recipient.
-#[derive(Clone)]
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct StealthSecretKey {
     pub scan_dk: DecapKeyBytes,
     pub spend_dk: DecapKeyBytes,
+}
+
+impl std::fmt::Debug for StealthSecretKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StealthSecretKey(<redacted>)")
+    }
 }
 
 /// A stealth payload attached to a bill when sent to a recipient.

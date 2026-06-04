@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use crate::billfold::BillFold;
 
@@ -259,8 +260,8 @@ impl WalletFile {
             self.encrypted_spend_credentials = None;
             return Ok(());
         }
-        let json = serde_json::to_vec(creds).context("serialize spend credentials")?;
-        self.encrypted_spend_credentials = Some(EncryptedBlob::encrypt(&json, enc_key)?);
+        let json = Zeroizing::new(serde_json::to_vec(creds).context("serialize spend credentials")?);
+        self.encrypted_spend_credentials = Some(EncryptedBlob::encrypt(json.as_slice(), enc_key)?);
         Ok(())
     }
 
@@ -274,9 +275,9 @@ impl WalletFile {
         enc_key: &[u8; 32],
     ) -> Result<()> {
         if let Some(ref blob) = self.encrypted_spend_credentials {
-            let json = blob.decrypt(enc_key)?;
+            let json = Zeroizing::new(blob.decrypt(enc_key)?);
             let creds: std::collections::HashMap<[u8; 32], crate::billfold::SpendCredential> =
-                serde_json::from_slice(&json).context("deserialize spend credentials")?;
+                serde_json::from_slice(json.as_slice()).context("deserialize spend credentials")?;
             billfold.import_credentials(creds);
         }
         // If no encrypted blob, the billfold may still have legacy plaintext
