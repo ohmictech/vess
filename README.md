@@ -1,6 +1,7 @@
 
 ```
-Keep your lives free from the love of money and be content with what you have, because God has said, 'Never will I leave you; never will I forsake you.'
+Keep your lives free from the love of money and be content with what you have, 
+because God has said, 'Never will I leave you; never will I forsake you.'
 Heb 13:5
 ```
 
