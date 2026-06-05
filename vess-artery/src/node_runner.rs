@@ -119,18 +119,32 @@ pub(crate) struct OutboundPaymentRecord {
     pub(crate) pending_mint_ids: HashSet<[u8; 32]>,
 }
 
-/// Node event for the CLI events log.
+/// Structured node event for CLI display via `vess events`.
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct NodeEvent {
-    pub event: String,
-    pub created_at: u64,
-    pub peer_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub direction: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub amount: Option<u64>,
+#[serde(tag = "event")]
+pub(crate) enum NodeEvent {
+    PeerVerified {
+        created_at: u64,
+        peer_id: String,
+        direction: String,
+    },
+    PeerBanished {
+        created_at: u64,
+        peer_id: String,
+        reason: String,
+    },
+    SeedSyncStarted {
+        created_at: u64,
+        peer_id: String,
+    },
+    SeedSyncCompleted {
+        created_at: u64,
+        peer_id: String,
+        consumed_records: usize,
+        manifests: usize,
+        ownership_records: usize,
+        tags: usize,
+    },
 }
 
 /// Maximum age (in seconds) for timestamps on incoming messages.
@@ -2878,6 +2892,9 @@ pub(crate) struct WalletState {
     /// Mailbox shard key derived from our spend encapsulation key.
     /// Used for targeted [`MailboxSweep`] and automatic forwarding subscription.
     pub(crate) mailbox_key: [u8; 32],
+    /// Spend seed for DHT manifest encryption and wallet recovery.
+    /// `None` for older wallets that haven't been migrated yet.
+    pub(crate) spend_seed: Option<[u8; 32]>,
 }
 
 impl Drop for WalletState {
@@ -2948,6 +2965,8 @@ pub(crate) struct ArteryState {
     pub(crate) wallet_path: Option<PathBuf>,
     /// Wallet-local notification queue for CLI and wallet layers.
     pub(crate) notifications: VecDeque<WalletNotification>,
+    /// Structured node events for CLI display (burns, claims, banishments, etc.).
+    pub(crate) events: VecDeque<NodeEvent>,
     /// Outbound payments waiting for recipient claim confirmation.
     pub(crate) outbound_payments: HashMap<[u8; 32], OutboundPaymentRecord>,
     /// Reverse index from mint_id to outbound payment_id for fast finalization.
@@ -2968,8 +2987,6 @@ pub(crate) struct ArteryState {
     pub(crate) unsafe_mode: bool,
     /// Runtime flag for the local test faucet.
     pub(crate) test_faucet_enabled: bool,
-    /// Node event log for CLI visibility.
-    pub(crate) events: VecDeque<NodeEvent>,
 }
 
 impl ArteryState {
@@ -3480,6 +3497,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 wallet_path: wallet_path.clone(),
                 enc_key,
                 mailbox_key,
+                spend_seed: None,
             }),
             startup_wallet_tag_store,
         )

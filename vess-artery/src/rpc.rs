@@ -284,6 +284,11 @@ pub enum RpcRequest {
         #[serde(default)]
         max: Option<usize>,
     },
+    Events {
+        #[serde(default)]
+        max: Option<usize>,
+    },
+    NodeHealth,
     TagLookup {
         tag: String,
     },
@@ -423,6 +428,31 @@ pub enum RpcData {
     Notifications {
         notifications: Vec<crate::node_runner::WalletNotification>,
     },
+    Events {
+        events: Vec<crate::node_runner::NodeEvent>,
+    },
+    NodeHealth {
+        node_id: String,
+        peer_count: usize,
+        verified_peer_count: usize,
+        banished_peer_count: usize,
+        discovered_peer_count: usize,
+        cached_peer_count: usize,
+        estimated_network_size: usize,
+        tag_count: usize,
+        registry_count: usize,
+        limbo_payment_count: usize,
+        reputation_high: usize,
+        reputation_medium: usize,
+        reputation_low: usize,
+        wallet_state: String, // "no_wallet" | "locked" | "unlocked"
+        wallet_balance: u64,
+        wallet_watch_only: u64,
+        bitcoin_peers: usize,
+        bitcoin_pending_burns: usize,
+        discovery_sources: Vec<String>,
+        total_supply: u64,
+    },
     WalletStatus {
         locked: bool,
         has_password: bool,
@@ -539,6 +569,8 @@ async fn handle_request(
         RpcRequest::Balance => handle_balance(state),
         RpcRequest::NodeInfo => handle_node_info(state, node),
         RpcRequest::Notifications { max } => handle_notifications(state, max.unwrap_or(64)),
+        RpcRequest::Events { max } => handle_events(state, max.unwrap_or(64)),
+        RpcRequest::NodeHealth => handle_node_health(state),
         RpcRequest::TagLookup { tag } => handle_tag_lookup(state, node, &tag).await,
         RpcRequest::Send {
             amount,
@@ -718,6 +750,93 @@ fn handle_notifications(state: &Arc<Mutex<ArteryState>>, max: usize) -> RpcRespo
     let mut s = state.lock().unwrap();
     RpcResponse::ok(RpcData::Notifications {
         notifications: s.take_notifications(max),
+    })
+}
+
+fn handle_events(state: &Arc<Mutex<ArteryState>>, max: usize) -> RpcResponse {
+    let mut s = state.lock().unwrap();
+    RpcResponse::ok(RpcData::Events {
+        events: s.take_events(max),
+    })
+}
+
+fn handle_node_health(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
+    let s = state.lock().unwrap();
+
+    let peer_count = s.routing_table.peer_count();
+    let verified_peer_count = s.peer_registry.count_in_state(crate::handshake::PeerState::Verified);
+    let banished_count = s.banishment.count();
+
+    let discovered_peer_count = s
+        .routing_table
+        .all_peers()
+        .iter()
+        .filter(|peer| peer.last_seen > 0)
+        .count();
+    let cached_peer_count = peer_count.saturating_sub(discovered_peer_count);
+
+    // Rough reputation buckets from the reputation table.
+    let (high, medium, low) = s.reputation.bucket_counts();
+
+    let wallet_state = match &s.wallet {
+        None => "no_wallet",
+        Some(_) => "unlocked",
+    };
+
+    let wallet_balance = s
+        .wallet
+        .as_ref()
+        .map(|ws| ws.billfold.spendable_balance())
+        .unwrap_or(0);
+    let wallet_watch_only = s
+        .wallet
+        .as_ref()
+        .map(|ws| ws.billfold.watch_only_balance())
+        .unwrap_or(0);
+
+    let total_supply = s.registry.total_supply();
+
+    // Report which discovery sources may have been active.
+    let discovery_sources: Vec<String> = {
+        let mut sources = Vec::new();
+        if s.routing_table.peer_count() > 0 {
+            sources.push("peers_present".to_string());
+        }
+        if s.bitcoin_client.is_some() {
+            sources.push("bitcoin_seed".to_string());
+        }
+        sources
+    };
+
+    RpcResponse::ok(RpcData::NodeHealth {
+        node_id: crate::persistence::hex_key(&s.node_id),
+        peer_count,
+        verified_peer_count,
+        banished_peer_count: banished_count,
+        discovered_peer_count,
+        cached_peer_count,
+        estimated_network_size: s.estimated_network_size,
+        tag_count: s.tag_dht.record_count(),
+        registry_count: s.registry.len(),
+        limbo_payment_count: s.limbo_payment_ids.len(),
+        reputation_high: high,
+        reputation_medium: medium,
+        reputation_low: low,
+        wallet_state: wallet_state.to_string(),
+        wallet_balance,
+        wallet_watch_only,
+        bitcoin_peers: s
+            .bitcoin_client
+            .as_ref()
+            .map(|client| client.connected_peers())
+            .unwrap_or(0),
+        bitcoin_pending_burns: s
+            .wallet
+            .as_ref()
+            .map(|ws| ws.bitcoin_wallet.pending_burn_count())
+            .unwrap_or(0),
+        discovery_sources,
+        total_supply,
     })
 }
 
@@ -1843,21 +1962,49 @@ async fn handle_send_direct(
             }
             RpcResponse::err("unexpected response from recipient node")
         }
-        Ok(Err(e)) => {
+        Ok(Err(_e)) => {
+            // D4: Direct delivery failed — fall back to relay delivery via the
+            // payment gossip drain.  The payment will reach the recipient when
+            // they come online and collect from limbo.
+            if let PulseMessage::Payment(payment) = msg {
+                let _ = senders.pay_tx.send(payment);
+            }
             let mut s = state.lock().unwrap();
             if let Some(ref mut ws) = s.wallet {
                 ws.billfold.release(&sent_mints);
+                s.record_outbound_payment(payment_id, amount, recipient_tag.to_string(), &sent_mints);
                 s.flush_wallet();
             }
-            RpcResponse::err(format!("direct send failed: {e}"))
+            RpcResponse::ok(RpcData::Send {
+                payment_id: hex_key(&payment_id),
+                amount,
+                remaining_balance: s
+                    .wallet
+                    .as_ref()
+                    .map(|w| w.billfold.available_balance())
+                    .unwrap_or(0),
+            })
         }
         Err(_) => {
+            // D4: Direct delivery timed out — fall back to relay delivery.
+            if let PulseMessage::Payment(payment) = msg {
+                let _ = senders.pay_tx.send(payment);
+            }
             let mut s = state.lock().unwrap();
             if let Some(ref mut ws) = s.wallet {
                 ws.billfold.release(&sent_mints);
+                s.record_outbound_payment(payment_id, amount, recipient_tag.to_string(), &sent_mints);
                 s.flush_wallet();
             }
-            RpcResponse::err("direct send timed out (5s) — recipient node may be unreachable")
+            RpcResponse::ok(RpcData::Send {
+                payment_id: hex_key(&payment_id),
+                amount,
+                remaining_balance: s
+                    .wallet
+                    .as_ref()
+                    .map(|w| w.billfold.available_balance())
+                    .unwrap_or(0),
+            })
         }
     }
 }
@@ -1933,6 +2080,7 @@ async fn handle_wallet_unlock(
     let (balance, bill_count, watch_only_balance) = {
         let mut s = state.lock().unwrap();
         s.wallet_path = Some(wallet_path.clone());
+        let spend_seed = vess_kloak::recovery::spend_seed_from_raw_seed(&raw_seed);
         s.wallet = Some(WalletState {
             stealth_secret,
             billfold,
@@ -1940,6 +2088,7 @@ async fn handle_wallet_unlock(
             bitcoin_receive_address,
             wallet_path: wallet_path.clone(),
             enc_key,
+            spend_seed: Some(spend_seed),
             mailbox_key,
         });
 
@@ -2327,6 +2476,7 @@ fn handle_local_test_faucet(
     amount: u64,
     og_tx: &tokio::sync::mpsc::UnboundedSender<vess_protocol::OwnershipGenesis>,
 ) -> RpcResponse {
+    // Gate behind runtime test-faucet flag (set via `set_test_mode` RPC or env var).
     {
         let s = state.lock().unwrap();
         if !s.test_faucet_enabled {
@@ -2336,7 +2486,7 @@ fn handle_local_test_faucet(
         }
         if !s.unsafe_mode {
             return RpcResponse::err(
-                "local test faucet is not available in production mode"
+                "local test faucet is not available in production mode; use --profile dev or test"
             );
         }
     }

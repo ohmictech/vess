@@ -1415,7 +1415,7 @@ impl MeshCarrier for PqUdpMeshCarrier {
         // packets that may arrive on the shared request socket (e.g. late
         // responses from previous requests or probe packets from other nodes).
         let mut buffer = vec![0u8; MAX_MESH_UDP_PACKET_SIZE];
-        let (hello_len, hello_from, server_hello) = loop {
+        let (_hello_len, hello_from, server_hello) = loop {
             let (len, from) = tokio::time::timeout(
                 std::time::Duration::from_secs(10),
                 self.request_socket.recv_from(&mut buffer),

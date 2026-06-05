@@ -21,6 +21,7 @@ use chacha20poly1305::{
     aead::{generic_array::GenericArray, Aead, KeyInit},
     ChaCha20Poly1305,
 };
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
 use crate::VessBill;
@@ -138,6 +139,59 @@ impl SealedBill {
 pub struct ManifestEntry {
     pub mint_id: [u8; 32],
     pub dht_index: u64,
+    /// Credential encrypted under the spend_seed so the bill can be
+    /// recovered from manifest alone without the original wallet file.
+    pub encrypted_credential: Vec<u8>,
+}
+
+/// Encrypt a spend credential for inclusion in a manifest entry.
+pub fn encrypt_cred_for_manifest(
+    spend_seed: &[u8; 32],
+    mint_id: &[u8; 32],
+    cred_bytes: &[u8],
+) -> Result<Vec<u8>> {
+    let mut key_material = [0u8; 32];
+    let mut h = blake3::Hasher::new();
+    h.update(spend_seed);
+    h.update(b"vess-manifest-cred-v0");
+    h.update(mint_id);
+    key_material.copy_from_slice(h.finalize().as_bytes());
+
+    let mut nonce_bytes = [0u8; 12];
+    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    let cipher = ChaCha20Poly1305::new(GenericArray::from_slice(&key_material));
+    let mut ciphertext = cipher
+        .encrypt(GenericArray::from_slice(&nonce_bytes), cred_bytes)
+        .map_err(|e| anyhow!("credential encryption failed: {e}"))?;
+    // Prepend nonce to ciphertext for compact storage.
+    let mut result = Vec::with_capacity(12 + ciphertext.len());
+    result.extend_from_slice(&nonce_bytes);
+    result.append(&mut ciphertext);
+    Ok(result)
+}
+
+/// Decrypt a spend credential from a manifest entry.
+pub fn decrypt_cred_from_manifest(
+    spend_seed: &[u8; 32],
+    mint_id: &[u8; 32],
+    encrypted: &[u8],
+) -> Result<Vec<u8>> {
+    if encrypted.len() < 12 {
+        anyhow::bail!("encrypted credential too short");
+    }
+    let (nonce_bytes, ciphertext) = encrypted.split_at(12);
+
+    let mut key_material = [0u8; 32];
+    let mut h = blake3::Hasher::new();
+    h.update(spend_seed);
+    h.update(b"vess-manifest-cred-v0");
+    h.update(mint_id);
+    key_material.copy_from_slice(h.finalize().as_bytes());
+
+    let cipher = ChaCha20Poly1305::new(GenericArray::from_slice(&key_material));
+    cipher
+        .decrypt(GenericArray::from_slice(nonce_bytes), ciphertext)
+        .map_err(|e| anyhow!("credential decryption failed: {e}"))
 }
 
 /// Compute the DHT key for a wallet's manifest.

@@ -37,6 +37,7 @@ pub mod seal;
 pub mod spend_auth;
 pub mod vm;
 
+use hex;
 use serde::{Deserialize, Serialize};
 
 /// Bill denomination following the 1-2-5 series: any `d × 10^k` where
@@ -46,8 +47,42 @@ use serde::{Deserialize, Serialize};
 /// 1000, …, 5_000_000_000_000_000_000.
 ///
 /// Higher denominations require exponentially more work to mint.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Denomination(u64);
+
+/// JSON uses human-readable hex strings for compatibility with wallet
+/// files and RPC responses. Postcard (binary protocol) uses raw u64
+/// for minimal wire size and zero-alloc decoding.
+impl Serialize for Denomination {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if serializer.is_human_readable() {
+            serializer.serialize_str(&hex::encode(self.0.to_be_bytes()))
+        } else {
+            serializer.serialize_u64(self.0)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Denomination {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        if deserializer.is_human_readable() {
+            let hex_str = String::deserialize(deserializer)?;
+            let bytes = hex::decode(&hex_str).map_err(serde::de::Error::custom)?;
+            if bytes.len() != 8 {
+                return Err(serde::de::Error::custom("denomination hex must be 8 bytes"));
+            }
+            let val = u64::from_be_bytes(bytes[..8].try_into().unwrap());
+            Denomination::from_value(val).ok_or_else(|| {
+                serde::de::Error::custom(format!("invalid denomination value: {val}"))
+            })
+        } else {
+            let val = u64::deserialize(deserializer)?;
+            Denomination::from_value(val).ok_or_else(|| {
+                serde::de::Error::custom(format!("invalid denomination value: {val}"))
+            })
+        }
+    }
+}
 
 impl Denomination {
     // ── Common constants for readability ──────────────────────────

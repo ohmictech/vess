@@ -248,6 +248,25 @@ impl ReputationTable {
             self.peers.insert(id, rep);
         }
     }
+
+    /// Return (high, medium, low) bucket counts by score threshold.
+    /// high >= 0.8, medium >= 0.4, low = rest.
+    pub fn bucket_counts(&self) -> (usize, usize, usize) {
+        let mut high = 0usize;
+        let mut medium = 0usize;
+        let mut low = 0usize;
+        for rep in self.peers.values() {
+            let score = rep.score();
+            if score >= 0.8 {
+                high += 1;
+            } else if score >= 0.4 {
+                medium += 1;
+            } else {
+                low += 1;
+            }
+        }
+        (high, medium, low)
+    }
 }
 
 fn now_unix() -> u64 {
