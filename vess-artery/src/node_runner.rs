@@ -3418,6 +3418,41 @@ async fn batch_forward_bytes_to_peers(
     }
 }
 
+/// Payment-specific variant of batch_forward_bytes_to_peers: when a send
+/// fails, the Payment payload is re-queued via retry_tx so transient mesh
+/// failures (e.g. peer changed ports after restart) don't drop payments.
+async fn batch_forward_payments_with_retry(
+    node: &MeshPulseNode,
+    routable_peers: &[Vec<u8>],
+    per_peer: HashMap<usize, Vec<Arc<Vec<u8>>>>,
+    retry_tx: &tokio::sync::mpsc::UnboundedSender<vess_protocol::Payment>,
+) {
+    let mut tasks = Vec::with_capacity(per_peer.len());
+    let mut failed = Vec::new();
+    for (idx, payloads) in per_peer {
+        if idx >= routable_peers.len() || payloads.is_empty() { continue; }
+        let target = match decode_contact_bytes(&routable_peers[idx]) {
+            Ok(c) => c, Err(_) => continue,
+        };
+        let node = node.clone();
+        let p = payloads.clone();
+        tasks.push(tokio::spawn(async move {
+            if let Err(e) = node.send_raw_pulses_to_peer(&target, &p).await {
+                warn!("batch forward (raw) to peer failed: {e}");
+                Err(p)
+            } else { Ok(()) }
+        }));
+    }
+    for t in tasks {
+        if let Ok(Err(p)) = t.await { failed.extend(p); }
+    }
+    for bytes in failed {
+        if let Ok(PulseMessage::Payment(p)) = PulseMessage::from_bytes(bytes.as_slice()) {
+            let _ = retry_tx.send(p);
+        }
+    }
+}
+
 /// Run the artery node. Blocks until the process is interrupted (Ctrl+C).
 ///
 /// Returns the node's mesh node ID string for display/use.
@@ -5136,7 +5171,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     per_peer.entry(idx).or_default().push(Arc::clone(&bytes));
                 }
             }
-            batch_forward_bytes_to_peers(&pay_drain_node, &routable_peers, per_peer).await;
+            batch_forward_payments_with_retry(&pay_drain_node, &routable_peers, per_peer, &pay_retry_tx).await;
             info!(count = items.len(), "payment relay batch forwarded");
         }
     });
