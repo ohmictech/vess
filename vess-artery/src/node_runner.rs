@@ -3422,6 +3422,16 @@ async fn batch_forward_bytes_to_peers(
 ///
 /// Returns the node's mesh node ID string for display/use.
 pub async fn run_node(config: NodeConfig) -> Result<String> {
+    // ── Panic hook for crash diagnostics ────────────────────────────
+    std::panic::set_hook(Box::new(|info| {
+        let loc = info.location().map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()));
+        let payload = info.payload().downcast_ref::<&str>().copied()
+            .or_else(|| info.payload().downcast_ref::<String>().map(|s| s.as_str()))
+            .unwrap_or("Box<dyn Any>");
+        eprintln!("=== VESS NODE PANIC ===\n  at: {}\n  payload: {payload}",
+            loc.as_deref().unwrap_or("unknown"));
+    }));
+
     let storage = NodeStorage::open(&config.state_dir)?;
     let mut snapshot = storage.load()?;
     if config.reset_transient_peer_state {
