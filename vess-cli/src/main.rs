@@ -212,6 +212,10 @@ enum Command {
         /// Discard persisted peer cache and ban state on startup.
         #[arg(long, hide = true)]
         reset_transient_peer_state: bool,
+        /// Shorthand for --profile dev + VESS_LOCAL_TEST_FAUCET=1.
+        /// Enables the local test faucet for minting test Vess bills.
+        #[arg(long)]
+        test: bool,
     },
 
     /// Set a password for fast daily wallet unlock.
@@ -470,11 +474,15 @@ async fn dispatch_command(cli: &Cli) -> Result<()> {
             wallet_password,
             rpc_port,
             reset_transient_peer_state,
+            test,
         }) => {
             let state_dir = match state_dir {
                 Some(d) => d.clone(),
                 None => vess_artery::persistence::NodeStorage::default_dir()?,
             };
+            if *test {
+                std::env::set_var("VESS_LOCAL_TEST_FAUCET", "1");
+            }
             let config = vess_artery::node_runner::NodeConfig {
                 k_neighbors: *k_neighbors,
                 max_hops: *max_hops,
@@ -488,6 +496,7 @@ async fn dispatch_command(cli: &Cli) -> Result<()> {
                 enable_local_discovery: true,
                 allow_private_bitcoin_seed_contact: false,
                 reset_transient_peer_state: *reset_transient_peer_state,
+                test: *test,
             };
             vess_artery::node_runner::run_node(config).await?;
             Ok(())

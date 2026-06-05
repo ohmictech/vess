@@ -678,6 +678,7 @@ mod tests {
             estimated_network_size: 0,
             limbo_mint_ids: std::collections::HashSet::new(),
             limbo_payment_ids: std::collections::HashSet::new(),
+            limbo_payment_times: HashMap::new(),
             manifest_store: HashMap::new(),
             retained_ownership_records: HashMap::new(),
             retained_consumed_records: HashMap::new(),
@@ -2805,6 +2806,8 @@ pub struct NodeConfig {
     /// When true, discard persisted peer cache / reputation / ban state on startup.
     /// Useful for ephemeral interactive CLI nodes that reuse slot directories.
     pub reset_transient_peer_state: bool,
+    /// When true, enable unsafe mode + local test faucet (equivalent to --profile dev).
+    pub test: bool,
 }
 
 impl Default for NodeConfig {
@@ -2822,6 +2825,7 @@ impl Default for NodeConfig {
             enable_local_discovery: true,
             allow_private_bitcoin_seed_contact: false,
             reset_transient_peer_state: false,
+            test: false,
         }
     }
 }
@@ -2931,6 +2935,8 @@ pub(crate) struct ArteryState {
     pub(crate) limbo_mint_ids: std::collections::HashSet<[u8; 32]>,
     /// Payment IDs already in limbo (prevents exact duplicate buffering).
     pub(crate) limbo_payment_ids: std::collections::HashSet<[u8; 32]>,
+    /// Unix timestamp (seconds) when each limbo payment ID was inserted.
+    pub(crate) limbo_payment_times: HashMap<[u8; 32], u64>,
     /// Encrypted wallet manifests keyed by DHT key.
     /// Value is `(encrypted_manifest, inserted_at_unix_secs)` for oldest-first eviction.
     pub(crate) manifest_store: HashMap<[u8; 32], (Vec<u8>, u64)>,
@@ -3142,6 +3148,41 @@ impl ArteryState {
                 }
             }
         }
+    }
+
+    /// Publish encrypted wallet manifest to DHT for seed-based recovery.
+    /// Returns the DHT key if published.
+    pub(crate) fn publish_manifest_to_dht(
+        &mut self,
+        manifest_tx: &tokio::sync::mpsc::UnboundedSender<vess_protocol::ManifestStore>,
+    ) -> Option<[u8; 32]> {
+        let ws = self.wallet.as_ref()?;
+        // Collect bill mint IDs and DHT indices for recovery.
+        let bill_info: Vec<([u8; 32], u64)> = ws.billfold.bills().iter()
+            .map(|b| (b.mint_id, b.dht_index)).collect();
+        if bill_info.is_empty() { return None; }
+
+        let manifest_json = serde_json::to_vec(&bill_info).ok()?;
+        let dht_key: [u8; 32] = *blake3::hash(&manifest_json).as_bytes();
+
+        // Encrypt with the wallet's enc_key (ChaCha20Poly1305 nonce || ct).
+        let encrypted_manifest = vess_kloak::persistence::EncryptedBlob::encrypt(
+            &manifest_json, &ws.enc_key
+        ).map(|blob| {
+            let mut v = Vec::with_capacity(12 + blob.ciphertext.len());
+            v.extend_from_slice(&blob.nonce);
+            v.extend_from_slice(&blob.ciphertext);
+            v
+        }).unwrap_or_default();
+
+        let msg = ManifestStore {
+            dht_key,
+            encrypted_manifest: encrypted_manifest.clone(),
+            hops_remaining: 6,
+        };
+        self.manifest_store.insert(dht_key, (encrypted_manifest, Self::now_unix()));
+        let _ = manifest_tx.send(msg);
+        Some(dht_key)
     }
 
     fn snapshot(&self) -> ArterySnapshot {
@@ -3658,9 +3699,10 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
         mailbox_fwd: HashMap::new(),
         // MailboxForwardRegister: 5 registrations per 60-second window per peer.
         mailbox_fwd_limiter: crate::gossip::PeerRateLimiter::new(5, 60),
-        unsafe_mode: false,
-        test_faucet_enabled: false,
+        unsafe_mode: config.test,
+        test_faucet_enabled: config.test,
         events: VecDeque::new(),
+        limbo_payment_times: HashMap::new(),
     }));
     let receipt_text_state_dir = config.state_dir.clone();
 
@@ -4148,6 +4190,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
     // ── Periodic state flush (every 60 seconds) ─────────────────────
     let flush_state = state.clone();
     let flush_storage_dir = config.state_dir.clone();
+    let flush_manifest_tx = manifest_tx.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
         loop {
@@ -4295,6 +4338,29 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 s.flush_wallet();
                 // M1: Flush tag cache if any get() hits marked it dirty.
                 s.tag_cache.flush_if_dirty();
+                // Publish wallet manifest to DHT for seed-based recovery.
+                if let Some(key) = s.publish_manifest_to_dht(&flush_manifest_tx) {
+                    info!(dht_key = %hex_key(&key), "wallet manifest published to DHT");
+                }
+                // 7-day limbo payment ID age-out (TTL is already handled
+                // by `evict_expired` above, but limbo_payment_ids is a
+                // separate dedup set that can grow over time).
+                let ago_7d = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+                    .saturating_sub(604_800);
+                let old: Vec<[u8; 32]> = s.limbo_payment_times.iter()
+                    .filter(|(_, &t)| t < ago_7d)
+                    .map(|(&pid, _)| pid)
+                    .collect();
+                for pid in &old {
+                    s.limbo_payment_ids.remove(pid);
+                    s.limbo_payment_times.remove(pid);
+                }
+                if !old.is_empty() {
+                    info!(count = old.len(), "pruned aged-out limbo payment IDs");
+                }
             }
         }
     });
