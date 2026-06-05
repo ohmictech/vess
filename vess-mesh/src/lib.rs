@@ -1411,25 +1411,46 @@ impl MeshCarrier for PqUdpMeshCarrier {
         });
         send_udp_packet(&self.request_socket, target_addr, &hello).await?;
 
+        // Loop to receive the ServerHello, discarding stray/non-matching
+        // packets that may arrive on the shared request socket (e.g. late
+        // responses from previous requests or probe packets from other nodes).
         let mut buffer = vec![0u8; MAX_MESH_UDP_PACKET_SIZE];
-        let (hello_len, hello_from) = self
-            .request_socket
-            .recv_from(&mut buffer)
+        let (hello_len, hello_from, server_hello) = loop {
+            let (len, from) = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                self.request_socket.recv_from(&mut buffer),
+            )
             .await
+            .context("receive PQ mesh udp server hello (timeout)")?
             .context("receive PQ mesh udp server hello")?;
-        anyhow::ensure!(
-            hello_from == target_addr,
-            "PQ mesh udp server hello from unexpected peer"
-        );
-        let hello_packet = parse_udp_packet(&buffer[..hello_len])?;
-        let MeshUdpPacket::ServerHello(server_hello) = hello_packet else {
-            return Err(anyhow!("expected PQ mesh udp server hello"));
-        };
-        anyhow::ensure!(
-            server_hello.responder_address == target_mesh_address,
-            "PQ mesh udp responder address mismatch"
-        );
 
+            let Ok(packet) = parse_udp_packet(&buffer[..len]) else {
+                tracing::debug!(from = %from, "discarding unparseable UDP packet on request socket");
+                continue;
+            };
+            let MeshUdpPacket::ServerHello(sh) = packet else {
+                tracing::debug!(from = %from, ?packet, "discarding non-ServerHello packet on request socket");
+                continue;
+            };
+            // Accept the server hello from any address — the target may have
+            // restarted with a new port.  Identity is verified cryptographically
+            // via the responder_address match and route handshake below.
+            if sh.responder_address != target_mesh_address {
+                tracing::debug!(from = %from, "discarding ServerHello from wrong responder");
+                continue;
+            }
+            break (len, from, sh);
+        };
+
+        if hello_from != target_addr {
+            tracing::debug!(
+                expected = %target_addr,
+                got = %hello_from,
+                "mesh server hello from different port — accepting (node may have restarted)"
+            );
+        }
+
+        // Verify identity cryptographically via the route handshake.
         let opened_return =
             open_route_handshake(self.local_secret.as_ref(), &server_hello.route_to_initiator)?;
         let transport_key = derive_transport_key(
@@ -1439,25 +1460,47 @@ impl MeshCarrier for PqUdpMeshCarrier {
             &opened_return.session_key,
         );
 
+        // Use the actual responding address for subsequent communications
+        // (the node may have restarted with a different port).
+        let actual_addr = hello_from;
+
         let encrypted_request = encrypt_transport_payload(&transport_key, b"request", payload)?;
         send_udp_packet(
             &self.request_socket,
-            target_addr,
+            actual_addr,
             &MeshUdpPacket::EncryptedRequest {
                 ciphertext: encrypted_request,
             },
         )
         .await?;
 
-        let (response_len, response_from) = self
-            .request_socket
-            .recv_from(&mut buffer)
+        let (response_len, response_from) = loop {
+            let (len, from) = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                self.request_socket.recv_from(&mut buffer),
+            )
             .await
+            .context("receive PQ mesh udp encrypted response (timeout)")?
             .context("receive PQ mesh udp encrypted response")?;
-        anyhow::ensure!(
-            response_from == target_addr,
-            "PQ mesh udp response from unexpected peer"
-        );
+
+            let Ok(packet) = parse_udp_packet(&buffer[..len]) else {
+                tracing::debug!(from = %from, "discarding unparseable UDP packet on request socket (response)");
+                continue;
+            };
+            // Accept EncryptedResponse from any address — the node may have
+            // shifted ports further during the session.
+            if matches!(packet, MeshUdpPacket::EncryptedResponse { .. }) {
+                break (len, from);
+            }
+            tracing::debug!(from = %from, ?packet, "discarding non-EncryptedResponse packet on request socket");
+        };
+        if response_from != actual_addr {
+            tracing::debug!(
+                expected = %actual_addr,
+                got = %response_from,
+                "mesh encrypted response from different address — accepting via crypto"
+            );
+        }
         let response_packet = parse_udp_packet(&buffer[..response_len])?;
         let MeshUdpPacket::EncryptedResponse { ciphertext } = response_packet else {
             return Err(anyhow!("expected PQ mesh udp encrypted response"));

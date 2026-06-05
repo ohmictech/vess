@@ -119,6 +119,20 @@ pub(crate) struct OutboundPaymentRecord {
     pub(crate) pending_mint_ids: HashSet<[u8; 32]>,
 }
 
+/// Node event for the CLI events log.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct NodeEvent {
+    pub event: String,
+    pub created_at: u64,
+    pub peer_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub direction: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub amount: Option<u64>,
+}
+
 /// Maximum age (in seconds) for timestamps on incoming messages.
 /// Messages older than this are rejected as stale / potential replays.
 const MAX_MESSAGE_AGE_SECS: u64 = 300; // 5 minutes
@@ -666,6 +680,9 @@ mod tests {
             tag_cache: crate::tag_cache::TagCache::load_or_create(tag_cache_path),
             mailbox_fwd: HashMap::new(),
             mailbox_fwd_limiter: crate::gossip::PeerRateLimiter::new(5, 60),
+            unsafe_mode: false,
+            test_faucet_enabled: false,
+            events: VecDeque::new(),
         }))
     }
 
@@ -2947,6 +2964,12 @@ pub(crate) struct ArteryState {
     pub(crate) mailbox_fwd: HashMap<[u8; 32], ForwardRecord>,
     /// Rate limiter for [`MailboxForwardRegister`] requests.
     pub(crate) mailbox_fwd_limiter: crate::gossip::PeerRateLimiter,
+    /// Whether test-only / unsafe features are permitted.
+    pub(crate) unsafe_mode: bool,
+    /// Runtime flag for the local test faucet.
+    pub(crate) test_faucet_enabled: bool,
+    /// Node event log for CLI visibility.
+    pub(crate) events: VecDeque<NodeEvent>,
 }
 
 impl ArteryState {
@@ -3002,6 +3025,25 @@ impl ArteryState {
             .unwrap_or_default()
             .as_secs()
     }
+
+    pub(crate) fn push_event(&mut self, event: NodeEvent) {
+        if self.events.len() >= 1024 {
+            self.events.pop_front();
+        }
+        self.events.push_back(event);
+    }
+
+    pub(crate) fn take_events(&mut self, max: usize) -> Vec<NodeEvent> {
+        let count = max.max(1).min(self.events.len());
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            if let Some(ev) = self.events.pop_front() {
+                out.push(ev);
+            }
+        }
+        out
+    }
+
     pub(crate) fn finalize_outbound_mint_if_complete(&mut self, mint_id: &[u8; 32]) {
         let Some(payment_id) = self.outbound_by_mint_id.remove(mint_id) else {
             return;
@@ -3553,6 +3595,9 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
         mailbox_fwd: HashMap::new(),
         // MailboxForwardRegister: 5 registrations per 60-second window per peer.
         mailbox_fwd_limiter: crate::gossip::PeerRateLimiter::new(5, 60),
+        unsafe_mode: false,
+        test_faucet_enabled: false,
+        events: VecDeque::new(),
     }));
     let receipt_text_state_dir = config.state_dir.clone();
 
@@ -5475,7 +5520,10 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
             return None;
         }
 
-        let mut state = st.lock().unwrap();
+        // Use into_inner() to recover from a poisoned mutex — if another task
+        // panicked while holding the lock, we still need to keep processing
+        // messages rather than crashing the entire process.
+        let mut state = st.lock().unwrap_or_else(|e| e.into_inner());
 
         let peer_id: [u8; 32] = peer_hash;
         let peer_bytes = match encode_contact_bytes(&peer.contact) {

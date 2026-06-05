@@ -215,24 +215,30 @@ enum Command {
     },
 
     /// Set a password for fast daily wallet unlock.
-    ///
-    /// Requires the wallet encryption key (via VESS_WALLET_PASSWORD or
-    /// VESS_RECOVERY_PHRASE) to encrypt the key
-    /// cache.  After this, the node only needs the password to start.
+    SetPassword {
+        /// The new password to set.
+        #[arg(long)]
+        password: String,
+    },
 
-    const LOCAL_BACKUP_FORMAT_VERSION: u32 = 1;
+    /// Manage the local VessTag address book (persistent tag → stealth address cache).
+    #[command(subcommand)]
+    TagCache(TagCacheCmd),
+}
+
+const LOCAL_BACKUP_FORMAT_VERSION: u32 = 1;
 
     #[derive(Serialize)]
-    struct LocalPhraseBackupFile {
-        version: u32,
-        kdf: &'static str,
-        cipher: &'static str,
-        salt_hex: String,
-        nonce_hex: String,
-        ciphertext_hex: String,
-    }
+struct LocalPhraseBackupFile {
+    version: u32,
+    kdf: &'static str,
+    cipher: &'static str,
+    salt_hex: String,
+    nonce_hex: String,
+    ciphertext_hex: String,
+}
 
-    fn local_phrase_backup_path(wallet_path: &Path) -> PathBuf {
+fn local_phrase_backup_path(wallet_path: &Path) -> PathBuf {
         let file_name = wallet_path
             .file_name()
             .and_then(|name| name.to_str())
@@ -240,7 +246,7 @@ enum Command {
         wallet_path.with_file_name(format!("{file_name}.seed-backup.json"))
     }
 
-    fn prompt_yes_no(msg: &str, default_no: bool) -> Result<bool> {
+fn prompt_yes_no(msg: &str, default_no: bool) -> Result<bool> {
         loop {
             let answer = prompt(msg)?;
             let normalized = answer.trim().to_ascii_lowercase();
@@ -255,7 +261,7 @@ enum Command {
         }
     }
 
-    fn write_local_phrase_backup_file(phrase: &RecoveryPhrase, backup_path: &Path) -> Result<()> {
+fn write_local_phrase_backup_file(phrase: &RecoveryPhrase, backup_path: &Path) -> Result<()> {
         let mut password = prompt_password("  Backup password (min 16 chars): ")?;
         if password.len() < 16 {
             anyhow::bail!("backup password must be at least 16 characters");
@@ -293,7 +299,7 @@ enum Command {
         Ok(())
     }
 
-    fn maybe_store_local_phrase_backup(phrase: &RecoveryPhrase, wallet_path: &Path) -> Result<Option<PathBuf>> {
+fn maybe_store_local_phrase_backup(phrase: &RecoveryPhrase, wallet_path: &Path) -> Result<Option<PathBuf>> {
         let should_store = prompt_yes_no(
             "Store a local encrypted backup of your recovery phrase? [y/N]: ",
             true,
@@ -323,16 +329,6 @@ enum Command {
         println!("Encrypted backup saved to {}", backup_path.display());
         println!("Store that file on a thumb drive or in cloud storage as an extra backup.\n");
         Ok(Some(backup_path))
-    }
-    SetPassword {
-        /// The new password to set.
-        #[arg(long)]
-        password: String,
-    },
-
-    /// Manage the local VessTag address book (persistent tag → stealth address cache).
-    #[command(subcommand)]
-    TagCache(TagCacheCmd),
 }
 
 /// Subcommands for `vess tag-cache`.
@@ -1102,8 +1098,31 @@ async fn cmd_init(cli: &Cli, tag_str: &str, wallet_name: Option<&str>) -> Result
             signature,
         });
 
-        node.send_message(&target, &msg).await?;
+        // Try all discovered peers until one accepts the registration.
+        // The lookup target is tried first since it confirmed reachability,
+        // but it may have become stale — fall through to other peers.
+        let mut registered = false;
+        let ordered_peers = std::iter::once(target.clone())
+            .chain(peers.iter().cloned().filter(|p| *p != target));
+        for peer in ordered_peers {
+            match node.send_message(&peer, &msg).await {
+                Ok(()) => {
+                    registered = true;
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!(%e, "tag registration to peer failed — trying next peer");
+                }
+            }
+        }
         node.shutdown().await;
+
+        if !registered {
+            anyhow::bail!(
+                "could not send tag registration to any discovered peer; \
+                 the tag may not be visible to the network until a peer relays it"
+            );
+        }
 
         if !cli.json {
             println!("Tag {} registration sent.", tag.display());
@@ -2561,9 +2580,14 @@ fn interactive_command_uses_node(cmd: &str) -> bool {
             | "recieve"
             | "faucet"
             | "test-mint"
+            | "test-mode"
+            | "testmode"
             | "send"
             | "notifications"
             | "notifs"
+            | "events"
+            | "health"
+            | "inventory"
     )
 }
 
@@ -2723,30 +2747,48 @@ async fn cmd_unlock_wallet_at_path(
         );
     }
 
-    let password = match password {
-        Some(password) => password,
-        None => prompt_password("Enter wallet password: ")?,
-    };
-    let resp = rpc_call(
-        rpc_port(cli),
-        &json!({
-            "method": "wallet_unlock",
-            "password": password,
-            "wallet_path": wallet_file.display().to_string(),
-        }),
-    )
-    .await?;
-
-    if resp["ok"] != true {
-        anyhow::bail!(
-            "{}",
-            resp["error"].as_str().unwrap_or("wallet unlock failed")
-        );
+    match password {
+        Some(pwd) => {
+            // External password — single attempt.
+            let resp = rpc_call(rpc_port(cli), &json!({
+                "method": "wallet_unlock",
+                "password": pwd,
+                "wallet_path": wallet_file.display().to_string(),
+            })).await?;
+            if resp["ok"] != true {
+                anyhow::bail!("{}", resp["error"].as_str().unwrap_or("wallet unlock failed"));
+            }
+        }
+        None => {
+            // Interactive prompt — retry up to 3 times on wrong password.
+            let mut ok = false;
+            for attempt in 1..=3 {
+                let pwd = prompt_password("Enter wallet password: ")?;
+                let resp = rpc_call(rpc_port(cli), &json!({
+                    "method": "wallet_unlock",
+                    "password": pwd,
+                    "wallet_path": wallet_file.display().to_string(),
+                })).await?;
+                if resp["ok"] == true {
+                    ok = true;
+                    break;
+                }
+                let err = resp["error"].as_str().unwrap_or("wallet unlock failed");
+                if attempt < 3 {
+                    eprintln!("  Incorrect password ({attempt}/3).");
+                } else {
+                    anyhow::bail!("{}", err);
+                }
+            }
+            if !ok {
+                anyhow::bail!("wallet unlock failed after 3 attempts");
+            }
+        }
     }
     set_active_wallet_path(wallet_file)?;
 
     if cli.json {
-        println!("{resp}");
+        println!("{}", json!({ "ok": true }));
     } else {
         println!("Wallet unlocked on the running node.");
     }
@@ -3305,18 +3347,52 @@ async fn cmd_interactive(cli: &Cli) -> Result<()> {
         }
     });
 
+    // Background task: poll for wallet notifications every 2 s and display
+    // them so the user sees payment receipts etc. in real time.
+    let (notif_tx, mut notif_rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
+    let notif_port = port;
+    tokio::spawn(async move {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            if let Ok(resp) = rpc_call(notif_port, &json!({"method": "notifications", "max": 16})).await {
+                if let Some(notes) = resp["notifications"].as_array() {
+                    for note in notes {
+                        let kind = note["kind"].as_str().unwrap_or("");
+                        let pid = note["payment_id"].as_str().unwrap_or("");
+                        let key = format!("{}:{}", kind, pid);
+                        if !pid.is_empty() && seen.insert(key) {
+                            let _ = notif_tx.send(note.clone());
+                        }
+                    }
+                }
+            }
+        }
+    });
+
     loop {
+        // Drain any pending notifications before showing the prompt.
+        while let Ok(note) = notif_rx.try_recv() {
+            let kind = note["kind"].as_str().unwrap_or("notification");
+            let msg = note["message"].as_str().unwrap_or("");
+            println!("\n  \x1b[1m[{kind}]\x1b[0m {msg}");
+        }
+
         print!("vess> ");
         std::io::stdout().flush().ok();
 
-        let line_str: String;
-        match stdin_rx.recv().await.flatten() {
-            Some(l) => line_str = l,
-            None => {
-                println!();
-                break;
-            }
-        }
+        tokio::select! {
+            biased;
+
+            line = stdin_rx.recv() => {
+                let line_str: String;
+                match line.flatten() {
+                    Some(l) => line_str = l,
+                    None => {
+                        println!();
+                        break;
+                    }
+                }
 
         let line = line_str.trim().to_string();
         if line.is_empty() {
@@ -3382,6 +3458,14 @@ async fn cmd_interactive(cli: &Cli) -> Result<()> {
                     }
                 }
             }
+            "test-mode" | "testmode" => cmd_test_mode(cli).await,
+            "events" => cmd_events(cli, 32, false).await,
+            "health" => cmd_health(cli, false).await,
+            "explain" | "help-topic" => {
+                let topic = args.first().copied();
+                cmd_explain(topic)
+            }
+            "inventory" => cmd_inventory(cli, false).await,
             "notifications" | "notifs" => {
                 let follow = args
                     .first()
@@ -3406,9 +3490,229 @@ async fn cmd_interactive(cli: &Cli) -> Result<()> {
             println!("Error: {e}");
         }
         println!();
+            }
+
+            // Also wake on incoming notifications so they're shown promptly.
+            note = notif_rx.recv() => {
+                if let Some(n) = note {
+                    let kind = n["kind"].as_str().unwrap_or("notification");
+                    let msg = n["message"].as_str().unwrap_or("");
+                    println!("\n  \x1b[1m[{kind}]\x1b[0m {msg}");
+                }
+            }
+        }
     }
 
     drop(node_guard);
+    Ok(())
+}
+
+async fn cmd_test_mode(cli: &Cli) -> Result<()> {
+    let port = rpc_port(cli);
+    let resp = rpc_call(port, &json!({"method": "set_test_mode"})).await?;
+    if resp["ok"] == true {
+        if cli.json {
+            println!("{resp}");
+        } else {
+            println!("Test mode enabled.");
+            println!("  test_faucet_enabled: {}", resp["test_faucet_enabled"]);
+            println!("  unsafe_mode:         {}", resp["unsafe_mode"]);
+            println!("You can now use `vess faucet <amount>` to mint test bills.");
+        }
+    } else {
+        anyhow::bail!("{}", resp["error"].as_str().unwrap_or("unknown error"));
+    }
+    Ok(())
+}
+
+async fn cmd_events(cli: &Cli, max: usize, as_json: bool) -> Result<()> {
+    let port = rpc_port(cli);
+    let running = match read_node_pid() {
+        None => false,
+        Some(pid) => is_pid_alive(pid),
+    };
+    if !running {
+        if as_json {
+            println!("{}", json!({ "ok": false, "error": "node not running" }));
+        } else {
+            println!("Node is not running.");
+        }
+        return Ok(());
+    }
+    let resp = rpc_call(port, &json!({"method": "events", "max": max})).await?;
+    if resp["ok"] != true {
+        if as_json {
+            println!("{}", resp);
+        } else {
+            println!("RPC error: {}", resp["error"]);
+        }
+        return Ok(());
+    }
+    let events = resp["events"].as_array().cloned().unwrap_or_default();
+    if as_json {
+        println!("{}", json!({ "ok": true, "count": events.len(), "events": events }));
+        return Ok(());
+    }
+    if events.is_empty() {
+        println!("No events.");
+        return Ok(());
+    }
+    println!("\n── Node Events ──────────────────────────────────────\n");
+    for event in &events {
+        let event_type = event["event"].as_str().unwrap_or("unknown");
+        let created_at = event["created_at"].as_u64().unwrap_or(0);
+        println!("  [{event_type}]  at t={created_at}");
+        for (key, value) in event.as_object().unwrap() {
+            if key != "event" && key != "created_at" {
+                println!("    {key}: {value}");
+            }
+        }
+        println!();
+    }
+    Ok(())
+}
+
+async fn cmd_health(cli: &Cli, as_json: bool) -> Result<()> {
+    let port = rpc_port(cli);
+    let running = match read_node_pid() {
+        None => false,
+        Some(pid) => is_pid_alive(pid),
+    };
+    if !running {
+        if as_json {
+            println!("{}", json!({ "ok": false, "error": "node not running" }));
+        } else {
+            println!("Node is not running.");
+        }
+        return Ok(());
+    }
+    let resp = rpc_call(port, &json!({"method": "node_health"})).await?;
+    if resp["ok"] != true {
+        if as_json {
+            println!("{}", resp);
+        } else {
+            println!("RPC error: {}", resp["error"]);
+        }
+        return Ok(());
+    }
+    if as_json {
+        println!("{}", resp);
+        return Ok(());
+    }
+    println!("\n── Node Health ──────────────────────────────────────\n");
+    println!("  Node ID:           {}", resp["node_id"]);
+    println!("  Peers:             {} total, {} verified, {} banished, {} discovered",
+        resp["peer_count"], resp["verified_peer_count"], resp["banished_peer_count"], resp["discovered_peer_count"]);
+    println!("  Network size:      {}", resp["estimated_network_size"]);
+    println!("  Reputation:        {} high, {} medium, {} low",
+        resp["reputation_high"], resp["reputation_medium"], resp["reputation_low"]);
+    if let Some(b) = resp["wallet_balance"].as_u64() {
+        println!("  Wallet balance:    {} Vess", b);
+    }
+    println!("  Limbo payments:    {}", resp["limbo_payment_count"]);
+    println!("  Tags:              {}", resp["tag_count"]);
+    Ok(())
+}
+
+// ── Explain topic constants ────────────────────────────────────────
+
+const EXPLAIN_LIMBO: &str = "\
+Limbo is a temporary holding area for payments sent to offline recipients.
+When you send Vess to someone who isn't connected to the network, the payment
+is held by infrastructure nodes (artery nodes) for up to 1 hour.
+When the recipient comes online, they collect their pending payments
+(trial-decrypting each payload with their keys) and finalize ownership.
+You do not need to do anything — the recipient's wallet handles this
+automatically. If a payment expires in limbo, the sender still has the
+bills and can re-send.";
+
+const EXPLAIN_OWNERSHIP: &str = "\
+Ownership is tracked through the Vess Ownership Registry — a distributed
+Merkle tree shared across all artery nodes. When you receive a payment,
+your wallet broadcasts an OwnershipClaim that updates the registry.
+'Ownership finalization' means the claim has been accepted by the network
+and the bill is now provably yours. This happens automatically when the
+recipient's wallet comes online and processes the limbo payment.";
+
+const EXPLAIN_PROGRAM_BILLS: &str = "\
+Program-owned bills are bills controlled by a VessLogic program rather than
+a human. The program defines conditions (like 'release to address X after
+timestamp Y') and the bill can only be spent by producing a valid witness
+that satisfies those conditions. Think of them as smart escrows: you send
+bills to a program, and the program releases them when the conditions are met.
+Common patterns: timelocked vaults, capped treasuries, recurring payments.";
+
+const EXPLAIN_TAGS: &str = "\
+VessTags (+names) are human-readable aliases for stealth addresses.
+They are registered on the DHT with an Argon2id proof-of-work to prevent
+squatting. When you send to +alice, your wallet looks up alice's stealth
+address from the DHT and encrypts the payment to that address.
+Tags are globally unique — the first person to register a tag with valid
+PoW owns it permanently. You can register a tag with `vess register-tag`.";
+
+const EXPLAIN_BURNS: &str = "\
+BTC burns are the only way to create Vess. You send bitcoin to a burn address
+(which no one can spend from), and the network mints an equivalent amount of
+Vess to your wallet at a 1:1 ratio (1 sat = 1 Vess). The burn is verified
+by a Bitcoin light client embedded in the artery node. Once confirmed,
+the burn proof is broadcast as an OwnershipGenesis and your wallet receives
+the bills. Burns are irreversible — always double-check the address.";
+
+fn cmd_explain(topic: Option<&str>) -> Result<()> {
+    let text = match topic {
+        Some("limbo") => crate::EXPLAIN_LIMBO,
+        Some("ownership") => crate::EXPLAIN_OWNERSHIP,
+        Some("program-bills") => crate::EXPLAIN_PROGRAM_BILLS,
+        Some("tags") => crate::EXPLAIN_TAGS,
+        Some("burns") => crate::EXPLAIN_BURNS,
+        Some(_) | None => {
+            println!("{}", crate::EXPLAIN_LIMBO);
+            println!();
+            println!("{}", crate::EXPLAIN_OWNERSHIP);
+            println!();
+            println!("{}", crate::EXPLAIN_PROGRAM_BILLS);
+            println!();
+            println!("{}", crate::EXPLAIN_TAGS);
+            println!();
+            println!("{}", crate::EXPLAIN_BURNS);
+            return Ok(());
+        }
+    };
+    println!("{text}");
+    Ok(())
+}
+
+async fn cmd_inventory(cli: &Cli, as_json: bool) -> Result<()> {
+    let port = rpc_port(cli);
+    let resp = rpc_call(port, &json!({"method": "balance"})).await?;
+    if resp["ok"] != true {
+        if as_json {
+            println!("{}", json!({ "ok": false, "error": resp["error"] }));
+        } else {
+            println!("RPC error: {}", resp["error"]);
+        }
+        return Ok(());
+    }
+    if as_json {
+        println!("{}", resp);
+        return Ok(());
+    }
+    let balance = resp["balance"].as_u64().unwrap_or(0);
+    let bill_count = resp["bill_count"].as_u64().unwrap_or(0);
+    println!("\n── Bill Inventory ───────────────────────────────────\n");
+    if bill_count == 0 {
+        println!("  No bills.");
+    } else {
+        println!("  Total: {balance} Vess across {bill_count} bills");
+        if let Some(breakdown) = resp["denominations"].as_array() {
+            for entry in breakdown {
+                let denom = entry["denomination"].as_u64().unwrap_or(0);
+                let count = entry["count"].as_u64().unwrap_or(0);
+                println!("  {count:>4} × V{denom:<12} = {} Vess", denom * count);
+            }
+        }
+    }
+    println!();
     Ok(())
 }
 
@@ -3418,8 +3722,13 @@ fn print_interactive_help() {
     println!("  wallets                List local VessTag wallets");
     println!("  balance                Show wallet balance");
     println!("  receive                Show BTC receive address + QR code");
-    println!("  faucet <amount>        Add local-test bills (requires VESS_LOCAL_TEST_FAUCET=1)");
+    println!("  test-mode              Enable test mode + faucet on this node");
+    println!("  faucet <amount>        Add local-test bills (test-mode must be on)");
     println!("  send <amount> <+tag>   Send Vess to a recipient");
+    println!("  events                 Show recent node events");
+    println!("  health                 Show detailed node health");
+    println!("  explain [topic]        Explain core Vess concepts");
+    println!("  inventory              Show wallet bill inventory");
     println!("  notifications [follow] Show recent notifications or follow them live");
     println!("  help                   Show this help");
     println!("  exit                   Close Vess");

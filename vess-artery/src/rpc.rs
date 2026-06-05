@@ -339,6 +339,8 @@ pub enum RpcRequest {
     LocalTestFaucet {
         amount: u64,
     },
+    /// Enable test mode on a running node (unsafe_mode + faucet).
+    SetTestMode,
     ManifestStore {
         dht_key_hex: String,
         encrypted_manifest_hex: String,
@@ -429,6 +431,10 @@ pub enum RpcData {
         amount: u64,
         bill_count: usize,
         balance: u64,
+    },
+    TestModeEnabled {
+        test_faucet_enabled: bool,
+        unsafe_mode: bool,
     },
     ProgramDeploy {
         prog_id: String,
@@ -620,6 +626,7 @@ async fn handle_request(
         RpcRequest::LocalTestFaucet { amount } => {
             handle_local_test_faucet(state, amount, &senders.og_tx)
         }
+        RpcRequest::SetTestMode => handle_set_test_mode(state),
         RpcRequest::ManifestStore {
             dht_key_hex,
             encrypted_manifest_hex,
@@ -2305,15 +2312,33 @@ fn handle_tag_confirm(
     RpcResponse::ok(RpcData::Empty {})
 }
 
+fn handle_set_test_mode(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
+    let mut s = state.lock().unwrap();
+    s.unsafe_mode = true;
+    s.test_faucet_enabled = true;
+    RpcResponse::ok(RpcData::TestModeEnabled {
+        test_faucet_enabled: true,
+        unsafe_mode: true,
+    })
+}
+
 fn handle_local_test_faucet(
     state: &Arc<Mutex<ArteryState>>,
     amount: u64,
     og_tx: &tokio::sync::mpsc::UnboundedSender<vess_protocol::OwnershipGenesis>,
 ) -> RpcResponse {
-    if !local_test_faucet_enabled() {
-        return RpcResponse::err(format!(
-            "local test faucet is disabled; set {LOCAL_TEST_FAUCET_ENV}=1 before starting the node"
-        ));
+    {
+        let s = state.lock().unwrap();
+        if !s.test_faucet_enabled {
+            return RpcResponse::err(
+                "local test faucet is disabled; run `vess test-mode` on the node, or set VESS_LOCAL_TEST_FAUCET=1 before starting"
+            );
+        }
+        if !s.unsafe_mode {
+            return RpcResponse::err(
+                "local test faucet is not available in production mode"
+            );
+        }
     }
     if amount == 0 {
         return RpcResponse::err("amount must be greater than zero");

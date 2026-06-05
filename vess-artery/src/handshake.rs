@@ -123,6 +123,14 @@ impl PeerRegistry {
     ///
     /// Returns the nonce to embed in a [`HandshakeChallenge`] message.
     pub fn issue_challenge(&mut self, peer_id: [u8; 32]) -> [u8; 32] {
+        // Never overwrite Verified or Banished entries — return a zero nonce
+        // sentinel so callers can skip challenge for already-established peers.
+        if let Some(existing) = self.peers.get(&peer_id) {
+            if existing.state == PeerState::Verified || existing.state == PeerState::Banished {
+                return [0u8; 32];
+            }
+        }
+
         let mut nonce = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut nonce);
         self.peers.insert(
