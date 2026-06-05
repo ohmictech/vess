@@ -7448,7 +7448,6 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                                     info!("bill permanently withdrawn after claim: {:?}", &oc.mint_id[..4]);
                                 }
                             }
-                            state.finalize_outbound_mint_if_complete(&oc.mint_id);
                             if let Some(new_owner_program) = &oc.new_owner_program {
                                 note_program_bill_activity(
                                     &mut state,
@@ -7506,6 +7505,8 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     }
                 }
 
+                // 8. Notify outbound payment tracking for all valid claims.
+                state.finalize_outbound_mint_if_complete(&oc.mint_id);
                 // 8. Forward to K-nearest peers if hops remain.
                 if oc.hops_remaining > 0 {
                     let mut fwd = oc.clone();
