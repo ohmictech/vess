@@ -4445,6 +4445,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                                 format!("Verified Vess peer after bootstrap handshake: {}", hex_key(&peer_hash)),
                             );
                             info!(peer = %peer_str, "bootstrap peer verified");
+                            s.push_event(NodeEvent::PeerVerified { created_at: ArteryState::now_unix(), peer_id: hex_key(&peer_hash), direction: "bootstrap".to_string() });
                         } else {
                             s.peer_registry.mark_banished(peer_hash);
                             boot_ban.banish(peer_hash);
@@ -5352,6 +5353,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                                     format!("Verified Vess peer after handshake: {}", hex_key(&peer_hash)),
                                 );
                                 info!("peer verified via handshake");
+                                s.push_event(NodeEvent::PeerVerified { created_at: ArteryState::now_unix(), peer_id: hex_key(&peer_hash), direction: "handshake".to_string() });
                                 true
                             }
                         } else {
@@ -5365,6 +5367,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                                 format!("Handshake returned an invalid response for peer: {}", hex_key(&peer_hash)),
                             );
                             info!("peer banished — invalid handshake response");
+                            s.push_event(NodeEvent::PeerBanished { created_at: ArteryState::now_unix(), peer_id: hex_key(&peer_hash), reason: "handshake drain: invalid response".to_string() });
                             false
                         }
                     };
