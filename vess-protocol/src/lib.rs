@@ -54,6 +54,10 @@ pub struct BitcoinBurnBundleProof {
     /// Minimum confirmations required by the validating Bitcoin light client.
     #[serde(default)]
     pub required_confirmations: u32,
+    /// Number of distinct Bitcoin peers that corroborated the tx/block data
+    /// used to assemble this burn proof.
+    #[serde(default)]
+    pub corroborating_peer_count: u32,
     /// Cumulative validated chainwork at the containing block, big-endian.
     #[serde(default)]
     pub chain_work: [u8; 32],

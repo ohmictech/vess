@@ -143,7 +143,7 @@ impl BillFold {
 
     /// Whether the billfold has enough available (non-reserved) value to cover an amount.
     pub fn can_afford(&self, amount: u64) -> bool {
-        self.available_balance() >= amount
+        self.spendable_balance() >= amount
     }
 
     // ── Reservation (limbo / in-flight) ──────────────────────────
@@ -195,6 +195,24 @@ impl BillFold {
         self.available_bills()
             .iter()
             .map(|b| b.denomination.value())
+            .sum()
+    }
+
+    /// Available balance backed by spend credentials.
+    pub fn spendable_balance(&self) -> u64 {
+        self.available_bills()
+            .into_iter()
+            .filter(|bill| self.spend_credentials.contains_key(&bill.mint_id))
+            .map(|bill| bill.denomination.value())
+            .sum()
+    }
+
+    /// Available balance present without spend credentials.
+    pub fn watch_only_balance(&self) -> u64 {
+        self.available_bills()
+            .into_iter()
+            .filter(|bill| !self.spend_credentials.contains_key(&bill.mint_id))
+            .map(|bill| bill.denomination.value())
             .sum()
     }
 
@@ -280,5 +298,31 @@ mod tests {
         let breakdown = bf.denomination_breakdown();
         assert!(breakdown.contains(&(Denomination::D5, 2)));
         assert!(breakdown.contains(&(Denomination::D10, 1)));
+    }
+
+    #[test]
+    fn spendable_and_watch_only_balances_are_separated() {
+        let mut bf = BillFold::new();
+        let watch_only = test_bill(Denomination::D10, 0);
+        let spendable = test_bill(Denomination::D5, 0);
+        let spendable_mint_id = spendable.mint_id;
+
+        bf.deposit(watch_only);
+        bf.deposit_with_credentials(
+            spendable,
+            SpendCredential {
+                spend_vk: vec![0x11; 64],
+                spend_sk: vec![0x22; 64],
+            },
+        );
+
+        assert_eq!(bf.available_balance(), 15);
+        assert_eq!(bf.spendable_balance(), 5);
+        assert_eq!(bf.watch_only_balance(), 10);
+
+        bf.reserve(&[spendable_mint_id], 1);
+        assert_eq!(bf.available_balance(), 10);
+        assert_eq!(bf.spendable_balance(), 0);
+        assert_eq!(bf.watch_only_balance(), 10);
     }
 }

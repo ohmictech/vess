@@ -10,6 +10,7 @@
 //! - Encrypted Bitcoin auto-burn state (address indexes, tracked UTXOs, pending burns).
 
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -161,6 +162,12 @@ struct WalletPrivateMetadata {
     tag_registration: Option<StoredTagRegistration>,
 }
 
+#[derive(Serialize, Deserialize)]
+struct StoredSpendCredential {
+    mint_id: [u8; 32],
+    credential: crate::billfold::SpendCredential,
+}
+
 impl EncryptedSpendSeed {
     /// Encrypt a spend seed with the given 32-byte key.
     pub fn encrypt(spend_seed: &[u8; 32], enc_key: &[u8; 32]) -> Result<Self> {
@@ -305,7 +312,19 @@ impl WalletFile {
             self.encrypted_spend_credentials = None;
             return Ok(());
         }
-        let json = Zeroizing::new(serde_json::to_vec(creds).context("serialize spend credentials")?);
+        let stored = creds
+            .iter()
+            .map(|(mint_id, credential)| StoredSpendCredential {
+                mint_id: *mint_id,
+                credential: crate::billfold::SpendCredential {
+                    spend_vk: credential.spend_vk.clone(),
+                    spend_sk: credential.spend_sk.clone(),
+                },
+            })
+            .collect::<Vec<_>>();
+        let json = Zeroizing::new(
+            serde_json::to_vec(&stored).context("serialize spend credentials")?,
+        );
         self.encrypted_spend_credentials = Some(EncryptedBlob::encrypt(json.as_slice(), enc_key)?);
         Ok(())
     }
@@ -321,8 +340,12 @@ impl WalletFile {
     ) -> Result<()> {
         if let Some(ref blob) = self.encrypted_spend_credentials {
             let json = Zeroizing::new(blob.decrypt(enc_key)?);
-            let creds: std::collections::HashMap<[u8; 32], crate::billfold::SpendCredential> =
+            let stored: Vec<StoredSpendCredential> =
                 serde_json::from_slice(json.as_slice()).context("deserialize spend credentials")?;
+            let creds = stored
+                .into_iter()
+                .map(|entry| (entry.mint_id, entry.credential))
+                .collect::<std::collections::HashMap<_, _>>();
             billfold.import_credentials(creds);
         }
         // If no encrypted blob, the billfold may still have legacy plaintext
@@ -448,23 +471,14 @@ impl WalletFile {
         let mut serializable = self.clone();
         serializable.version = Self::CURRENT_VERSION;
         serializable.refresh_encrypted_private_metadata(enc_key)?;
+        serializable.encrypt_spend_credentials(&self.billfold, enc_key)?;
         serializable.billfold = BillFold::new();
         serializable.next_dht_index = 0;
         serializable.tag_registration = None;
 
         let json = serde_json::to_string_pretty(&serializable).context("serialize wallet")?;
 
-        std::fs::write(path, json.as_bytes())
-            .with_context(|| format!("write wallet file: {}", path.display()))?;
-
-        // Restrict file permissions (Unix: owner-only read/write).
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o600);
-            std::fs::set_permissions(path, perms)
-                .with_context(|| format!("set wallet permissions: {}", path.display()))?;
-        }
+        write_wallet_file_atomically(path, json.as_bytes())?;
 
         Ok(())
     }
@@ -693,6 +707,55 @@ fn dirs_next() -> Option<std::path::PathBuf> {
     }
 }
 
+fn write_wallet_file_atomically(path: &Path, contents: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("wallet path has no parent directory"))?;
+    let temp_name = format!(
+        ".{}.tmp-{}-{}",
+        path.file_name().and_then(|name| name.to_str()).unwrap_or("wallet"),
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+    let temp_path = parent.join(temp_name);
+
+    let write_result = (|| -> Result<()> {
+        std::fs::write(&temp_path, contents)
+            .with_context(|| format!("write wallet temp file: {}", temp_path.display()))?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o600);
+            std::fs::set_permissions(&temp_path, perms).with_context(|| {
+                format!("set wallet temp permissions: {}", temp_path.display())
+            })?;
+        }
+
+        if path.exists() {
+            std::fs::remove_file(path)
+                .with_context(|| format!("remove existing wallet file: {}", path.display()))?;
+        }
+        std::fs::rename(&temp_path, path).with_context(|| {
+            format!(
+                "replace wallet file {} with {}",
+                path.display(),
+                temp_path.display()
+            )
+        })?;
+        Ok(())
+    })();
+
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+
+    write_result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -764,6 +827,75 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(decrypted, state_bytes);
+    }
+
+    #[test]
+    fn save_overwrites_existing_wallet_file() {
+        let (secret, address) = generate_master_keys();
+        let phrase = RecoveryPhrase::generate();
+        let enc_key = derive_encryption_key_with_params(&phrase, 1, 64, 1).unwrap();
+        let encrypted = encrypt_secrets(&secret, &enc_key).unwrap();
+
+        let dir = std::env::temp_dir().join("vess-test-persistence-overwrite");
+        let path = dir.join("wallet.json");
+
+        let mut wallet =
+            WalletFile::new(address, encrypted, BillFold::new(), [0u8; 32], &enc_key).unwrap();
+        wallet.name = Some("first".to_string());
+        wallet.save(&path, &enc_key).unwrap();
+
+        wallet.name = Some("second".to_string());
+        wallet.save(&path, &enc_key).unwrap();
+
+        let loaded = WalletFile::load(&path).unwrap();
+        assert_eq!(loaded.name.as_deref(), Some("second"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_persists_spend_credentials_from_billfold() {
+        let (secret, address) = generate_master_keys();
+        let phrase = RecoveryPhrase::generate();
+        let enc_key = derive_encryption_key_with_params(&phrase, 1, 64, 1).unwrap();
+        let encrypted = encrypt_secrets(&secret, &enc_key).unwrap();
+
+        let mut billfold = BillFold::new();
+        let bill = vess_foundry::VessBill {
+            denomination: vess_foundry::Denomination::D10,
+            digest: [0x11; 32],
+            created_at: 1,
+            stealth_id: [0x22; 32],
+            dht_index: 7,
+            mint_id: [0x33; 32],
+            chain_tip: [0x44; 32],
+            chain_depth: 0,
+        };
+        billfold.deposit_with_credentials(
+            bill.clone(),
+            crate::billfold::SpendCredential {
+                spend_vk: vec![0x55; 64],
+                spend_sk: vec![0x66; 64],
+            },
+        );
+
+        let wallet = WalletFile::new(address, encrypted, billfold, [0u8; 32], &enc_key).unwrap();
+
+        let dir = std::env::temp_dir().join("vess-test-persistence-creds");
+        let path = dir.join("wallet.json");
+
+        wallet.save(&path, &enc_key).unwrap();
+        let mut loaded = WalletFile::load(&path).unwrap();
+        loaded.decrypt_private_metadata(&enc_key).unwrap();
+        let mut loaded_billfold = loaded.billfold.clone();
+        loaded
+            .decrypt_spend_credentials_into(&mut loaded_billfold, &enc_key)
+            .unwrap();
+
+        assert_eq!(loaded_billfold.balance(), 10);
+        assert!(loaded_billfold.get_credentials(&bill.mint_id).is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

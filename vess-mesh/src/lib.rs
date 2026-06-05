@@ -1853,6 +1853,13 @@ fn parse_relay_message(payload: &[u8]) -> Result<MeshRelayMessage> {
     serde_json::from_slice(payload).context("deserialize mesh relay packet")
 }
 
+fn usable_udp_contact_addr(advertised: Option<&str>, fallback: SocketAddr) -> SocketAddr {
+    advertised
+        .and_then(|addr| addr.parse::<SocketAddr>().ok())
+        .filter(|addr| !addr.ip().is_unspecified() && addr.port() != 0)
+        .unwrap_or(fallback)
+}
+
 async fn process_udp_packet(
     socket: &UdpSocket,
     handler: &Arc<dyn Fn(MeshPeer, Vec<u8>) -> Vec<u8> + Send + Sync>,
@@ -1865,11 +1872,8 @@ async fn process_udp_packet(
 ) -> Result<Option<(SocketAddr, MeshRelayMessage)>> {
     match packet {
         MeshUdpPacket::ClientHello(hello) => {
-            let remote_contact_addr = hello
-                .initiator_contact_addr
-                .as_deref()
-                .and_then(|addr| addr.parse::<SocketAddr>().ok())
-                .unwrap_or(peer_addr);
+            let remote_contact_addr =
+                usable_udp_contact_addr(hello.initiator_contact_addr.as_deref(), peer_addr);
             let opened_inbound = open_route_handshake(local_secret, &hello.route_to_responder)?;
             let outbound = generate_route_handshake(&hello.initiator_address)?;
             let transport_key = derive_transport_key(
@@ -2166,6 +2170,21 @@ mod tests {
         assert!(!is_public_routable_socket_addr(
             &"10.0.0.1:443".parse().unwrap()
         ));
+    }
+
+    #[test]
+    fn usable_udp_contact_addr_falls_back_from_unspecified_address() {
+        let fallback = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 44), 55000));
+
+        assert_eq!(
+            usable_udp_contact_addr(Some("0.0.0.0:19001"), fallback),
+            fallback
+        );
+        assert_eq!(
+            usable_udp_contact_addr(Some("192.168.1.9:19001"), fallback),
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 9), 19001))
+        );
+        assert_eq!(usable_udp_contact_addr(None, fallback), fallback);
     }
 
     #[tokio::test]

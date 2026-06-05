@@ -175,6 +175,7 @@ pub struct BurnConfirmationProof {
     pub block_height: u64,
     pub confirmations: u32,
     pub required_confirmations: u32,
+    pub corroborating_peer_count: u32,
     pub chain_work: [u8; 32],
     pub merkle_root: TxMerkleNode,
     pub merkle_proof: Vec<[u8; 32]>,
@@ -440,7 +441,9 @@ pub struct BitcoinLightClient {
     connected_peers: Arc<AtomicUsize>,
     active_peers: Arc<Mutex<HashSet<SocketAddr>>>,
     cache: Arc<Mutex<HashMap<Txid, Transaction>>>,
+    tx_sources: Arc<Mutex<HashMap<Txid, HashSet<SocketAddr>>>>,
     block_cache: Arc<Mutex<HashMap<BlockHash, Block>>>,
+    block_sources: Arc<Mutex<HashMap<BlockHash, HashSet<SocketAddr>>>>,
     header_chain: Arc<Mutex<HeaderChain>>,
     known_vess_nodes: Arc<Mutex<HashMap<String, VessSeedNode>>>,
     known_bitcoin_peers: Arc<Mutex<HashSet<SocketAddr>>>,
@@ -542,8 +545,10 @@ impl BitcoinPeerRetryState {
 struct SharedState {
     pending: Mutex<HashMap<Txid, Vec<oneshot::Sender<Result<Option<Transaction>>>>>>,
     cache: Arc<Mutex<HashMap<Txid, Transaction>>>,
+    tx_sources: Arc<Mutex<HashMap<Txid, HashSet<SocketAddr>>>>,
     pending_blocks: Mutex<HashMap<BlockHash, Vec<oneshot::Sender<Result<Option<Block>>>>>>,
     block_cache: Arc<Mutex<HashMap<BlockHash, Block>>>,
+    block_sources: Arc<Mutex<HashMap<BlockHash, HashSet<SocketAddr>>>>,
     header_chain: Arc<Mutex<HeaderChain>>,
     incoming_txs: broadcast::Sender<ObservedTransaction>,
     connected_peers: Arc<AtomicUsize>,
@@ -559,15 +564,19 @@ impl BitcoinLightClient {
         let connected_peers = Arc::new(AtomicUsize::new(0));
         let active_peers = Arc::new(Mutex::new(HashSet::new()));
         let cache = Arc::new(Mutex::new(HashMap::new()));
+        let tx_sources = Arc::new(Mutex::new(HashMap::new()));
         let block_cache = Arc::new(Mutex::new(HashMap::new()));
+        let block_sources = Arc::new(Mutex::new(HashMap::new()));
         let header_chain = Arc::new(Mutex::new(HeaderChain::new(config.network)));
         let known_vess_nodes = Arc::new(Mutex::new(HashMap::new()));
         let vess_probe_state = Arc::new(Mutex::new(HashMap::new()));
         let shared = Arc::new(SharedState {
             pending: Mutex::new(HashMap::new()),
             cache: cache.clone(),
+            tx_sources: tx_sources.clone(),
             pending_blocks: Mutex::new(HashMap::new()),
             block_cache: block_cache.clone(),
+            block_sources: block_sources.clone(),
             header_chain: header_chain.clone(),
             incoming_txs: incoming_txs.clone(),
             connected_peers: connected_peers.clone(),
@@ -609,7 +618,9 @@ impl BitcoinLightClient {
             connected_peers,
             active_peers,
             cache,
+            tx_sources,
             block_cache,
+            block_sources,
             header_chain,
             known_vess_nodes,
             known_bitcoin_peers,
@@ -717,12 +728,25 @@ impl BitcoinLightClient {
                 continue;
             }
             if let Some((merkle_index, merkle_proof)) = compute_merkle_proof(&block, txid) {
+                let corroborating_peer_count = {
+                    let tx_sources = self.tx_sources.lock().unwrap();
+                    let block_sources = self.block_sources.lock().unwrap();
+                    let mut peers = HashSet::new();
+                    if let Some(observed) = tx_sources.get(&txid) {
+                        peers.extend(observed.iter().copied());
+                    }
+                    if let Some(observed) = block_sources.get(&block_hash) {
+                        peers.extend(observed.iter().copied());
+                    }
+                    peers.len() as u32
+                };
                 return Ok(Some(BurnConfirmationProof {
                     txid,
                     block_hash,
                     block_height: height as u64,
                     confirmations,
                     required_confirmations,
+                    corroborating_peer_count,
                     chain_work: chain_work.to_be_bytes(),
                     merkle_root: header.merkle_root,
                     merkle_proof,
@@ -1170,12 +1194,36 @@ fn known_bitcoin_peer_matches_ip(peer: SocketAddr, known_bitcoin_peers: &HashSet
     known_bitcoin_peers.iter().any(|known| known.ip() == peer.ip())
 }
 
+fn vess_seed_rate_limit_bucket(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(addr) => {
+            let [a, b, c, _] = addr.octets();
+            IpAddr::V4(std::net::Ipv4Addr::new(a, b, c, 0))
+        }
+        IpAddr::V6(addr) => {
+            let segments = addr.segments();
+            IpAddr::V6(std::net::Ipv6Addr::new(
+                segments[0],
+                segments[1],
+                segments[2],
+                segments[3],
+                0,
+                0,
+                0,
+                0,
+            ))
+        }
+    }
+}
+
 fn rate_limit_vess_seed_client(
     peer: SocketAddr,
     request_windows: &mut HashMap<IpAddr, VessSeedClientWindow>,
     now_unix: u64,
 ) -> bool {
-    let entry = request_windows.entry(peer.ip()).or_default();
+    let entry = request_windows
+        .entry(vess_seed_rate_limit_bucket(peer.ip()))
+        .or_default();
     if now_unix.saturating_sub(entry.window_started_unix) >= 60 {
         entry.window_started_unix = now_unix;
         entry.requests_in_window = 0;
@@ -2222,6 +2270,10 @@ fn handle_incoming(
                 }
                 cache.insert(txid, transaction.clone());
             }
+            {
+                let mut tx_sources = shared.tx_sources.lock().unwrap();
+                tx_sources.entry(txid).or_default().insert(peer);
+            }
             let observed = ObservedTransaction {
                 txid,
                 transaction: transaction.clone(),
@@ -2244,6 +2296,10 @@ fn handle_incoming(
                     }
                 }
                 cache.insert(block_hash, block.clone());
+            }
+            {
+                let mut block_sources = shared.block_sources.lock().unwrap();
+                block_sources.entry(block_hash).or_default().insert(peer);
             }
             if let Some(waiters) = shared.pending_blocks.lock().unwrap().remove(&block_hash) {
                 for waiter in waiters {
@@ -2744,7 +2800,7 @@ mod tests {
     }
 
     #[test]
-    fn seed_request_rate_limit_is_ip_based() {
+    fn seed_request_rate_limit_is_subnet_based() {
         let peer: SocketAddr = "203.0.113.10:42000".parse().unwrap();
         let mut windows = HashMap::new();
 
@@ -2753,11 +2809,44 @@ mod tests {
         }
         assert!(!should_accept_vess_seed_request(peer, &mut windows, 100));
 
-        let unknown_peer: SocketAddr = "203.0.113.11:42000".parse().unwrap();
+        let same_v4_subnet_peer: SocketAddr = "203.0.113.11:42000".parse().unwrap();
         assert!(should_accept_vess_seed_request(
-            unknown_peer,
+            "203.0.114.11:42000".parse().unwrap(),
             &mut HashMap::new(),
             100,
+        ));
+        assert!(!should_accept_vess_seed_request(
+            same_v4_subnet_peer,
+            &mut windows,
+            100,
+        ));
+
+        let mut windows = HashMap::new();
+        let first_v6 = SocketAddr::new(
+            IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 0x1, 0x2, 0, 0, 0, 1)),
+            8333,
+        );
+        let second_v6_same_prefix = SocketAddr::new(
+            IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 0x1, 0x2, 0, 0, 0, 2)),
+            8333,
+        );
+        let different_v6_prefix = SocketAddr::new(
+            IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 0x1, 0x3, 0, 0, 0, 1)),
+            8333,
+        );
+
+        for _ in 0..MAX_VESS_SEED_REQUESTS_PER_MINUTE {
+            assert!(should_accept_vess_seed_request(first_v6, &mut windows, 200));
+        }
+        assert!(!should_accept_vess_seed_request(
+            second_v6_same_prefix,
+            &mut windows,
+            200,
+        ));
+        assert!(should_accept_vess_seed_request(
+            different_v6_prefix,
+            &mut HashMap::new(),
+            200,
         ));
     }
 

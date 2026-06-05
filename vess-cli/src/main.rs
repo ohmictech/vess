@@ -8,6 +8,10 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use chacha20poly1305::{
+    aead::{generic_array::GenericArray, Aead, KeyInit},
+    ChaCha20Poly1305,
+};
 use clap::{Parser, Subcommand};
 use qrcode::QrCode;
 use rand::Rng;
@@ -24,8 +28,8 @@ use vess_kloak::persistence::{
     WalletDescriptor, WalletFile,
 };
 use vess_kloak::recovery::{
-    derive_raw_seed, encrypt_secrets, encryption_key_from_seed, recover_master_keys,
-    spend_seed_from_raw_seed, RecoveryPhrase,
+    derive_key_from_password, derive_raw_seed, encrypt_secrets, encryption_key_from_seed,
+    recover_master_keys, spend_seed_from_raw_seed, RecoveryPhrase,
 };
 use vess_kloak::BillFold;
 use vess_mesh::{
@@ -205,6 +209,9 @@ enum Command {
         /// Enable the local-only JSON-RPC server on 127.0.0.1:<port>.
         #[arg(long)]
         rpc_port: Option<u16>,
+        /// Discard persisted peer cache and ban state on startup.
+        #[arg(long, hide = true)]
+        reset_transient_peer_state: bool,
     },
 
     /// Set a password for fast daily wallet unlock.
@@ -212,6 +219,111 @@ enum Command {
     /// Requires the wallet encryption key (via VESS_WALLET_PASSWORD or
     /// VESS_RECOVERY_PHRASE) to encrypt the key
     /// cache.  After this, the node only needs the password to start.
+
+    const LOCAL_BACKUP_FORMAT_VERSION: u32 = 1;
+
+    #[derive(Serialize)]
+    struct LocalPhraseBackupFile {
+        version: u32,
+        kdf: &'static str,
+        cipher: &'static str,
+        salt_hex: String,
+        nonce_hex: String,
+        ciphertext_hex: String,
+    }
+
+    fn local_phrase_backup_path(wallet_path: &Path) -> PathBuf {
+        let file_name = wallet_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("wallet");
+        wallet_path.with_file_name(format!("{file_name}.seed-backup.json"))
+    }
+
+    fn prompt_yes_no(msg: &str, default_no: bool) -> Result<bool> {
+        loop {
+            let answer = prompt(msg)?;
+            let normalized = answer.trim().to_ascii_lowercase();
+            if normalized.is_empty() {
+                return Ok(!default_no);
+            }
+            match normalized.as_str() {
+                "y" | "yes" => return Ok(true),
+                "n" | "no" => return Ok(false),
+                _ => println!("Please answer y or n."),
+            }
+        }
+    }
+
+    fn write_local_phrase_backup_file(phrase: &RecoveryPhrase, backup_path: &Path) -> Result<()> {
+        let mut password = prompt_password("  Backup password (min 16 chars): ")?;
+        if password.len() < 16 {
+            anyhow::bail!("backup password must be at least 16 characters");
+        }
+        let password_confirm = prompt_password("  Confirm backup password: ")?;
+        if password != password_confirm {
+            anyhow::bail!("backup passwords did not match");
+        }
+
+        let mut salt = [0u8; 16];
+        rand::thread_rng().fill(&mut salt);
+        let derived_key = derive_key_from_password(&password, &salt)?;
+        let cipher = ChaCha20Poly1305::new(GenericArray::from_slice(&derived_key));
+
+        let mut nonce = [0u8; 12];
+        rand::thread_rng().fill(&mut nonce);
+        let phrase_text = phrase.display_phrase();
+        let ciphertext = cipher
+            .encrypt(GenericArray::from_slice(&nonce), phrase_text.as_bytes())
+            .map_err(|err| anyhow::anyhow!("backup encryption failed: {err}"))?;
+
+        let backup = LocalPhraseBackupFile {
+            version: LOCAL_BACKUP_FORMAT_VERSION,
+            kdf: "argon2id",
+            cipher: "chacha20poly1305",
+            salt_hex: hex::encode(salt),
+            nonce_hex: hex::encode(nonce),
+            ciphertext_hex: hex::encode(ciphertext),
+        };
+
+        let encoded = serde_json::to_vec_pretty(&backup)?;
+        std::fs::write(backup_path, encoded)
+            .with_context(|| format!("write backup file {}", backup_path.display()))?;
+        password.clear();
+        Ok(())
+    }
+
+    fn maybe_store_local_phrase_backup(phrase: &RecoveryPhrase, wallet_path: &Path) -> Result<Option<PathBuf>> {
+        let should_store = prompt_yes_no(
+            "Store a local encrypted backup of your recovery phrase? [y/N]: ",
+            true,
+        )?;
+        if !should_store {
+            return Ok(None);
+        }
+
+        let backup_path = local_phrase_backup_path(wallet_path);
+        if backup_path.exists() {
+            let overwrite = prompt_yes_no(
+                &format!(
+                    "Encrypted backup already exists at {}. Overwrite it? [y/N]: ",
+                    backup_path.display()
+                ),
+                true,
+            )?;
+            if !overwrite {
+                println!("  Skipped local backup.");
+                return Ok(None);
+            }
+        }
+
+        println!("\nCreate a separate high-entropy password for this backup file.");
+        println!("Do not store that password in the same place as the backup file.\n");
+        write_local_phrase_backup_file(phrase, &backup_path)?;
+        println!("Encrypted backup saved to {}", backup_path.display());
+        println!("Store that file on a thumb drive or in cloud storage as an extra backup.\n");
+        Ok(Some(backup_path))
+    }
     SetPassword {
         /// The new password to set.
         #[arg(long)]
@@ -361,6 +473,7 @@ async fn dispatch_command(cli: &Cli) -> Result<()> {
             wallet,
             wallet_password,
             rpc_port,
+            reset_transient_peer_state,
         }) => {
             let state_dir = match state_dir {
                 Some(d) => d.clone(),
@@ -378,6 +491,7 @@ async fn dispatch_command(cli: &Cli) -> Result<()> {
                 bitcoin_config: None,
                 enable_local_discovery: true,
                 allow_private_bitcoin_seed_contact: false,
+                reset_transient_peer_state: *reset_transient_peer_state,
             };
             vess_artery::node_runner::run_node(config).await?;
             Ok(())
@@ -504,7 +618,7 @@ async fn spawn_udp_mesh_carrier() -> Result<PqUdpMeshCarrier> {
 /// Used by init/recover when the local node is not yet running.
 async fn discover_peers(verbose: bool) -> Result<Vec<MeshCarrierContact>> {
     if verbose {
-        println!("Discovering Vess peers through LAN and Bitcoin peers...");
+        println!("Discovering Bitcoin & Vess peers...");
     }
     let client = match vess_bitcoin::BitcoinLightClient::spawn(Default::default()).await {
         Ok(client) => Some(client),
@@ -648,6 +762,10 @@ fn rpc_port(cli: &Cli) -> u16 {
                 .and_then(|value| value.parse().ok())
         })
         .unwrap_or(vess_artery::rpc::DEFAULT_RPC_PORT)
+}
+
+fn should_use_rpc(cli: &Cli) -> bool {
+    cli.rpc.is_some() || std::env::var_os(VESS_RPC_PORT_ENV).is_some()
 }
 
 fn parse_proof_system(value: &str) -> Result<ProofSystem> {
@@ -1031,6 +1149,10 @@ async fn cmd_init(cli: &Cli, tag_str: &str, wallet_name: Option<&str>) -> Result
             );
         }
 
+        if let Err(error) = maybe_store_local_phrase_backup(&phrase, &path) {
+            eprintln!("Warning: could not create encrypted local backup: {error}");
+        }
+
         wallet.save(&path, &enc_key)?;
         set_active_wallet_path(&path)?;
         println!(
@@ -1225,14 +1347,18 @@ async fn cmd_recover(cli: &Cli, words: &str, wallet_name: Option<&str>) -> Resul
 
 async fn cmd_balance(cli: &Cli) -> Result<()> {
     // ── RPC path ────────────────────────────────────────────────────
-    if let Some(port) = cli.rpc {
+    if should_use_rpc(cli) {
+        let port = rpc_port(cli);
         let resp = rpc_call(port, &json!({"method": "balance"})).await?;
         if resp["ok"] == true {
             if cli.json {
                 println!("{resp}");
             } else {
-                println!("Balance: {} Vess", resp["balance"]);
-                println!("Bills:   {}", resp["bill_count"]);
+                println!("Spendable:  {} Vess", resp["balance"]);
+                if let Some(watch_only_balance) = resp["watch_only_balance"].as_u64() {
+                    println!("Watch-only: {} Vess", watch_only_balance);
+                }
+                println!("Bills:      {}", resp["bill_count"]);
             }
         } else {
             anyhow::bail!("{}", resp["error"].as_str().unwrap_or("unknown error"));
@@ -2344,6 +2470,7 @@ async fn spawn_interactive_node(cli: &Cli, active_node: ActiveNodeRef) -> Result
         &port_str,
         "--state-dir",
         &state_dir_arg,
+        "--reset-transient-peer-state",
     ]);
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(log_file);
@@ -2472,7 +2599,7 @@ enum WalletOpenChoice {
 
 fn prompt_wallet_tag_destination() -> Result<(PathBuf, String)> {
     loop {
-        let name = prompt("Enter this wallet's VessTag (e.g. +alice): ")?;
+        let name = prompt("Choose a unique VessTag. This is your 3-20 alphanumeric character identifier: ")?;
         let name = match normalize_wallet_tag_name(&name) {
             Ok(name) => name,
             Err(e) => {
@@ -2545,7 +2672,7 @@ fn prompt_wallet_open_choice(wallets: &[WalletDescriptor]) -> Result<WalletOpenC
     if wallets.len() == 1 {
         let wallet = &wallets[0];
         println!("Found wallet: {}", wallet_display_name(&wallet.name));
-        let answer = prompt("Unlock this wallet now? [Y/n/new]: ")?;
+        let answer = prompt("Unlock this wallet now? [y/n/new]: ")?;
         return match answer.trim().to_ascii_lowercase().as_str() {
             "n" | "no" | "skip" => Ok(WalletOpenChoice::Skip),
             "new" | "create" | "recover" => Ok(WalletOpenChoice::CreateOrRecover),
@@ -2629,7 +2756,7 @@ async fn cmd_unlock_wallet_at_path(
 
 async fn ensure_wallet_layer(cli: &Cli) -> Result<()> {
     if !wait_for_node_rpc(cli, std::time::Duration::from_secs(20)).await {
-        println!("Node is still starting; network discovery continues in the background.");
+        println!("Node is starting; network discovery running in the background.");
         return Ok(());
     }
     if wallet_loaded_in_node(cli).await {
@@ -2639,8 +2766,8 @@ async fn ensure_wallet_layer(cli: &Cli) -> Result<()> {
     if cli.wallet.is_none() && cli.wallet_name.is_none() {
         let wallets = list_wallets()?;
         if wallets.is_empty() {
-            println!("No local wallets found. The node is already running without a wallet.");
-            let answer = prompt("Create or recover a wallet now? [Y/n]: ")?;
+            println!("No local wallets found. The node is running without a wallet.");
+            let answer = prompt("Create or recover a wallet now? [y/n]: ")?;
             if matches!(answer.trim().to_ascii_lowercase().as_str(), "n" | "no") {
                 return Ok(());
             }
@@ -2666,10 +2793,10 @@ async fn ensure_wallet_layer(cli: &Cli) -> Result<()> {
     let wallet_file = wallet_path(cli)?;
     if !wallet_file.exists() {
         println!(
-            "Selected wallet not found at {}. The node is already running without a wallet.",
+            "Selected wallet not found at {}. The node is running without a wallet.",
             wallet_file.display()
         );
-        let answer = prompt("Create or recover a wallet now? [Y/n]: ")?;
+        let answer = prompt("Create or recover a wallet now? [y/n]: ")?;
         if matches!(answer.trim().to_ascii_lowercase().as_str(), "n" | "no") {
             return Ok(());
         }
@@ -2679,7 +2806,7 @@ async fn ensure_wallet_layer(cli: &Cli) -> Result<()> {
         return Ok(());
     }
 
-    let answer = prompt("Unlock wallet on the running node now? [Y/n]: ")?;
+    let answer = prompt("Unlock wallet on the running node now? [y/n]: ")?;
     if matches!(answer.trim().to_ascii_lowercase().as_str(), "n" | "no") {
         return Ok(());
     }
@@ -2695,7 +2822,7 @@ async fn first_run_wizard(
 ) -> Result<(PathBuf, String)> {
     println!();
     println!("  ╔══════════════════════════════════════╗");
-    println!("  ║  Welcome to Vess — first-time setup  ║");
+    println!("  ║           First-time Setup           ║");
     println!("  ╚══════════════════════════════════════╝");
     println!();
     println!("  [1] Create a new wallet");
@@ -2711,7 +2838,7 @@ async fn first_run_wizard(
 
     // Now set a quick-unlock password (raw_seed still in scope — no re-prompt).
     println!();
-    println!("Set a quick-unlock password for the background service.");
+    println!("Set a quick-unlock password for the background service. Typing is hidden for security.");
     println!("(Your recovery phrase is the fallback if you ever forget it.)\n");
     let password = loop {
         let pwd = prompt_password("  New password:     ")?;
@@ -2840,12 +2967,12 @@ async fn wizard_new(
     // Display recovery phrase and require confirmation before saving.
     println!();
     println!("  ╔═══════════════════════════════════════════════════════════════╗");
-    println!("  ║  YOUR 12-WORD RECOVERY PHRASE — WRITE THIS DOWN NOW!         ║");
+    println!("  ║      YOUR 12-WORD RECOVERY PHRASE — WRITE THIS DOWN NOW!      ║");
     println!("  ╚═══════════════════════════════════════════════════════════════╝");
     println!("  {}", phrase.display_phrase());
     println!();
     println!("  This is the ONLY way to recover your wallet if you lose your password.");
-    println!("  Store it offline — paper, not a screenshot.\n");
+    println!("  Store it offline on paper, NOT on your device or as a screenshot.\n");
 
     loop {
         let words_in = prompt("  Re-enter your 12-word phrase to confirm you saved it: ")?;
@@ -2857,6 +2984,10 @@ async fn wizard_new(
             break;
         }
         println!("  That doesn't match. Please try again.\n");
+    }
+
+    if let Err(error) = maybe_store_local_phrase_backup(&phrase, &wallet_path) {
+        eprintln!("Warning: could not create encrypted local backup: {error}");
     }
 
     wallet.save(&wallet_path, &enc_key)?;
@@ -3017,11 +3148,13 @@ async fn cmd_status(cli: &Cli) -> Result<()> {
     }
 
     let mut balance = None;
+    let mut watch_only_balance = None;
     let mut bill_count = None;
     // Try RPC for live stats.
     if let Ok(resp) = rpc_call(port, &json!({"method": "balance"})).await {
         if resp["ok"] == true {
             balance = resp["balance"].as_u64();
+            watch_only_balance = resp["watch_only_balance"].as_u64();
             bill_count = resp["bill_count"].as_u64();
         }
     }
@@ -3035,7 +3168,11 @@ async fn cmd_status(cli: &Cli) -> Result<()> {
                         "ok": true,
                         "running": true,
                         "balance": balance,
+                        "watch_only_balance": watch_only_balance,
                         "bill_count": bill_count,
+                        "peer_count": resp["peer_count"],
+                        "discovered_peer_count": resp["discovered_peer_count"],
+                        "cached_peer_count": resp["cached_peer_count"],
                         "verified_peer_count": resp["verified_peer_count"],
                         "node_id": resp["node_id"],
                         "node_contact": resp["node_contact"],
@@ -3049,9 +3186,34 @@ async fn cmd_status(cli: &Cli) -> Result<()> {
             }
 
             if let (Some(balance), Some(bill_count)) = (balance, bill_count) {
-                println!("Balance: {} Vess  ({} bills)", balance, bill_count);
+                if let Some(watch_only_balance) = watch_only_balance {
+                    println!(
+                        "Balance: {} spendable / {} watch-only Vess  ({} bills)",
+                        balance,
+                        watch_only_balance,
+                        bill_count
+                    );
+                } else {
+                    println!("Balance: {} Vess  ({} bills)", balance, bill_count);
+                }
             }
-            println!("Peers:   {}", resp["verified_peer_count"]);
+            let discovered_peer_count = resp["discovered_peer_count"].as_u64().unwrap_or(0);
+            let cached_peer_count = resp["cached_peer_count"].as_u64().unwrap_or(0);
+            let verified_peer_count = resp["verified_peer_count"].as_u64().unwrap_or(0);
+            if cached_peer_count > 0 {
+                println!(
+                    "Peers:   {} discovered / {} verified  ({} cached from prior state)",
+                    discovered_peer_count,
+                    verified_peer_count,
+                    cached_peer_count
+                );
+            } else {
+                println!(
+                    "Peers:   {} discovered / {} verified",
+                    discovered_peer_count,
+                    verified_peer_count
+                );
+            }
             println!("Node ID: {}", resp["node_id"].as_str().unwrap_or("?"));
             println!(
                 "Mesh contact: {}",
@@ -3230,7 +3392,7 @@ async fn cmd_interactive(cli: &Cli) -> Result<()> {
             _ => {
                 if matches!(cmd, "start" | "stop") {
                     println!(
-                        "`{cmd}` is no longer a CLI command. This CLI now manages its node automatically."
+                        "`{cmd}` is not a CLI command. This CLI manages its node automatically."
                     );
                     Ok(())
                 } else {

@@ -168,6 +168,13 @@ fn min_bitcoin_burn_confirmations(network: BitcoinNetwork) -> u32 {
     }
 }
 
+fn min_bitcoin_burn_corroborating_peers(network: BitcoinNetwork) -> u32 {
+    match network {
+        BitcoinNetwork::Mainnet | BitcoinNetwork::Testnet | BitcoinNetwork::Signet => 2,
+        BitcoinNetwork::Regtest => 1,
+    }
+}
+
 fn bitcoin_burn_merkle_root(burn: &vess_protocol::BitcoinBurnBundleProof) -> [u8; 32] {
     let mut current = burn.txid;
     let mut index = burn.merkle_index;
@@ -240,6 +247,7 @@ fn confirmed_burn_outputs(
         block_height: confirmation.block_height,
         confirmations: confirmation.confirmations,
         required_confirmations: confirmation.required_confirmations,
+        corroborating_peer_count: confirmation.corroborating_peer_count,
         chain_work: confirmation.chain_work,
         merkle_root: *confirmation.merkle_root.as_byte_array(),
         merkle_proof: confirmation.merkle_proof.clone(),
@@ -315,6 +323,10 @@ fn validate_bitcoin_burn_genesis(
         || burn.confirmations < burn.required_confirmations
     {
         return Err("bitcoin burn confirmation depth insufficient");
+    }
+
+    if burn.corroborating_peer_count < min_bitcoin_burn_corroborating_peers(burn.network) {
+        return Err("bitcoin burn corroboration insufficient");
     }
 
     if burn.chain_work == [0u8; 32] {
@@ -510,6 +522,7 @@ mod tests {
             block_height: 12,
             confirmations: 1,
             required_confirmations: 1,
+            corroborating_peer_count: 1,
             chain_work: [0x33; 32],
             merkle_root: txid,
             merkle_proof: Vec::new(),
@@ -577,6 +590,31 @@ mod tests {
             denomination_value: 10,
             digest: [tag.wrapping_add(3); 32],
         }
+    }
+
+    fn sample_payment(tag: u8) -> vess_protocol::Payment {
+        vess_protocol::Payment {
+            payment_id: [tag; 32],
+            stealth_payload: vec![tag; 8],
+            view_tag: tag,
+            stealth_id: [tag.wrapping_add(1); 32],
+            created_at: 1,
+            bill_count: 1,
+            mailbox_key: Some([tag.wrapping_add(2); 32]),
+            direct_receipt_tag_hash: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_unroutable_payment_batch_requeues_items() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let payment = sample_payment(0x44);
+
+        retry_unroutable_payment_batch(&tx, vec![payment.clone()]).await;
+
+        let replayed = rx.recv().await.expect("payment should be requeued");
+        assert_eq!(replayed.payment_id, payment.payment_id);
+        assert_eq!(replayed.mailbox_key, payment.mailbox_key);
     }
 
     fn sample_seed_state() -> Arc<Mutex<ArteryState>> {
@@ -690,6 +728,18 @@ mod tests {
 
         let error = validate_bitcoin_burn_genesis(&og, &burn).unwrap_err();
         assert_eq!(error, "bitcoin burn OP_RETURN payload mismatch");
+    }
+
+    #[test]
+    fn bitcoin_burn_bundle_rejects_insufficient_corroboration() {
+        let (mut burn, og) = sample_burn_bundle();
+        burn.network = BitcoinNetwork::Mainnet;
+        burn.required_confirmations = 6;
+        burn.confirmations = 6;
+        burn.corroborating_peer_count = 1;
+
+        let error = validate_bitcoin_burn_genesis(&og, &burn).unwrap_err();
+        assert_eq!(error, "bitcoin burn corroboration insufficient");
     }
 
     #[test]
@@ -1408,6 +1458,28 @@ fn bootstrap_string_from_contact(contact: &MeshCarrierContact) -> Option<String>
     encode_contact_string(contact).ok()
 }
 
+fn push_peer_notification(
+    state: &mut ArteryState,
+    kind: &str,
+    peer_hash: &[u8; 32],
+    counterparty: Option<String>,
+    message: String,
+) {
+    let created_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    state.push_notification(WalletNotification {
+        kind: kind.to_string(),
+        created_at,
+        payment_id: hex_key(peer_hash),
+        amount: None,
+        bill_count: None,
+        counterparty,
+        message,
+    });
+}
+
 fn queue_discovered_peer_contact(
     state: &Arc<Mutex<ArteryState>>,
     contact: MeshCarrierContact,
@@ -1440,18 +1512,13 @@ fn queue_discovered_peer_contact(
         first_seen: now,
     }) {
         if !already_known {
-            s.push_notification(WalletNotification {
-                kind: "vess_peer_discovered".to_string(),
-                created_at: now,
-                payment_id: hex_key(&peer_hash),
-                amount: None,
-                bill_count: None,
-                counterparty: Some(source.to_string()),
-                message: format!(
-                    "Discovered Vess peer via {source}: {}",
-                    hex_key(&peer_hash)
-                ),
-            });
+            push_peer_notification(
+                &mut s,
+                "vess_peer_discovered",
+                &peer_hash,
+                Some(source.to_string()),
+                format!("Discovered Vess peer via {source}: {}", hex_key(&peer_hash)),
+            );
         }
     }
     if s.peer_registry.state(&peer_hash) != PeerState::Verified
@@ -2227,6 +2294,54 @@ async fn request_dht_seed_catchup(
     Some(snapshot)
 }
 
+async fn request_peer_exchange_from_peer(
+    node: &MeshPulseNode,
+    target: &MeshCarrierContact,
+    state: &Arc<Mutex<ArteryState>>,
+) {
+    let msg = PulseMessage::PeerExchange(PeerExchange {
+        sender_id: node.id().as_bytes().to_vec(),
+    });
+    let Ok(Some(PulseMessage::PeerExchangeResponse(resp))) =
+        node.send_message_with_response(target, &msg).await
+    else {
+        return;
+    };
+
+    if resp.peers.len() > MAX_PEER_EXCHANGE_PEERS {
+        warn!(
+            count = resp.peers.len(),
+            "peer exchange returned too many contacts; truncating response"
+        );
+    }
+
+    let mut s = state.lock().unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    for peer_bytes in resp.peers.iter().take(MAX_PEER_EXCHANGE_PEERS) {
+        let Some(peer_hash) = peer_hash_from_contact_bytes(peer_bytes) else {
+            continue;
+        };
+        if peer_hash == s.node_id {
+            continue;
+        }
+        if !s.routing_table.contains(&peer_hash) {
+            s.routing_table.insert(RoutingPeer {
+                id_hash: peer_hash,
+                id_bytes: peer_bytes.clone(),
+                last_seen: now,
+                first_seen: now,
+            });
+            s.handshake_queue.push(peer_hash);
+        }
+    }
+    s.estimated_network_size = s.routing_table.estimated_network_size();
+    let repl = dht_replication_factor(s.estimated_network_size);
+    s.tag_dht.set_k_replication(repl);
+}
+
 pub(crate) async fn refresh_mailbox_forward_subscriptions(
     node: &MeshPulseNode,
     state: &Arc<Mutex<ArteryState>>,
@@ -2656,6 +2771,9 @@ pub struct NodeConfig {
     /// Allow advertising a non-public mesh contact into Bitcoin-side Vess seed discovery.
     /// Intended for local integration tests that run all nodes on loopback.
     pub allow_private_bitcoin_seed_contact: bool,
+    /// When true, discard persisted peer cache / reputation / ban state on startup.
+    /// Useful for ephemeral interactive CLI nodes that reuse slot directories.
+    pub reset_transient_peer_state: bool,
 }
 
 impl Default for NodeConfig {
@@ -2672,6 +2790,7 @@ impl Default for NodeConfig {
             bitcoin_config: None,
             enable_local_discovery: true,
             allow_private_bitcoin_seed_contact: false,
+            reset_transient_peer_state: false,
         }
     }
 }
@@ -3196,6 +3315,16 @@ fn compute_gossip_targets_scored(
     indices
 }
 
+async fn retry_unroutable_payment_batch(
+    pay_tx: &tokio::sync::mpsc::UnboundedSender<vess_protocol::Payment>,
+    items: Vec<vess_protocol::Payment>,
+) {
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    for item in items {
+        let _ = pay_tx.send(item);
+    }
+}
+
 /// Batch-send grouped messages to peers over single mesh sessions.
 /// Sends to all target peers concurrently via tokio::spawn.
 ///
@@ -3235,7 +3364,13 @@ async fn batch_forward_bytes_to_peers(
 /// Returns the node's mesh node ID string for display/use.
 pub async fn run_node(config: NodeConfig) -> Result<String> {
     let storage = NodeStorage::open(&config.state_dir)?;
-    let snapshot = storage.load()?;
+    let mut snapshot = storage.load()?;
+    if config.reset_transient_peer_state {
+        snapshot.known_peers.clear();
+        snapshot.peer_endpoints.clear();
+        snapshot.peer_reputations.clear();
+        snapshot.banned_peers.clear();
+    }
 
     // ── Load embedded wallet (if configured) ────────────────────────
     let (wallet_state, startup_wallet_tag_store) = if let Some(ref wallet_path) = config.wallet_path {
@@ -4152,6 +4287,13 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                             first_seen: boot_now,
                         });
                     }
+                    push_peer_notification(
+                        &mut s,
+                        "vess_peer_handshake_attempted",
+                        &peer_hash,
+                        Some("bootstrap".to_string()),
+                        format!("Attempting Vess handshake with bootstrap peer: {}", hex_key(&peer_hash)),
+                    );
                 }
                 info!(peer = %peer_str, "connecting to bootstrap peer");
 
@@ -4178,21 +4320,58 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                                 warn!(peer = %peer_str, "bootstrap peer PoW verification failed — banishing");
                                 s.peer_registry.mark_banished(peer_hash);
                                 boot_ban.banish(peer_hash);
+                                push_peer_notification(
+                                    &mut s,
+                                    "vess_peer_handshake_failed",
+                                    &peer_hash,
+                                    Some("bootstrap".to_string()),
+                                    format!("Bootstrap handshake failed PoW verification for peer: {}", hex_key(&peer_hash)),
+                                );
                                 continue;
                             }
+                            push_peer_notification(
+                                &mut s,
+                                "vess_peer_verified",
+                                &peer_hash,
+                                Some("bootstrap".to_string()),
+                                format!("Verified Vess peer after bootstrap handshake: {}", hex_key(&peer_hash)),
+                            );
                             info!(peer = %peer_str, "bootstrap peer verified");
                         } else {
                             s.peer_registry.mark_banished(peer_hash);
                             boot_ban.banish(peer_hash);
+                            push_peer_notification(
+                                &mut s,
+                                "vess_peer_handshake_failed",
+                                &peer_hash,
+                                Some("bootstrap".to_string()),
+                                format!("Bootstrap handshake returned an invalid response for peer: {}", hex_key(&peer_hash)),
+                            );
                             info!(peer = %peer_str, "bootstrap peer banished — bad handshake");
                             continue;
                         }
                     }
                     Ok(_) => {
+                        let mut s = boot_state.lock().unwrap();
+                        push_peer_notification(
+                            &mut s,
+                            "vess_peer_handshake_failed",
+                            &peer_hash,
+                            Some("bootstrap".to_string()),
+                            format!("Bootstrap handshake got an unexpected response from peer: {}", hex_key(&peer_hash)),
+                        );
                         info!(peer = %peer_str, "bootstrap peer gave unexpected response");
                         continue;
                     }
                     Err(e) => {
+                        let mut s = boot_state.lock().unwrap();
+                        push_peer_notification(
+                            &mut s,
+                            "vess_peer_handshake_failed",
+                            &peer_hash,
+                            Some("bootstrap".to_string()),
+                            format!("Bootstrap handshake could not reach peer {}: {e}", hex_key(&peer_hash)),
+                        );
                         warn!("bootstrap peer {peer_str} unreachable: {e}");
                         continue;
                     }
@@ -4827,6 +5006,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
     // single-relay censorship.
     let pay_drain_state = state.clone();
     let pay_drain_node = node.clone();
+    let pay_retry_tx = pay_tx.clone();
     tokio::spawn(async move {
         while let Some(first) = pay_rx.recv().await {
             let mut items = vec![first];
@@ -4854,6 +5034,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 )
             };
             if routable_peers.is_empty() {
+                retry_unroutable_payment_batch(&pay_retry_tx, items).await;
                 continue;
             }
 
@@ -5016,6 +5197,17 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     s.peer_registry.issue_challenge(peer_hash)
                 };
 
+                {
+                    let mut s = hs_state.lock().unwrap();
+                    push_peer_notification(
+                        &mut s,
+                        "vess_peer_handshake_attempted",
+                        &peer_hash,
+                        None,
+                        format!("Attempting Vess handshake with discovered peer: {}", hex_key(&peer_hash)),
+                    );
+                }
+
                 let challenge = PulseMessage::HandshakeChallenge(HandshakeChallenge { nonce });
                 if let Ok(Some(PulseMessage::HandshakeResponse(resp))) = hs_node
                     .send_message_with_response(&target, &challenge)
@@ -5035,23 +5227,54 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                                 warn!("peer PoW verification failed — banishing");
                                 s.peer_registry.mark_banished(peer_hash);
                                 hs_ban.banish(peer_hash);
+                                push_peer_notification(
+                                    &mut s,
+                                    "vess_peer_handshake_failed",
+                                    &peer_hash,
+                                    None,
+                                    format!("Handshake failed PoW verification for peer: {}", hex_key(&peer_hash)),
+                                );
                                 false
                             } else {
+                                push_peer_notification(
+                                    &mut s,
+                                    "vess_peer_verified",
+                                    &peer_hash,
+                                    None,
+                                    format!("Verified Vess peer after handshake: {}", hex_key(&peer_hash)),
+                                );
                                 info!("peer verified via handshake");
                                 true
                             }
                         } else {
                             s.peer_registry.mark_banished(peer_hash);
                             hs_ban.banish(peer_hash);
+                            push_peer_notification(
+                                &mut s,
+                                "vess_peer_handshake_failed",
+                                &peer_hash,
+                                None,
+                                format!("Handshake returned an invalid response for peer: {}", hex_key(&peer_hash)),
+                            );
                             info!("peer banished — invalid handshake response");
                             false
                         }
                     };
 
                     if verified {
+                        request_peer_exchange_from_peer(&hs_node, &target, &hs_state).await;
                         request_dht_seed_catchup(&hs_node, &target, &hs_state, &hs_receipt_text_state_dir).await;
                         refresh_mailbox_forward_subscriptions(&hs_node, &hs_state).await;
                     }
+                } else {
+                    let mut s = hs_state.lock().unwrap();
+                    push_peer_notification(
+                        &mut s,
+                        "vess_peer_handshake_failed",
+                        &peer_hash,
+                        None,
+                        format!("Handshake timed out or returned no usable response for peer: {}", hex_key(&peer_hash)),
+                    );
                 }
             }
         }
@@ -5276,8 +5499,20 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 first_seen: now_ts,
             });
             if inserted {
+                push_peer_notification(
+                    &mut state,
+                    "vess_peer_discovered",
+                    &peer_id,
+                    Some("inbound".to_string()),
+                    format!("Discovered Vess peer via inbound traffic: {}", hex_key(&peer_id)),
+                );
                 info!(%peer, "new peer discovered ({} total)", state.routing_table.peer_count());
             }
+        }
+        if state.peer_registry.state(&peer_id) != PeerState::Verified
+            && !state.handshake_queue.contains(&peer_id)
+        {
+            state.handshake_queue.push(peer_id);
         }
 
         // ── Handshake messages ──────────────────────────────────────
@@ -5316,6 +5551,14 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                             warn!(%peer, "handshake PoW verification failed — banishing");
                             state.peer_registry.mark_banished(peer_id);
                             ban_ref.banish(peer_id);
+                        } else {
+                            push_peer_notification(
+                                &mut state,
+                                "vess_peer_verified",
+                                &peer_id,
+                                Some("inbound".to_string()),
+                                format!("Verified Vess peer after handshake: {}", hex_key(&peer_id)),
+                            );
                         }
                     }
                     None => {

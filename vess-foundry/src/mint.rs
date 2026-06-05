@@ -296,6 +296,10 @@ impl MintSessionState {
         let data = serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?;
         let tmp = path.with_extension("tmp");
         std::fs::write(&tmp, &data)?;
+        #[cfg(target_os = "windows")]
+        if path.exists() {
+            std::fs::remove_file(path)?;
+        }
         std::fs::rename(&tmp, path)?;
         Ok(())
     }

@@ -19,6 +19,18 @@ use crate::limbo_buffer::LimboEntry;
 use crate::ownership_registry::{ConsumedRecord, OwnershipRecord};
 use crate::reputation::PeerReputation;
 
+fn replace_file_from_temp(tmp_path: &Path, dest_path: &Path) -> Result<()> {
+    #[cfg(target_os = "windows")]
+    if dest_path.exists() {
+        fs::remove_file(dest_path)
+            .with_context(|| format!("remove existing state file: {}", dest_path.display()))?;
+    }
+
+    fs::rename(tmp_path, dest_path)
+        .with_context(|| format!("rename state file: {}", dest_path.display()))?;
+    Ok(())
+}
+
 /// Serializable snapshot of all artery state for disk persistence.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ArterySnapshot {
@@ -159,8 +171,7 @@ impl NodeStorage {
         let data = serde_json::to_string_pretty(snapshot).context("serialize artery state")?;
         fs::write(&tmp_path, data.as_bytes())
             .with_context(|| format!("write temp state file: {}", tmp_path.display()))?;
-        fs::rename(&tmp_path, &state_path)
-            .with_context(|| format!("rename state file: {}", state_path.display()))?;
+        replace_file_from_temp(&tmp_path, &state_path)?;
         Ok(())
     }
 

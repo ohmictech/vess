@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -23,8 +23,8 @@ use vess_foundry::reforge::{reforge, ReforgeRequest};
 use vess_foundry::spend_auth::{generate_spend_keypair, vk_hash};
 use vess_kloak::auto_reforge::ConsolidationScheduler;
 use vess_kloak::billfold::SpendCredential;
-use vess_kloak::payment::{prepare_payment_from_bills, prepare_payment_with_transfer};
-use vess_kloak::selection::{decompose_amount, select_bills_filtered};
+use vess_kloak::payment::prepare_payment_from_bills;
+use vess_kloak::selection::{decompose_amount, select_bills_filtered, SelectionResult};
 use vess_mesh::MeshCarrierContact;
 use vess_protocol::{
     ManifestStore, ProgramManifestStore, ProgramStore, PulseMessage, TagLookup, TagStore,
@@ -47,6 +47,56 @@ fn now_unix() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn verified_peer_count(state: &Arc<Mutex<ArteryState>>) -> usize {
+    let s = state.lock().unwrap();
+    s.peer_registry
+        .count_in_state(crate::handshake::PeerState::Verified)
+}
+
+fn select_spendable_bills(
+    billfold: &vess_kloak::BillFold,
+    amount: u64,
+) -> anyhow::Result<SelectionResult> {
+    let reserved = billfold.reserved_set();
+    let mut spendable_indices = Vec::new();
+    let mut spendable_bills = Vec::new();
+    let mut spendable_total = 0u64;
+    let mut watch_only_total = 0u64;
+
+    for (index, bill) in billfold.bills().iter().enumerate() {
+        if reserved.contains(&bill.mint_id) {
+            continue;
+        }
+
+        let value = bill.denomination.value();
+        if billfold.get_credentials(&bill.mint_id).is_some() {
+            spendable_indices.push(index);
+            spendable_bills.push(bill.clone());
+            spendable_total += value;
+        } else {
+            watch_only_total += value;
+        }
+    }
+
+    if spendable_total < amount {
+        let mut message = format!("insufficient spendable funds: need {amount}, have {spendable_total}");
+        if watch_only_total > 0 {
+            message.push_str(&format!(
+                " ({watch_only_total} Vess is present without spend credentials)"
+            ));
+        }
+        return Err(anyhow!(message));
+    }
+
+    let mut selection = select_bills_filtered(&spendable_bills, amount, &[])?;
+    selection.send_indices = selection
+        .send_indices
+        .iter()
+        .map(|&i| spendable_indices[i])
+        .collect();
+    Ok(selection)
 }
 
 pub(crate) fn wallet_tag_store(
@@ -332,10 +382,14 @@ pub enum RpcData {
     Balance {
         balance: u64,
         bill_count: usize,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        watch_only_balance: Option<u64>,
     },
     NodeInfo {
         node_id: String,
         peer_count: usize,
+        discovered_peer_count: usize,
+        cached_peer_count: usize,
         verified_peer_count: usize,
         node_contact: String,
         estimated_network_size: usize,
@@ -593,10 +647,10 @@ fn handle_balance(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
     let s = state.lock().unwrap();
     match &s.wallet {
         Some(ws) => RpcResponse::ok(RpcData::Balance {
-            // Use available_balance so reserved (in-flight) bills are not shown
-            // as spendable. Total balance = available + reserved.
-            balance: ws.billfold.available_balance(),
+            // Report spendable balance; reserved and watch-only bills are excluded.
+            balance: ws.billfold.spendable_balance(),
             bill_count: ws.billfold.bills().len(),
+            watch_only_balance: Some(ws.billfold.watch_only_balance()),
         }),
         None => RpcResponse::err("wallet not loaded"),
     }
@@ -610,10 +664,20 @@ fn handle_node_info(state: &Arc<Mutex<ArteryState>>, node: &MeshPulseNode) -> Rp
             return RpcResponse::err(format!("failed to encode local mesh contact: {error}"))
         }
     };
+    let peer_count = s.routing_table.peer_count();
+    let discovered_peer_count = s
+        .routing_table
+        .all_peers()
+        .iter()
+        .filter(|peer| peer.last_seen > 0)
+        .count();
+    let cached_peer_count = peer_count.saturating_sub(discovered_peer_count);
 
     RpcResponse::ok(RpcData::NodeInfo {
         node_id: hex_key(&s.node_id),
-        peer_count: s.routing_table.peer_count(),
+        peer_count,
+        discovered_peer_count,
+        cached_peer_count,
         verified_peer_count: s
             .peer_registry
             .count_in_state(crate::handshake::PeerState::Verified),
@@ -1116,6 +1180,12 @@ async fn handle_send(
 ) -> RpcResponse {
     let tag_str = recipient_tag.strip_prefix('+').unwrap_or(recipient_tag);
 
+    if verified_peer_count(state) == 0 {
+        return RpcResponse::err(
+            "send refused: verified peer count is 0; wait for peer discovery and handshake to complete",
+        );
+    }
+
     // ── Resolve tag (cache → local DHT → active DHT query) ──────────
     // Done outside the mutex so the async network query doesn't block
     // the state lock.
@@ -1135,13 +1205,6 @@ async fn handle_send(
     let ws = s.wallet.as_ref().unwrap();
     let cred_map = ws.billfold.export_credentials();
 
-    if !ws.billfold.can_afford(amount) {
-        return RpcResponse::err(format!(
-            "insufficient funds: need {amount}, have {}",
-            ws.billfold.balance()
-        ));
-    }
-
     // Validate memo length.
     if let Some(ref m) = memo {
         if m.len() > 256 {
@@ -1149,9 +1212,8 @@ async fn handle_send(
         }
     }
 
-    // ── Bill selection (excludes reserved / in-flight bills) ────────
-    let reserved: Vec<[u8; 32]> = ws.billfold.reserved_set().iter().copied().collect();
-    let selection = match select_bills_filtered(ws.billfold.bills(), amount, &reserved) {
+    // ── Bill selection (excludes reserved / in-flight and watch-only bills) ────────
+    let selection = match select_spendable_bills(&ws.billfold, amount) {
         Ok(sel) => sel,
         Err(e) => return RpcResponse::err(format!("bill selection failed: {e}")),
     };
@@ -1353,11 +1415,15 @@ async fn handle_send(
         (msg, pid, sent_mints)
     } else {
         // === EXACT MATCH PATH ===
-        let (msg, pid, send_indices) = match prepare_payment_with_transfer(
-            &ws.billfold,
-            amount,
+        let send_bills: Vec<vess_foundry::VessBill> = selection
+            .send_indices
+            .iter()
+            .map(|&i| ws.billfold.bills()[i].clone())
+            .collect();
+        let (msg, pid) = match prepare_payment_from_bills(
+            &send_bills,
             &recipient_address,
-            &cred_map,
+            cred_map,
             memo.clone(),
         ) {
             Ok(v) => v,
@@ -1365,7 +1431,8 @@ async fn handle_send(
         };
 
         let ws_mut = s.wallet.as_mut().unwrap();
-        let mint_ids: Vec<[u8; 32]> = send_indices
+        let mint_ids: Vec<[u8; 32]> = selection
+            .send_indices
             .iter()
             .map(|&i| ws_mut.billfold.bills()[i].mint_id)
             .collect();
@@ -1430,6 +1497,12 @@ async fn handle_send_direct(
     senders: &QueueSenders,
     node: &MeshPulseNode,
 ) -> RpcResponse {
+    if verified_peer_count(state) == 0 {
+        return RpcResponse::err(
+            "send refused: verified peer count is 0; wait for peer discovery and handshake to complete",
+        );
+    }
+
     let target = match resolve_target_contact_from_str(state, node_id_str) {
         Ok(contact) => contact,
         Err(error) => return RpcResponse::err(error),
@@ -1454,21 +1527,13 @@ async fn handle_send_direct(
         let ws = s.wallet.as_ref().unwrap();
         let cred_map = ws.billfold.export_credentials();
 
-        if !ws.billfold.can_afford(amount) {
-            return RpcResponse::err(format!(
-                "insufficient funds: need {amount}, have {}",
-                ws.billfold.balance()
-            ));
-        }
-
         if let Some(ref m) = memo {
             if m.len() > 256 {
                 return RpcResponse::err("memo exceeds 256 byte limit");
             }
         }
 
-        let reserved: Vec<[u8; 32]> = ws.billfold.reserved_set().iter().copied().collect();
-        let selection = match select_bills_filtered(ws.billfold.bills(), amount, &reserved) {
+        let selection = match select_spendable_bills(&ws.billfold, amount) {
             Ok(sel) => sel,
             Err(e) => return RpcResponse::err(format!("bill selection failed: {e}")),
         };
@@ -1656,9 +1721,13 @@ async fn handle_send_direct(
             (msg, pid, sent_mints)
         } else {
             // === EXACT MATCH PATH ===
-            let (msg, pid, send_indices) = match prepare_payment_with_transfer(
-                &ws.billfold,
-                amount,
+            let send_bills: Vec<vess_foundry::VessBill> = selection
+                .send_indices
+                .iter()
+                .map(|&i| ws.billfold.bills()[i].clone())
+                .collect();
+            let (msg, pid) = match prepare_payment_from_bills(
+                &send_bills,
                 &recipient_address,
                 &cred_map,
                 memo.clone(),
@@ -1668,7 +1737,8 @@ async fn handle_send_direct(
             };
 
             let ws_mut = s.wallet.as_mut().unwrap();
-            let mint_ids: Vec<[u8; 32]> = send_indices
+            let mint_ids: Vec<[u8; 32]> = selection
+                .send_indices
                 .iter()
                 .map(|&i| ws_mut.billfold.bills()[i].mint_id)
                 .collect();
@@ -1853,7 +1923,7 @@ async fn handle_wallet_unlock(
     };
 
     // 4. Set wallet state + sweep limbo.
-    let (balance, bill_count) = {
+    let (balance, bill_count, watch_only_balance) = {
         let mut s = state.lock().unwrap();
         s.wallet_path = Some(wallet_path.clone());
         s.wallet = Some(WalletState {
@@ -1949,18 +2019,27 @@ async fn handle_wallet_unlock(
             }
         }
 
-        let balance = s.wallet.as_ref().map(|w| w.billfold.balance()).unwrap_or(0);
+        let balance = s
+            .wallet
+            .as_ref()
+            .map(|w| w.billfold.spendable_balance())
+            .unwrap_or(0);
         let bill_count = s
             .wallet
             .as_ref()
             .map(|w| w.billfold.bills().len())
             .unwrap_or(0);
-        (balance, bill_count)
+        let watch_only_balance = s
+            .wallet
+            .as_ref()
+            .map(|w| w.billfold.watch_only_balance());
+        (balance, bill_count, watch_only_balance)
     };
 
     let response = RpcResponse::ok(RpcData::Balance {
         balance,
         bill_count,
+        watch_only_balance,
     });
 
     crate::node_runner::refresh_mailbox_forward_subscriptions(node, state).await;
@@ -2505,6 +2584,46 @@ fn handle_tag_cache_clear(state: &Arc<Mutex<ArteryState>>, tag: Option<&str>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_bill(mint_byte: u8, denomination: vess_foundry::Denomination) -> vess_foundry::VessBill {
+        vess_foundry::VessBill {
+            denomination,
+            digest: [mint_byte; 32],
+            created_at: 0,
+            stealth_id: [mint_byte.wrapping_add(1); 32],
+            dht_index: mint_byte as u64,
+            mint_id: [mint_byte; 32],
+            chain_tip: [mint_byte.wrapping_add(2); 32],
+            chain_depth: 0,
+        }
+    }
+
+    #[test]
+    fn select_spendable_bills_ignores_watch_only_entries() {
+        let mut billfold = vess_kloak::BillFold::new();
+        billfold.deposit(test_bill(1, vess_foundry::Denomination::D50));
+
+        let credentialed = test_bill(2, vess_foundry::Denomination::D50);
+        let (spend_vk, spend_sk) = vess_foundry::spend_auth::generate_spend_keypair();
+        billfold.deposit_with_credentials(
+            credentialed.clone(),
+            vess_kloak::billfold::SpendCredential { spend_vk, spend_sk },
+        );
+
+        let selection = select_spendable_bills(&billfold, 50).unwrap();
+        assert_eq!(selection.send_indices, vec![1]);
+        assert_eq!(billfold.bills()[selection.send_indices[0]].mint_id, credentialed.mint_id);
+    }
+
+    #[test]
+    fn select_spendable_bills_reports_watch_only_balance() {
+        let mut billfold = vess_kloak::BillFold::new();
+        billfold.deposit(test_bill(3, vess_foundry::Denomination::D50));
+
+        let error = select_spendable_bills(&billfold, 50).unwrap_err().to_string();
+        assert!(error.contains("insufficient spendable funds: need 50, have 0"));
+        assert!(error.contains("50 Vess is present without spend credentials"));
+    }
 
     #[test]
     fn wallet_tag_store_generates_and_persists_missing_metadata() {

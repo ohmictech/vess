@@ -14,6 +14,16 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
+fn replace_file_from_temp(tmp_path: &std::path::Path, dest_path: &std::path::Path) -> anyhow::Result<()> {
+    #[cfg(target_os = "windows")]
+    if dest_path.exists() {
+        fs::remove_file(dest_path)?;
+    }
+
+    fs::rename(tmp_path, dest_path)?;
+    Ok(())
+}
+
 /// Maximum number of entries kept in the tag cache.
 /// When this limit is reached, the least-recently-used entry is evicted
 /// before inserting the new one.
@@ -170,7 +180,7 @@ impl TagCache {
         }
         let data = serde_json::to_string_pretty(&self.entries)?;
         fs::write(&tmp, data.as_bytes())?;
-        fs::rename(&tmp, &self.path)?;
+        replace_file_from_temp(&tmp, &self.path)?;
         Ok(())
     }
 }
