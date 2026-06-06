@@ -111,7 +111,7 @@ fn full_payment_lifecycle() {
             claim_hash: None,
             chain_depth: 0,
             encrypted_bill: vec![],
-        };
+            accumulated_work: None,};
         assert!(registry.register(record));
     }
 
@@ -146,7 +146,7 @@ fn ownership_registry_double_registration() {
         claim_hash: None,
         chain_depth: 0,
         encrypted_bill: vec![],
-    };
+            accumulated_work: None,};
     let record2 = OwnershipRecord {
         mint_id: mint_id2,
         chain_tip: rand::random(),
@@ -163,7 +163,7 @@ fn ownership_registry_double_registration() {
         claim_hash: None,
         chain_depth: 0,
         encrypted_bill: vec![],
-    };
+            accumulated_work: None,};
 
     assert!(registry.register(record1.clone()));
     assert!(registry.register(record2));
@@ -196,7 +196,7 @@ fn ownership_registry_consume_and_merkle() {
         claim_hash: None,
         chain_depth: 0,
         encrypted_bill: vec![],
-    };
+            accumulated_work: None,};
     registry.register(record);
 
     assert!(registry.is_active(&mint_id));
@@ -542,7 +542,7 @@ fn ownership_registry_persistence_roundtrip() {
             claim_hash: None,
             chain_depth: 0,
             encrypted_bill: vec![],
-        };
+            accumulated_work: None,};
         registry.register(record);
     }
 
@@ -585,7 +585,7 @@ fn ownership_registry_total_supply() {
             claim_hash: None,
             chain_depth: 0,
             encrypted_bill: vec![],
-        };
+            accumulated_work: None,};
         registry.register(record);
     }
 
@@ -737,7 +737,7 @@ fn artery_snapshot_save_load() {
         claim_hash: None,
         chain_depth: 0,
         encrypted_bill: vec![],
-    };
+            accumulated_work: None,};
     let record2 = OwnershipRecord {
         mint_id: rand::random(),
         chain_tip: rand::random(),
@@ -754,7 +754,7 @@ fn artery_snapshot_save_load() {
         claim_hash: None,
         chain_depth: 0,
         encrypted_bill: vec![],
-    };
+            accumulated_work: None,};
 
     let snapshot = ArterySnapshot {
         tags: std::collections::BTreeMap::new(),
@@ -936,7 +936,7 @@ fn full_send_receive_attest_finalize() {
             claim_hash: None,
             chain_depth: 0,
             encrypted_bill: vec![],
-        };
+            accumulated_work: None,};
         assert!(
             registry.register(record.clone()),
             "fresh mint_ids should register"
@@ -961,7 +961,7 @@ fn full_send_receive_attest_finalize() {
             claim_hash: None,
             chain_depth: 0,
             encrypted_bill: vec![],
-        };
+            accumulated_work: None,};
         assert!(
             !registry.register(record),
             "second registration = double-spend detected"

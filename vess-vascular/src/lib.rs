@@ -11,7 +11,7 @@ use std::{
 
 use anyhow::{anyhow, Context, Result};
 use rand::RngCore;
-use tracing::warn;
+use tracing::{info, warn};
 use vess_mesh::{MeshCarrier, MeshCarrierContact, MeshNodeId, MeshPeer, PqUdpMeshCarrier};
 use vess_protocol::PulseMessage;
 
@@ -67,7 +67,12 @@ impl MeshPulseNode {
         self.carrier.wait_online().await;
     }
 
-    pub async fn shutdown(&self) {}
+    /// Initiate graceful shutdown. The caller should drop all clones of this
+    /// node after calling shutdown — the underlying UDP sockets will close
+    /// when the last Arc reference is released.
+    pub async fn shutdown(&self) {
+        info!("mesh pulse node shutdown requested");
+    }
 
     pub async fn register_with_rendezvous(
         &self,

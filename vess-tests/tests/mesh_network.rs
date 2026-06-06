@@ -415,6 +415,7 @@ async fn program_lock_receipt_unlock_propagates_across_live_nodes() {
                                 claim_hash: None,
                                 chain_depth: og.chain_depth,
                                 encrypted_bill: Vec::new(),
+                                accumulated_work: None,
                             };
                             state.registry.register(record);
                             None
@@ -560,6 +561,9 @@ async fn program_lock_receipt_unlock_propagates_across_live_nodes() {
                 hops_remaining: 8,
                 chain_depth: 0,
                 output_index: 0,
+                pow_nonce: None,
+                pow_hash: None,
+                accumulated_work: None,
             }),
         )
         .await

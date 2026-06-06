@@ -400,6 +400,7 @@ mod tests {
             prev_transfer_chain_tip: None,
             chain_depth: 0,
             encrypted_bill: vec![],
+            accumulated_work: None,
         }
     }
 

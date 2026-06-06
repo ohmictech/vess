@@ -2146,7 +2146,7 @@ mod tests {
         generate_route_handshake, is_public_routable_socket_addr, open_route_handshake,
         validate_public_mesh_contact, MeshCarrier, MeshCarrierContact, MeshReassemblyBuffer,
         MeshRelayServer, MeshRendezvousServer, MeshSessionFrame, MeshSessionFrameKind,
-        PqTcpMeshCarrier, PqUdpMeshCarrier, DEFAULT_UDP_MTU_SAFE_PAYLOAD,
+        PqTcpMeshCarrier, PqUdpMeshCarrier, DEFAULT_UDP_MTU_SAFE_PAYLOAD, usable_udp_contact_addr,
     };
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
     use std::time::Duration;

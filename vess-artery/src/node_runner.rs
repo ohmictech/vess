@@ -56,6 +56,15 @@ use vess_kloak::billfold::SpendCredential;
 use vess_kloak::payment::{receive_and_claim, ClaimedBill};
 use vess_stealth::StealthSecretKey;
 
+/// Lock the artery state mutex, recovering from poisoning if another task panicked.
+/// Prevents a single poisoned mutex from crashing the entire node.
+pub(crate) fn lock_state(state: &Arc<Mutex<ArteryState>>) -> std::sync::MutexGuard<'_, ArteryState> {
+    state.lock().unwrap_or_else(|e| {
+        tracing::warn!("artery state mutex was poisoned — recovering via into_inner()");
+        e.into_inner()
+    })
+}
+
 const MAX_WALLET_NOTIFICATIONS: usize = 256;
 const AUTO_BURN_FEE_SATS: u64 = 500;
 const AUTO_BURN_RETRY_SECS: u64 = 30;
@@ -496,7 +505,7 @@ async fn broadcast_pending_burns(
         {
             Ok(txid) => {
                 let now = ArteryState::now_unix();
-                let mut s = state.lock().unwrap();
+                let mut s = lock_state(&state);
                 if let Some(ws) = s.wallet.as_mut() {
                     ws.bitcoin_wallet
                         .mark_pending_burn_broadcast_success(&pending.txid, now);
@@ -520,7 +529,7 @@ async fn broadcast_pending_burns(
             Err(e) => {
                 warn!(txid = %pending.txid, error = %e, "failed to broadcast automatic bitcoin burn");
                 let now = ArteryState::now_unix();
-                let mut s = state.lock().unwrap();
+                let mut s = lock_state(&state);
                 if let Some(ws) = s.wallet.as_mut() {
                     ws.bitcoin_wallet.mark_pending_burn_broadcast_failure(
                         &pending.txid,
@@ -717,6 +726,7 @@ mod tests {
             mailbox_fwd_limiter: crate::gossip::PeerRateLimiter::new(5, 60),
             unsafe_mode: false,
             test_faucet_enabled: false,
+            profile: DeploymentProfile::Production,
             events: VecDeque::new(),
         }))
     }
@@ -752,6 +762,9 @@ mod tests {
             chain_depth,
             encrypted_bill: Vec::new(),
             program_spend_witness: None,
+            pow_nonce: None,
+            pow_hash: None,
+            accumulated_work: None,
         }
     }
 
@@ -871,7 +884,7 @@ mod tests {
 
         apply_quorum_seed_snapshots(&state, vec![snapshot]);
 
-        let locked = state.lock().unwrap();
+        let locked = lock_state(&state);
         assert!(locked.registry.get(&ownership_mint).is_none());
         assert!(locked.registry.was_consumed(&consumed_mint).is_none());
     }
@@ -901,7 +914,7 @@ mod tests {
 
         apply_quorum_seed_snapshots(&state, vec![left, right]);
 
-        let locked = state.lock().unwrap();
+        let locked = lock_state(&state);
         assert!(locked.registry.get(&ownership_mint).is_none());
         assert!(locked.registry.was_consumed(&consumed_mint).is_none());
     }
@@ -954,7 +967,7 @@ mod tests {
 
         apply_quorum_seed_snapshots(&state, vec![first, second, third]);
 
-        let locked = state.lock().unwrap();
+        let locked = lock_state(&state);
         let installed = locked.registry.get(&ownership_mint).unwrap();
         assert_eq!(installed.chain_tip, winning_record.chain_tip);
         assert_eq!(installed.claim_hash, winning_record.claim_hash);
@@ -967,7 +980,7 @@ mod tests {
     #[test]
     fn validated_seed_ownership_record_rejects_non_authoritative_source_peer() {
         let state = sample_seed_state();
-        let locked = state.lock().unwrap();
+        let locked = lock_state(&state);
         let source_peer_id = [0x01; 32];
         let closer_peer_id = [0x02; 32];
         let mint_id = [0x03; 32];
@@ -994,7 +1007,7 @@ mod tests {
     #[test]
     fn validated_seed_consumed_record_rejects_non_authoritative_source_peer() {
         let state = sample_seed_state();
-        let locked = state.lock().unwrap();
+        let locked = lock_state(&state);
         let source_peer_id = [0x11; 32];
         let closer_peer_id = [0x12; 32];
         let mint_id = [0x13; 32];
@@ -1045,6 +1058,9 @@ mod tests {
             chain_depth: 2,
             encrypted_bill: Vec::new(),
             program_spend_witness: None,
+            pow_nonce: None,
+            pow_hash: None,
+            accumulated_work: None,
         };
 
         assert!(verify_competing_claim_chain_tip(base_chain_tip, &claim, witness_hash));
@@ -1065,7 +1081,7 @@ mod tests {
         let state = sample_seed_state();
 
         {
-            let mut locked = state.lock().unwrap();
+            let mut locked = lock_state(&state);
             locked.retained_ownership_records.insert(
                 mint_id,
                 OwnershipRecord {
@@ -1129,7 +1145,7 @@ mod tests {
         );
 
         {
-            let mut locked = state.lock().unwrap();
+            let mut locked = lock_state(&state);
             retain_local_ownership_claim(&mut locked, &winning_hop_two, None, updated_at + 2);
         }
 
@@ -1184,6 +1200,9 @@ mod tests {
                 chain_depth: 2,
                 encrypted_bill: Vec::new(),
                 program_spend_witness: None,
+                pow_nonce: None,
+                pow_hash: None,
+                accumulated_work: None,
             };
 
             prop_assert!(verify_competing_claim_chain_tip(base_chain_tip, &claim, witness_hash));
@@ -1561,7 +1580,7 @@ fn queue_discovered_peer_contact(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let mut s = state.lock().unwrap();
+    let mut s = lock_state(&state);
     if peer_hash == s.node_id {
         return;
     }
@@ -1754,7 +1773,7 @@ fn apply_quorum_seed_snapshots(state: &Arc<Mutex<ArteryState>>, snapshots: Vec<S
     // Emit SeedSyncStarted for the first responding peer.
     let first_peer_id = snapshots[0].peer_id;
     {
-        let mut s = state.lock().unwrap();
+        let mut s = lock_state(&state);
         s.push_event(NodeEvent::SeedSyncStarted {
             created_at: ArteryState::now_unix(),
             peer_id: hex_key(&first_peer_id),
@@ -1794,7 +1813,7 @@ fn apply_quorum_seed_snapshots(state: &Arc<Mutex<ArteryState>>, snapshots: Vec<S
 
     let mut inserted_ownership_records = 0usize;
     let mut inserted_consumed_records = 0usize;
-    let mut s = state.lock().unwrap();
+    let mut s = lock_state(&state);
 
     for (mint_id, variants) in ownership_votes {
         let mut ranked: Vec<(usize, OwnershipRecord)> = variants.into_values().collect();
@@ -1847,7 +1866,7 @@ fn apply_quorum_seed_snapshots(state: &Arc<Mutex<ArteryState>>, snapshots: Vec<S
 
     // Emit SeedSyncCompleted with summary stats.
     {
-        let mut s = state.lock().unwrap();
+        let mut s = lock_state(&state);
         s.push_event(NodeEvent::SeedSyncCompleted {
             created_at: ArteryState::now_unix(),
             peer_id: hex_key(&first_peer_id),
@@ -2421,7 +2440,7 @@ async fn request_peer_exchange_from_peer(
         );
     }
 
-    let mut s = state.lock().unwrap();
+    let mut s = lock_state(&state);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -2453,7 +2472,7 @@ pub(crate) async fn refresh_mailbox_forward_subscriptions(
     state: &Arc<Mutex<ArteryState>>,
 ) {
     let (mailbox_key, nearest_peers) = {
-        let s = state.lock().unwrap();
+        let s = lock_state(&state);
         let mailbox_key = match s.wallet.as_ref().map(|wallet| wallet.mailbox_key) {
             Some(key) => key,
             None => return,
@@ -2526,7 +2545,7 @@ fn ingest_dht_seed_response(
         ownership_records: HashMap::new(),
         consumed_records: HashMap::new(),
     };
-    let mut s = state.lock().unwrap();
+    let mut s = lock_state(&state);
     let peer_ids: Vec<[u8; 32]> = s
         .routing_table
         .routable_peers(|_| true)
@@ -2700,7 +2719,7 @@ fn spawn_local_lan_discovery(local_contact: MeshCarrierContact, state: Arc<Mutex
 
     tokio::spawn(async move {
         let self_node_id = {
-            let s = state.lock().unwrap();
+            let s = lock_state(&state);
             s.node_id
         };
         let socket = match crate::local_discovery::bind_lan_discovery_socket(
@@ -2770,7 +2789,7 @@ fn spawn_local_lan_discovery(local_contact: MeshCarrierContact, state: Arc<Mutex
 }
 
 fn routing_table_has_capacity(state: &Arc<Mutex<ArteryState>>) -> bool {
-    let state = state.lock().unwrap();
+    let state = lock_state(&state);
     state.routing_table.has_capacity()
 }
 
@@ -2827,7 +2846,7 @@ fn spawn_bitcoin_peer_notifications(
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs();
-                let mut s = state.lock().unwrap();
+                let mut s = lock_state(&state);
                 for peer in newly_connected {
                     s.push_notification(WalletNotification {
                         kind: "bitcoin_peer_connected".to_string(),
@@ -2916,6 +2935,8 @@ pub struct NodeConfig {
     /// Optional override for the embedded Bitcoin light client configuration.
     /// Useful for deterministic integration tests with local mock peers.
     pub bitcoin_config: Option<vess_bitcoin::BitcoinConfig>,
+    /// Optional bind address override. Default: 0.0.0.0:0 (OS-assigned port on all interfaces).
+    pub bind_addr: Option<std::net::SocketAddr>,
     /// Whether to enable LAN/local-file peer discovery.
     pub enable_local_discovery: bool,
     /// Allow advertising a non-public mesh contact into Bitcoin-side Vess seed discovery.
@@ -2943,6 +2964,7 @@ impl Default for NodeConfig {
             rpc_port: None,
             wallet_password: None,
             bitcoin_config: None,
+            bind_addr: None,
             enable_local_discovery: true,
             allow_private_bitcoin_seed_contact: false,
             reset_transient_peer_state: false,
@@ -3681,6 +3703,31 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
             loc.as_deref().unwrap_or("unknown"));
     }));
 
+    // ── SIGTERM / Ctrl+C handler ───────────────────────────────────
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    tokio::spawn(async move {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::warn!(error = %e, "failed to install Ctrl+C signal handler");
+            return;
+        }
+        tracing::info!("Ctrl+C received, initiating graceful shutdown…");
+        let _ = shutdown_tx.send(());
+    });
+    #[cfg(unix)]
+    {
+        let tx = shutdown_tx.clone();
+        tokio::spawn(async move {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sigterm = match signal(SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            sigterm.recv().await;
+            tracing::info!("SIGTERM received, initiating graceful shutdown…");
+            let _ = tx.send(());
+        });
+    }
+
     let storage = NodeStorage::open(&config.state_dir)?;
     let mut snapshot = storage.load()?;
     if config.reset_transient_peer_state {
@@ -3785,11 +3832,14 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
     let bitcoin_seed_client = bitcoin_client.clone();
 
     let mesh_seed = load_or_create_mesh_seed(&config.state_dir)?;
-    let node = MeshPulseNode::bind_from_seed(
+    let bind_addr = config.bind_addr.unwrap_or_else(|| {
         std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
             std::net::Ipv4Addr::UNSPECIFIED,
             0,
-        )),
+        ))
+    });
+    let node = MeshPulseNode::bind_from_seed(
+        bind_addr,
         &mesh_seed,
         0,
     )
@@ -3881,7 +3931,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
     let receipt_text_state_dir = config.state_dir.clone();
 
     if let Some(client) = {
-        let s = state.lock().unwrap();
+        let s = lock_state(&state);
         s.bitcoin_client.clone()
     } {
         spawn_bitcoin_peer_notifications(client.clone(), state.clone());
@@ -4077,7 +4127,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
     // Restore persisted state.
     {
         let restored_receipts = snapshot.compute_receipts.values().cloned().collect::<Vec<_>>();
-        let mut s = state.lock().unwrap();
+        let mut s = lock_state(&state);
         let tag_count = snapshot.tags.len();
         let manifest_count = snapshot.manifests.len();
         let banned_count = snapshot.banned_peers.len();
@@ -4098,7 +4148,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
     }
 
     if let Some((tag_str, tag_store)) = startup_wallet_tag_store.clone() {
-        let mut s = state.lock().unwrap();
+        let mut s = lock_state(&state);
         let record = vess_tag::TagRecord {
             tag_hash: tag_store.tag_hash,
             master_address: vess_stealth::MasterStealthAddress {
@@ -4132,7 +4182,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
 
     // ── Auto-sweep existing limbo entries through wallet ────────────
     {
-        let mut s = state.lock().unwrap();
+        let mut s = lock_state(&state);
         if s.wallet.is_some() {
             let all_sids: Vec<[u8; 32]> = s.limbo_buffer.stealth_ids_with_payments();
             let mut payloads: Vec<Vec<u8>> = Vec::new();
@@ -4192,7 +4242,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
         spawn_bitcoin_vess_discovery(client, state.clone());
     }
     if config.wallet_path.is_some() {
-        let s = state.lock().unwrap();
+        let s = lock_state(&state);
         let bal = s.wallet.as_ref().map(|w| w.billfold.balance()).unwrap_or(0);
         info!(balance = bal, "wallet enabled");
     }
@@ -4241,7 +4291,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
     info!("listening for protocol messages");
 
     if let Some(confirm_client) = {
-        let s = state.lock().unwrap();
+        let s = lock_state(&state);
         s.bitcoin_client.clone()
     } {
         let confirm_state = state.clone();
@@ -4578,7 +4628,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
     // ── Bootstrap discovery ─────────────────────────────────────────
     let mut all_bootstrap = config.bootstrap.clone();
     {
-        let s = state.lock().unwrap();
+        let s = lock_state(&state);
         all_bootstrap.extend(
             s.routing_table
                 .routable_peers(|_| true)
@@ -5879,7 +5929,11 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
     let h_ra_tx = ra_tx.clone();
     let h_pay_tx = pay_tx.clone();
     let h_fwd_tx = fwd_tx.clone();
-    node.listen_messages_with_response(move |peer, msg| {
+
+    // ── Spawn message listener so we can cancel on SIGTERM ──────────
+    let listen_node = node.clone();
+    let listen_handle = tokio::spawn(async move {
+        listen_node.listen_messages_with_response(move |peer, msg| {
         let Some(peer_hash) = peer.node_id().map(|node_id| *node_id.as_bytes()) else {
             return None;
         };
@@ -8068,11 +8122,24 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
             }
         }
     })
-    .await?;
+    .await
+    });
+
+    // ── Wait for either the listen loop to finish or SIGTERM ────────
+    tokio::select! {
+        result = listen_handle => {
+            if let Err(e) = result {
+                warn!(error = %e, "message listener task panicked");
+            }
+        }
+        _ = shutdown_rx.recv() => {
+            info!("shutdown signal received, stopping message listener…");
+        }
+    }
 
     // Save state on shutdown.
     {
-        let s = state.lock().unwrap();
+        let s = lock_state(&state);
         let snap = s.snapshot();
         storage.save(&snap)?;
         info!("state saved to disk on shutdown");

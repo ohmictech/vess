@@ -40,6 +40,7 @@ use crate::mesh_contact::{
 use crate::node_runner::ArteryState;
 use crate::node_runner::DeploymentProfile;
 use crate::node_runner::WalletState;
+use crate::node_runner::lock_state;
 use crate::persistence::hex_key;
 use crate::tag_resolver::{TagResolution, TagResolver};
 
@@ -51,7 +52,7 @@ fn now_unix() -> u64 {
 }
 
 fn verified_peer_count(state: &Arc<Mutex<ArteryState>>) -> usize {
-    let s = state.lock().unwrap();
+    let s = lock_state(&state);
     s.peer_registry
         .count_in_state(crate::handshake::PeerState::Verified)
 }
@@ -254,7 +255,7 @@ fn resolve_target_contact_from_str(
     })?;
 
     let contact_bytes = {
-        let s = state.lock().unwrap();
+        let s = lock_state(&state);
         s.routing_table
             .peer_id_bytes(&peer_id)
             .ok_or_else(|| format!("unknown node_id: {value}"))?
@@ -693,7 +694,7 @@ async fn handle_request(
 // ── Handlers ────────────────────────────────────────────────────────
 
 fn handle_balance(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
-    let s = state.lock().unwrap();
+    let s = lock_state(&state);
     match &s.wallet {
         Some(ws) => RpcResponse::ok(RpcData::Balance {
             // Report spendable balance; reserved and watch-only bills are excluded.
@@ -706,7 +707,7 @@ fn handle_balance(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
 }
 
 fn handle_node_info(state: &Arc<Mutex<ArteryState>>, node: &MeshPulseNode) -> RpcResponse {
-    let s = state.lock().unwrap();
+    let s = lock_state(&state);
     let node_contact = match encode_contact_string(&node.contact()) {
         Ok(contact) => contact,
         Err(error) => {
@@ -765,7 +766,7 @@ fn handle_notifications(
     max: usize,
     payment_id: Option<&str>,
 ) -> RpcResponse {
-    let mut s = state.lock().unwrap();
+    let mut s = lock_state(&state);
     let all = s.take_notifications(max);
     if let Some(pid) = payment_id {
         // Filter: only return matching notifications. Re-queue the rest.
@@ -786,14 +787,14 @@ fn handle_notifications(
 }
 
 fn handle_events(state: &Arc<Mutex<ArteryState>>, max: usize) -> RpcResponse {
-    let mut s = state.lock().unwrap();
+    let mut s = lock_state(&state);
     RpcResponse::ok(RpcData::Events {
         events: s.take_events(max),
     })
 }
 
 fn handle_node_health(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
-    let s = state.lock().unwrap();
+    let s = lock_state(&state);
 
     let peer_count = s.routing_table.peer_count();
     let verified_peer_count = s.peer_registry.count_in_state(crate::handshake::PeerState::Verified);
@@ -964,7 +965,7 @@ async fn resolve_tag(
 
     // ── 1. Local cache ───────────────────────────────────────────────
     {
-        let mut s = state.lock().unwrap();
+        let mut s = lock_state(&state);
         if let Some(cached) = s.tag_cache.get(tag_str, now) {
             return Some(MasterStealthAddress {
                 scan_ek: cached.scan_ek,
@@ -975,7 +976,7 @@ async fn resolve_tag(
 
     // ── 2. Local DHT shard ──────────────────────────────────────────
     {
-        let mut s = state.lock().unwrap();
+        let mut s = lock_state(&state);
         if let Some(record) = s.tag_dht.lookup(tag_str) {
             let addr = MasterStealthAddress {
                 scan_ek: record.master_address.scan_ek.clone(),
@@ -997,7 +998,7 @@ async fn resolve_tag(
 
     let targets: Vec<(MeshCarrierContact, [u8; 32])> = {
         use rand::seq::SliceRandom;
-        let s = state.lock().unwrap();
+        let s = lock_state(&state);
         let peers = s.routing_table.routable_peers(|_| true);
         if peers.is_empty() {
             return None;
@@ -1086,7 +1087,7 @@ async fn resolve_tag(
         match resolver.add_response(id_hash, &tlr) {
             TagResolution::Verified { address, .. } => {
                 // Quorum reached — cache and return.
-                let mut s = state.lock().unwrap();
+                let mut s = lock_state(&state);
                 s.tag_cache.insert(
                     tag_str,
                     address.scan_ek.clone(),
@@ -1108,7 +1109,7 @@ async fn resolve_tag(
 
     if !relaxed_conflict && resolver.response_count() < crate::QUORUM_THRESHOLD {
         if let Some(address) = relaxed_candidate {
-            let mut s = state.lock().unwrap();
+            let mut s = lock_state(&state);
             s.tag_cache.insert(
                 tag_str,
                 address.scan_ek.clone(),
@@ -1353,7 +1354,7 @@ async fn try_direct_delivery(
     // this is always the correct recipient. On larger networks the
     // Payment handler will just relay if it's the wrong node.
     let target_contact = {
-        let s = state.lock().unwrap();
+        let s = lock_state(&state);
         let routable = s.routing_table.routable_peers(|_| true);
         routable
             .iter()
@@ -1391,7 +1392,7 @@ async fn try_direct_delivery(
                     pr.total_amount, pr.claimed_mint_ids.len());
                 // Push confirmation notification.
                 {
-                    let mut s = state.lock().unwrap();
+                    let mut s = lock_state(&state);
                     s.push_notification(crate::node_runner::WalletNotification {
                         kind: "payment_receipt_confirmed".to_string(),
                         created_at: std::time::SystemTime::now()
@@ -1451,7 +1452,7 @@ async fn handle_send(
     // ── Prepare payment inside a block so the mutex guard is dropped
     // before the async direct-delivery attempt.
     let (msg, payment_id, sent_mints, recipient_scan_ek) = {
-        let mut s = state.lock().unwrap();
+        let mut s = lock_state(&state);
 
     // ── Require wallet ──────────────────────────────────────────────
     if s.wallet.is_none() {
@@ -1730,7 +1731,7 @@ async fn handle_send(
         "none"
     };
 
-    let mut s = state.lock().unwrap();
+    let mut s = lock_state(&state);
     s.record_outbound_payment(payment_id, amount, recipient_tag.to_string(), &sent_mints);
     s.push_notification(crate::node_runner::WalletNotification {
         kind: "payment_sent".to_string(),
@@ -1798,7 +1799,7 @@ async fn handle_send_direct(
     };
 
     let (mut msg, payment_id, sent_mints) = {
-        let mut s = state.lock().unwrap();
+        let mut s = lock_state(&state);
 
         if s.wallet.is_none() {
             return RpcResponse::err("wallet not loaded");
@@ -2063,14 +2064,14 @@ async fn handle_send_direct(
                     &sent_mints,
                     amount,
                 ) {
-                    let mut s = state.lock().unwrap();
+                    let mut s = lock_state(&state);
                     if let Some(ref mut ws) = s.wallet {
                         ws.billfold.release(&sent_mints);
                         s.flush_wallet();
                     }
                     return RpcResponse::err(format!("invalid direct payment receipt: {error}"));
                 }
-                let mut s = state.lock().unwrap();
+                let mut s = lock_state(&state);
                 if let Some(ref mut ws) = s.wallet {
                     for mid in &sent_mints {
                         ws.billfold.withdraw(mid);
@@ -2102,7 +2103,7 @@ async fn handle_send_direct(
                     remaining_balance: remaining,
                 })
             } else {
-                let mut s = state.lock().unwrap();
+                let mut s = lock_state(&state);
                 if let Some(ref mut ws) = s.wallet {
                     ws.billfold.release(&sent_mints);
                     s.flush_wallet();
@@ -2111,7 +2112,7 @@ async fn handle_send_direct(
             }
         }
         Ok(Ok(_)) => {
-            let mut s = state.lock().unwrap();
+            let mut s = lock_state(&state);
             if let Some(ref mut ws) = s.wallet {
                 ws.billfold.release(&sent_mints);
                 s.flush_wallet();
@@ -2125,7 +2126,7 @@ async fn handle_send_direct(
             if let PulseMessage::Payment(payment) = msg {
                 let _ = senders.pay_tx.send(payment);
             }
-            let mut s = state.lock().unwrap();
+            let mut s = lock_state(&state);
             if let Some(ref mut ws) = s.wallet {
                 ws.billfold.release(&sent_mints);
                 s.record_outbound_payment(payment_id, amount, recipient_tag.to_string(), &sent_mints);
@@ -2146,7 +2147,7 @@ async fn handle_send_direct(
             if let PulseMessage::Payment(payment) = msg {
                 let _ = senders.pay_tx.send(payment);
             }
-            let mut s = state.lock().unwrap();
+            let mut s = lock_state(&state);
             if let Some(ref mut ws) = s.wallet {
                 ws.billfold.release(&sent_mints);
                 s.record_outbound_payment(payment_id, amount, recipient_tag.to_string(), &sent_mints);
@@ -2178,7 +2179,7 @@ async fn handle_wallet_unlock(
 
     // 1. Get wallet_path from the request or node config.
     let wallet_path = {
-        let s = state.lock().unwrap();
+        let s = lock_state(&state);
         if let Some(path) = wallet_path_override {
             std::path::PathBuf::from(path)
         } else if let Some(p) = &s.wallet_path {
@@ -2190,7 +2191,7 @@ async fn handle_wallet_unlock(
 
     // 2. Already unlocked?
     {
-        let s = state.lock().unwrap();
+        let s = lock_state(&state);
         if s.wallet.is_some() {
             return RpcResponse::err("wallet already unlocked");
         }
@@ -2234,7 +2235,7 @@ async fn handle_wallet_unlock(
 
     // 4. Set wallet state + sweep limbo.
     let (balance, bill_count, watch_only_balance) = {
-        let mut s = state.lock().unwrap();
+        let mut s = lock_state(&state);
         s.wallet_path = Some(wallet_path.clone());
         let spend_seed = vess_kloak::recovery::spend_seed_from_raw_seed(&raw_seed);
         s.wallet = Some(WalletState {
@@ -2365,7 +2366,7 @@ fn handle_wallet_set_password(
     new_password: &str,
 ) -> RpcResponse {
     let wallet_path = {
-        let s = state.lock().unwrap();
+        let s = lock_state(&state);
         match &s.wallet {
             Some(ws) => ws.wallet_path.clone(),
             None => return RpcResponse::err("wallet not loaded — unlock first"),
@@ -2398,7 +2399,7 @@ fn handle_wallet_set_password(
 }
 
 fn handle_wallet_lock(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
-    let mut s = state.lock().unwrap();
+    let mut s = lock_state(&state);
     if s.wallet.is_none() {
         return RpcResponse::err("wallet already locked");
     }
@@ -2526,7 +2527,7 @@ fn handle_tag_register(
         hardened_at: None,
     };
 
-    let mut s = state.lock().unwrap();
+    let mut s = lock_state(&state);
 
     // Check if tag is already registered.
     if s.tag_dht.lookup(tag.as_str()).is_some() {
@@ -2586,7 +2587,7 @@ fn handle_tag_confirm(
         Err(e) => return RpcResponse::err(format!("invalid signature_hex: {e}")),
     };
 
-    let mut s = state.lock().unwrap();
+    let mut s = lock_state(&state);
 
     // Validate tag exists and is unhardened.
     match s.tag_dht.lookup(tag_str) {
@@ -2618,7 +2619,7 @@ fn handle_tag_confirm(
 }
 
 fn handle_set_test_mode(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
-    let mut s = state.lock().unwrap();
+    let mut s = lock_state(&state);
     s.unsafe_mode = true;
     s.test_faucet_enabled = true;
     RpcResponse::ok(RpcData::TestModeEnabled {
@@ -2640,7 +2641,7 @@ fn handle_set_profile(state: &Arc<Mutex<ArteryState>>, label: &str) -> RpcRespon
         }
     };
 
-    let mut s = state.lock().unwrap();
+    let mut s = lock_state(&state);
     s.profile = profile;
     s.unsafe_mode = profile.allow_unsafe();
     // Only auto-enable faucet for Development; Test keeps it off by default.
@@ -2663,7 +2664,7 @@ fn handle_local_test_faucet(
 ) -> RpcResponse {
     // Gate behind runtime test-faucet flag (set via `set_test_mode` RPC or env var).
     {
-        let s = state.lock().unwrap();
+        let s = lock_state(&state);
         if !s.test_faucet_enabled {
             return RpcResponse::err(
                 "local test faucet is disabled; run `vess test-mode` on the node, or set VESS_LOCAL_TEST_FAUCET=1 before starting"
@@ -2688,7 +2689,7 @@ fn handle_local_test_faucet(
     let mut genesis_records = Vec::with_capacity(denominations.len());
 
     let (bill_count, balance) = {
-        let mut s = state.lock().unwrap();
+        let mut s = lock_state(&state);
         let (bill_count, balance) = {
             let Some(ws) = s.wallet.as_mut() else {
                 return RpcResponse::err("wallet not loaded — unlock first");
@@ -2758,7 +2759,7 @@ fn handle_local_test_faucet(
     };
 
     {
-        let mut s = state.lock().unwrap();
+        let mut s = lock_state(&state);
         for og in genesis_records {
             crate::node_runner::queue_local_ownership_genesis(&mut s, og_tx, og);
         }
@@ -2808,7 +2809,7 @@ fn handle_ownership_genesis(
         Err(e) => return RpcResponse::err(format!("invalid digest_hex: {e}")),
     };
 
-    let mut s = state.lock().unwrap();
+    let mut s = lock_state(&state);
     crate::node_runner::queue_local_ownership_genesis(
         &mut s,
         og_tx,
@@ -2846,7 +2847,7 @@ fn handle_manifest_store(
         Err(e) => return RpcResponse::err(format!("invalid encrypted_manifest_hex: {e}")),
     };
 
-    let mut s = state.lock().unwrap();
+    let mut s = lock_state(&state);
 
     // Store locally (record current time for oldest-first eviction).
     let now = std::time::SystemTime::now()
@@ -2885,7 +2886,7 @@ fn handle_program_deploy(
     }
 
     let name = manifest.name.to_string();
-    let mut s = state.lock().unwrap();
+    let mut s = lock_state(&state);
     let stored_program = match s.compute_dht.store_program(program.clone()) {
         Ok(inserted) => inserted,
         Err(error) => return RpcResponse::err(format!("program deploy rejected: {error}")),
@@ -2918,14 +2919,14 @@ fn handle_program_deploy(
 // ── Tag cache handlers ───────────────────────────────────────────────
 
 fn handle_tag_cache_list(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
-    let s = state.lock().unwrap();
+    let s = lock_state(&state);
     RpcResponse::ok(RpcData::TagCacheList {
         entries: s.tag_cache.to_views(),
     })
 }
 
 fn handle_tag_cache_clear(state: &Arc<Mutex<ArteryState>>, tag: Option<&str>) -> RpcResponse {
-    let mut s = state.lock().unwrap();
+    let mut s = lock_state(&state);
     match tag {
         Some(t) => {
             let tag_str = t.strip_prefix('+').unwrap_or(t);

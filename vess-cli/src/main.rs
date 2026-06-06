@@ -516,6 +516,7 @@ async fn dispatch_command(cli: &Cli) -> Result<()> {
                 rpc_port: *rpc_port,
                 wallet_password: wallet_password.clone(),
                 bitcoin_config: None,
+                bind_addr: None,
                 enable_local_discovery: true,
                 allow_private_bitcoin_seed_contact: false,
                 reset_transient_peer_state: *reset_transient_peer_state,
