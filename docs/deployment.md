@@ -5,13 +5,12 @@ development through to internet-facing production.
 
 ## Profiles
 
-Vess ships with five built-in deployment profiles selectable via
+Vess ships with four built-in deployment profiles selectable via
 `vess node --profile <name>` (or the `--testnet` shorthand):
 
 | Profile     | `allow_unsafe` | Bitcoin Network | Use case                          |
 |-------------|:--------------:|:---------------:|-----------------------------------|
-| development | yes            | regtest         | Local single-node testing         |
-| test        | yes            | regtest         | Multi-node integration tests      |
+| development | yes            | regtest         | Local single-node dev with faucet |
 | testnet     | no             | signet          | Public testnet (zero-config)      |
 | staging     | no             | mainnet         | Pre-production staging environment |
 | production  | no             | mainnet         | Public internet-facing node       |
@@ -28,7 +27,7 @@ Production profile enforces:
 
 ### Profile-specific defaults
 
-| Flag/Default        | dev/test  | testnet    | staging/prod |
+| Flag/Default        | dev        | testnet    | staging/prod |
 |---------------------|-----------|------------|--------------|
 | Faucet enabled      | yes       | no         | no           |
 | Bitcoin network     | regtest   | signet     | mainnet      |

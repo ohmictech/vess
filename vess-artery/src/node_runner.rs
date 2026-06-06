@@ -2870,11 +2870,9 @@ fn spawn_bitcoin_peer_notifications(
 /// Deployment profile that controls safety defaults.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DeploymentProfile {
-    /// Developer mode — unsafe operations allowed, test faucet enabled.
+    /// Developer mode — unsafe operations allowed, test faucet enabled, Bitcoin regtest.
     Development,
-    /// Test mode — unsafe operations allowed, but test faucet disabled by default.
-    Test,
-    /// Public testnet — production safety, Bitcoin signet, testnet DHT namespace.
+    /// Public testnet — production safety, Bitcoin signet, testnet DHT namespace, seed peers.
     Testnet,
     /// Staging — close to production, but diagnostics enabled.
     Staging,
@@ -2885,13 +2883,13 @@ pub enum DeploymentProfile {
 impl DeploymentProfile {
     /// True when unsafe operations (e.g. test faucet) are permitted.
     pub fn allow_unsafe(&self) -> bool {
-        matches!(self, Self::Development | Self::Test)
+        matches!(self, Self::Development)
     }
 
     /// The Bitcoin network to use for this profile.
     pub fn bitcoin_network(&self) -> vess_bitcoin::BitcoinNetwork {
         match self {
-            Self::Development | Self::Test => vess_bitcoin::BitcoinNetwork::Regtest,
+            Self::Development => vess_bitcoin::BitcoinNetwork::Regtest,
             Self::Testnet => vess_bitcoin::BitcoinNetwork::Signet,
             Self::Staging | Self::Production => vess_bitcoin::BitcoinNetwork::Mainnet,
         }
@@ -2920,7 +2918,6 @@ impl DeploymentProfile {
     pub fn as_label(&self) -> &'static str {
         match self {
             Self::Development => "dev",
-            Self::Test => "test",
             Self::Testnet => "testnet",
             Self::Staging => "staging",
             Self::Production => "prod",
@@ -2930,8 +2927,7 @@ impl DeploymentProfile {
     /// Short description.
     pub fn describe(&self) -> &'static str {
         match self {
-            Self::Development => "development (unsafe ops enabled, faucet on)",
-            Self::Test => "test (unsafe ops enabled, faucet off by default)",
+            Self::Development => "development (unsafe ops enabled, faucet on, Bitcoin regtest)",
             Self::Testnet => "public testnet (Bitcoin signet, production safety)",
             Self::Staging => "staging (close to production with diagnostics)",
             Self::Production => "production (all safety enforced)",

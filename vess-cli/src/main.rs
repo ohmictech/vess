@@ -212,18 +212,14 @@ enum Command {
         /// Discard persisted peer cache and ban state on startup.
         #[arg(long, hide = true)]
         reset_transient_peer_state: bool,
-        /// Shorthand for --profile dev + VESS_LOCAL_TEST_FAUCET=1.
-        /// Enables the local test faucet for minting test Vess bills.
-        #[arg(long)]
-        test: bool,
-        /// Join the public testnet (Bitcoin signet, production safety, zero-config).
-        /// Equivalent to --profile testnet with default seed peers.
+        /// Join the public testnet (Bitcoin signet, production safety, zero-config seed peers).
+        /// Equivalent to --profile testnet.
         #[arg(long)]
         testnet: bool,
         /// Bind mesh UDP socket to a specific address (default: 0.0.0.0:0).
         #[arg(long)]
         bind: Option<String>,
-        /// Deployment profile: dev, test, testnet, staging, or prod (default).
+        /// Deployment profile: dev, testnet, staging, or prod (default).
         #[arg(long, default_value = "prod")]
         profile: String,
     },
@@ -484,7 +480,6 @@ async fn dispatch_command(cli: &Cli) -> Result<()> {
             wallet_password,
             rpc_port,
             reset_transient_peer_state,
-            test,
             testnet,
             bind,
             profile,
@@ -493,28 +488,21 @@ async fn dispatch_command(cli: &Cli) -> Result<()> {
                 Some(d) => d.clone(),
                 None => vess_artery::persistence::NodeStorage::default_dir()?,
             };
-            if *test {
-                std::env::set_var("VESS_LOCAL_TEST_FAUCET", "1");
-            }
-            let test = *test;
             let profile_label = profile.to_lowercase();
             let profile = match profile_label.as_str() {
                 "dev" => vess_artery::node_runner::DeploymentProfile::Development,
-                "test" => vess_artery::node_runner::DeploymentProfile::Test,
                 "testnet" => vess_artery::node_runner::DeploymentProfile::Testnet,
                 "staging" => vess_artery::node_runner::DeploymentProfile::Staging,
                 "prod" | "production" => vess_artery::node_runner::DeploymentProfile::Production,
                 other => {
                     eprintln!("⚠ unknown profile '{other}', using 'prod'");
-                    eprintln!("  expected: dev, test, testnet, staging, prod");
+                    eprintln!("  expected: dev, testnet, staging, prod");
                     vess_artery::node_runner::DeploymentProfile::Production
                 }
             };
-            // --testnet overrides profile to testnet, --test to dev
+            // --testnet overrides profile to Testnet
             let effective_profile = if *testnet {
                 vess_artery::node_runner::DeploymentProfile::Testnet
-            } else if test {
-                vess_artery::node_runner::DeploymentProfile::Development
             } else {
                 profile
             };
@@ -534,7 +522,7 @@ async fn dispatch_command(cli: &Cli) -> Result<()> {
                 allow_private_bitcoin_seed_contact: false,
                 reset_transient_peer_state: *reset_transient_peer_state,
                 profile: effective_profile,
-                test,
+                test: false,
             };
             vess_artery::node_runner::run_node(config).await?;
             Ok(())

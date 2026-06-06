@@ -2631,12 +2631,12 @@ fn handle_set_test_mode(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
 fn handle_set_profile(state: &Arc<Mutex<ArteryState>>, label: &str) -> RpcResponse {
     let profile = match label {
         "dev" => DeploymentProfile::Development,
-        "test" => DeploymentProfile::Test,
+        "testnet" => DeploymentProfile::Testnet,
         "staging" => DeploymentProfile::Staging,
         "prod" => DeploymentProfile::Production,
         other => {
             return RpcResponse::err(&format!(
-                "unknown profile '{other}'; expected: dev, test, staging, prod"
+                "unknown profile '{other}'; expected: dev, testnet, staging, prod"
             ));
         }
     };
@@ -2644,7 +2644,6 @@ fn handle_set_profile(state: &Arc<Mutex<ArteryState>>, label: &str) -> RpcRespon
     let mut s = lock_state(&state);
     s.profile = profile;
     s.unsafe_mode = profile.allow_unsafe();
-    // Only auto-enable faucet for Development; Test keeps it off by default.
     s.test_faucet_enabled = matches!(profile, DeploymentProfile::Development);
 
     let warnings = s.audit();
