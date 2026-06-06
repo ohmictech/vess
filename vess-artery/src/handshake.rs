@@ -87,6 +87,12 @@ pub struct PeerEntry {
     pub challenged_at: Option<Instant>,
     /// When the peer was verified.
     pub verified_at: Option<Instant>,
+    /// Number of consecutive failed handshake attempts.
+    /// Reset to 0 on successful verification.
+    pub handshake_failures: u32,
+    /// When the last handshake attempt was made (success or failure).
+    /// Used for backoff calculation.
+    pub last_handshake_at: Option<Instant>,
 }
 
 // ── Peer registry ───────────────────────────────────────────────────
@@ -133,6 +139,9 @@ impl PeerRegistry {
 
         let mut nonce = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut nonce);
+
+        // Preserve failure count across re-challenges so backoff works.
+        let failures = self.peers.get(&peer_id).map(|e| e.handshake_failures).unwrap_or(0);
         self.peers.insert(
             peer_id,
             PeerEntry {
@@ -140,6 +149,8 @@ impl PeerRegistry {
                 challenge_nonce: Some(nonce),
                 challenged_at: Some(Instant::now()),
                 verified_at: None,
+                handshake_failures: failures,
+                last_handshake_at: Some(Instant::now()),
             },
         );
         nonce
@@ -172,6 +183,8 @@ impl PeerRegistry {
                     challenge_nonce: None,
                     challenged_at: None,
                     verified_at: Some(Instant::now()),
+                    handshake_failures: 0,
+                    last_handshake_at: Some(Instant::now()),
                 },
             );
             true
@@ -189,6 +202,8 @@ impl PeerRegistry {
                 challenge_nonce: None,
                 challenged_at: None,
                 verified_at: Some(Instant::now()),
+                handshake_failures: 0,
+                last_handshake_at: Some(Instant::now()),
             },
         );
     }
@@ -198,8 +213,10 @@ impl PeerRegistry {
         self.peers.get(peer_id).and_then(|e| e.challenge_nonce)
     }
 
-    /// Mark a peer as banished.
+    /// Mark a peer as banished.  Preserves the failure count so that
+    /// callers can decide whether to permanently banish or just track.
     pub fn mark_banished(&mut self, peer_id: [u8; 32]) {
+        let failures = self.peers.get(&peer_id).map(|e| e.handshake_failures).unwrap_or(0);
         self.peers.insert(
             peer_id,
             PeerEntry {
@@ -207,24 +224,69 @@ impl PeerRegistry {
                 challenge_nonce: None,
                 challenged_at: None,
                 verified_at: None,
+                handshake_failures: failures,
+                last_handshake_at: Some(Instant::now()),
             },
         );
     }
 
     /// Remove stale challenges that have exceeded the timeout,
     /// reverting them back to Unknown so they can be re-challenged.
-    pub fn evict_stale(&mut self) {
+    /// Returns the peer IDs that were evicted.
+    pub fn evict_stale(&mut self) -> Vec<[u8; 32]> {
         let timeout = self.challenge_timeout;
-        self.peers.retain(|_, entry| {
+        let mut evicted = Vec::new();
+        self.peers.retain(|id, entry| {
             if entry.state == PeerState::Challenged {
                 if let Some(at) = entry.challenged_at {
                     if at.elapsed() > timeout {
+                        evicted.push(*id);
                         return false; // remove stale
                     }
                 }
             }
             true
         });
+        evicted
+    }
+
+    /// Increment the handshake failure count for a peer.
+    /// Returns the new count.
+    pub fn record_handshake_failure(&mut self, peer_id: &[u8; 32]) -> u32 {
+        if let Some(entry) = self.peers.get_mut(peer_id) {
+            entry.handshake_failures += 1;
+            entry.last_handshake_at = Some(Instant::now());
+            entry.handshake_failures
+        } else {
+            1
+        }
+    }
+
+    /// Reset the handshake failure count on successful verification.
+    pub fn record_handshake_success(&mut self, peer_id: &[u8; 32]) {
+        if let Some(entry) = self.peers.get_mut(peer_id) {
+            entry.handshake_failures = 0;
+            entry.last_handshake_at = Some(Instant::now());
+        }
+    }
+
+    /// Check whether a peer should be retried based on failure count and
+    /// backoff. Returns `true` if enough time has passed since the last
+    /// attempt.
+    pub fn ready_for_retry(&self, peer_id: &[u8; 32]) -> bool {
+        let Some(entry) = self.peers.get(peer_id) else {
+            return true; // never attempted
+        };
+        if entry.state == PeerState::Verified {
+            return false; // already verified, no retry needed
+        }
+        let failures = entry.handshake_failures.max(1);
+        // Exponential backoff: 10s × 2^(failures-1), capped at ~5 min
+        let backoff_secs = (10u64 << (failures - 1).min(5)).min(300);
+        match entry.last_handshake_at {
+            Some(at) => at.elapsed().as_secs() >= backoff_secs,
+            None => true,
+        }
     }
 
     /// Count of peers currently in a given state.

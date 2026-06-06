@@ -151,6 +151,9 @@ pub enum NodeEvent {
 /// Messages older than this are rejected as stale / potential replays.
 const MAX_MESSAGE_AGE_SECS: u64 = 300; // 5 minutes
 
+/// Maximum consecutive handshake failures before permanent banishment.
+const MAX_HANDSHAKE_FAILURES: u32 = 3;
+
 fn bitcoin_network_tag(network: BitcoinNetwork) -> &'static [u8] {
     match network {
         BitcoinNetwork::Mainnet => b"bitcoin-mainnet",
@@ -5475,7 +5478,13 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
 
             let peers_to_challenge: Vec<[u8; 32]> = {
                 let mut s = hs_state.lock().unwrap();
-                s.peer_registry.evict_stale();
+                let evicted = s.peer_registry.evict_stale();
+                // Re-queue evicted peers that are ready for retry.
+                for id in evicted {
+                    if s.peer_registry.ready_for_retry(&id) {
+                        s.handshake_queue.push(id);
+                    }
+                }
                 s.handshake_queue.drain(..).collect()
             };
 
@@ -5532,18 +5541,24 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                             if resp.pow_hash.is_empty()
                                 || !verify_handshake_pow(&peer_hash, &nonce, &resp.pow_hash)
                             {
-                                warn!("peer PoW verification failed — banishing");
-                                s.peer_registry.mark_banished(peer_hash);
-                                hs_ban.banish(peer_hash);
+                                let failures = s.peer_registry.record_handshake_failure(&peer_hash);
+                                warn!(failures, "peer PoW verification failed");
+                                if failures >= MAX_HANDSHAKE_FAILURES {
+                                    s.peer_registry.mark_banished(peer_hash);
+                                    hs_ban.banish(peer_hash);
+                                    s.push_event(NodeEvent::PeerBanished { created_at: ArteryState::now_unix(), peer_id: hex_key(&peer_hash), reason: format!("PoW verification failed {failures} times") });
+                                }
                                 push_peer_notification(
                                     &mut s,
                                     "vess_peer_handshake_failed",
                                     &peer_hash,
                                     None,
-                                    format!("Handshake failed PoW verification for peer: {}", hex_key(&peer_hash)),
+                                    format!("Handshake failed PoW verification for peer: {} (attempt {failures})", hex_key(&peer_hash)),
                                 );
                                 false
                             } else {
+                                // Reset failure count on success.
+                                s.peer_registry.record_handshake_success(&peer_hash);
                                 push_peer_notification(
                                     &mut s,
                                     "vess_peer_verified",
@@ -5556,17 +5571,21 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                                 true
                             }
                         } else {
-                            s.peer_registry.mark_banished(peer_hash);
-                            hs_ban.banish(peer_hash);
+                            let failures = s.peer_registry.record_handshake_failure(&peer_hash);
+                            warn!(failures, "peer HMAC verification failed");
+                            if failures >= MAX_HANDSHAKE_FAILURES {
+                                s.peer_registry.mark_banished(peer_hash);
+                                hs_ban.banish(peer_hash);
+                                s.push_event(NodeEvent::PeerBanished { created_at: ArteryState::now_unix(), peer_id: hex_key(&peer_hash), reason: format!("HMAC verification failed {failures} times") });
+                            }
                             push_peer_notification(
                                 &mut s,
                                 "vess_peer_handshake_failed",
                                 &peer_hash,
                                 None,
-                                format!("Handshake returned an invalid response for peer: {}", hex_key(&peer_hash)),
+                                format!("Handshake returned an invalid response for peer: {} (attempt {failures})", hex_key(&peer_hash)),
                             );
-                            info!("peer banished — invalid handshake response");
-                            s.push_event(NodeEvent::PeerBanished { created_at: ArteryState::now_unix(), peer_id: hex_key(&peer_hash), reason: "handshake drain: invalid response".to_string() });
+                            info!("peer HMAC failed — attempt {failures}/{}", MAX_HANDSHAKE_FAILURES);
                             false
                         }
                     };
@@ -5578,12 +5597,18 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     }
                 } else {
                     let mut s = hs_state.lock().unwrap();
+                    let failures = s.peer_registry.record_handshake_failure(&peer_hash);
+                    if failures >= MAX_HANDSHAKE_FAILURES {
+                        s.peer_registry.mark_banished(peer_hash);
+                        hs_ban.banish(peer_hash);
+                        s.push_event(NodeEvent::PeerBanished { created_at: ArteryState::now_unix(), peer_id: hex_key(&peer_hash), reason: format!("handshake timed out {failures} times") });
+                    }
                     push_peer_notification(
                         &mut s,
                         "vess_peer_handshake_failed",
                         &peer_hash,
                         None,
-                        format!("Handshake timed out or returned no usable response for peer: {}", hex_key(&peer_hash)),
+                        format!("Handshake timed out or returned no usable response for peer: {} (attempt {failures})", hex_key(&peer_hash)),
                     );
                 }
             }
