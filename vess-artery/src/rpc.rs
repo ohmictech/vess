@@ -987,19 +987,28 @@ async fn resolve_tag(
         }
     }
 
-    // ── 3. Active DHT query ─────────────────────────────────────────
-    // Select peers closest to the tag's DHT key.
+    // ── 3. Active DHT query (privacy-preserving) ─────────────────────
+    // Pick from the 2K nearest peers with random jitter rather than
+    // deterministically selecting the exact K-nearest.  This prevents
+    // an observer from predicting exactly which peers will be queried
+    // for a given tag.
     let tag_hash: [u8; 32] = *blake3::hash(tag_str.as_bytes()).as_bytes();
     let nonce: [u8; 16] = rand::random();
 
     let targets: Vec<(MeshCarrierContact, [u8; 32])> = {
+        use rand::seq::SliceRandom;
         let s = state.lock().unwrap();
         let peers = s.routing_table.routable_peers(|_| true);
         if peers.is_empty() {
             return None;
         }
         let peer_hashes: Vec<[u8; 32]> = peers.iter().map(|p| p.id_hash).collect();
-        let nearest_indices = k_nearest(&tag_hash, &peer_hashes, TAG_LOOKUP_FAN_OUT);
+        // Get 2K nearest, then randomly select K from them.
+        let fan_2k = (TAG_LOOKUP_FAN_OUT * 2).min(peer_hashes.len());
+        let mut nearest_indices = k_nearest(&tag_hash, &peer_hashes, fan_2k);
+        let mut rng = rand::thread_rng();
+        nearest_indices.shuffle(&mut rng);
+        nearest_indices.truncate(TAG_LOOKUP_FAN_OUT.min(nearest_indices.len()));
         nearest_indices
             .into_iter()
             .filter_map(|i| {
@@ -1329,22 +1338,6 @@ fn fire_opportunistic_consolidations(
     }
 }
 
-/// Compute the digest that a PaymentReceipt signature signs.
-fn payment_receipt_digest(
-    payment_id: &[u8; 32],
-    claimed_mint_ids: &[[u8; 32]],
-    total_amount: u64,
-    timestamp: u64,
-) -> [u8; 32] {
-    let mut input = Vec::with_capacity(16 + 32 + claimed_mint_ids.len() * 32 + 16);
-    input.extend_from_slice(b"vess-receipt-v0");
-    input.extend_from_slice(payment_id);
-    for mid in claimed_mint_ids { input.extend_from_slice(mid); }
-    input.extend_from_slice(&total_amount.to_le_bytes());
-    input.extend_from_slice(&timestamp.to_le_bytes());
-    *blake3::hash(&input).as_bytes()
-}
-
 /// Attempt to deliver a payment directly to the recipient if they are a
 /// known verified peer whose mesh contact is in the routing table.
 /// Returns true if the delivery was acknowledged.
@@ -1386,18 +1379,15 @@ async fn try_direct_delivery(
         Ok(Ok(Some(ack))) => {
             // Verify PaymentReceipt signature if present.
             if let PulseMessage::PaymentReceipt(ref pr) = ack {
-                let digest = payment_receipt_digest(
-                    &pr.payment_id, &pr.claimed_mint_ids, pr.total_amount, pr.timestamp);
-                // Verify against the recipient's spend_vk from the payment.
-                // The payment contains the recipient's stealth address which
-                // we resolved from their tag — we trust the tag resolution.
-                // For full verification, use the first claimed bill's owner_vk.
                 if pr.signature.is_empty() {
                     warn!("direct delivery: PaymentReceipt missing signature");
                     return false;
                 }
                 // Peer responded with a receipt — they decrypted and claimed it.
-                info!("direct delivery: PaymentReceipt verified OK ({} Vess, {} bills)",
+                // Full signature verification requires the recipient's owner_vk
+                // from the ownership registry; that check is done in the payment
+                // handler on the receiving side.
+                info!("direct delivery: PaymentReceipt confirmed ({} Vess, {} bills)",
                     pr.total_amount, pr.claimed_mint_ids.len());
                 // Push confirmation notification.
                 {

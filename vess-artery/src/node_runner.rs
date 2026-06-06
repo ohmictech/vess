@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 use bitcoin::hashes::Hash;
 use rand::Rng;
+use rand::seq::SliceRandom;
 use serde::Serialize;
 use tracing::{info, warn};
 use zeroize::{Zeroize, Zeroizing};
@@ -150,6 +151,9 @@ pub enum NodeEvent {
 /// Maximum age (in seconds) for timestamps on incoming messages.
 /// Messages older than this are rejected as stale / potential replays.
 const MAX_MESSAGE_AGE_SECS: u64 = 300; // 5 minutes
+
+/// Number of random DHT registry queries per periodic flush tick.
+const COVER_QUERIES_PER_TICK: usize = 2;
 
 /// Maximum consecutive handshake failures before permanent banishment.
 const MAX_HANDSHAKE_FAILURES: u32 = 3;
@@ -4359,6 +4363,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
 
     // ── Periodic state flush (every 60 seconds) ─────────────────────
     let flush_state = state.clone();
+    let flush_node = node.clone();
     let flush_storage_dir = config.state_dir.clone();
     let flush_manifest_tx = manifest_tx.clone();
     tokio::spawn(async move {
@@ -4490,6 +4495,41 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 s.gossip_config.max_hops = log_ratio.max(3);
                 let repl = dht_replication_factor(n);
                 s.tag_dht.set_k_replication(repl);
+
+                // ── Cover traffic ────────────────────────────────────
+                if n > 1 && COVER_QUERIES_PER_TICK > 0 {
+                    let cover_mint_ids: Vec<[u8; 32]> = {
+                        let mut rng = rand::thread_rng();
+                        (0..COVER_QUERIES_PER_TICK)
+                            .map(|_| rng.gen::<[u8; 32]>())
+                            .collect()
+                    };
+                    let routable_peers: Vec<Vec<u8>> = s.routing_table
+                        .routable_peers(|id| s.peer_registry.state(id) == PeerState::Verified)
+                        .iter()
+                        .map(|p| p.id_bytes.clone())
+                        .collect();
+                    drop(s);
+                    let mut rng = rand::thread_rng();
+                    for mint_id in &cover_mint_ids {
+                        let Some(peer_bytes) = routable_peers.choose(&mut rng) else { continue };
+                        let Ok(contact) = decode_contact_bytes(peer_bytes) else { continue };
+                        let query = PulseMessage::RegistryQuery(
+                            vess_protocol::RegistryQuery {
+                                mint_ids: vec![*mint_id],
+                            },
+                        );
+                        let n = flush_node.clone();
+                        tokio::spawn(async move {
+                            let _ = tokio::time::timeout(
+                                std::time::Duration::from_secs(2),
+                                n.send_message_with_response(&contact, &query),
+                            ).await;
+                        });
+                    }
+                    // Re-acquire lock for remaining flush work.
+                    s = flush_state.lock().unwrap();
+                }
             }
             let snap = {
                 let s = flush_state.lock().unwrap();
@@ -6331,7 +6371,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                         &payload,
                     ) {
                         Ok(Some(result)) => {
-                            let receipt = if let Some(tag_hash) = direct_receipt_tag_hash {
+                            let _receipt = if let Some(tag_hash) = direct_receipt_tag_hash {
                                 match build_direct_payment_receipt(
                                     payment_id,
                                     tag_hash,

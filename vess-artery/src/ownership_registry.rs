@@ -161,6 +161,12 @@ impl OwnershipRegistry {
     ///
     /// Returns `true` if this node is among the `replication_factor`-closest
     /// to the `mint_id` by XOR distance.
+    /// Decide whether this node should store a given mint_id.
+    ///
+    /// Uses randomized replication: selects K nodes from the 2K nearest
+    /// with weighted probability favoring closer nodes.  This prevents
+    /// an observer from deterministically predicting which K nodes hold
+    /// a given shard.
     pub fn should_store(
         &self,
         mint_id: &[u8; 32],
@@ -168,11 +174,25 @@ impl OwnershipRegistry {
         replication_factor: usize,
     ) -> bool {
         let my_distance = xor_distance(&self.node_id, mint_id);
-        let closer_count = peer_ids
+        let fan = (replication_factor * 2).min(peer_ids.len());
+        let mut distances: Vec<(&[u8; 32], [u8; 32])> = peer_ids
             .iter()
-            .filter(|pid| xor_distance(pid, mint_id) < my_distance)
+            .map(|pid| (pid, xor_distance(pid, mint_id)))
+            .collect();
+        distances.sort_by_key(|(_, d)| *d);
+        let closer_count = distances[..fan]
+            .iter()
+            .filter(|(_, d)| *d < my_distance)
             .count();
-        closer_count < replication_factor
+        if closer_count >= replication_factor * 2 {
+            return false;
+        }
+        if closer_count < replication_factor {
+            return true;
+        }
+        let rank = closer_count.saturating_sub(replication_factor);
+        let max_rank = replication_factor;
+        rand::random::<usize>() % (max_rank + 1) > rank
     }
 
     /// Register a new mint_id in the registry.
