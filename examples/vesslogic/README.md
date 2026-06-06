@@ -70,6 +70,65 @@ This generates the witness, builds the claim, and broadcasts it.
 
 ---
 
+## Program Receipts — Bearer Credentials for Program Interaction
+
+When you deposit bills into a program, your node generates a **`ProgramReceipt`** —
+a cryptographic proof that the program accepted your deposit. This receipt is:
+
+- **Signed** by your spend key (proving you authorized the deposit)
+- **Gossiped** back to your node via the mesh
+- **Transferable** — you can forward it inside a `Payment` to another party
+
+### Why Transferable Receipts Matter
+
+Program receipts are **bearer credentials**. Whoever holds a valid receipt
+can present it alongside a `ProgramSpendWitness` to attempt a program unlock.
+This enables trustless program interaction:
+
+1. **Alice** deposits 100 Vess into `+vl_escrow1` → gets a `ProgramReceipt`
+2. **Alice** sends the receipt to **Bob** inside a `Payment`
+3. **Bob** presents the receipt + his witness to unlock the escrow
+4. The program verifies the receipt is valid and the witness satisfies `[withdraw]`
+
+Without transferable receipts, the depositor would need to be online to
+authorize the withdrawal — the receipt decouples deposit from withdrawal.
+
+### Sending a Program Receipt
+
+To forward a receipt you received (e.g., as escrow depositor) to the
+intended recipient:
+
+```bash
+vess send-receipt <payment-id> +bob
+```
+
+This wraps the `ProgramReceipt` in a `Payment` envelope addressed to Bob.
+Bob's node stores the receipt and can use it when building the unlock claim.
+
+### Receiving and Using a Receipt
+
+When you receive a payment containing a `program_receipt`, your node:
+
+1. Stores the receipt keyed by `program_id`
+2. When you attempt to unlock bills from that program, your node
+   automatically includes the receipt in the `OwnershipClaim`
+3. Verifying nodes check the receipt signature against the depositor's
+   owner_vk before accepting the unlock
+
+### Receipt Verification
+
+Any node can verify a `ProgramReceipt`:
+```rust
+let digest = blake3_hash(
+    b"vess-program-receipt-v0"
+    || program_id || payment_id || claimed_mint_ids
+    || total_amount || resulting_state || depositor_owner_vk || timestamp
+);
+verify_spend(&receipt.depositor_owner_vk, &digest, &receipt.signature)
+```
+
+---
+
 ## Example: Escrow Covenant
 
 `escrow.vess` — A two-party escrow that releases funds after a timelock

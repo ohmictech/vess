@@ -65,6 +65,28 @@ pub(crate) fn lock_state(state: &Arc<Mutex<ArteryState>>) -> std::sync::MutexGua
     })
 }
 
+/// Compute the digest that a ProgramReceipt signature signs.
+pub(crate) fn program_receipt_digest(
+    program_id: &vess_compute::ProgramId,
+    payment_id: &[u8; 32],
+    claimed_mint_ids: &[[u8; 32]],
+    total_amount: u64,
+    resulting_state: &[u8],
+    depositor_owner_vk: &[u8],
+    timestamp: u64,
+) -> [u8; 32] {
+    let mut input = Vec::with_capacity(64 + payment_id.len() + claimed_mint_ids.len() * 32 + 32);
+    input.extend_from_slice(b"vess-program-receipt-v0");
+    input.extend_from_slice(&program_id.0);
+    input.extend_from_slice(payment_id);
+    for mid in claimed_mint_ids { input.extend_from_slice(mid); }
+    input.extend_from_slice(&total_amount.to_le_bytes());
+    input.extend_from_slice(resulting_state);
+    input.extend_from_slice(depositor_owner_vk);
+    input.extend_from_slice(&timestamp.to_le_bytes());
+    *blake3::hash(&input).as_bytes()
+}
+
 const MAX_WALLET_NOTIFICATIONS: usize = 256;
 const AUTO_BURN_FEE_SATS: u64 = 500;
 const AUTO_BURN_RETRY_SECS: u64 = 30;
@@ -6419,8 +6441,9 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                             let mut total = 0u64;
                             let mut pending_oc = Vec::new();
                             let mut claimed_mids: Vec<[u8; 32]> = Vec::new();
-                            // Save first spend_sk before the loop consumes result.claimed.
+                            // Save first spend credential before the loop consumes result.claimed.
                             let first_spend_sk = result.claimed.first().map(|c| c.spend_sk.clone());
+                            let first_spend_vk = result.claimed.first().map(|c| c.spend_vk.clone());
                             for claimed in result.claimed {
                                 total += claimed.bill.denomination.value();
                                 claimed_mids.push(claimed.bill.mint_id);
@@ -6479,6 +6502,40 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                                 },
                             );
 
+                            // ── Program receipt: if bills landed in a program ──
+                            // Check if any ownership claim binds bills to a program.
+                            let program_receipt_msg = pending_oc.iter().find_map(|oc| {
+                                oc.new_owner_program.as_ref().map(|prog_cond| {
+                                    let prog_id = prog_cond.controller.prog_id;
+                                    let depositor_vk = first_spend_vk.clone().unwrap_or_default();
+                                    let pr_digest = program_receipt_digest(
+                                        &prog_id,
+                                        &payment_id,
+                                        &claimed_mids,
+                                        total,
+                                        &prog_cond.state_commitment,
+                                        &depositor_vk,
+                                        now,
+                                    );
+                                    let pr_sig = first_spend_sk.as_ref()
+                                        .and_then(|sk| vess_foundry::spend_auth::sign_spend(
+                                            sk, &pr_digest).ok())
+                                        .unwrap_or_default();
+                                    PulseMessage::ProgramReceipt(
+                                        vess_protocol::ProgramReceipt {
+                                            program_id: prog_id,
+                                            program_name: String::new(),
+                                            payment_id,
+                                            claimed_mint_ids: claimed_mids.clone(),
+                                            total_amount: total,
+                                            resulting_state: prog_cond.state_commitment.to_vec(),
+                                            depositor_owner_vk: depositor_vk,
+                                            timestamp: now,
+                                            signature: pr_sig,
+                                        })
+                                })
+                            });
+
                             // Forward the receipt via gossip so the sender's
                             // node gets confirmation even if they're not a
                             // direct peer (relay_copy was already queued above).
@@ -6489,7 +6546,9 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
 
                             // Return receipt so direct senders get instant
                             // confirmation via send_message_with_response.
-                            return Some(receipt_msg);
+                            // If this was a program deposit, return the ProgramReceipt instead
+                            // so the sender gets cryptographic proof of deposit.
+                            return program_receipt_msg.or(Some(receipt_msg));
                         }
                         Ok(None) => {} // Not for us — normal relay.
                         Err(e) => {
@@ -6876,6 +6935,45 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     counterparty: None,
                     message: format!("Receipt confirmed: {} Vess by recipient", pr.total_amount),
                 });
+                None
+            }
+
+            PulseMessage::ProgramReceipt(pr) => {
+                info!(payment_id = %hex_key(&pr.payment_id), amount = pr.total_amount,
+                      program = %hex_key(&pr.program_id.0),
+                      "program receipt received — deposit confirmed by program");
+                // Verify the receipt signature.
+                let digest = crate::node_runner::program_receipt_digest(
+                    &pr.program_id,
+                    &pr.payment_id,
+                    &pr.claimed_mint_ids,
+                    pr.total_amount,
+                    &pr.resulting_state,
+                    &pr.depositor_owner_vk,
+                    pr.timestamp,
+                );
+                if let Ok(true) = vess_foundry::spend_auth::verify_spend(
+                    &pr.depositor_owner_vk, &digest, &pr.signature,
+                ) {
+                    for mid in &pr.claimed_mint_ids {
+                        state.finalize_outbound_mint_if_complete(mid);
+                    }
+                    state.push_notification(WalletNotification {
+                        kind: "program_deposit_confirmed".to_string(),
+                        created_at: ArteryState::now_unix(),
+                        payment_id: hex_key(&pr.payment_id),
+                        amount: Some(pr.total_amount),
+                        bill_count: Some(pr.claimed_mint_ids.len()),
+                        counterparty: Some(pr.program_name.clone()),
+                        message: format!(
+                            "Program deposit confirmed: {} Vess locked in program {}",
+                            pr.total_amount,
+                            hex_key(&pr.program_id.0),
+                        ),
+                    });
+                } else {
+                    warn!(payment_id = %hex_key(&pr.payment_id), "program receipt signature invalid");
+                }
                 None
             }
 

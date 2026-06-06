@@ -257,6 +257,11 @@ pub enum PulseMessage {
     /// verify locally without waiting for DHT gossip.
     PaymentReceipt(PaymentReceipt),
 
+    /// Cryptographic receipt proving a program covenant accepted deposited
+    /// bills. Signed by the claim submitter. Can be forwarded inside a
+    /// Payment to authorize another party to unlock the program.
+    ProgramReceipt(ProgramReceipt),
+
     /// Kademlia FIND_NODE: ask a peer for the K closest nodes to a target.
     /// Used for iterative routing table population — never for locating
     /// wallet users or payment recipients.
@@ -326,6 +331,16 @@ pub struct Payment {
     /// empty because fire-and-forget relays do not consume responses.
     #[serde(default)]
     pub direct_receipt_tag_hash: Option<[u8; 32]>,
+
+    /// Optional program receipt authorizing the recipient to attempt a
+    /// program unlock. When present, the recipient can use this receipt
+    /// as bearer authorization to satisfy the program's `[withdraw]`
+    /// predicate with a valid [`ProgramSpendWitness`].
+    ///
+    /// Set by a previous depositor who wants to transfer their claim
+    /// rights to another party (e.g. escrow seller, auction winner).
+    #[serde(default)]
+    pub program_receipt: Option<ProgramReceipt>,
 }
 
 // ── Tag Operations ───────────────────────────────────────────────────
@@ -1283,6 +1298,39 @@ pub struct PaymentReceipt {
     pub signature: Vec<u8>,
 }
 
+/// Cryptographic receipt proving a program covenant accepted deposited bills.
+///
+/// Generated when bills land in a program's ownership (e.g. escrow, auction,
+/// vault). The receipt is signed by the claim submitter's spend key and can
+/// be forwarded inside a [`Payment`] to another party, authorizing them to
+/// attempt a program unlock with a valid [`ProgramSpendWitness`].
+///
+/// This turns program receipts into **bearer credentials** — whoever holds
+/// a valid receipt can try to satisfy the program's `[withdraw]` predicate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProgramReceipt {
+    /// The program that accepted the deposit.
+    pub program_id: vess_compute::ProgramId,
+    /// Human-readable program name (e.g. "vl_escrow1").
+    pub program_name: String,
+    /// Echoed payment ID from the original Payment message.
+    pub payment_id: [u8; 32],
+    /// Mint IDs now owned by the program.
+    pub claimed_mint_ids: Vec<[u8; 32]>,
+    /// Total value deposited.
+    pub total_amount: u64,
+    /// The program's resulting state commitment after this deposit.
+    /// Programs can use this to track cumulative state.
+    pub resulting_state: Vec<u8>,
+    /// The depositor's owner verification key (claim submitter).
+    pub depositor_owner_vk: Vec<u8>,
+    /// Unix timestamp.
+    pub timestamp: u64,
+    /// ML-DSA-65 signature over the receipt digest:
+    /// `Blake3("vess-program-receipt-v0" || program_id || program_name || payment_id || claimed_mint_ids || total_amount || resulting_state || depositor_owner_vk || timestamp)`
+    pub signature: Vec<u8>,
+}
+
 impl PulseMessage {
     /// Serialize this message to bytes using postcard.
     pub fn to_bytes(&self) -> Result<Vec<u8>, postcard::Error> {
@@ -1311,6 +1359,7 @@ mod tests {
             bill_count: 1,
             mailbox_key: None,
             direct_receipt_tag_hash: None,
+            program_receipt: None,
         });
         let bytes = msg.to_bytes().unwrap();
         let decoded = PulseMessage::from_bytes(&bytes).unwrap();
@@ -1413,7 +1462,8 @@ mod tests {
                 bill_count,
                 mailbox_key: None,
                 direct_receipt_tag_hash: None,
-            });
+            program_receipt: None,
+        });
             let bytes = msg.to_bytes().unwrap();
             prop_assume!(!bytes.is_empty());
             let truncate_at = cutoff % bytes.len();

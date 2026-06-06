@@ -206,6 +206,7 @@ pub fn prepare_payment(
         bill_count,
         mailbox_key: Some(derive_mailbox_key(&recipient.spend_ek)),
         direct_receipt_tag_hash: None,
+        program_receipt: None,
     });
 
     Ok((msg, payment_id, selection.send_indices))
@@ -284,6 +285,7 @@ pub fn prepare_payment_with_transfer(
         bill_count,
         mailbox_key: Some(derive_mailbox_key(&recipient.spend_ek)),
         direct_receipt_tag_hash: None,
+        program_receipt: None,
     });
 
     Ok((msg, payment_id, selection.send_indices))
@@ -344,6 +346,7 @@ pub fn prepare_payment_from_bills(
         bill_count,
         mailbox_key: Some(derive_mailbox_key(&recipient.spend_ek)),
         direct_receipt_tag_hash: None,
+        program_receipt: None,
     });
 
     Ok((msg, payment_id))
