@@ -9,23 +9,6 @@ Vess upgrades Bitcoin sats into private, feeless bearer bills. 1 sat = 1 Vess. T
 
 ---
 
-## Table of Contents
-
-- [How It Works](#how-it-works)
-- [Quick Start](#quick-start)
-- [Architecture](#architecture)
-- [Why Vess](#why-vess)
-- [Ownership & Payments](#ownership--payments)
-- [Privacy](#privacy)
-- [Smart Contracts](#smart-contracts)
-- [Cryptography](#cryptography)
-- [Status](#status)
-- [Security Assumptions](#security-assumptions)
-- [Specification](#specification)
-- [License](#license)
-
----
-
 ## How It Works
 
 1. **Deposit BTC** — Your node tracks incoming Bitcoin via its embedded light client.
@@ -172,25 +155,6 @@ All Vess-native operations are post-quantum.
 
 ---
 
-## Status
-
-| Feature | Status |
-|---|---|
-| PQ mesh networking (UDP) | ✅ Stable |
-| Peer handshake + PoW | ✅ Stable |
-| Kademlia DHT (256 buckets) | ✅ Stable |
-| Wallet create / unlock / backup | ✅ Stable |
-| Send / receive / reforge | ✅ Stable |
-| +Tag registration / lookup | ✅ Stable |
-| CLI + interactive mode | ✅ Stable |
-| Test faucet (dev profile) | ✅ Stable |
-| Bitcoin light client | 🧪 Experimental |
-| BTC burn → Vess genesis | 🧪 Experimental |
-| VessLogic covenant engine | 🧪 Experimental |
-| Vess STARKs | 🔬 Planned |
-
----
-
 ## Security Assumptions
 
 Vess nodes trust:
@@ -201,12 +165,6 @@ Vess nodes trust:
 - **Argon2id PoW** — handshake proof-of-work raises the cost of Sybil identities.
 
 Vess nodes do **not** trust any single peer, coordinator, sequencer, or validator.
-
----
-
-## Specification
-
-The frozen V1 protocol specification is in **[docs/v1-spec.md](docs/v1-spec.md)**.
 
 ---
 

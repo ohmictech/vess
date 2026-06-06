@@ -753,8 +753,8 @@ fn handle_node_info(state: &Arc<Mutex<ArteryState>>, node: &MeshPulseNode) -> Rp
             .as_ref()
             .map(|client| client.connected_peers())
             .unwrap_or(0),
-        profile: s.profile.as_label().to_string(),
-        profile_description: s.profile.describe().to_string(),
+        profile: if s.is_testnet { "testnet" } else { "production" }.to_string(),
+        profile_description: if s.is_testnet { "testnet (signet, faucet on)" } else { "production (mainnet)" }.to_string(),
         unsafe_mode: s.unsafe_mode,
         test_faucet_enabled: s.test_faucet_enabled,
     })
