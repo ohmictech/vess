@@ -419,6 +419,83 @@ pub fn verify_handshake_pow_with_params(
     constant_time_eq_slice(&expected, pow_hash)
 }
 
+// ── Claim / Genesis PoW (denomination-scaled) ───────────────────────
+
+/// Base Argon2id parameters for claim PoW (lighter than handshake).
+const CLAIM_POW_T_COST: u32 = 1;
+const CLAIM_POW_M_COST: u32 = 64 * 1024; // 64 MiB
+const CLAIM_POW_P_COST: u32 = 1;
+const CLAIM_POW_OUTPUT_LEN: usize = 32;
+
+/// Compute PoW difficulty based on denomination value.
+/// Returns the number of Argon2id passes required.
+pub fn claim_pow_difficulty(denomination_value: u64) -> u32 {
+    if denomination_value == 0 {
+        return 1;
+    }
+    // log2 scale: 1→1, 2→2, 4→3, 8→4, 16→5, ..., capped at 16.
+    let bits = 64 - denomination_value.leading_zeros();
+    (bits.min(16)).max(1)
+}
+
+/// Compute a claim/genesis PoW nonce + hash.
+/// Returns (nonce, hash, difficulty) where difficulty is the number of passes.
+pub fn compute_claim_pow(
+    mint_id: &[u8; 32],
+    owner_vk_hash: &[u8; 32],
+    denomination_value: u64,
+) -> ([u8; 32], [u8; 32], u64) {
+    let difficulty = claim_pow_difficulty(denomination_value) as u64;
+    let mut nonce = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut nonce);
+    let hash = compute_claim_pow_with_difficulty(mint_id, owner_vk_hash, &nonce, difficulty as u32);
+    (nonce, hash, difficulty)
+}
+
+/// Compute claim PoW with explicit difficulty.
+fn compute_claim_pow_with_difficulty(
+    mint_id: &[u8; 32],
+    owner_vk_hash: &[u8; 32],
+    nonce: &[u8; 32],
+    passes: u32,
+) -> [u8; 32] {
+    use argon2::{Algorithm, Argon2, Params, Version};
+    let params = Params::new(
+        CLAIM_POW_M_COST,
+        passes, // time cost = difficulty passes
+        CLAIM_POW_P_COST,
+        Some(CLAIM_POW_OUTPUT_LEN),
+    )
+    .expect("valid claim PoW params");
+    let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    let mut out = [0u8; CLAIM_POW_OUTPUT_LEN];
+    // Concatenate mint_id and owner_vk_hash as the password input.
+    let mut password = Vec::with_capacity(64);
+    password.extend_from_slice(mint_id);
+    password.extend_from_slice(owner_vk_hash);
+    argon
+        .hash_password_into(&password, nonce, &mut out)
+        .expect("Argon2id claim PoW");
+    out
+}
+
+/// Verify a claim/genesis PoW.
+/// Returns true if the PoW hash is valid for the given parameters.
+pub fn verify_claim_pow(
+    mint_id: &[u8; 32],
+    owner_vk_hash: &[u8; 32],
+    denomination_value: u64,
+    nonce: &[u8; 32],
+    pow_hash: &[u8],
+) -> bool {
+    if pow_hash.len() != CLAIM_POW_OUTPUT_LEN {
+        return false;
+    }
+    let difficulty = claim_pow_difficulty(denomination_value);
+    let expected = compute_claim_pow_with_difficulty(mint_id, owner_vk_hash, nonce, difficulty);
+    constant_time_eq_slice(&expected, pow_hash)
+}
+
 /// Constant-time equality check for variable-length slices.
 fn constant_time_eq_slice(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {

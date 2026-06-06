@@ -767,6 +767,15 @@ impl BitcoinLightClient {
         self.connected_peers.load(Ordering::Relaxed)
     }
 
+    /// Check whether a block hash exists in the validated header chain.
+    /// Used by burn genesis validation to independently verify that a
+    /// burn transaction's block has valid PoW without trusting the broadcaster.
+    pub fn has_block_header(&self, block_hash: &[u8; 32]) -> bool {
+        let hash = BlockHash::from_slice(block_hash)
+            .unwrap_or(BlockHash::all_zeros());
+        self.header_chain.lock().unwrap().index.contains_key(&hash)
+    }
+
     pub fn active_peers(&self) -> Vec<SocketAddr> {
         let mut peers: Vec<_> = self.active_peers.lock().unwrap().iter().copied().collect();
         peers.sort_unstable();
