@@ -5522,6 +5522,14 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     s.peer_registry.issue_challenge(peer_hash)
                 };
 
+                // Sentinel: peer was already Verified (or Banished) by the time
+                // we acquired the lock — another path (e.g. HandshakeResponse
+                // handler) beat us to it.  Skip the challenge to avoid sending
+                // a zero nonce that would trigger a spurious banish.
+                if nonce == [0u8; 32] {
+                    continue;
+                }
+
                 {
                     let mut s = hs_state.lock().unwrap();
                     push_peer_notification(
@@ -5876,12 +5884,21 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
             PulseMessage::HandshakeResponse(hr) => {
                 // Read the challenge nonce BEFORE verify_response consumes it.
                 let stored_nonce = state.peer_registry.challenge_nonce(&peer_id);
+                let was_already_verified =
+                    state.peer_registry.state(&peer_id) == PeerState::Verified;
                 let valid = state.peer_registry.verify_response(
                     &peer_id,
                     &hr.hmac,
                     &ALLOWED_VERSIONS,
                 );
                 if !valid {
+                    // If the peer was already Verified (e.g. via the handshake
+                    // drain task), a stray HandshakeResponse with a zero nonce
+                    // is harmless — just ignore it rather than banishing.
+                    if was_already_verified {
+                        info!(%peer, "ignoring HandshakeResponse for already-verified peer");
+                        return None;
+                    }
                     state.peer_registry.mark_banished(peer_id);
                     ban_ref.banish(peer_id);
                     info!(%peer, "handshake HMAC verification failed — banished locally");
