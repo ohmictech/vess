@@ -7,8 +7,6 @@
 
 Vess upgrades Bitcoin sats into private, feeless bearer bills. 1 sat = 1 Vess. The conversion is one-way: a burn transaction commits to the first owner, and from that point the value moves inside Vess as encrypted bills on a distributed hash table, with no public transfer history.
 
----
-
 ## How It Works
 
 1. **Deposit BTC** — Your node tracks incoming Bitcoin via its embedded light client.
@@ -165,6 +163,12 @@ Vess nodes trust:
 - **Argon2id PoW** — handshake proof-of-work raises the cost of Sybil identities.
 
 Vess nodes do **not** trust any single peer, coordinator, sequencer, or validator.
+
+---
+
+## Specification
+
+The frozen V1 protocol specification is in **[docs/v1-spec.md](docs/v1-spec.md)**.
 
 ---
 

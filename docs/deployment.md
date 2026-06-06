@@ -1,40 +1,34 @@
 # Vess Node Deployment Guide
 
-This document describes how to deploy a Vess artery node from local
-development through to internet-facing production.
+This document describes how to deploy a Vess artery node.
 
-## Profiles
+## Two Modes
 
-Vess ships with four built-in deployment profiles selectable via
-`vess node --profile <name>` (or the `--testnet` shorthand):
+Vess has exactly two operating modes:
 
-| Profile     | `allow_unsafe` | Bitcoin Network | Use case                          |
-|-------------|:--------------:|:---------------:|-----------------------------------|
-| development | yes            | regtest         | Local single-node dev with faucet |
-| testnet     | yes            | signet          | Public testnet (faucet, seed peers) |
-| staging     | no             | mainnet         | Pre-production staging environment |
-| production  | no             | mainnet         | Public internet-facing node       |
+| Mode | Flag | Bitcoin | Faucet | DHT | Use case |
+|---|---|---|---|---|---|
+| **Production** | *(default)* | Mainnet | off | `vess-v1` | Real value |
+| **Testnet** | `--testnet` | Signet | on | `vess-testnet-v1` | Testing, dev |
 
-Quick-start for public testnet:
+Quick-start:
+
 ```bash
-vess node --testnet
+vess node              # production (mainnet, real value)
+vess node --testnet    # testnet (signet, faucet, seed peers)
 ```
 
-Production profile enforces:
+Production mode enforces:
 - `allow_private_bitcoin_seed_contact = false`
 - `reset_transient_peer_state = false`
 - Config audit warnings printed at startup
+- No faucet, no unsafe operations
 
-### Profile-specific defaults
-
-| Flag/Default        | dev        | testnet    | staging/prod |
-|---------------------|-----------|------------|--------------|
-| Faucet enabled      | yes       | yes        | no           |
-| Bitcoin network     | regtest   | signet     | mainnet      |
-| DHT namespace       | vess-v1   | vess-testnet-v1 | vess-v1  |
-| Seed peers          | none      | built-in   | none         |
-| Unsafe operations   | allowed   | forbidden  | forbidden    |
-| Mesh bind address   | 0.0.0.0:0 | 0.0.0.0:0  | 0.0.0.0:0    |
+Testnet mode provides:
+- Faucet for free test Vess bills
+- Bitcoin signet for Vess seed peer discovery
+- Isolated DHT namespace
+- Unsafe operations allowed
 
 ## Staged Canary Rollout
 
@@ -46,8 +40,8 @@ When deploying a new version to production, follow this staged sequence:
 # Build the binary
 cargo build --release -p vess-cli
 
-# Run a local development node
-vess node --profile dev --rpc-port 9400
+# Run a local testnet node
+vess node --testnet --rpc-port 9400
 ```
 
 Verify: the node starts, peers discover each other, payments flow.
@@ -56,7 +50,7 @@ Verify: the node starts, peers discover each other, payments flow.
 
 ```bash
 # Start a staging node with known bootstrap peers
-vess node --profile staging \
+vess node --testnet \
   --bootstrap "<peer1-contact>,<peer2-contact>" \
   --bind "0.0.0.0:19000" \
   --rpc-port 9400
