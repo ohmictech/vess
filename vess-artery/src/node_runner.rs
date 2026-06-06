@@ -2770,6 +2770,46 @@ fn spawn_bitcoin_peer_notifications(
 }
 
 /// Configuration for running an artery node.
+/// Deployment profile that controls safety defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum DeploymentProfile {
+    /// Developer mode — unsafe operations allowed, test faucet enabled.
+    Development,
+    /// Test mode — unsafe operations allowed, but test faucet disabled by default.
+    Test,
+    /// Staging — close to production, but diagnostics enabled.
+    Staging,
+    /// Production — all safety checks enforced.
+    Production,
+}
+
+impl DeploymentProfile {
+    /// True when unsafe operations (e.g. test faucet) are permitted.
+    pub fn allow_unsafe(&self) -> bool {
+        matches!(self, Self::Development | Self::Test)
+    }
+
+    /// Human-readable label.
+    pub fn as_label(&self) -> &'static str {
+        match self {
+            Self::Development => "dev",
+            Self::Test => "test",
+            Self::Staging => "staging",
+            Self::Production => "prod",
+        }
+    }
+
+    /// Short description.
+    pub fn describe(&self) -> &'static str {
+        match self {
+            Self::Development => "development (unsafe ops enabled, faucet on)",
+            Self::Test => "test (unsafe ops enabled, faucet off by default)",
+            Self::Staging => "staging (close to production with diagnostics)",
+            Self::Production => "production (all safety enforced)",
+        }
+    }
+}
+
 pub struct NodeConfig {
     /// Number of gossip neighbors (K).
     pub k_neighbors: usize,
@@ -2806,7 +2846,10 @@ pub struct NodeConfig {
     /// When true, discard persisted peer cache / reputation / ban state on startup.
     /// Useful for ephemeral interactive CLI nodes that reuse slot directories.
     pub reset_transient_peer_state: bool,
+    /// Deployment profile controlling safety defaults.
+    pub profile: DeploymentProfile,
     /// When true, enable unsafe mode + local test faucet (equivalent to --profile dev).
+    /// Deprecated in favor of `profile` but kept for backward compatibility.
     pub test: bool,
 }
 
@@ -2825,6 +2868,7 @@ impl Default for NodeConfig {
             enable_local_discovery: true,
             allow_private_bitcoin_seed_contact: false,
             reset_transient_peer_state: false,
+            profile: DeploymentProfile::Production,
             test: false,
         }
     }
@@ -2993,6 +3037,8 @@ pub(crate) struct ArteryState {
     pub(crate) unsafe_mode: bool,
     /// Runtime flag for the local test faucet.
     pub(crate) test_faucet_enabled: bool,
+    /// Deployment profile for safety audits.
+    pub(crate) profile: DeploymentProfile,
 }
 
 impl ArteryState {
@@ -3018,6 +3064,46 @@ impl ArteryState {
             }
         }
         out
+    }
+
+    /// Audit the current state for unsafe configurations.
+    /// Returns a list of warnings. In production, any warning indicates
+    /// a misconfiguration.
+    pub(crate) fn audit(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+
+        if self.profile == DeploymentProfile::Production {
+            if self.unsafe_mode {
+                warnings.push("unsafe_mode is enabled in production profile".into());
+            }
+            if self.test_faucet_enabled {
+                warnings.push("test_faucet is enabled in production profile".into());
+            }
+        }
+
+        if self.profile == DeploymentProfile::Production
+            || self.profile == DeploymentProfile::Staging
+        {
+            // Verify we have >= K neighbors after bootstrap
+            let peer_count = self.routing_table.peer_count();
+            let k = self.gossip_config.k_neighbors;
+            if peer_count < k && k > 0 {
+                warnings.push(format!(
+                    "only {peer_count} verified peers (target K={k})"
+                ));
+            }
+        }
+
+        // Always warn about zero K
+        if self.gossip_config.k_neighbors == 0 {
+            warnings.push("k_neighbors is 0: gossip is disabled".into());
+        }
+
+        if self.gossip_config.max_hops == 0 {
+            warnings.push("max_hops is 0: payments cannot be relayed".into());
+        }
+
+        warnings
     }
 
     pub(crate) fn record_outbound_payment(
@@ -3699,8 +3785,9 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
         mailbox_fwd: HashMap::new(),
         // MailboxForwardRegister: 5 registrations per 60-second window per peer.
         mailbox_fwd_limiter: crate::gossip::PeerRateLimiter::new(5, 60),
-        unsafe_mode: config.test,
-        test_faucet_enabled: config.test,
+        unsafe_mode: config.test || config.profile.allow_unsafe(),
+        test_faucet_enabled: config.test || matches!(config.profile, DeploymentProfile::Development),
+        profile: config.profile,
         events: VecDeque::new(),
         limbo_payment_times: HashMap::new(),
     }));

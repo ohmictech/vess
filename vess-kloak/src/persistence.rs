@@ -73,6 +73,11 @@ impl EncryptedBlob {
 pub struct WalletFile {
     /// Format version for forward compatibility.
     pub version: u32,
+    /// Blake3 hash of all other fields for integrity verification.
+    /// Computed by `compute_integrity_hash()` and validated by `verify_integrity()`.
+    /// `None` for older wallets that predate this field.
+    #[serde(default)]
+    pub integrity_hash: Option<String>,
     /// Optional user-facing local wallet VessTag name. Older single-wallet
     /// files do not contain this field and are shown as `default` by wallet
     /// discovery.
@@ -243,6 +248,7 @@ impl WalletFile {
             encrypted_spend_credentials: None,
             encrypted_bitcoin_wallet_state: None,
             password_cache: None,
+            integrity_hash: None,
         };
         wallet.refresh_encrypted_private_metadata(enc_key)?;
         Ok(wallet)
@@ -469,12 +475,14 @@ impl WalletFile {
         }
 
         let mut serializable = self.clone();
+        serializable.migrate();
         serializable.version = Self::CURRENT_VERSION;
         serializable.refresh_encrypted_private_metadata(enc_key)?;
         serializable.encrypt_spend_credentials(&self.billfold, enc_key)?;
         serializable.billfold = BillFold::new();
         serializable.next_dht_index = 0;
         serializable.tag_registration = None;
+        serializable.compute_integrity_hash();
 
         let json = serde_json::to_string_pretty(&serializable).context("serialize wallet")?;
 
@@ -488,7 +496,7 @@ impl WalletFile {
         let data =
             std::fs::read(path).with_context(|| format!("read wallet file: {}", path.display()))?;
 
-        let wallet: WalletFile = serde_json::from_slice(&data).context("deserialize wallet")?;
+        let mut wallet: WalletFile = serde_json::from_slice(&data).context("deserialize wallet")?;
 
         if wallet.version > Self::CURRENT_VERSION {
             anyhow::bail!(
@@ -498,12 +506,100 @@ impl WalletFile {
             );
         }
 
+        wallet.migrate();
+        // Integrity check: warn but don't refuse to load — we may have
+        // corrupted data that repair_from_bytes could fix.
+        if let Err(e) = wallet.verify_integrity() {
+            tracing::warn!("wallet integrity check failed: {e}");
+        }
+
         Ok(wallet)
     }
 
     /// Create a backup copy of the wallet at the given path.
     pub fn backup(&self, backup_path: &Path, enc_key: &[u8; 32]) -> Result<()> {
         self.save(backup_path, enc_key)
+    }
+
+    /// Verify that a backup file is a valid, decryptable wallet.
+    pub fn verify_backup(backup_path: &Path, enc_key: &[u8; 32]) -> Result<()> {
+        let mut wallet = Self::load(backup_path)?;
+        wallet.decrypt_private_metadata(enc_key)?;
+        Ok(())
+    }
+
+    /// Compute and return the integrity hash of the wallet bytes.
+    /// The hash covers all JSON fields EXCEPT `integrity_hash` itself.
+    pub fn compute_integrity_hash(&mut self) -> String {
+        let saved = self.integrity_hash.take();
+        self.integrity_hash = None;
+        let json = serde_json::to_string(&self).unwrap_or_default();
+        let hash = hex_prefix(blake3::hash(json.as_bytes()).as_bytes());
+        self.integrity_hash = Some(hash.clone());
+        if let Some(old) = saved { self.integrity_hash = Some(old); }
+        else { self.integrity_hash = Some(hash.clone()); }
+        hash
+    }
+
+    /// Verify the wallet's integrity hash matches the current content.
+    pub fn verify_integrity(&self) -> Result<()> {
+        let Some(ref expected) = self.integrity_hash else { return Ok(()); };
+        let mut this = self.clone();
+        this.integrity_hash = None;
+        let json = serde_json::to_string(&this).context("serialize for integrity check")?;
+        let actual = hex_prefix(blake3::hash(json.as_bytes()).as_bytes());
+        if actual != *expected {
+            anyhow::bail!("wallet integrity hash mismatch: expected {expected}, got {actual}");
+        }
+        Ok(())
+    }
+
+    /// Migrate wallet from older formats to the current version.
+    pub fn migrate(&mut self) {
+        if self.version >= Self::CURRENT_VERSION { return; }
+        // v1 → v2: encrypted private metadata for bill inventory
+        // Handled during save when refresh_encrypted_private_metadata runs.
+        // v1 had plaintext spend_seed; v2 encrypts it.
+        if self.encrypted_spend_seed.is_none() && self.spend_seed != [0u8; 32] {
+            // Can't encrypt without enc_key — skip, will be done on save.
+        }
+        self.version = Self::CURRENT_VERSION;
+    }
+
+    /// Attempt to recover a wallet from corrupted or truncated bytes.
+    pub fn repair_from_bytes(data: &[u8]) -> Result<Self> {
+        // Try direct deserialization first.
+        if let Ok(wallet) = serde_json::from_slice::<Self>(data) {
+            return Ok(wallet);
+        }
+        // Try up to 5 times, each time removing trailing bytes
+        for truncate in (0..5).rev() {
+            let len = data.len().saturating_sub(truncate);
+            if let Ok(wallet) = serde_json::from_slice::<Self>(&data[..len]) {
+                return Ok(wallet);
+            }
+        }
+        anyhow::bail!("could not repair wallet file")
+    }
+
+    /// Load wallet with automatic repair on corruption.
+    pub fn load_with_recovery(path: &Path) -> Result<Self> {
+        let data = std::fs::read(path)
+            .with_context(|| format!("read wallet: {}", path.display()))?;
+        match serde_json::from_slice::<Self>(&data) {
+            Ok(w) => Ok(w),
+            Err(e) => {
+                // Try repair
+                match Self::repair_from_bytes(&data) {
+                    Ok(w) => {
+                        // Save repaired version
+                        let _ = std::fs::write(path, serde_json::to_vec_pretty(&w).unwrap_or_default());
+                        Ok(w)
+                    }
+                    Err(_) => Err(e).context("deserialize wallet (repair failed)"),
+                }
+            }
+        }
     }
 }
 
@@ -705,6 +801,15 @@ fn dirs_next() -> Option<std::path::PathBuf> {
     {
         std::env::var_os("HOME").map(std::path::PathBuf::from)
     }
+}
+
+fn hex_prefix(bytes: &[u8]) -> String {
+    use core::fmt::Write;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        write!(&mut s, "{b:02x}").unwrap();
+    }
+    s
 }
 
 fn write_wallet_file_atomically(path: &Path, contents: &[u8]) -> Result<()> {

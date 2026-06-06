@@ -38,6 +38,7 @@ use crate::mesh_contact::{
     decode_contact_bytes, encode_contact_string, parse_contact_string, parse_node_id_hex,
 };
 use crate::node_runner::ArteryState;
+use crate::node_runner::DeploymentProfile;
 use crate::node_runner::WalletState;
 use crate::persistence::hex_key;
 use crate::tag_resolver::{TagResolution, TagResolver};
@@ -346,6 +347,10 @@ pub enum RpcRequest {
     },
     /// Enable test mode on a running node (unsafe_mode + faucet).
     SetTestMode,
+    /// Set the deployment profile at runtime.
+    SetProfile {
+        profile: String,
+    },
     ManifestStore {
         dht_key_hex: String,
         encrypted_manifest_hex: String,
@@ -409,6 +414,10 @@ pub enum RpcData {
         bitcoin_tracked_balance: Option<u64>,
         bitcoin_pending_burns: usize,
         bitcoin_connected_peers: usize,
+        profile: String,
+        profile_description: String,
+        unsafe_mode: bool,
+        test_faucet_enabled: bool,
     },
     TagLookup {
         found: bool,
@@ -465,6 +474,13 @@ pub enum RpcData {
     TestModeEnabled {
         test_faucet_enabled: bool,
         unsafe_mode: bool,
+    },
+    ProfileInfo {
+        profile: String,
+        description: String,
+        unsafe_mode: bool,
+        test_faucet_enabled: bool,
+        audit_warnings: Vec<String>,
     },
     ProgramDeploy {
         prog_id: String,
@@ -659,6 +675,7 @@ async fn handle_request(
             handle_local_test_faucet(state, amount, &senders.og_tx)
         }
         RpcRequest::SetTestMode => handle_set_test_mode(state),
+        RpcRequest::SetProfile { profile } => handle_set_profile(state, &profile),
         RpcRequest::ManifestStore {
             dht_key_hex,
             encrypted_manifest_hex,
@@ -743,6 +760,10 @@ fn handle_node_info(state: &Arc<Mutex<ArteryState>>, node: &MeshPulseNode) -> Rp
             .as_ref()
             .map(|client| client.connected_peers())
             .unwrap_or(0),
+        profile: s.profile.as_label().to_string(),
+        profile_description: s.profile.describe().to_string(),
+        unsafe_mode: s.unsafe_mode,
+        test_faucet_enabled: s.test_faucet_enabled,
     })
 }
 
@@ -1296,6 +1317,21 @@ fn fire_opportunistic_consolidations(
     }
 }
 
+/// Attempt to deliver a payment directly to the recipient if they are a
+/// known verified peer whose mesh contact is in the routing table.
+/// Returns true if the delivery was acknowledged.
+///
+/// TODO: Make async and implement when routing table stores full MeshCarrierContact per peer.
+#[allow(unused_variables)]
+fn try_direct_delivery(
+    state: &Arc<Mutex<ArteryState>>,
+    node: &MeshPulseNode,
+    payment: &vess_protocol::Payment,
+) -> bool {
+    // Placeholder: always fall back to gossip relay for now.
+    false
+}
+
 async fn handle_send(
     state: &Arc<Mutex<ArteryState>>,
     node: &MeshPulseNode,
@@ -1574,10 +1610,19 @@ async fn handle_send(
         (msg, pid, mint_ids)
     };
 
-    // ── Queue payment for relay ─────────────────────────────────────
-    if let PulseMessage::Payment(ref payment) = msg {
-        let _ = senders.pay_tx.send(payment.clone());
-    }
+    // ── Relay: try direct delivery first, fall back to gossip ───────
+    let delivery_method = if let PulseMessage::Payment(ref payment) = msg {
+        let direct_ok = try_direct_delivery(state, node, payment);
+        if !direct_ok {
+            // Fall back to gossip relay
+            let _ = senders.pay_tx.send(payment.clone());
+            "gossip"
+        } else {
+            "direct"
+        }
+    } else {
+        "none"
+    };
 
     s.record_outbound_payment(payment_id, amount, recipient_tag.to_string(), &sent_mints);
     s.push_notification(crate::node_runner::WalletNotification {
@@ -1590,7 +1635,9 @@ async fn handle_send(
         amount: Some(amount),
         bill_count: Some(sent_mints.len()),
         counterparty: Some(recipient_tag.to_string()),
-        message: format!("Payment to {recipient_tag} queued for delivery."),
+        message: format!(
+            "Payment to {recipient_tag} queued for delivery ({delivery_method})."
+        ),
     });
 
     // Persist wallet immediately so bill withdrawals/reservations survive a crash.
@@ -2468,6 +2515,35 @@ fn handle_set_test_mode(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
     RpcResponse::ok(RpcData::TestModeEnabled {
         test_faucet_enabled: true,
         unsafe_mode: true,
+    })
+}
+
+fn handle_set_profile(state: &Arc<Mutex<ArteryState>>, label: &str) -> RpcResponse {
+    let profile = match label {
+        "dev" => DeploymentProfile::Development,
+        "test" => DeploymentProfile::Test,
+        "staging" => DeploymentProfile::Staging,
+        "prod" => DeploymentProfile::Production,
+        other => {
+            return RpcResponse::err(&format!(
+                "unknown profile '{other}'; expected: dev, test, staging, prod"
+            ));
+        }
+    };
+
+    let mut s = state.lock().unwrap();
+    s.profile = profile;
+    s.unsafe_mode = profile.allow_unsafe();
+    // Only auto-enable faucet for Development; Test keeps it off by default.
+    s.test_faucet_enabled = matches!(profile, DeploymentProfile::Development);
+
+    let warnings = s.audit();
+    RpcResponse::ok(RpcData::ProfileInfo {
+        profile: profile.as_label().to_string(),
+        description: profile.describe().to_string(),
+        unsafe_mode: s.unsafe_mode,
+        test_faucet_enabled: s.test_faucet_enabled,
+        audit_warnings: warnings,
     })
 }
 

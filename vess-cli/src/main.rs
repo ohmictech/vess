@@ -216,6 +216,9 @@ enum Command {
         /// Enables the local test faucet for minting test Vess bills.
         #[arg(long)]
         test: bool,
+        /// Deployment profile: dev, test, staging, or prod (default).
+        #[arg(long, default_value = "prod")]
+        profile: String,
     },
 
     /// Set a password for fast daily wallet unlock.
@@ -475,6 +478,7 @@ async fn dispatch_command(cli: &Cli) -> Result<()> {
             rpc_port,
             reset_transient_peer_state,
             test,
+            profile,
         }) => {
             let state_dir = match state_dir {
                 Some(d) => d.clone(),
@@ -483,6 +487,25 @@ async fn dispatch_command(cli: &Cli) -> Result<()> {
             if *test {
                 std::env::set_var("VESS_LOCAL_TEST_FAUCET", "1");
             }
+            let test = *test;
+            let profile_label = profile.to_lowercase();
+            let profile = match profile_label.as_str() {
+                "dev" => vess_artery::node_runner::DeploymentProfile::Development,
+                "test" => vess_artery::node_runner::DeploymentProfile::Test,
+                "staging" => vess_artery::node_runner::DeploymentProfile::Staging,
+                "prod" | "production" => vess_artery::node_runner::DeploymentProfile::Production,
+                other => {
+                    eprintln!("⚠ unknown profile '{other}', using 'prod'");
+                    eprintln!("  expected: dev, test, staging, prod");
+                    vess_artery::node_runner::DeploymentProfile::Production
+                }
+            };
+            // --test overrides profile to dev behavior
+            let effective_profile = if test {
+                vess_artery::node_runner::DeploymentProfile::Development
+            } else {
+                profile
+            };
             let config = vess_artery::node_runner::NodeConfig {
                 k_neighbors: *k_neighbors,
                 max_hops: *max_hops,
@@ -496,7 +519,8 @@ async fn dispatch_command(cli: &Cli) -> Result<()> {
                 enable_local_discovery: true,
                 allow_private_bitcoin_seed_contact: false,
                 reset_transient_peer_state: *reset_transient_peer_state,
-                test: *test,
+                profile: effective_profile,
+                test,
             };
             vess_artery::node_runner::run_node(config).await?;
             Ok(())
@@ -3468,6 +3492,7 @@ async fn cmd_interactive(cli: &Cli) -> Result<()> {
                 }
             }
             "test-mode" | "testmode" => cmd_test_mode(cli).await,
+            "profile" | "set-profile" => cmd_profile(cli, args.first().copied()).await,
             "events" => cmd_events(cli, 32, false).await,
             "health" => cmd_health(cli, false).await,
             "explain" | "help-topic" => {
@@ -3530,6 +3555,50 @@ async fn cmd_test_mode(cli: &Cli) -> Result<()> {
         }
     } else {
         anyhow::bail!("{}", resp["error"].as_str().unwrap_or("unknown error"));
+    }
+    Ok(())
+}
+
+async fn cmd_profile(cli: &Cli, profile: Option<&str>) -> Result<()> {
+    let port = rpc_port(cli);
+    if let Some(label) = profile {
+        let resp = rpc_call(port, &json!({"method": "set_profile", "profile": label})).await?;
+        if resp["ok"] == true {
+            if cli.json {
+                println!("{resp}");
+            } else {
+                println!("Profile set: {}", resp["profile"]);
+                println!("  {}", resp["description"]);
+                println!("  unsafe_mode:         {}", resp["unsafe_mode"]);
+                println!("  test_faucet_enabled: {}", resp["test_faucet_enabled"]);
+                if let Some(warnings) = resp["audit_warnings"].as_array() {
+                    if !warnings.is_empty() {
+                        println!("Audit warnings:");
+                        for w in warnings {
+                            println!("  ⚠ {}", w.as_str().unwrap_or("?"));
+                        }
+                    }
+                }
+            }
+        } else {
+            anyhow::bail!("{}", resp["error"].as_str().unwrap_or("unknown error"));
+        }
+    } else {
+        // Query current profile
+        let resp = rpc_call(port, &json!({"method": "node_info"})).await?;
+        if resp["ok"] == true {
+            if cli.json {
+                println!("{resp}");
+            } else {
+                let p = resp["profile"].as_str().unwrap_or("unknown");
+                let desc = resp["profile_description"].as_str().unwrap_or("");
+                println!("Current profile: {p} — {desc}");
+                println!("  unsafe_mode:         {}", resp["unsafe_mode"]);
+                println!("  test_faucet_enabled: {}", resp["test_faucet_enabled"]);
+            }
+        } else {
+            anyhow::bail!("{}", resp["error"].as_str().unwrap_or("unknown error"));
+        }
     }
     Ok(())
 }
@@ -3732,6 +3801,7 @@ fn print_interactive_help() {
     println!("  balance                Show wallet balance");
     println!("  receive                Show BTC receive address + QR code");
     println!("  test-mode              Enable test mode + faucet on this node");
+    println!("  profile [dev|test|staging|prod]  Set or view deployment profile");
     println!("  faucet <amount>        Add local-test bills (test-mode must be on)");
     println!("  send <amount> <+tag>   Send Vess to a recipient");
     println!("  events                 Show recent node events");

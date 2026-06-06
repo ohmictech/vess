@@ -10,7 +10,7 @@ use vess_foundry::{Denomination, VessBill};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// ML-DSA-65 spend credentials for a bill, indexed by mint_id.
-#[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
+#[derive(Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct SpendCredential {
     pub spend_vk: Vec<u8>,
     pub spend_sk: Vec<u8>,
