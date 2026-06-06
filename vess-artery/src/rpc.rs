@@ -272,6 +272,9 @@ pub enum RpcRequest {
     Notifications {
         #[serde(default)]
         max: Option<usize>,
+        /// Optional: only return notifications matching this payment_id.
+        #[serde(default)]
+        payment_id: Option<String>,
     },
     Events {
         #[serde(default)]
@@ -572,7 +575,9 @@ async fn handle_request(
     match req {
         RpcRequest::Balance => handle_balance(state),
         RpcRequest::NodeInfo => handle_node_info(state, node),
-        RpcRequest::Notifications { max } => handle_notifications(state, max.unwrap_or(64)),
+        RpcRequest::Notifications { max, payment_id } => {
+            handle_notifications(state, max.unwrap_or(64), payment_id.as_deref())
+        }
         RpcRequest::Events { max } => handle_events(state, max.unwrap_or(64)),
         RpcRequest::NodeHealth => handle_node_health(state),
         RpcRequest::TagLookup { tag } => handle_tag_lookup(state, node, &tag).await,
@@ -755,11 +760,29 @@ fn handle_node_info(state: &Arc<Mutex<ArteryState>>, node: &MeshPulseNode) -> Rp
     })
 }
 
-fn handle_notifications(state: &Arc<Mutex<ArteryState>>, max: usize) -> RpcResponse {
+fn handle_notifications(
+    state: &Arc<Mutex<ArteryState>>,
+    max: usize,
+    payment_id: Option<&str>,
+) -> RpcResponse {
     let mut s = state.lock().unwrap();
-    RpcResponse::ok(RpcData::Notifications {
-        notifications: s.take_notifications(max),
-    })
+    let all = s.take_notifications(max);
+    if let Some(pid) = payment_id {
+        // Filter: only return matching notifications. Re-queue the rest.
+        let (matching, rest): (Vec<_>, Vec<_>) = all
+            .into_iter()
+            .partition(|n| n.payment_id == pid);
+        for n in rest {
+            s.push_notification_raw(n);
+        }
+        RpcResponse::ok(RpcData::Notifications {
+            notifications: matching,
+        })
+    } else {
+        RpcResponse::ok(RpcData::Notifications {
+            notifications: all,
+        })
+    }
 }
 
 fn handle_events(state: &Arc<Mutex<ArteryState>>, max: usize) -> RpcResponse {
@@ -1687,7 +1710,7 @@ async fn handle_send(
         bill_count: Some(sent_mints.len()),
         counterparty: Some(recipient_tag.to_string()),
         message: format!(
-            "Payment to {recipient_tag} queued for delivery ({delivery_method})."
+            "Payment sent to {recipient_tag} via ({delivery_method})."
         ),
     });
 

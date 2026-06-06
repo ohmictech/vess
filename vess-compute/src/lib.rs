@@ -160,8 +160,12 @@ impl ProgramName {
     pub fn new(raw: &str) -> Result<Self> {
         let raw = raw.trim();
         let canonical = raw.strip_prefix('+').unwrap_or(raw);
-        let Some(name_part) = canonical.strip_prefix(PROGRAM_NAME_PREFIX) else {
-            return Err(anyhow!("program name must start with +vl_ or vl_"));
+        // Auto-prefix vl_ if the user didn't include it.
+        let name_part = if let Some(rest) = canonical.strip_prefix(PROGRAM_NAME_PREFIX) {
+            rest.to_string()
+        } else {
+            // User typed just the name like "market1" — auto-prefix vl_.
+            canonical.to_string()
         };
         if name_part.len() < PROGRAM_NAME_PART_MIN_LEN {
             return Err(anyhow!("program name too short"));

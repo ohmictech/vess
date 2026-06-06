@@ -3098,6 +3098,11 @@ impl ArteryState {
             "{}",
             notification.message
         );
+        self.push_notification_raw(notification);
+    }
+
+    /// Re-queue a previously-drained notification without logging.
+    pub(crate) fn push_notification_raw(&mut self, notification: WalletNotification) {
         if self.notifications.len() >= MAX_WALLET_NOTIFICATIONS {
             self.notifications.pop_front();
         }
@@ -6337,7 +6342,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                                 amount: Some(total),
                                 bill_count: Some(pending_oc.len()),
                                 counterparty: None,
-                                message: format!("Received {total} Vess and claimed ownership."),
+                                message: format!("Received {total} Vess"),
                             });
                             for oc in pending_oc {
                                 queue_local_ownership_claim(&mut state, &h_oc_tx, oc);

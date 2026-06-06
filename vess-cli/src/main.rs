@@ -1560,6 +1560,7 @@ async fn auto_watch_send_confirmation(cli: &Cli, payment_id: &str, timeout_ms: u
             &json!({
                 "method": "notifications",
                 "max": 64,
+                "payment_id": payment_id,
             }),
         )
         .await?;
