@@ -5522,14 +5522,6 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     s.peer_registry.issue_challenge(peer_hash)
                 };
 
-                // Sentinel: peer was already Verified (or Banished) by the time
-                // we acquired the lock — another path (e.g. HandshakeResponse
-                // handler) beat us to it.  Skip the challenge to avoid sending
-                // a zero nonce that would trigger a spurious banish.
-                if nonce == [0u8; 32] {
-                    continue;
-                }
-
                 {
                     let mut s = hs_state.lock().unwrap();
                     push_peer_notification(

@@ -129,10 +129,12 @@ impl PeerRegistry {
     ///
     /// Returns the nonce to embed in a [`HandshakeChallenge`] message.
     pub fn issue_challenge(&mut self, peer_id: [u8; 32]) -> [u8; 32] {
-        // Never overwrite Verified or Banished entries — return a zero nonce
-        // sentinel so callers can skip challenge for already-established peers.
+        // Never overwrite Banished entries — return a zero nonce sentinel.
+        // Verified peers ARE allowed to be re-challenged (for periodic
+        // reverification).  The caller should check for the sentinel and
+        // skip Banished peers.
         if let Some(existing) = self.peers.get(&peer_id) {
-            if existing.state == PeerState::Verified || existing.state == PeerState::Banished {
+            if existing.state == PeerState::Banished {
                 return [0u8; 32];
             }
         }
@@ -158,8 +160,9 @@ impl PeerRegistry {
 
     /// Verify the HMAC in a [`HandshakeResponse`] against the stored nonce.
     ///
-    /// Returns `true` if the peer proved a valid version hash (→ Verified).
-    /// Returns `false` if the HMAC is invalid or no challenge was issued.
+    /// Returns `true` if the peer is (or already was) Verified.
+    /// Returns `false` only if the HMAC is invalid AND the peer was not
+    /// already Verified — callers should only banish on `false`.
     pub fn verify_response(
         &mut self,
         peer_id: &[u8; 32],
@@ -168,6 +171,8 @@ impl PeerRegistry {
     ) -> bool {
         let entry = match self.peers.get(peer_id) {
             Some(e) if e.state == PeerState::Challenged => e,
+            // Already Verified — treat as success (no state change needed).
+            Some(e) if e.state == PeerState::Verified => return true,
             _ => return false,
         };
         let nonce = match &entry.challenge_nonce {
