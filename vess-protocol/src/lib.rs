@@ -252,6 +252,11 @@ pub enum PulseMessage {
     /// Response to a direct peer-to-peer payment.
     DirectPaymentResponse(DirectPaymentResponse),
 
+    /// Cryptographic receipt proving the recipient decrypted and claimed
+    /// a payment.  Signed with the recipient's spend_sk so the sender can
+    /// verify locally without waiting for DHT gossip.
+    PaymentReceipt(PaymentReceipt),
+
     /// Kademlia FIND_NODE: ask a peer for the K closest nodes to a target.
     /// Used for iterative routing table population — never for locating
     /// wallet users or payment recipients.
@@ -1257,6 +1262,35 @@ pub struct DirectPaymentReceipt {
     pub recipient_owner_vk: Vec<u8>,
     /// ML-DSA-65 signature over the receipt digest.
     pub signature: Vec<u8>,
+}
+
+/// Recipient-signed cryptographic proof of payment receipt.
+///
+/// The recipient signs this after decrypting and claiming the payment.
+/// The sender verifies locally — no DHT gossip needed for confirmation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaymentReceipt {
+    /// Echoed payment ID from the original Payment message.
+    pub payment_id: [u8; 32],
+    /// Mint IDs claimed by the recipient.
+    pub claimed_mint_ids: Vec<[u8; 32]>,
+    /// Total value received.
+    pub total_amount: u64,
+    /// Unix timestamp.
+    pub timestamp: u64,
+    /// ML-DSA-65 signature over the receipt digest:
+    /// `Blake3("vess-receipt-v0" || payment_id || claimed_mint_ids || total_amount || timestamp)`
+    pub signature: Vec<u8>,
+}
+
+/// Blinding factor for privacy-preserving DHT queries.
+/// Derived from a shared secret between querier and DHT node.
+pub fn blinded_dht_key(base_key: &[u8; 32], blinding: &[u8; 32]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"vess-dht-query-v1");
+    h.update(base_key);
+    h.update(blinding);
+    *h.finalize().as_bytes()
 }
 
 impl PulseMessage {

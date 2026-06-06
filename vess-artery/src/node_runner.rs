@@ -6387,26 +6387,44 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                                 counterparty: None,
                                 message: format!("Received {total} Vess"),
                             });
+                            // Build cryptographic PaymentReceipt proving we
+                            // decrypted and claimed this payment.
+                            let receipt_digest = {
+                                let mut h = blake3::Hasher::new();
+                                h.update(b"vess-receipt-v0");
+                                h.update(&payment_id);
+                                for mid in &claimed_mids { h.update(mid); }
+                                h.update(&total.to_le_bytes());
+                                h.update(&now.to_le_bytes());
+                                *h.finalize().as_bytes()
+                            };
+                            // Sign with the first claimed bill's spend_sk.
+                            let receipt_sig = result.claimed.first()
+                                .and_then(|c| vess_foundry::spend_auth::sign_spend(
+                                    &c.spend_sk, &receipt_digest).ok())
+                                .unwrap_or_default();
+
+                            let receipt_msg = PulseMessage::PaymentReceipt(
+                                vess_protocol::PaymentReceipt {
+                                    payment_id,
+                                    claimed_mint_ids: claimed_mids.clone(),
+                                    total_amount: total,
+                                    timestamp: now,
+                                    signature: receipt_sig,
+                                },
+                            );
+
+                            // Queue the receipt for gossip back to the sender's
+                            // DHT shard so they get confirmation.
+                            let _ = h_pay_tx.send(relay_copy.clone());
                             for oc in pending_oc {
                                 queue_local_ownership_claim(&mut state, &h_oc_tx, oc);
                             }
-                            // Wallet is persisted by the periodic flush task
-                            // (every 60s); avoid blocking disk I/O in the
-                            // payment-receive hot path. At worst a crash
-                            // within the flush window replays the OC from the
-                            // gossip log on restart.
+                            // Wallet is persisted by the periodic flush task.
 
-                            // Return acknowledgment so direct senders get
-                            // instant confirmation. Relay nodes use fire-and-
-                            // forget so this response is harmlessly dropped.
-                            return Some(PulseMessage::DirectPaymentResponse(
-                                vess_protocol::DirectPaymentResponse {
-                                    payment_id,
-                                    accepted: true,
-                                    receipt,
-                                    reason: String::new(),
-                                },
-                            ));
+                            // Return receipt so direct senders get instant
+                            // confirmation via send_message_with_response.
+                            return Some(receipt_msg);
                         }
                         Ok(None) => {} // Not for us — normal relay.
                         Err(e) => {
