@@ -1,0 +1,33 @@
+# Time-Locked Vault
+#
+# A personal vault program. Anyone can deposit, but only the owner
+# can withdraw — and only after the unlock timestamp.
+#
+# Usage:
+#   vess deploy ./vault.vess --name +vl_vault1
+#   vess send 50 +vl_vault1     # Deposit to vault
+#   # Wait for unlock_at, then claim
+
+[constants]
+# Unix timestamp after which withdrawals are allowed
+u64 unlock_at = 1750000000
+# Minimum deposit to prevent dust
+u64 min_deposit = 10
+# Emergency pause
+bool paused = false
+
+[deposit]
+require !paused
+require amount >= min_deposit
+# Record the lock timestamp in the bill's state
+bind locked_until = unlock_at
+approve
+
+[withdraw]
+require !paused
+# Enforce the timelock
+require after(unlock_at)
+# Cannot withdraw more than the program holds
+require requested <= program_balance
+bind withdrawn = requested
+approve

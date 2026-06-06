@@ -1,3 +1,12 @@
+# Annotated Covenant Example
+#
+# Demonstrates: deposit/withdraw guards, linked programs, caps,
+# timelocks, and state commitments.
+#
+# Usage:
+#   vess deploy ./progname.vess --name +vl_example1
+#   vess send 50 +vl_example1
+
 [constants]
 u64 min_deposit = 5
 u64 max_withdraw = 250

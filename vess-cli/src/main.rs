@@ -216,7 +216,14 @@ enum Command {
         /// Enables the local test faucet for minting test Vess bills.
         #[arg(long)]
         test: bool,
-        /// Deployment profile: dev, test, staging, or prod (default).
+        /// Join the public testnet (Bitcoin signet, production safety, zero-config).
+        /// Equivalent to --profile testnet with default seed peers.
+        #[arg(long)]
+        testnet: bool,
+        /// Bind mesh UDP socket to a specific address (default: 0.0.0.0:0).
+        #[arg(long)]
+        bind: Option<String>,
+        /// Deployment profile: dev, test, testnet, staging, or prod (default).
         #[arg(long, default_value = "prod")]
         profile: String,
     },
@@ -478,6 +485,8 @@ async fn dispatch_command(cli: &Cli) -> Result<()> {
             rpc_port,
             reset_transient_peer_state,
             test,
+            testnet,
+            bind,
             profile,
         }) => {
             let state_dir = match state_dir {
@@ -492,20 +501,24 @@ async fn dispatch_command(cli: &Cli) -> Result<()> {
             let profile = match profile_label.as_str() {
                 "dev" => vess_artery::node_runner::DeploymentProfile::Development,
                 "test" => vess_artery::node_runner::DeploymentProfile::Test,
+                "testnet" => vess_artery::node_runner::DeploymentProfile::Testnet,
                 "staging" => vess_artery::node_runner::DeploymentProfile::Staging,
                 "prod" | "production" => vess_artery::node_runner::DeploymentProfile::Production,
                 other => {
                     eprintln!("⚠ unknown profile '{other}', using 'prod'");
-                    eprintln!("  expected: dev, test, staging, prod");
+                    eprintln!("  expected: dev, test, testnet, staging, prod");
                     vess_artery::node_runner::DeploymentProfile::Production
                 }
             };
-            // --test overrides profile to dev behavior
-            let effective_profile = if test {
+            // --testnet overrides profile to testnet, --test to dev
+            let effective_profile = if *testnet {
+                vess_artery::node_runner::DeploymentProfile::Testnet
+            } else if test {
                 vess_artery::node_runner::DeploymentProfile::Development
             } else {
                 profile
             };
+            let bind_addr = bind.as_ref().and_then(|s| s.parse::<std::net::SocketAddr>().ok());
             let config = vess_artery::node_runner::NodeConfig {
                 k_neighbors: *k_neighbors,
                 max_hops: *max_hops,
@@ -516,7 +529,7 @@ async fn dispatch_command(cli: &Cli) -> Result<()> {
                 rpc_port: *rpc_port,
                 wallet_password: wallet_password.clone(),
                 bitcoin_config: None,
-                bind_addr: None,
+                bind_addr,
                 enable_local_discovery: true,
                 allow_private_bitcoin_seed_contact: false,
                 reset_transient_peer_state: *reset_transient_peer_state,

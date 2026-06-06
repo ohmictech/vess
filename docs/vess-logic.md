@@ -78,3 +78,40 @@ vess deploy ./my-program --name +vl_market1
 
 The client canonicalizes the name (strips `+`), keys it on the DHT via
 `Blake3("vl_market1")`, matching the same name-hash style used for VessTags.
+
+## Sending Bills to a Program
+
+Sending to a program is identical to sending to a person — the CLI
+resolves the program tag, looks up its `ProgramOwnershipCondition` from the
+DHT, and constructs an `OwnershipClaim` with `new_owner_program` set.
+
+```bash
+vess send 100 +vl_market1
+```
+
+The program's `[deposit]` section is evaluated when the claim is verified
+by receiving nodes. If the deposit predicate reaches `approve`, the bill
+transitions to program ownership.
+
+## Withdrawing Bills from a Program
+
+To unlock bills held by a program, the claimant must provide a
+`ProgramSpendWitness` that:
+
+1. References the program's `ProgramId`
+2. Contains a `ComputeReceipt` proving the `[withdraw]` section was
+   satisfied
+3. Specifies the `next_owner_commitment` (who receives the unlocked bills)
+
+This happens automatically when your wallet receives a payment addressed
+to a program tag — the `vess-compute` crate evaluates the withdraw
+predicate and generates the witness.
+
+For manual unlocking:
+
+```bash
+vess program-unlock --program +vl_market1 --recipient +alice
+```
+
+See [`examples/vesslogic/`](../examples/vesslogic/README.md) for
+detailed walkthroughs and example covenants.
