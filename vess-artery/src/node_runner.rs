@@ -4554,7 +4554,6 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
     if !all_bootstrap.is_empty() {
         let boot_node = node.clone();
         let boot_state = state.clone();
-        let boot_ban = banishment.clone();
         let boot_receipt_text_state_dir = receipt_text_state_dir.clone();
         let bootstrap_peers = all_bootstrap;
         tokio::spawn(async move {
@@ -4627,18 +4626,20 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                             if resp.pow_hash.is_empty()
                                 || !verify_handshake_pow(&peer_hash, &nonce, &resp.pow_hash)
                             {
-                                warn!(peer = %peer_str, "bootstrap peer PoW verification failed — banishing");
-                                s.peer_registry.mark_banished(peer_hash);
-                                boot_ban.banish(peer_hash);
+                                let failures = s.peer_registry.record_handshake_failure(&peer_hash);
+                                warn!(peer = %peer_str, failures, "bootstrap peer PoW verification failed");
+                                // Don't banish here — let the handshake drain retry with backoff.
                                 push_peer_notification(
                                     &mut s,
                                     "vess_peer_handshake_failed",
                                     &peer_hash,
                                     Some("bootstrap".to_string()),
-                                    format!("Bootstrap handshake failed PoW verification for peer: {}", hex_key(&peer_hash)),
+                                    format!("Bootstrap handshake failed PoW verification for peer: {} (attempt {failures})", hex_key(&peer_hash)),
                                 );
                                 continue;
                             }
+                            // Reset failure count on success.
+                            s.peer_registry.record_handshake_success(&peer_hash);
                             push_peer_notification(
                                 &mut s,
                                 "vess_peer_verified",
@@ -4649,39 +4650,41 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                             info!(peer = %peer_str, "bootstrap peer verified");
                             s.push_event(NodeEvent::PeerVerified { created_at: ArteryState::now_unix(), peer_id: hex_key(&peer_hash), direction: "bootstrap".to_string() });
                         } else {
-                            s.peer_registry.mark_banished(peer_hash);
-                            boot_ban.banish(peer_hash);
+                            let failures = s.peer_registry.record_handshake_failure(&peer_hash);
+                            warn!(peer = %peer_str, failures, "bootstrap peer HMAC verification failed");
+                            // Don't banish here — let the handshake drain retry with backoff.
                             push_peer_notification(
                                 &mut s,
                                 "vess_peer_handshake_failed",
                                 &peer_hash,
                                 Some("bootstrap".to_string()),
-                                format!("Bootstrap handshake returned an invalid response for peer: {}", hex_key(&peer_hash)),
+                                format!("Bootstrap handshake returned an invalid response for peer: {} (attempt {failures})", hex_key(&peer_hash)),
                             );
-                            info!(peer = %peer_str, "bootstrap peer banished — bad handshake");
                             continue;
                         }
                     }
                     Ok(_) => {
                         let mut s = boot_state.lock().unwrap();
+                        let failures = s.peer_registry.record_handshake_failure(&peer_hash);
                         push_peer_notification(
                             &mut s,
                             "vess_peer_handshake_failed",
                             &peer_hash,
                             Some("bootstrap".to_string()),
-                            format!("Bootstrap handshake got an unexpected response from peer: {}", hex_key(&peer_hash)),
+                            format!("Bootstrap handshake got an unexpected response from peer: {} (attempt {})", hex_key(&peer_hash), failures),
                         );
                         info!(peer = %peer_str, "bootstrap peer gave unexpected response");
                         continue;
                     }
                     Err(e) => {
                         let mut s = boot_state.lock().unwrap();
+                        let failures = s.peer_registry.record_handshake_failure(&peer_hash);
                         push_peer_notification(
                             &mut s,
                             "vess_peer_handshake_failed",
                             &peer_hash,
                             Some("bootstrap".to_string()),
-                            format!("Bootstrap handshake could not reach peer {}: {e}", hex_key(&peer_hash)),
+                            format!("Bootstrap handshake could not reach peer {}: {e} (attempt {})", hex_key(&peer_hash), failures),
                         );
                         warn!("bootstrap peer {peer_str} unreachable: {e}");
                         continue;
