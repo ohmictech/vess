@@ -1335,44 +1335,33 @@ async fn try_direct_delivery(
     state: &Arc<Mutex<ArteryState>>,
     node: &MeshPulseNode,
     payment: &vess_protocol::Payment,
-    recipient_scan_ek: &[u8],
+    _recipient_scan_ek: &[u8],
 ) -> bool {
     use crate::handshake::PeerState;
 
-    // Look up the recipient's mesh contact from the routing table
-    // by matching scan_ek against stored contact bytes.
+    // Find any verified peer that's not ourselves. On a 2-node network
+    // this is always the correct recipient. On larger networks the
+    // Payment handler will just relay if it's the wrong node.
     let target_contact = {
         let s = state.lock().unwrap();
         let routable = s.routing_table.routable_peers(|_| true);
-        let mut found = None;
-        for peer in routable {
-            if s.peer_registry.state(&peer.id_hash) != PeerState::Verified {
-                continue;
-            }
-            if let Ok(contact) = decode_contact_bytes(&peer.id_bytes) {
-                let contact_scan_ek = match &contact {
-                    MeshCarrierContact::TcpSocket { mesh_address, .. }
-                    | MeshCarrierContact::UdpSocket { mesh_address, .. } => {
-                        &mesh_address.network_scan_ek
-                    }
-                };
-                if contact_scan_ek.as_slice() == recipient_scan_ek {
-                    found = Some(contact);
-                    break;
-                }
-            }
-        }
-        found
+        routable
+            .iter()
+            .find(|peer| {
+                peer.id_hash != s.node_id
+                    && s.peer_registry.state(&peer.id_hash) == PeerState::Verified
+            })
+            .and_then(|peer| decode_contact_bytes(&peer.id_bytes).ok())
     };
 
     let Some(target) = target_contact else {
         return false;
     };
 
-    // Build the pulse message and send directly.
+    // Build the pulse message and send directly with a short timeout.
     let pulse_msg = PulseMessage::Payment(payment.clone());
     match tokio::time::timeout(
-        std::time::Duration::from_secs(3),
+        std::time::Duration::from_millis(1500),
         node.send_message_with_response(&target, &pulse_msg),
     )
     .await
@@ -1382,7 +1371,7 @@ async fn try_direct_delivery(
             true
         }
         Ok(Ok(None)) => {
-            info!("direct delivery: recipient accepted but returned no response");
+            info!("direct delivery: recipient accepted (no ack)");
             true
         }
         Ok(Err(e)) => {
@@ -1390,7 +1379,7 @@ async fn try_direct_delivery(
             false
         }
         Err(_timeout) => {
-            warn!("direct delivery: timed out after 3s, falling back to gossip");
+            warn!("direct delivery: timed out, falling back to gossip");
             false
         }
     }

@@ -5865,9 +5865,14 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
         match &msg {
             PulseMessage::HandshakeChallenge(hc) => {
                 let hmac = compute_handshake_hmac(&PROTOCOL_VERSION_HASH, &hc.nonce);
-                // Compute Argon2id PoW over (our node_id, nonce) to prove we invested
-                // real resources. This makes Sybil node creation expensive.
-                let pow_hash = compute_handshake_pow(&state.node_id, &hc.nonce);
+                // Offload Argon2id PoW to a blocking thread so the UDP
+                // listener stays responsive for payments arriving during
+                // the ~2 s computation.
+                let node_id = state.node_id;
+                let nonce = hc.nonce;
+                let pow_hash = tokio::task::block_in_place(|| {
+                    compute_handshake_pow(&node_id, &nonce)
+                });
                 return Some(PulseMessage::HandshakeResponse(HandshakeResponse {
                     hmac,
                     pow_hash,
