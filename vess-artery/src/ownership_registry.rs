@@ -92,6 +92,9 @@ pub struct OwnershipRecord {
     /// the owner can recover bills from the DHT if they lose their device.
     #[serde(default)]
     pub encrypted_bill: Vec<u8>,
+    /// Accumulated propagation work for the winning claim.
+    #[serde(default)]
+    pub accumulated_work: Option<u64>,
 }
 
 /// The ownership registry — the single source of truth for bill ownership.
