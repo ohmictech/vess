@@ -67,7 +67,7 @@ Verify for at least 24 hours:
 Run ONE production node before scaling:
 
 ```bash
-vess node --profile production \
+vess node \
   --bootstrap "<existing-peer-contact>" \
   --bind "0.0.0.0:19000" \
   --rpc-port 9400 \
