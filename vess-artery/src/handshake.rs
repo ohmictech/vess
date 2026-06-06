@@ -130,13 +130,25 @@ impl PeerRegistry {
     /// Returns the nonce to embed in a [`HandshakeChallenge`] message.
     pub fn issue_challenge(&mut self, peer_id: [u8; 32]) -> [u8; 32] {
         // Never overwrite Banished entries — return a zero nonce sentinel.
-        // Verified peers ARE allowed to be re-challenged (for periodic
-        // reverification).  The caller should check for the sentinel and
-        // skip Banished peers.
         if let Some(existing) = self.peers.get(&peer_id) {
             if existing.state == PeerState::Banished {
                 return [0u8; 32];
             }
+            // If already Challenged and the challenge hasn't expired, return
+            // the existing nonce.  This prevents concurrent tasks (handshake
+            // drain + reverification) from overwriting each other's nonces
+            // and causing spurious banishment.
+            if existing.state == PeerState::Challenged {
+                if let (Some(nonce), Some(at)) =
+                    (existing.challenge_nonce, existing.challenged_at)
+                {
+                    if at.elapsed() < self.challenge_timeout {
+                        return nonce;
+                    }
+                }
+            }
+            // Verified peers fall through to get a fresh challenge
+            // (needed for periodic reverification).
         }
 
         let mut nonce = [0u8; 32];
