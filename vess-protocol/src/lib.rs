@@ -961,36 +961,6 @@ pub struct OwnershipGenesis {
     /// and confirm the `mint_id` of a reforge output without a random nonce.
     #[serde(default)]
     pub output_index: u32,
-    /// Argon2id PoW nonce for genesis anti-spam.
-    #[serde(default)]
-    pub pow_nonce: Option<[u8; 32]>,
-    /// Argon2id PoW hash.
-    #[serde(default)]
-    pub pow_hash: Option<[u8; 32]>,
-    /// Accumulated propagation work.
-    #[serde(default)]
-    pub accumulated_work: Option<u64>,
-}
-
-impl Default for OwnershipGenesis {
-    fn default() -> Self {
-        Self {
-            mint_id: [0u8; 32],
-            chain_tip: [0u8; 32],
-            owner_vk_hash: [0u8; 32],
-            owner_vk: Vec::new(),
-            program_owner: None,
-            denomination_value: 0,
-            genesis_proof: GenesisProof::Vess(Vec::new()),
-            digest: [0u8; 32],
-            hops_remaining: 0,
-            chain_depth: 0,
-            output_index: 0,
-            pow_nonce: None,
-            pow_hash: None,
-            accumulated_work: None,
-        }
-    }
 }
 
 /// Claim ownership of a bill after receiving a transfer.
@@ -1048,15 +1018,6 @@ pub struct OwnershipClaim {
     /// distribution before accepting the ownership rotation.
     #[serde(default)]
     pub program_spend_witness: Option<ProgramSpendWitness>,
-    /// Argon2id PoW nonce for claim anti-spam.
-    #[serde(default)]
-    pub pow_nonce: Option<[u8; 32]>,
-    /// Argon2id PoW hash.
-    #[serde(default)]
-    pub pow_hash: Option<[u8; 32]>,
-    /// Accumulated propagation work.
-    #[serde(default)]
-    pub accumulated_work: Option<u64>,
 }
 
 // ── Reforge Attestation ──────────────────────────────────────────────
