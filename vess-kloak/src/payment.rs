@@ -638,6 +638,9 @@ pub fn claim_transfer_bills(
             chain_depth: new_depth,
             encrypted_bill,
             program_spend_witness: None,
+            pow_nonce: None,
+            pow_hash: None,
+            accumulated_work: None,
         });
         ownership_claims.push(claim);
 
@@ -684,6 +687,7 @@ pub fn build_genesis_messages(bills: &[(VessBill, Vec<u8>)], owner_vk: &[u8]) ->
                 hops_remaining: 6,
                 chain_depth: 0,
                 output_index: 0,
+                ..Default::default()
             })
         })
         .collect()
@@ -748,6 +752,9 @@ pub fn build_program_lock_claims(
             chain_depth: bill.chain_depth + 1,
             encrypted_bill: Vec::new(),
             program_spend_witness: None,
+            pow_nonce: None,
+            pow_hash: None,
+            accumulated_work: None,
         }));
     }
 
@@ -800,6 +807,9 @@ pub fn build_program_unlock_claims(
             chain_depth: new_depth,
             encrypted_bill,
             program_spend_witness: Some(witness.clone()),
+            pow_nonce: None,
+            pow_hash: None,
+            accumulated_work: None,
         }));
 
         let mut updated_bill = bill.clone();

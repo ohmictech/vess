@@ -319,6 +319,7 @@ fn confirmed_burn_outputs(
             hops_remaining,
             chain_depth: 0,
             output_index: output_index as u32,
+            ..Default::default()
         });
 
         bills.push(vess_foundry::VessBill {
@@ -583,6 +584,7 @@ mod tests {
             hops_remaining: 0,
             chain_depth: 0,
             output_index: 0,
+            ..Default::default()
         };
         (burn, og)
     }
@@ -610,6 +612,7 @@ mod tests {
             claim_hash,
             chain_depth,
             encrypted_bill: Vec::new(),
+            accumulated_work: None,
         }
     }
 
@@ -1067,6 +1070,7 @@ mod tests {
                     claim_hash: None,
                     chain_depth: 0,
                     encrypted_bill: Vec::new(),
+            accumulated_work: None,
                 },
             );
 
@@ -1642,6 +1646,7 @@ fn ownership_record_from_dht_seed(record: DhtSeedOwnershipRecord) -> OwnershipRe
         prev_transfer_chain_tip: record.prev_transfer_chain_tip,
         chain_depth: record.chain_depth,
         encrypted_bill: record.encrypted_bill,
+            accumulated_work: None,
     }
 }
 
@@ -2081,6 +2086,7 @@ pub(crate) fn retain_local_ownership_genesis(
             prev_transfer_chain_tip: None,
             chain_depth: og.chain_depth,
             encrypted_bill: Vec::new(),
+            accumulated_work: None,
         },
     );
 }
@@ -2107,6 +2113,7 @@ pub(crate) fn local_seed_record_from_claimed_bill(
         prev_transfer_chain_tip: None,
         chain_depth: bill.chain_depth,
         encrypted_bill: claim.encrypted_bill.clone(),
+            accumulated_work: None,
     }
 }
 
@@ -7446,6 +7453,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                         claim_hash: None,
                         chain_depth: 0,
                         encrypted_bill: vec![],
+            accumulated_work: None,
                     });
                     info!("ownership genesis stored for mint_id {:?}", &og.mint_id[..4]);
                 }

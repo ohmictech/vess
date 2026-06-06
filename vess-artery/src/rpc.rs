@@ -1306,6 +1306,7 @@ fn fire_opportunistic_consolidations(
                 hops_remaining: 6,
                 chain_depth: 0,
                 output_index: 0,
+            ..Default::default()
             },
         );
 
@@ -1575,6 +1576,7 @@ async fn handle_send(
                         hops_remaining: 6,
                         chain_depth: 0,
                         output_index: (send_count + j) as u32,
+            ..Default::default()
                     },
                 );
             }
@@ -1601,6 +1603,7 @@ async fn handle_send(
                         hops_remaining: 6,
                         chain_depth: 0,
                         output_index: i as u32,
+            ..Default::default()
                     },
                 );
             }
@@ -1909,6 +1912,7 @@ async fn handle_send_direct(
                             hops_remaining: 6,
                             chain_depth: 0,
                             output_index: (send_count + j) as u32,
+            ..Default::default()
                         },
                     );
                 }
@@ -1934,6 +1938,7 @@ async fn handle_send_direct(
                             hops_remaining: 6,
                             chain_depth: 0,
                             output_index: i as u32,
+            ..Default::default()
                         },
                     );
                 }
@@ -2694,6 +2699,7 @@ fn handle_local_test_faucet(
                         hops_remaining: 6,
                         chain_depth: 0,
                         output_index: 0,
+            ..Default::default()
                     });
                 }
             }
@@ -2780,6 +2786,7 @@ fn handle_ownership_genesis(
             hops_remaining: 6,
             chain_depth: 0,
             output_index: 0,
+            ..Default::default()
         },
     );
 
