@@ -340,6 +340,7 @@ fn confirmed_burn_outputs(
 fn validate_bitcoin_burn_genesis(
     og: &OwnershipGenesis,
     burn: &vess_protocol::BitcoinBurnBundleProof,
+    bitcoin_client: Option<&vess_bitcoin::BitcoinLightClient>,
 ) -> std::result::Result<[u8; 32], &'static str> {
     const MAX_BURN_OUTPUTS: usize = 64;
     const BURN_PAYLOAD_BYTES: usize = 32;
@@ -359,6 +360,15 @@ fn validate_bitcoin_burn_genesis(
 
     if burn.corroborating_peer_count < min_bitcoin_burn_corroborating_peers(burn.network) {
         return Err("bitcoin burn corroboration insufficient");
+    }
+
+    // Independent block header verification: if the node has a Bitcoin
+    // light client, verify the block exists in the locally-validated
+    // header chain rather than trusting the broadcaster.
+    if let Some(client) = bitcoin_client {
+        if !client.has_block_header(&burn.block_hash) {
+            return Err("bitcoin burn block hash not in local header chain");
+        }
     }
 
     if burn.chain_work == [0u8; 32] {
@@ -744,7 +754,7 @@ mod tests {
     #[test]
     fn bitcoin_burn_bundle_accepts_canonical_genesis_binding() {
         let (burn, og) = sample_burn_bundle();
-        let bundle_commitment = validate_bitcoin_burn_genesis(&og, &burn).unwrap();
+        let bundle_commitment = validate_bitcoin_burn_genesis(&og, &burn, None).unwrap();
         assert_eq!(bundle_commitment, og.digest);
     }
 
@@ -755,7 +765,7 @@ mod tests {
         burn.required_confirmations = 6;
         burn.confirmations = 5;
 
-        let error = validate_bitcoin_burn_genesis(&og, &burn).unwrap_err();
+        let error = validate_bitcoin_burn_genesis(&og, &burn, None).unwrap_err();
         assert_eq!(error, "bitcoin burn confirmation depth insufficient");
     }
 
@@ -764,7 +774,7 @@ mod tests {
         let (mut burn, og) = sample_burn_bundle();
         burn.burn_commitment_payload[0] ^= 0xff;
 
-        let error = validate_bitcoin_burn_genesis(&og, &burn).unwrap_err();
+        let error = validate_bitcoin_burn_genesis(&og, &burn, None).unwrap_err();
         assert_eq!(error, "bitcoin burn OP_RETURN payload mismatch");
     }
 
@@ -776,7 +786,7 @@ mod tests {
         burn.confirmations = 6;
         burn.corroborating_peer_count = 1;
 
-        let error = validate_bitcoin_burn_genesis(&og, &burn).unwrap_err();
+        let error = validate_bitcoin_burn_genesis(&og, &burn, None).unwrap_err();
         assert_eq!(error, "bitcoin burn corroboration insufficient");
     }
 
@@ -2211,8 +2221,20 @@ pub(crate) fn queue_local_ownership_genesis(
 pub(crate) fn queue_local_ownership_claim(
     state: &mut ArteryState,
     tx: &tokio::sync::mpsc::UnboundedSender<OwnershipClaim>,
-    oc: OwnershipClaim,
+    mut oc: OwnershipClaim,
 ) {
+    // Attach denomination-scaled claim PoW before broadcasting.
+    let denom_value = state
+        .registry
+        .get(&oc.mint_id)
+        .map(|r| r.denomination_value)
+        .unwrap_or(1);
+    let (pow_nonce, pow_hash, pow_difficulty) =
+        crate::handshake::compute_claim_pow(&oc.mint_id, &oc.new_owner_vk_hash, denom_value);
+    oc.pow_nonce = Some(pow_nonce);
+    oc.pow_hash = Some(pow_hash);
+    oc.accumulated_work = Some(pow_difficulty);
+
     let updated_at = ArteryState::now_unix();
     let fallback = local_seed_claim_fallback_from_wallet(state, &oc, updated_at);
     retain_local_ownership_claim(state, &oc, fallback, updated_at);
@@ -7141,7 +7163,25 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     return None;
                 }
 
-                // 2. Verify proof — supports STARK, aggregate, and reforge proofs.
+                // 2. Verify claim PoW (denomination-scaled Argon2id).
+                if let (Some(ref pow_nonce), Some(ref pow_hash)) = (&og.pow_nonce, &og.pow_hash) {
+                    if !crate::handshake::verify_claim_pow(
+                        &og.mint_id,
+                        &og.owner_vk_hash,
+                        og.denomination_value,
+                        pow_nonce,
+                        pow_hash,
+                    ) {
+                        warn!("ownership genesis: PoW verification failed — banishing");
+                        state.peer_registry.mark_banished(peer_id);
+                        ban_ref.banish(peer_id);
+                        return None;
+                    }
+                }
+                // Track accumulated propagation work.
+                let _claim_work = og.accumulated_work.unwrap_or(0);
+
+                // 3. Verify proof — supports STARK, aggregate, and reforge proofs.
                 //    Native Vess proof bytes cover STARK, aggregate, sampled aggregate,
                 //    and reforge outputs. Bitcoin burns use a shared bundle proof where
                 //    every output bill commits to one indexed slice of the burned amount.
@@ -7353,7 +7393,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                             return None;
                         }
                     }
-                    GenesisProof::BitcoinBurn(burn) => match validate_bitcoin_burn_genesis(&og, burn) {
+                    GenesisProof::BitcoinBurn(burn) => match validate_bitcoin_burn_genesis(&og, burn, state.bitcoin_client.as_ref()) {
                         Ok(bundle_commitment) => {
                             proof_nonce = bundle_commitment;
                             proof_hash = bundle_commitment;
@@ -7477,7 +7517,28 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
             PulseMessage::OwnershipClaim(oc) => {
                 info!(%peer, "ownership claim for mint_id {:?}", &oc.mint_id[..4]);
 
-                // 0. Reforge-wins rule (highest priority):
+                // 0. Verify claim PoW (denomination-scaled Argon2id).
+                let denom_value = state
+                    .registry
+                    .get(&oc.mint_id)
+                    .map(|r| r.denomination_value)
+                    .unwrap_or(1);
+                if let (Some(ref pow_nonce), Some(ref pow_hash)) = (&oc.pow_nonce, &oc.pow_hash) {
+                    if !crate::handshake::verify_claim_pow(
+                        &oc.mint_id,
+                        &oc.new_owner_vk_hash,
+                        denom_value,
+                        pow_nonce,
+                        pow_hash,
+                    ) {
+                        warn!("ownership claim: PoW verification failed — banishing");
+                        state.peer_registry.mark_banished(peer_id);
+                        ban_ref.banish(peer_id);
+                        return None;
+                    }
+                }
+
+                // 1. Reforge-wins rule (highest priority):
                 //    If this bill was consumed by a valid split/combine, no
                 //    subsequent OwnershipClaim is valid — the value literally
                 //    no longer exists at this mint_id.
@@ -7674,6 +7735,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                             let previous_chain_tip = rec.chain_tip;
                             rec.prev_claim_vk_hash = Some(prev_owner_commitment);
                             rec.claim_hash = Some(claim_hash);
+                            rec.accumulated_work = oc.accumulated_work;
                             rec.prev_transfer_chain_tip = Some(previous_chain_tip);
                             rec.chain_depth = oc.chain_depth;
                             rec.chain_tip = oc.new_chain_tip;
@@ -7729,13 +7791,20 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                                         return None;
                                     }
                                     if let Some(existing_hash) = rec.claim_hash {
-                                        if claim_hash < existing_hash {
+                                        // Tiebreaker: higher accumulated_work wins;
+                                        // equal work → lowest claim hash wins.
+                                        let new_work = oc.accumulated_work.unwrap_or(0);
+                                        let existing_work = rec.accumulated_work.unwrap_or(0);
+                                        let better = new_work > existing_work
+                                            || (new_work == existing_work && claim_hash < existing_hash);
+                                        if better {
                                             rec.chain_tip = oc.new_chain_tip;
                                             rec.current_owner_vk_hash = oc.new_owner_vk_hash;
                                             rec.current_owner_vk = oc.new_owner_vk.clone();
                                             rec.current_owner_program = oc.new_owner_program.clone();
                                             rec.updated_at = now;
                                             rec.claim_hash = Some(claim_hash);
+                                            rec.accumulated_work = oc.accumulated_work;
                                             rec.prev_transfer_chain_tip = Some(base_chain_tip);
                                             rec.encrypted_bill = oc.encrypted_bill.clone();
                                             if let Some(new_owner_program) = &oc.new_owner_program {
