@@ -1682,16 +1682,19 @@ async fn handle_send(
     (msg, payment_id, sent_mints, scan_ek)
     }; // mutex guard dropped here
 
-    // ── Relay: try direct delivery first, fall back to gossip ───────
+    // ── Relay: always gossip for reliability, direct for speed ──────
+    // Gossip relay provides retry-and-forward with dedup protection.
+    // Direct delivery is a best-effort speed boost for verified peers.
+    // Both paths are used — the recipient's limbo_payment_ids deduplicates.
     let delivery_method = if let PulseMessage::Payment(ref payment) = msg {
         let direct_ok =
             try_direct_delivery(state, node, payment, &recipient_scan_ek).await;
-        if !direct_ok {
-            // Fall back to gossip relay
-            let _ = senders.pay_tx.send(payment.clone());
-            "gossip"
+        // Always queue for gossip relay regardless of direct outcome.
+        let _ = senders.pay_tx.send(payment.clone());
+        if direct_ok {
+            "direct+gossip"
         } else {
-            "direct"
+            "gossip"
         }
     } else {
         "none"
