@@ -47,3 +47,13 @@ pub use persistence::{ArterySnapshot, NodeStorage};
 pub use reputation::ReputationTable;
 pub use tag_dht::TagDht;
 pub use tag_resolver::{TagResolution, TagResolver, QUORUM_THRESHOLD};
+
+/// Blinding factor for privacy-preserving DHT queries.
+/// Storage keys stay as plain `mint_id`; queries use `blinded_dht_key(mint_id, blinding)`.
+pub fn blinded_dht_key(base_key: &[u8; 32], blinding: &[u8; 32]) -> [u8; 32] {
+    let mut input = Vec::with_capacity(11 + 32 + 32);
+    input.extend_from_slice(b"vess-dht-query-v1");
+    input.extend_from_slice(base_key);
+    input.extend_from_slice(blinding);
+    *blake3::hash(&input).as_bytes()
+}

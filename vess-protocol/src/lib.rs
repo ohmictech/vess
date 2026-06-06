@@ -1283,16 +1283,6 @@ pub struct PaymentReceipt {
     pub signature: Vec<u8>,
 }
 
-/// Blinding factor for privacy-preserving DHT queries.
-/// Derived from a shared secret between querier and DHT node.
-pub fn blinded_dht_key(base_key: &[u8; 32], blinding: &[u8; 32]) -> [u8; 32] {
-    let mut h = blake3::Hasher::new();
-    h.update(b"vess-dht-query-v1");
-    h.update(base_key);
-    h.update(blinding);
-    *h.finalize().as_bytes()
-}
-
 impl PulseMessage {
     /// Serialize this message to bytes using postcard.
     pub fn to_bytes(&self) -> Result<Vec<u8>, postcard::Error> {

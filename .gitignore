@@ -3,3 +3,5 @@
 $HOME/
 /docs
 .vscode
+/target-full-rebuild
+/scripts

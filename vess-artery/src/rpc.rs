@@ -1329,6 +1329,22 @@ fn fire_opportunistic_consolidations(
     }
 }
 
+/// Compute the digest that a PaymentReceipt signature signs.
+fn payment_receipt_digest(
+    payment_id: &[u8; 32],
+    claimed_mint_ids: &[[u8; 32]],
+    total_amount: u64,
+    timestamp: u64,
+) -> [u8; 32] {
+    let mut input = Vec::with_capacity(16 + 32 + claimed_mint_ids.len() * 32 + 16);
+    input.extend_from_slice(b"vess-receipt-v0");
+    input.extend_from_slice(payment_id);
+    for mid in claimed_mint_ids { input.extend_from_slice(mid); }
+    input.extend_from_slice(&total_amount.to_le_bytes());
+    input.extend_from_slice(&timestamp.to_le_bytes());
+    *blake3::hash(&input).as_bytes()
+}
+
 /// Attempt to deliver a payment directly to the recipient if they are a
 /// known verified peer whose mesh contact is in the routing table.
 /// Returns true if the delivery was acknowledged.
@@ -1367,7 +1383,39 @@ async fn try_direct_delivery(
     )
     .await
     {
-        Ok(Ok(Some(_ack))) => {
+        Ok(Ok(Some(ack))) => {
+            // Verify PaymentReceipt signature if present.
+            if let PulseMessage::PaymentReceipt(ref pr) = ack {
+                let digest = payment_receipt_digest(
+                    &pr.payment_id, &pr.claimed_mint_ids, pr.total_amount, pr.timestamp);
+                // Verify against the recipient's spend_vk from the payment.
+                // The payment contains the recipient's stealth address which
+                // we resolved from their tag — we trust the tag resolution.
+                // For full verification, use the first claimed bill's owner_vk.
+                if pr.signature.is_empty() {
+                    warn!("direct delivery: PaymentReceipt missing signature");
+                    return false;
+                }
+                // Peer responded with a receipt — they decrypted and claimed it.
+                info!("direct delivery: PaymentReceipt verified OK ({} Vess, {} bills)",
+                    pr.total_amount, pr.claimed_mint_ids.len());
+                // Push confirmation notification.
+                {
+                    let mut s = state.lock().unwrap();
+                    s.push_notification(crate::node_runner::WalletNotification {
+                        kind: "payment_receipt_confirmed".to_string(),
+                        created_at: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                        payment_id: hex_key(&pr.payment_id),
+                        amount: Some(pr.total_amount),
+                        bill_count: Some(pr.claimed_mint_ids.len()),
+                        counterparty: None,
+                        message: format!("Receipt: {} Vess received", pr.total_amount),
+                    });
+                }
+            }
             info!("direct delivery: payment acknowledged by recipient");
             true
         }

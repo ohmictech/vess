@@ -6356,6 +6356,8 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                             let mut total = 0u64;
                             let mut pending_oc = Vec::new();
                             let mut claimed_mids: Vec<[u8; 32]> = Vec::new();
+                            // Save first spend_sk before the loop consumes result.claimed.
+                            let first_spend_sk = result.claimed.first().map(|c| c.spend_sk.clone());
                             for claimed in result.claimed {
                                 total += claimed.bill.denomination.value();
                                 claimed_mids.push(claimed.bill.mint_id);
@@ -6390,18 +6392,18 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                             // Build cryptographic PaymentReceipt proving we
                             // decrypted and claimed this payment.
                             let receipt_digest = {
-                                let mut h = blake3::Hasher::new();
-                                h.update(b"vess-receipt-v0");
-                                h.update(&payment_id);
-                                for mid in &claimed_mids { h.update(mid); }
-                                h.update(&total.to_le_bytes());
-                                h.update(&now.to_le_bytes());
-                                *h.finalize().as_bytes()
+                                let mut input = Vec::with_capacity(16 + 32 + claimed_mids.len() * 32 + 16);
+                                input.extend_from_slice(b"vess-receipt-v0");
+                                input.extend_from_slice(&payment_id);
+                                for mid in &claimed_mids { input.extend_from_slice(mid); }
+                                input.extend_from_slice(&total.to_le_bytes());
+                                input.extend_from_slice(&now.to_le_bytes());
+                                *blake3::hash(&input).as_bytes()
                             };
                             // Sign with the first claimed bill's spend_sk.
-                            let receipt_sig = result.claimed.first()
-                                .and_then(|c| vess_foundry::spend_auth::sign_spend(
-                                    &c.spend_sk, &receipt_digest).ok())
+                            let receipt_sig = first_spend_sk.as_ref()
+                                .and_then(|sk| vess_foundry::spend_auth::sign_spend(
+                                    sk, &receipt_digest).ok())
                                 .unwrap_or_default();
 
                             let receipt_msg = PulseMessage::PaymentReceipt(
@@ -6414,9 +6416,9 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                                 },
                             );
 
-                            // Queue the receipt for gossip back to the sender's
-                            // DHT shard so they get confirmation.
-                            let _ = h_pay_tx.send(relay_copy.clone());
+                            // Forward the receipt via gossip so the sender's
+                            // node gets confirmation even if they're not a
+                            // direct peer (relay_copy was already queued above).
                             for oc in pending_oc {
                                 queue_local_ownership_claim(&mut state, &h_oc_tx, oc);
                             }
@@ -6794,6 +6796,25 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
             }
 
             PulseMessage::RegistryQueryResponse(_) => None,
+
+            PulseMessage::PaymentReceipt(pr) => {
+                info!(payment_id = %hex_key(&pr.payment_id), amount = pr.total_amount,
+                      "payment receipt received — marking outbound payment confirmed");
+                // Finalize each claimed mint_id in the outbound tracker.
+                for mid in &pr.claimed_mint_ids {
+                    state.finalize_outbound_mint_if_complete(mid);
+                }
+                state.push_notification(WalletNotification {
+                    kind: "payment_receipt_confirmed".to_string(),
+                    created_at: ArteryState::now_unix(),
+                    payment_id: hex_key(&pr.payment_id),
+                    amount: Some(pr.total_amount),
+                    bill_count: Some(pr.claimed_mint_ids.len()),
+                    counterparty: None,
+                    message: format!("Receipt confirmed: {} Vess by recipient", pr.total_amount),
+                });
+                None
+            }
 
             PulseMessage::LimboHold(lh) => {
                 if lh.bill_ids.len() > MAX_LIMBO_HOLD_IDS {
