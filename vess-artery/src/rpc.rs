@@ -2644,7 +2644,7 @@ fn handle_set_profile(state: &Arc<Mutex<ArteryState>>, label: &str) -> RpcRespon
     let mut s = lock_state(&state);
     s.profile = profile;
     s.unsafe_mode = profile.allow_unsafe();
-    s.test_faucet_enabled = matches!(profile, DeploymentProfile::Development);
+    s.test_faucet_enabled = matches!(profile, DeploymentProfile::Development | DeploymentProfile::Testnet);
 
     let warnings = s.audit();
     RpcResponse::ok(RpcData::ProfileInfo {

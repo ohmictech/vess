@@ -11,7 +11,7 @@ Vess ships with four built-in deployment profiles selectable via
 | Profile     | `allow_unsafe` | Bitcoin Network | Use case                          |
 |-------------|:--------------:|:---------------:|-----------------------------------|
 | development | yes            | regtest         | Local single-node dev with faucet |
-| testnet     | no             | signet          | Public testnet (zero-config)      |
+| testnet     | yes            | signet          | Public testnet (faucet, seed peers) |
 | staging     | no             | mainnet         | Pre-production staging environment |
 | production  | no             | mainnet         | Public internet-facing node       |
 
@@ -29,7 +29,7 @@ Production profile enforces:
 
 | Flag/Default        | dev        | testnet    | staging/prod |
 |---------------------|-----------|------------|--------------|
-| Faucet enabled      | yes       | no         | no           |
+| Faucet enabled      | yes       | yes        | no           |
 | Bitcoin network     | regtest   | signet     | mainnet      |
 | DHT namespace       | vess-v1   | vess-testnet-v1 | vess-v1  |
 | Seed peers          | none      | built-in   | none         |

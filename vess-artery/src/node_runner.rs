@@ -2872,7 +2872,7 @@ fn spawn_bitcoin_peer_notifications(
 pub enum DeploymentProfile {
     /// Developer mode — unsafe operations allowed, test faucet enabled, Bitcoin regtest.
     Development,
-    /// Public testnet — production safety, Bitcoin signet, testnet DHT namespace, seed peers.
+    /// Public testnet — dev-like (faucet enabled), Bitcoin signet, testnet DHT, seed peers.
     Testnet,
     /// Staging — close to production, but diagnostics enabled.
     Staging,
@@ -2883,7 +2883,7 @@ pub enum DeploymentProfile {
 impl DeploymentProfile {
     /// True when unsafe operations (e.g. test faucet) are permitted.
     pub fn allow_unsafe(&self) -> bool {
-        matches!(self, Self::Development)
+        matches!(self, Self::Development | Self::Testnet)
     }
 
     /// The Bitcoin network to use for this profile.
@@ -2928,7 +2928,7 @@ impl DeploymentProfile {
     pub fn describe(&self) -> &'static str {
         match self {
             Self::Development => "development (unsafe ops enabled, faucet on, Bitcoin regtest)",
-            Self::Testnet => "public testnet (Bitcoin signet, production safety)",
+            Self::Testnet => "public testnet (Bitcoin signet, faucet enabled, seed peers)",
             Self::Staging => "staging (close to production with diagnostics)",
             Self::Production => "production (all safety enforced)",
         }
@@ -3954,7 +3954,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
         // MailboxForwardRegister: 5 registrations per 60-second window per peer.
         mailbox_fwd_limiter: crate::gossip::PeerRateLimiter::new(5, 60),
         unsafe_mode: config.test || config.profile.allow_unsafe(),
-        test_faucet_enabled: config.test || matches!(config.profile, DeploymentProfile::Development),
+        test_faucet_enabled: config.test || matches!(config.profile, DeploymentProfile::Development | DeploymentProfile::Testnet),
         profile: config.profile,
         events: VecDeque::new(),
         limbo_payment_times: HashMap::new(),
