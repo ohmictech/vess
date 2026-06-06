@@ -48,7 +48,7 @@ impl Clone for BillFold {
             bills: self.bills.clone(),
             reserved: self.reserved.clone(),
             reserve_times: self.reserve_times.clone(),
-            spend_credentials: HashMap::new(),
+            spend_credentials: self.spend_credentials.clone(),
         }
     }
 }
