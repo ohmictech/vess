@@ -219,9 +219,6 @@ enum Command {
         /// Bind mesh UDP socket to a specific address (default: 0.0.0.0:0).
         #[arg(long)]
         bind: Option<String>,
-        /// Deployment profile: dev, testnet, staging, or prod (default).
-        #[arg(long, default_value = "prod")]
-        profile: String,
     },
 
     /// Set a password for fast daily wallet unlock.
@@ -482,29 +479,10 @@ async fn dispatch_command(cli: &Cli) -> Result<()> {
             reset_transient_peer_state,
             testnet,
             bind,
-            profile,
         }) => {
             let state_dir = match state_dir {
                 Some(d) => d.clone(),
                 None => vess_artery::persistence::NodeStorage::default_dir()?,
-            };
-            let profile_label = profile.to_lowercase();
-            let profile = match profile_label.as_str() {
-                "dev" => vess_artery::node_runner::DeploymentProfile::Development,
-                "testnet" => vess_artery::node_runner::DeploymentProfile::Testnet,
-                "staging" => vess_artery::node_runner::DeploymentProfile::Staging,
-                "prod" | "production" => vess_artery::node_runner::DeploymentProfile::Production,
-                other => {
-                    eprintln!("⚠ unknown profile '{other}', using 'prod'");
-                    eprintln!("  expected: dev, testnet, staging, prod");
-                    vess_artery::node_runner::DeploymentProfile::Production
-                }
-            };
-            // --testnet overrides profile to Testnet
-            let effective_profile = if *testnet {
-                vess_artery::node_runner::DeploymentProfile::Testnet
-            } else {
-                profile
             };
             let bind_addr = bind.as_ref().and_then(|s| s.parse::<std::net::SocketAddr>().ok());
             let config = vess_artery::node_runner::NodeConfig {
@@ -521,7 +499,7 @@ async fn dispatch_command(cli: &Cli) -> Result<()> {
                 enable_local_discovery: true,
                 allow_private_bitcoin_seed_contact: false,
                 reset_transient_peer_state: *reset_transient_peer_state,
-                profile: effective_profile,
+                is_testnet: *testnet,
                 test: false,
             };
             vess_artery::node_runner::run_node(config).await?;

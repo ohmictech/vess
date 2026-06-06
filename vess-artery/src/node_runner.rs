@@ -726,7 +726,7 @@ mod tests {
             mailbox_fwd_limiter: crate::gossip::PeerRateLimiter::new(5, 60),
             unsafe_mode: false,
             test_faucet_enabled: false,
-            profile: DeploymentProfile::Production,
+            is_testnet: false,
             events: VecDeque::new(),
         }))
     }
@@ -2867,74 +2867,6 @@ fn spawn_bitcoin_peer_notifications(
 }
 
 /// Configuration for running an artery node.
-/// Deployment profile that controls safety defaults.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum DeploymentProfile {
-    /// Developer mode — unsafe operations allowed, test faucet enabled, Bitcoin regtest.
-    Development,
-    /// Public testnet — dev-like (faucet enabled), Bitcoin signet, testnet DHT, seed peers.
-    Testnet,
-    /// Staging — close to production, but diagnostics enabled.
-    Staging,
-    /// Production — all safety checks enforced.
-    Production,
-}
-
-impl DeploymentProfile {
-    /// True when unsafe operations (e.g. test faucet) are permitted.
-    pub fn allow_unsafe(&self) -> bool {
-        matches!(self, Self::Development | Self::Testnet)
-    }
-
-    /// The Bitcoin network to use for this profile.
-    pub fn bitcoin_network(&self) -> vess_bitcoin::BitcoinNetwork {
-        match self {
-            Self::Development => vess_bitcoin::BitcoinNetwork::Regtest,
-            Self::Testnet => vess_bitcoin::BitcoinNetwork::Signet,
-            Self::Staging | Self::Production => vess_bitcoin::BitcoinNetwork::Mainnet,
-        }
-    }
-
-    /// Default testnet seed peers (empty for non-testnet profiles).
-    pub fn default_seed_peers(&self) -> &[&str] {
-        match self {
-            Self::Testnet => &[
-                // Placeholder — replace with actual testnet seed node contacts
-                // once seed nodes are deployed. Format: serialized MeshCarrierContact.
-            ],
-            _ => &[],
-        }
-    }
-
-    /// DHT namespace byte to isolate testnet from mainnet.
-    pub fn dht_namespace(&self) -> &[u8] {
-        match self {
-            Self::Testnet => b"vess-testnet-v1",
-            _ => b"vess-v1",
-        }
-    }
-
-    /// Human-readable label.
-    pub fn as_label(&self) -> &'static str {
-        match self {
-            Self::Development => "dev",
-            Self::Testnet => "testnet",
-            Self::Staging => "staging",
-            Self::Production => "prod",
-        }
-    }
-
-    /// Short description.
-    pub fn describe(&self) -> &'static str {
-        match self {
-            Self::Development => "development (unsafe ops enabled, faucet on, Bitcoin regtest)",
-            Self::Testnet => "public testnet (Bitcoin signet, faucet enabled, seed peers)",
-            Self::Staging => "staging (close to production with diagnostics)",
-            Self::Production => "production (all safety enforced)",
-        }
-    }
-}
-
 pub struct NodeConfig {
     /// Number of gossip neighbors (K).
     pub k_neighbors: usize,
@@ -2973,10 +2905,11 @@ pub struct NodeConfig {
     /// When true, discard persisted peer cache / reputation / ban state on startup.
     /// Useful for ephemeral interactive CLI nodes that reuse slot directories.
     pub reset_transient_peer_state: bool,
-    /// Deployment profile controlling safety defaults.
-    pub profile: DeploymentProfile,
-    /// When true, enable unsafe mode + local test faucet (equivalent to --profile dev).
-    /// Deprecated in favor of `profile` but kept for backward compatibility.
+    /// When true, run in testnet mode: Bitcoin signet, faucet enabled,
+    /// unsafe ops allowed, testnet DHT namespace, seed peers.
+    /// When false, production mode: Bitcoin mainnet, all safety enforced.
+    pub is_testnet: bool,
+    /// Deprecated alias for is_testnet + faucet. Kept for backward compat.
     pub test: bool,
 }
 
@@ -2996,7 +2929,7 @@ impl Default for NodeConfig {
             enable_local_discovery: true,
             allow_private_bitcoin_seed_contact: false,
             reset_transient_peer_state: false,
-            profile: DeploymentProfile::Production,
+            is_testnet: false,
             test: false,
         }
     }
@@ -3169,8 +3102,8 @@ pub(crate) struct ArteryState {
     pub(crate) unsafe_mode: bool,
     /// Runtime flag for the local test faucet.
     pub(crate) test_faucet_enabled: bool,
-    /// Deployment profile for safety audits.
-    pub(crate) profile: DeploymentProfile,
+    /// True when running in testnet mode (signet, faucet, unsafe ops).
+    pub(crate) is_testnet: bool,
 }
 
 impl ArteryState {
@@ -3209,18 +3142,14 @@ impl ArteryState {
     pub(crate) fn audit(&self) -> Vec<String> {
         let mut warnings = Vec::new();
 
-        if self.profile == DeploymentProfile::Production {
+        if !self.is_testnet {
             if self.unsafe_mode {
-                warnings.push("unsafe_mode is enabled in production profile".into());
+                warnings.push("unsafe_mode is enabled in production".into());
             }
             if self.test_faucet_enabled {
-                warnings.push("test_faucet is enabled in production profile".into());
+                warnings.push("test_faucet is enabled in production".into());
             }
-        }
 
-        if self.profile == DeploymentProfile::Production
-            || self.profile == DeploymentProfile::Staging
-        {
             // Verify we have >= K neighbors after bootstrap
             let peer_count = self.routing_table.peer_count();
             let k = self.gossip_config.k_neighbors;
@@ -3841,9 +3770,13 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
 
     info!("Starting Bitcoin peer discovery before Vess mesh bootstrap...");
     let mut btc_config = config.bitcoin_config.clone().unwrap_or_default();
-    // If no explicit Bitcoin network was configured, use the profile default.
+    // If no explicit Bitcoin network was configured, use testnet signet or mainnet.
     if config.bitcoin_config.is_none() {
-        btc_config.network = config.profile.bitcoin_network();
+        btc_config.network = if config.is_testnet {
+            vess_bitcoin::BitcoinNetwork::Signet
+        } else {
+            vess_bitcoin::BitcoinNetwork::Mainnet
+        };
     }
     let bitcoin_client = match vess_bitcoin::BitcoinLightClient::spawn(btc_config)
     .await
@@ -3953,9 +3886,9 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
         mailbox_fwd: HashMap::new(),
         // MailboxForwardRegister: 5 registrations per 60-second window per peer.
         mailbox_fwd_limiter: crate::gossip::PeerRateLimiter::new(5, 60),
-        unsafe_mode: config.test || config.profile.allow_unsafe(),
-        test_faucet_enabled: config.test || matches!(config.profile, DeploymentProfile::Development | DeploymentProfile::Testnet),
-        profile: config.profile,
+        unsafe_mode: config.is_testnet || config.test,
+        test_faucet_enabled: config.is_testnet || config.test,
+        is_testnet: config.is_testnet,
         events: VecDeque::new(),
         limbo_payment_times: HashMap::new(),
     }));
@@ -4658,9 +4591,10 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
 
     // ── Bootstrap discovery ─────────────────────────────────────────
     let mut all_bootstrap = config.bootstrap.clone();
-    // Append profile-default seed peers (e.g. testnet seed nodes).
-    for seed in config.profile.default_seed_peers() {
-        all_bootstrap.push(seed.to_string());
+    // Append testnet seed peers when running in testnet mode.
+    if config.is_testnet {
+        // Placeholder — add seed node contacts here once deployed.
+        // for seed in TESTNET_SEED_PEERS { all_bootstrap.push(seed.to_string()); }
     }
     {
         let s = lock_state(&state);

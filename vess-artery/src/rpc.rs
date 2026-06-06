@@ -38,7 +38,6 @@ use crate::mesh_contact::{
     decode_contact_bytes, encode_contact_string, parse_contact_string, parse_node_id_hex,
 };
 use crate::node_runner::ArteryState;
-use crate::node_runner::DeploymentProfile;
 use crate::node_runner::WalletState;
 use crate::node_runner::lock_state;
 use crate::persistence::hex_key;
@@ -2629,27 +2628,20 @@ fn handle_set_test_mode(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
 }
 
 fn handle_set_profile(state: &Arc<Mutex<ArteryState>>, label: &str) -> RpcResponse {
-    let profile = match label {
-        "dev" => DeploymentProfile::Development,
-        "testnet" => DeploymentProfile::Testnet,
-        "staging" => DeploymentProfile::Staging,
-        "prod" => DeploymentProfile::Production,
-        other => {
-            return RpcResponse::err(&format!(
-                "unknown profile '{other}'; expected: dev, testnet, staging, prod"
-            ));
-        }
+    let is_testnet = match label {
+        "testnet" => true,
+        "prod" | "production" | _ => false,
     };
 
     let mut s = lock_state(&state);
-    s.profile = profile;
-    s.unsafe_mode = profile.allow_unsafe();
-    s.test_faucet_enabled = matches!(profile, DeploymentProfile::Development | DeploymentProfile::Testnet);
+    s.is_testnet = is_testnet;
+    s.unsafe_mode = is_testnet;
+    s.test_faucet_enabled = is_testnet;
 
     let warnings = s.audit();
     RpcResponse::ok(RpcData::ProfileInfo {
-        profile: profile.as_label().to_string(),
-        description: profile.describe().to_string(),
+        profile: if is_testnet { "testnet" } else { "production" }.to_string(),
+        description: if is_testnet { "testnet (signet, faucet, seed peers)" } else { "production (mainnet, all safety)" }.to_string(),
         unsafe_mode: s.unsafe_mode,
         test_faucet_enabled: s.test_faucet_enabled,
         audit_warnings: warnings,

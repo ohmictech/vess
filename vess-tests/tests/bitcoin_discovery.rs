@@ -18,7 +18,7 @@ use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
-use vess_artery::node_runner::{run_node, DeploymentProfile, NodeConfig};
+use vess_artery::node_runner::{run_node, NodeConfig};
 use vess_bitcoin::{BitcoinConfig, BitcoinNetwork};
 use vess_foundry::spend_auth::{generate_spend_keypair, sign_spend};
 use vess_stealth::generate_master_keys_from_seed;
@@ -527,7 +527,7 @@ async fn five_nodes_discover_via_bitcoin_seed_and_register_tags() {
             enable_local_discovery: false,
             allow_private_bitcoin_seed_contact: true,
             reset_transient_peer_state: false,
-            profile: DeploymentProfile::Production,
+            is_testnet: false,
             test: false,
         };
 
