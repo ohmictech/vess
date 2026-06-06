@@ -122,7 +122,7 @@ pub(crate) struct OutboundPaymentRecord {
 /// Structured node event for CLI display via `vess events`.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "event")]
-pub(crate) enum NodeEvent {
+pub enum NodeEvent {
     PeerVerified {
         created_at: u64,
         peer_id: String,
@@ -826,13 +826,21 @@ mod tests {
         assert_eq!(right.get(&mint_id).unwrap().chain_tip, lower_hash.chain_tip);
     }
 
+    fn empty_seed_sync_snapshot() -> SeedSyncPeerSnapshot {
+        SeedSyncPeerSnapshot {
+            peer_id: [0u8; 32],
+            ownership_records: HashMap::new(),
+            consumed_records: HashMap::new(),
+        }
+    }
+
     #[test]
     fn seed_sync_rejects_single_peer_overwrite_without_quorum() {
         let state = sample_seed_state();
         let ownership_mint = [0xC1; 32];
         let consumed_mint = [0xC2; 32];
 
-        let mut snapshot = SeedSyncPeerSnapshot::default();
+        let mut snapshot = empty_seed_sync_snapshot();
         snapshot.ownership_records.insert(
             ownership_mint,
             sample_partition_record(ownership_mint, 2, Some([0x01; 32]), [0x11; 32], 100),
@@ -854,7 +862,7 @@ mod tests {
         let ownership_mint = [0xD1; 32];
         let consumed_mint = [0xD2; 32];
 
-        let mut left = SeedSyncPeerSnapshot::default();
+        let mut left = empty_seed_sync_snapshot();
         left.ownership_records.insert(
             ownership_mint,
             sample_partition_record(ownership_mint, 2, Some([0x10; 32]), [0x12; 32], 100),
@@ -862,7 +870,7 @@ mod tests {
         left.consumed_records
             .insert(consumed_mint, sample_consumed_record(0x31, 300));
 
-        let mut right = SeedSyncPeerSnapshot::default();
+        let mut right = empty_seed_sync_snapshot();
         right.ownership_records.insert(
             ownership_mint,
             sample_partition_record(ownership_mint, 2, Some([0x20; 32]), [0x13; 32], 101),
@@ -900,7 +908,7 @@ mod tests {
         let winning_consumed = sample_consumed_record(0x51, 500);
         let losing_consumed = sample_consumed_record(0x61, 501);
 
-        let mut first = SeedSyncPeerSnapshot::default();
+        let mut first = empty_seed_sync_snapshot();
         first
             .ownership_records
             .insert(ownership_mint, winning_record.clone());
@@ -908,7 +916,7 @@ mod tests {
             .consumed_records
             .insert(consumed_mint, winning_consumed.clone());
 
-        let mut second = SeedSyncPeerSnapshot::default();
+        let mut second = empty_seed_sync_snapshot();
         second
             .ownership_records
             .insert(ownership_mint, winning_record.clone());
@@ -916,7 +924,7 @@ mod tests {
             .consumed_records
             .insert(consumed_mint, winning_consumed.clone());
 
-        let mut third = SeedSyncPeerSnapshot::default();
+        let mut third = empty_seed_sync_snapshot();
         third
             .ownership_records
             .insert(ownership_mint, losing_record);
@@ -1636,6 +1644,7 @@ fn ownership_record_from_dht_seed(record: DhtSeedOwnershipRecord) -> OwnershipRe
 
 #[derive(Debug, Default)]
 struct SeedSyncPeerSnapshot {
+    peer_id: [u8; 32],
     ownership_records: HashMap<[u8; 32], OwnershipRecord>,
     consumed_records: HashMap<[u8; 32], ConsumedRecord>,
 }
@@ -1717,6 +1726,18 @@ fn validated_seed_consumed_record(
 }
 
 fn apply_quorum_seed_snapshots(state: &Arc<Mutex<ArteryState>>, snapshots: Vec<SeedSyncPeerSnapshot>) {
+    if snapshots.is_empty() {
+        return;
+    }
+    // Emit SeedSyncStarted for the first responding peer.
+    let first_peer_id = snapshots[0].peer_id;
+    {
+        let mut s = state.lock().unwrap();
+        s.push_event(NodeEvent::SeedSyncStarted {
+            created_at: ArteryState::now_unix(),
+            peer_id: hex_key(&first_peer_id),
+        });
+    }
     if snapshots.len() < 2 {
         info!(peers = snapshots.len(), "skipping ownership seed sync install because quorum is unavailable");
         return;
@@ -1800,6 +1821,19 @@ fn apply_quorum_seed_snapshots(state: &Arc<Mutex<ArteryState>>, snapshots: Vec<S
             inserted_consumed_records,
             "installed quorum-validated ownership state from seed sync"
         );
+    }
+
+    // Emit SeedSyncCompleted with summary stats.
+    {
+        let mut s = state.lock().unwrap();
+        s.push_event(NodeEvent::SeedSyncCompleted {
+            created_at: ArteryState::now_unix(),
+            peer_id: hex_key(&first_peer_id),
+            consumed_records: inserted_consumed_records,
+            manifests: 0, // manifests are synced separately via DHT
+            ownership_records: inserted_ownership_records,
+            tags: 0, // tags are synced separately via DHT
+        });
     }
 }
 
@@ -2292,7 +2326,11 @@ async fn request_dht_seed_catchup(
     let requester_node_id = *node.id().as_bytes();
     let source_peer_id = contact_node_id_bytes(target)?;
     let mut cursor = DhtSeedCursor::default();
-    let mut snapshot = SeedSyncPeerSnapshot::default();
+    let mut snapshot = SeedSyncPeerSnapshot {
+        peer_id: source_peer_id,
+        ownership_records: HashMap::new(),
+        consumed_records: HashMap::new(),
+    };
 
     for round in 0..MAX_DHT_SEED_CATCHUP_ROUNDS {
         let dht_seed_request = PulseMessage::DhtSeedRequest(cursor.into_request(requester_node_id));
@@ -2447,7 +2485,11 @@ fn ingest_dht_seed_response(
     let mut inserted_program_manifests = 0usize;
     let mut inserted_compute_receipts = 0usize;
     let mut mirrored_receipts = Vec::new();
-    let mut snapshot = SeedSyncPeerSnapshot::default();
+    let mut snapshot = SeedSyncPeerSnapshot {
+        peer_id: source_peer_id,
+        ownership_records: HashMap::new(),
+        consumed_records: HashMap::new(),
+    };
     let mut s = state.lock().unwrap();
     let peer_ids: Vec<[u8; 32]> = s
         .routing_table
@@ -2942,6 +2984,10 @@ pub(crate) struct WalletState {
     pub(crate) mailbox_key: [u8; 32],
     /// Spend seed for DHT manifest encryption and wallet recovery.
     /// `None` for older wallets that haven't been migrated yet.
+    /// Cached spend seed derived from the wallet raw seed.
+    /// Used by the node to sign spend operations without re-deriving.
+    /// Set during wallet load/create; consumed by payment signing paths.
+    #[allow(dead_code)]
     pub(crate) spend_seed: Option<[u8; 32]>,
 }
 

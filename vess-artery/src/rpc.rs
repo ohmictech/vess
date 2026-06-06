@@ -227,18 +227,6 @@ fn from_hex(hex_str: &str) -> Result<Vec<u8>, String> {
 
 /// Default RPC port.
 pub const DEFAULT_RPC_PORT: u16 = 9400;
-const LOCAL_TEST_FAUCET_ENV: &str = "VESS_LOCAL_TEST_FAUCET";
-
-fn local_test_faucet_enabled() -> bool {
-    std::env::var(LOCAL_TEST_FAUCET_ENV)
-        .map(|value| {
-            matches!(
-                value.to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
-}
 
 fn local_test_faucet_digest(
     nonce: &[u8; 32],
@@ -1320,16 +1308,69 @@ fn fire_opportunistic_consolidations(
 /// Attempt to deliver a payment directly to the recipient if they are a
 /// known verified peer whose mesh contact is in the routing table.
 /// Returns true if the delivery was acknowledged.
-///
-/// TODO: Make async and implement when routing table stores full MeshCarrierContact per peer.
-#[allow(unused_variables)]
-fn try_direct_delivery(
+async fn try_direct_delivery(
     state: &Arc<Mutex<ArteryState>>,
     node: &MeshPulseNode,
     payment: &vess_protocol::Payment,
+    recipient_scan_ek: &[u8],
 ) -> bool {
-    // Placeholder: always fall back to gossip relay for now.
-    false
+    use crate::handshake::PeerState;
+
+    // Look up the recipient's mesh contact from the routing table
+    // by matching scan_ek against stored contact bytes.
+    let target_contact = {
+        let s = state.lock().unwrap();
+        let routable = s.routing_table.routable_peers(|_| true);
+        let mut found = None;
+        for peer in routable {
+            if s.peer_registry.state(&peer.id_hash) != PeerState::Verified {
+                continue;
+            }
+            if let Ok(contact) = decode_contact_bytes(&peer.id_bytes) {
+                let contact_scan_ek = match &contact {
+                    MeshCarrierContact::TcpSocket { mesh_address, .. }
+                    | MeshCarrierContact::UdpSocket { mesh_address, .. } => {
+                        &mesh_address.network_scan_ek
+                    }
+                };
+                if contact_scan_ek.as_slice() == recipient_scan_ek {
+                    found = Some(contact);
+                    break;
+                }
+            }
+        }
+        found
+    };
+
+    let Some(target) = target_contact else {
+        return false;
+    };
+
+    // Build the pulse message and send directly.
+    let pulse_msg = PulseMessage::Payment(payment.clone());
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        node.send_message_with_response(&target, &pulse_msg),
+    )
+    .await
+    {
+        Ok(Ok(Some(_ack))) => {
+            info!("direct delivery: payment acknowledged by recipient");
+            true
+        }
+        Ok(Ok(None)) => {
+            info!("direct delivery: recipient accepted but returned no response");
+            true
+        }
+        Ok(Err(e)) => {
+            warn!("direct delivery: mesh send failed: {e}");
+            false
+        }
+        Err(_timeout) => {
+            warn!("direct delivery: timed out after 3s, falling back to gossip");
+            false
+        }
+    }
 }
 
 async fn handle_send(
@@ -1356,7 +1397,10 @@ async fn handle_send(
         None => return RpcResponse::err(format!("tag +{tag_str} not found")),
     };
 
-    let mut s = state.lock().unwrap();
+    // ── Prepare payment inside a block so the mutex guard is dropped
+    // before the async direct-delivery attempt.
+    let (msg, payment_id, sent_mints, recipient_scan_ek) = {
+        let mut s = state.lock().unwrap();
 
     // ── Require wallet ──────────────────────────────────────────────
     if s.wallet.is_none() {
@@ -1610,9 +1654,15 @@ async fn handle_send(
         (msg, pid, mint_ids)
     };
 
+    // ── Return values from the payment-prep block ───────────────────
+    let scan_ek = recipient_address.scan_ek.clone();
+    (msg, payment_id, sent_mints, scan_ek)
+    }; // mutex guard dropped here
+
     // ── Relay: try direct delivery first, fall back to gossip ───────
     let delivery_method = if let PulseMessage::Payment(ref payment) = msg {
-        let direct_ok = try_direct_delivery(state, node, payment);
+        let direct_ok =
+            try_direct_delivery(state, node, payment, &recipient_scan_ek).await;
         if !direct_ok {
             // Fall back to gossip relay
             let _ = senders.pay_tx.send(payment.clone());
@@ -1624,6 +1674,7 @@ async fn handle_send(
         "none"
     };
 
+    let mut s = state.lock().unwrap();
     s.record_outbound_payment(payment_id, amount, recipient_tag.to_string(), &sent_mints);
     s.push_notification(crate::node_runner::WalletNotification {
         kind: "payment_sent".to_string(),
