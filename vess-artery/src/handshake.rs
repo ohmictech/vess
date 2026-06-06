@@ -421,7 +421,7 @@ pub fn verify_handshake_pow_with_params(
 
 // ── Claim / Genesis PoW (denomination-scaled) ───────────────────────
 
-const CLAIM_POW_M_COST: u32 = 64 * 1024; // 64 MiB
+const CLAIM_POW_M_COST: u32 = 256 * 1024; // 256 MiB
 const CLAIM_POW_P_COST: u32 = 1;
 const CLAIM_POW_OUTPUT_LEN: usize = 32;
 
