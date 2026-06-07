@@ -8219,6 +8219,9 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                         ).is_some();
                     if was_active {
                         info!("reforge consumed mint_id {:?}", &mint_id[..4]);
+                        // Prune the genesis/ownership record — the tombstone is
+                        // sufficient for double-spend prevention. Saves DHT storage.
+                        state.retained_ownership_records.remove(mint_id);
                     }
                 }
 
