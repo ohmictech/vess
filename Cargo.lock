@@ -1901,6 +1901,7 @@ dependencies = [
  "dirs-next",
  "futures",
  "ipconfig",
+ "postcard",
  "proptest",
  "rand 0.8.6",
  "serde",

@@ -88,13 +88,12 @@ pub(crate) fn program_receipt_digest(
 }
 
 /// Derive the encryption key for a LimboAck.
-/// Only the sender (who knows payment_id + stealth_id) and gossip-path
-/// peers can derive this key. Random DHT nodes cannot.
-pub(crate) fn limbo_ack_key(payment_id: &[u8; 32], stealth_id: &[u8; 32]) -> [u8; 32] {
+/// Uses payment_id so only the sender and gossip-path peers (who saw the
+/// Payment message) can decrypt. Random DHT nodes cannot.
+pub(crate) fn limbo_ack_key(payment_id: &[u8; 32]) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"vess-limbo-ack-v1");
     hasher.update(payment_id);
-    hasher.update(stealth_id);
     *hasher.finalize().as_bytes()
 }
 
@@ -5934,6 +5933,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
 
     // ── Spawn message listener so we can cancel on SIGTERM ──────────
     let listen_node = node.clone();
+    let limbo_ack_node = node.clone();
     let listen_handle = tokio::spawn(async move {
         listen_node.listen_messages_with_response(move |peer, msg| {
         let Some(peer_hash) = peer.node_id().map(|node_id| *node_id.as_bytes()) else {
@@ -6574,7 +6574,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 // Lets the sender know their payment reached a limbo-holding
                 // peer. Encrypted with Blake3(payment_id || stealth_id).
                 {
-                    let ack_key = crate::node_runner::limbo_ack_key(&payment_id, &stealth_id);
+                    let ack_key = crate::node_runner::limbo_ack_key(&payment_id);
                     let payload = vess_protocol::LimboAckPayload {
                         payment_id,
                         holder_peer_id: node_id_bytes,
@@ -6588,13 +6588,21 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                                 nonce: blob.nonce,
                                 ciphertext: blob.ciphertext,
                             });
-                            let ack_node = node.clone();
-                            let ack_peer = contact_bytes.clone();
-                            tokio::spawn(async move {
-                                if let Ok(contact) = decode_contact_bytes(&ack_peer) {
+                            // Send the ack back to the peer who relayed the payment.
+                            // They'll forward it toward the sender via the mesh.
+                            let peer_contact = {
+                                let s = lock_state(&st);
+                                s.routing_table.routable_peers(|_| true)
+                                    .into_iter()
+                                    .find(|p| p.id_hash == peer_id)
+                                    .and_then(|p| decode_contact_bytes(&p.id_bytes).ok())
+                            };
+                            if let Some(contact) = peer_contact {
+                                let ack_node = limbo_ack_node.clone();
+                                tokio::spawn(async move {
                                     let _ = ack_node.send_message(&contact, &ack_msg).await;
-                                }
-                            });
+                                });
+                            }
                         }
                     }
                 }
@@ -7014,6 +7022,38 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     });
                 } else {
                     warn!(payment_id = %hex_key(&pr.payment_id), "program receipt signature invalid");
+                }
+                None
+            }
+
+            PulseMessage::LimboAck(ack) => {
+                // Try to decrypt using each outbound payment_id we sent.
+                let pids: Vec<[u8; 32]> = state.outbound_payments.keys().copied().collect();
+                for pid in &pids {
+                    let ack_key = crate::node_runner::limbo_ack_key(pid);
+                    let blob = vess_kloak::persistence::EncryptedBlob {
+                        ciphertext: ack.ciphertext.clone(),
+                        nonce: ack.nonce,
+                    };
+                    if let Ok(plain) = blob.decrypt(&ack_key) {
+                        if let Ok(payload) = postcard::from_bytes::<vess_protocol::LimboAckPayload>(&plain) {
+                            if &payload.payment_id == pid {
+                                info!(payment_id = %hex_key(pid),
+                                      holder = %hex_key(&payload.holder_peer_id),
+                                      "payment delivered to limbo — recipient DHT shard reached");
+                                state.push_notification(WalletNotification {
+                                    kind: "payment_delivered".to_string(),
+                                    created_at: ArteryState::now_unix(),
+                                    payment_id: hex_key(pid),
+                                    amount: None,
+                                    bill_count: None,
+                                    counterparty: None,
+                                    message: "Payment delivered to recipient's DHT shard".to_string(),
+                                });
+                                break;
+                            }
+                        }
+                    }
                 }
                 None
             }

@@ -1344,8 +1344,8 @@ pub struct ProgramReceipt {
 /// DHT neighborhood — without waiting for the recipient to decrypt.
 ///
 /// The payload is ChaCha20Poly1305-encrypted with a key derived from
-/// `Blake3("vess-limbo-ack-v1" || payment_id || stealth_id)`, so only
-/// the sender and gossip-path peers can decrypt it.
+/// `Blake3("vess-limbo-ack-v1" || payment_id)`, so only the sender
+/// and gossip-path peers (who saw the Payment message) can decrypt it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LimboAck {
     /// Random nonce for the AEAD encryption.
