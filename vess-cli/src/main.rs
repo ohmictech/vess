@@ -187,7 +187,7 @@ enum Command {
     /// Run as a full artery node (network participant).
     Node {
         /// Number of gossip neighbors (K).
-        #[arg(long, default_value = "6")]
+        #[arg(long, default_value = "4")]
         k_neighbors: usize,
         /// Maximum gossip hops.
         #[arg(long, default_value = "3")]

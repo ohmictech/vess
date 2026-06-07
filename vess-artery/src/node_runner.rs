@@ -194,10 +194,10 @@ pub enum NodeEvent {
 const MAX_MESSAGE_AGE_SECS: u64 = 300; // 5 minutes
 
 /// Number of random DHT registry queries per periodic flush tick.
-const COVER_QUERIES_PER_TICK: usize = 2;
+const COVER_QUERIES_PER_TICK: usize = 1;
 
 /// Maximum consecutive handshake failures before permanent banishment.
-const MAX_HANDSHAKE_FAILURES: u32 = 3;
+const MAX_HANDSHAKE_FAILURES: u32 = 5;
 
 fn bitcoin_network_tag(network: BitcoinNetwork) -> &'static [u8] {
     match network {
@@ -2948,7 +2948,7 @@ pub struct NodeConfig {
 impl Default for NodeConfig {
     fn default() -> Self {
         Self {
-            k_neighbors: 6,
+            k_neighbors: 4,
             max_hops: 3,
             state_dir: NodeStorage::default_dir().unwrap_or_else(|_| PathBuf::from(".vess-artery")),
             bootstrap: Vec::new(),
