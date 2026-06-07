@@ -87,6 +87,17 @@ pub(crate) fn program_receipt_digest(
     *blake3::hash(&input).as_bytes()
 }
 
+/// Derive the encryption key for a LimboAck.
+/// Only the sender (who knows payment_id + stealth_id) and gossip-path
+/// peers can derive this key. Random DHT nodes cannot.
+pub(crate) fn limbo_ack_key(payment_id: &[u8; 32], stealth_id: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"vess-limbo-ack-v1");
+    hasher.update(payment_id);
+    hasher.update(stealth_id);
+    *hasher.finalize().as_bytes()
+}
+
 const MAX_WALLET_NOTIFICATIONS: usize = 256;
 const AUTO_BURN_FEE_SATS: u64 = 500;
 const AUTO_BURN_RETRY_SECS: u64 = 30;
@@ -6558,6 +6569,36 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 }
 
                 info!(%peer, "payment entered limbo");
+
+                // ── Send privacy-preserving LimboAck ─────────────────
+                // Lets the sender know their payment reached a limbo-holding
+                // peer. Encrypted with Blake3(payment_id || stealth_id).
+                {
+                    let ack_key = crate::node_runner::limbo_ack_key(&payment_id, &stealth_id);
+                    let payload = vess_protocol::LimboAckPayload {
+                        payment_id,
+                        holder_peer_id: node_id_bytes,
+                        timestamp: now,
+                    };
+                    if let Ok(payload_bytes) = postcard::to_allocvec(&payload) {
+                        if let Ok(blob) = vess_kloak::persistence::EncryptedBlob::encrypt(
+                            &payload_bytes, &ack_key,
+                        ) {
+                            let ack_msg = PulseMessage::LimboAck(vess_protocol::LimboAck {
+                                nonce: blob.nonce,
+                                ciphertext: blob.ciphertext,
+                            });
+                            let ack_node = node.clone();
+                            let ack_peer = contact_bytes.clone();
+                            tokio::spawn(async move {
+                                if let Ok(contact) = decode_contact_bytes(&ack_peer) {
+                                    let _ = ack_node.send_message(&contact, &ack_msg).await;
+                                }
+                            });
+                        }
+                    }
+                }
+
                 None
             }
 

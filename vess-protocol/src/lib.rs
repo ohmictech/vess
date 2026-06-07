@@ -262,6 +262,12 @@ pub enum PulseMessage {
     /// Payment to authorize another party to unlock the program.
     ProgramReceipt(ProgramReceipt),
 
+    /// Privacy-preserving acknowledgment that a payment has been stored
+    /// in a limbo buffer on a peer in the recipient's K-nearest DHT shard.
+    /// Encrypted with Blake3(payment_id || stealth_id) so only the sender
+    /// and gossip-path peers can decrypt it.
+    LimboAck(LimboAck),
+
     /// Kademlia FIND_NODE: ask a peer for the K closest nodes to a target.
     /// Used for iterative routing table population — never for locating
     /// wallet users or payment recipients.
@@ -1329,6 +1335,34 @@ pub struct ProgramReceipt {
     /// ML-DSA-65 signature over the receipt digest:
     /// `Blake3("vess-program-receipt-v0" || program_id || program_name || payment_id || claimed_mint_ids || total_amount || resulting_state || depositor_owner_vk || timestamp)`
     pub signature: Vec<u8>,
+}
+
+/// Encrypted acknowledgment from a limbo-holding peer to the sender.
+///
+/// When a peer stores a payment in limbo for a recipient's mailbox key,
+/// it sends this back so the sender knows their payment reached the right
+/// DHT neighborhood — without waiting for the recipient to decrypt.
+///
+/// The payload is ChaCha20Poly1305-encrypted with a key derived from
+/// `Blake3("vess-limbo-ack-v1" || payment_id || stealth_id)`, so only
+/// the sender and gossip-path peers can decrypt it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LimboAck {
+    /// Random nonce for the AEAD encryption.
+    pub nonce: [u8; 12],
+    /// Encrypted LimboAckPayload (ChaCha20Poly1305).
+    pub ciphertext: Vec<u8>,
+}
+
+/// Decrypted contents of a LimboAck.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LimboAckPayload {
+    /// Echoed payment ID from the original Payment.
+    pub payment_id: [u8; 32],
+    /// Node ID of the peer that stored the payment in limbo.
+    pub holder_peer_id: [u8; 32],
+    /// Unix timestamp.
+    pub timestamp: u64,
 }
 
 impl PulseMessage {
