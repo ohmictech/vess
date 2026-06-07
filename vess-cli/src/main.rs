@@ -212,8 +212,7 @@ enum Command {
         /// Discard persisted peer cache and ban state on startup.
         #[arg(long, hide = true)]
         reset_transient_peer_state: bool,
-        /// Join the public testnet (Bitcoin signet, production safety, zero-config seed peers).
-        /// Equivalent to --profile testnet.
+        /// Join the public testnet: Bitcoin signet, faucet enabled, seed peers.
         #[arg(long)]
         testnet: bool,
         /// Bind mesh UDP socket to a specific address (default: 0.0.0.0:0).
