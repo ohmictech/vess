@@ -16,6 +16,7 @@ const DEPOSIT_BUILTINS: &[&str] = &[
     "claim_prev_owner",
     "claim_new_owner",
     "claim_chain_depth",
+    "claim_denomination",
     "claim_has_prev_program",
     "claim_has_new_program",
 ];
@@ -31,6 +32,7 @@ const WITHDRAW_BUILTINS: &[&str] = &[
     "claim_prev_owner",
     "claim_new_owner",
     "claim_chain_depth",
+    "claim_denomination",
     "claim_has_prev_program",
     "claim_has_new_program",
 ];

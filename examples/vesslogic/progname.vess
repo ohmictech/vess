@@ -10,6 +10,7 @@
 [constants]
 u64 min_deposit = 5
 u64 max_withdraw = 250
+u64 max_denomination = 500
 u64 cap = 1000
 u64 withdraw_unlock_at = 86400
 bool paused = false
@@ -22,6 +23,7 @@ risk_guard
 require !paused
 require amount >= min_deposit
 require program_balance + amount <= cap
+require claim_denomination <= max_denomination
 require all_of(compliance_guard, risk_guard)
 require claim_has_new_program || claim_chain_depth >= 1
 bind credited = amount

@@ -1,0 +1,6 @@
+<resources>
+    <style name="Theme.Vess" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:statusBarColor">#FF1A1A2E</item>
+        <item name="android:navigationBarColor">#FF1A1A2E</item>
+    </style>
+</resources>

@@ -34,13 +34,15 @@ approve
 fn capped_treasury() -> CovenantTemplate {
     CovenantTemplate {
         name: "capped-treasury",
-        description: "Capped treasury",
+        description: "Capped treasury with denomination limits",
         source: r#"[constants]
 u64 max_balance = 100000
 u64 max_withdraw = 10000
+u64 max_denomination = 500
 
 [deposit]
 require(amount + program_balance <= max_balance)
+require(claim_denomination <= max_denomination)
 approve
 
 [withdraw]

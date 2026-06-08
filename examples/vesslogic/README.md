@@ -223,6 +223,36 @@ This means: "This deposit is valid only if BOTH `compliance_guard` AND
 
 ---
 
+## Example: Denomination-Gated Deposit
+
+`denom.vess` — Accepts only bills of a specific denomination (or max cap):
+
+```vess
+[constants]
+u64 denom_limit = 100
+u64 max_balance = 1000
+bool paused = false
+
+[deposit]
+require !paused
+require claim_denomination <= denom_limit
+require program_balance + amount <= max_balance
+approve
+
+[withdraw]
+require !paused
+require requested <= program_balance
+approve
+```
+
+This ensures only bills of denomination ≤100 can enter the treasury.
+Useful for:
+- **Mint programs** that issue bills of a known face value
+- **Fee-graded vaults** where different denominations map to different risk tiers
+- **Regulatory per-bill caps** enforced by covenant logic
+
+---
+
 ## See Also
 
 - [VessLogic Language Reference](../../docs/vess-logic.md) — Full syntax and built-in values
