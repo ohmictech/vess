@@ -433,12 +433,15 @@ fn validate_instruction_block(
     instructions: &[VessLogicInstruction],
     scope: &BTreeSet<String>,
 ) -> Result<()> {
+    let mut scope = scope.clone();
     for instruction in instructions {
         match instruction {
-            VessLogicInstruction::Require(expr) => validate_expr(expr, scope)?,
+            VessLogicInstruction::Require(expr) => validate_expr(expr, &scope)?,
             VessLogicInstruction::Bind { name, value } => {
                 validate_identifier(name)?;
-                validate_expr(value, scope)?;
+                validate_expr(value, &scope)?;
+                // Bind variables are visible to subsequent instructions
+                scope.insert(name.clone());
             }
             VessLogicInstruction::Approve => {}
         }

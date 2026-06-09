@@ -13,3 +13,4 @@ argon2 = "0.5"
 blake3 = "1"
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
+winterfell = "0.12"

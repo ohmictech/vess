@@ -10,6 +10,8 @@
 //! - program-address and program-owned bill routing primitives
 
 pub mod vesslogic;
+pub mod evaluator;
+pub mod stark;
 
 use anyhow::{anyhow, Result};
 use argon2::Argon2;

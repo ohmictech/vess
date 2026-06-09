@@ -12,5 +12,6 @@ members = [
     "vess-kloak",
     "vess-protocol",
     "vess-tests",
+    "vess-mobile",
 ]
 resolver = "2"

@@ -58,7 +58,7 @@ use vess_stealth::StealthSecretKey;
 
 /// Lock the artery state mutex, recovering from poisoning if another task panicked.
 /// Prevents a single poisoned mutex from crashing the entire node.
-pub(crate) fn lock_state(state: &Arc<Mutex<ArteryState>>) -> std::sync::MutexGuard<'_, ArteryState> {
+pub fn lock_state(state: &Arc<Mutex<ArteryState>>) -> std::sync::MutexGuard<'_, ArteryState> {
     state.lock().unwrap_or_else(|e| {
         tracing::warn!("artery state mutex was poisoned — recovering via into_inner()");
         e.into_inner()
@@ -146,7 +146,7 @@ pub struct WalletNotification {
 /// When a shard custodian holds this record it will attempt a [`LimboDeliver`]
 /// to `target_id_bytes` for every payment whose `mailbox_key` matches.
 #[derive(Debug, Clone)]
-pub(crate) struct ForwardRecord {
+pub struct ForwardRecord {
     /// Serialized mesh contact of the subscribing node.
     pub(crate) target_id_bytes: Vec<u8>,
     /// Unix timestamp when the subscription expires.
@@ -154,7 +154,7 @@ pub(crate) struct ForwardRecord {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct OutboundPaymentRecord {
+pub struct OutboundPaymentRecord {
     pub(crate) payment_id: [u8; 32],
     pub(crate) amount: u64,
     pub(crate) recipient: String,
@@ -1324,7 +1324,7 @@ const PENDING_GENESIS_TTL_SECS: u64 = 300;
 ///
 /// When a peer sends the same payload hash more than `DUPLICATE_FLOOD_THRESHOLD`
 /// times within `DUPLICATE_WINDOW_SECS`, they are flagged for banishment.
-pub(crate) struct DuplicateTracker {
+pub struct DuplicateTracker {
     /// Peer → { payload_hash → (count, first_seen_ts) }.
     #[allow(clippy::type_complexity)]
     table: HashMap<[u8; 32], HashMap<[u8; 32], (u32, u64)>>,
@@ -2971,7 +2971,7 @@ impl Default for NodeConfig {
 
 /// Tracks end-to-end payment latency samples (payment relay → ownership
 /// claim confirmation).  Keeps a bounded sliding window so memory is fixed.
-pub(crate) struct PaymentLatencyTracker {
+pub struct PaymentLatencyTracker {
     /// Recent latency samples in milliseconds.
     samples: VecDeque<u64>,
     /// Maximum number of samples to retain.
@@ -3022,24 +3022,24 @@ impl PaymentLatencyTracker {
 }
 
 /// Embedded wallet state — present when the wallet is unlocked.
-pub(crate) struct WalletState {
-    pub(crate) stealth_secret: StealthSecretKey,
-    pub(crate) billfold: vess_kloak::BillFold,
-    pub(crate) bitcoin_wallet: vess_bitcoin::BitcoinWallet,
-    pub(crate) bitcoin_receive_address: String,
-    pub(crate) wallet_path: PathBuf,
+pub struct WalletState {
+    pub stealth_secret: StealthSecretKey,
+    pub billfold: vess_kloak::BillFold,
+    pub bitcoin_wallet: vess_bitcoin::BitcoinWallet,
+    pub bitcoin_receive_address: String,
+    pub wallet_path: PathBuf,
     /// Encryption key for spend credentials and tag keys on disk.
-    pub(crate) enc_key: [u8; 32],
+    pub enc_key: [u8; 32],
     /// Mailbox shard key derived from our spend encapsulation key.
     /// Used for targeted [`MailboxSweep`] and automatic forwarding subscription.
-    pub(crate) mailbox_key: [u8; 32],
+    pub mailbox_key: [u8; 32],
     /// Spend seed for DHT manifest encryption and wallet recovery.
     /// `None` for older wallets that haven't been migrated yet.
     /// Cached spend seed derived from the wallet raw seed.
     /// Used by the node to sign spend operations without re-deriving.
     /// Set during wallet load/create; consumed by payment signing paths.
     #[allow(dead_code)]
-    pub(crate) spend_seed: Option<[u8; 32]>,
+    pub spend_seed: Option<[u8; 32]>,
 }
 
 impl Drop for WalletState {
@@ -3049,50 +3049,50 @@ impl Drop for WalletState {
 }
 
 /// Shared artery node state behind a mutex.
-pub(crate) struct ArteryState {
-    pub(crate) registry: OwnershipRegistry,
-    pub(crate) tag_dht: TagDht,
-    pub(crate) compute_dht: ComputeDht,
-    pub(crate) node_id: [u8; 32],
+pub struct ArteryState {
+    pub registry: OwnershipRegistry,
+    pub tag_dht: TagDht,
+    pub compute_dht: ComputeDht,
+    pub node_id: [u8; 32],
     /// Kademlia routing table: 256 XOR-distance buckets of infrastructure
     /// relay peers. Never contains wallet users or payment recipients.
-    pub(crate) routing_table: RoutingTable,
-    pub(crate) gossip_config: GossipConfig,
-    pub(crate) peer_registry: PeerRegistry,
-    pub(crate) handshake_queue: Vec<[u8; 32]>,
-    pub(crate) limbo_buffer: LimboBuffer,
-    pub(crate) reputation: ReputationTable,
-    pub(crate) rate_limiter: crate::gossip::PeerRateLimiter,
-    pub(crate) mailbox_collect_limiter: crate::gossip::PeerRateLimiter,
+    pub routing_table: RoutingTable,
+    pub gossip_config: GossipConfig,
+    pub peer_registry: PeerRegistry,
+    pub handshake_queue: Vec<[u8; 32]>,
+    pub limbo_buffer: LimboBuffer,
+    pub reputation: ReputationTable,
+    pub rate_limiter: crate::gossip::PeerRateLimiter,
+    pub mailbox_collect_limiter: crate::gossip::PeerRateLimiter,
     /// Rate limiter for TagLookup to prevent tag enumeration.
-    pub(crate) tag_lookup_limiter: crate::gossip::PeerRateLimiter,
+    pub tag_lookup_limiter: crate::gossip::PeerRateLimiter,
     /// Rate limiter for RegistryQuery / OwnershipFetch to prevent
     /// bulk mint_id enumeration (surveillance attack).
-    pub(crate) registry_query_limiter: crate::gossip::PeerRateLimiter,
-    pub(crate) duplicate_tracker: DuplicateTracker,
+    pub registry_query_limiter: crate::gossip::PeerRateLimiter,
+    pub duplicate_tracker: DuplicateTracker,
     /// Estimated number of peers in the network (for dynamic DHT replication).
-    pub(crate) estimated_network_size: usize,
+    pub estimated_network_size: usize,
     /// Mint IDs currently in limbo (soft reservation while payment is in flight).
-    pub(crate) limbo_mint_ids: std::collections::HashSet<[u8; 32]>,
+    pub limbo_mint_ids: std::collections::HashSet<[u8; 32]>,
     /// Payment IDs already in limbo (prevents exact duplicate buffering).
-    pub(crate) limbo_payment_ids: std::collections::HashSet<[u8; 32]>,
+    pub limbo_payment_ids: std::collections::HashSet<[u8; 32]>,
     /// Unix timestamp (seconds) when each limbo payment ID was inserted.
-    pub(crate) limbo_payment_times: HashMap<[u8; 32], u64>,
+    pub limbo_payment_times: HashMap<[u8; 32], u64>,
     /// Encrypted wallet manifests keyed by DHT key.
     /// Value is `(encrypted_manifest, inserted_at_unix_secs)` for oldest-first eviction.
-    pub(crate) manifest_store: HashMap<[u8; 32], (Vec<u8>, u64)>,
+    pub manifest_store: HashMap<[u8; 32], (Vec<u8>, u64)>,
     /// Locally-retained ownership records for bills this node originated or
     /// currently owns, kept even when this node is not in the live DHT shard.
     /// Used to seed newly closer peers during bootstrap.
-    pub(crate) retained_ownership_records: HashMap<[u8; 32], OwnershipRecord>,
+    pub retained_ownership_records: HashMap<[u8; 32], OwnershipRecord>,
     /// Locally-retained tombstones for consumed bills this node originated or
     /// tracked, so newly closer peers can learn reforge outcomes during seed sync.
-    pub(crate) retained_consumed_records: HashMap<[u8; 32], ConsumedRecord>,
+    pub retained_consumed_records: HashMap<[u8; 32], ConsumedRecord>,
     /// Unix-millis timestamp when each bill entered limbo (keyed by mint_id,
     /// populated at auto-receive time for end-to-end latency tracking).
-    pub(crate) limbo_entry_times: HashMap<[u8; 32], u64>,
+    pub limbo_entry_times: HashMap<[u8; 32], u64>,
     /// Payment latency tracker (payment relay → ownership claim completion).
-    pub(crate) payment_latency: PaymentLatencyTracker,
+    pub payment_latency: PaymentLatencyTracker,
     /// H3: OwnershipGenesis messages that arrived before their ReforgeAttestation
     /// tombstones. Keyed by a missing input mint_id — when that tombstone is
     /// created by an RA, the pending genesis messages are retried.
@@ -3100,46 +3100,95 @@ pub(crate) struct ArteryState {
     /// broadcaster being falsely banished) due to gossip ordering races.
     /// Value is `(OwnershipGenesis, buffered_at_unix_secs)` for TTL eviction.
     /// C1: Enforced global cap + per-key cap to prevent memory exhaustion.
-    pub(crate) pending_reforge_genesis:
+    pub pending_reforge_genesis:
         HashMap<[u8; 32], Vec<(vess_protocol::OwnershipGenesis, u64)>>,
     /// Embedded wallet — trial-decrypts incoming payments automatically.
-    pub(crate) wallet: Option<WalletState>,
+    pub wallet: Option<WalletState>,
     /// Background Bitcoin light client used for burn verification and
     /// transaction broadcast/onboarding.
-    pub(crate) bitcoin_client: Option<vess_bitcoin::BitcoinLightClient>,
+    pub bitcoin_client: Option<vess_bitcoin::BitcoinLightClient>,
     /// Wallet file path (set from config even when wallet is locked).
     /// Used by the RPC `wallet_unlock` endpoint to load the file.
-    pub(crate) wallet_path: Option<PathBuf>,
+    pub wallet_path: Option<PathBuf>,
     /// Wallet-local notification queue for CLI and wallet layers.
-    pub(crate) notifications: VecDeque<WalletNotification>,
+    pub notifications: VecDeque<WalletNotification>,
     /// Structured node events for CLI display (burns, claims, banishments, etc.).
-    pub(crate) events: VecDeque<NodeEvent>,
+    pub events: VecDeque<NodeEvent>,
     /// Outbound payments waiting for recipient claim confirmation.
-    pub(crate) outbound_payments: HashMap<[u8; 32], OutboundPaymentRecord>,
+    pub outbound_payments: HashMap<[u8; 32], OutboundPaymentRecord>,
     /// Reverse index from mint_id to outbound payment_id for fast finalization.
-    pub(crate) outbound_by_mint_id: HashMap<[u8; 32], [u8; 32]>,
+    pub outbound_by_mint_id: HashMap<[u8; 32], [u8; 32]>,
     /// Shared banishment manager — included in snapshots so the ban list
     /// survives node restarts.
-    pub(crate) banishment: Arc<BanishmentManager>,
+    pub banishment: Arc<BanishmentManager>,
     /// Persistent local VessTag address book.
     /// Caches every verified tag → stealth address the wallet has sent to,
     /// so repeat payments skip the DHT entirely.
-    pub(crate) tag_cache: crate::tag_cache::TagCache,
+    pub tag_cache: crate::tag_cache::TagCache,
     /// Active push-forwarding subscriptions: mailbox_key → record of the
     /// subscribing node and subscription expiry time.
-    pub(crate) mailbox_fwd: HashMap<[u8; 32], ForwardRecord>,
+    pub mailbox_fwd: HashMap<[u8; 32], ForwardRecord>,
     /// Rate limiter for [`MailboxForwardRegister`] requests.
-    pub(crate) mailbox_fwd_limiter: crate::gossip::PeerRateLimiter,
+    pub mailbox_fwd_limiter: crate::gossip::PeerRateLimiter,
     /// Whether test-only / unsafe features are permitted.
-    pub(crate) unsafe_mode: bool,
+    pub unsafe_mode: bool,
     /// Runtime flag for the local test faucet.
-    pub(crate) test_faucet_enabled: bool,
+    pub test_faucet_enabled: bool,
     /// True when running in testnet mode (signet, faucet, unsafe ops).
-    pub(crate) is_testnet: bool,
+    pub is_testnet: bool,
 }
 
 impl ArteryState {
-    pub(crate) fn push_notification(&mut self, notification: WalletNotification) {
+    /// Create a fresh artery state for a new node.
+    pub fn new(is_testnet: bool) -> Self {
+        let node_id_bytes: [u8; 32] = rand::thread_rng().gen();
+        let k_neighbors = 4usize;
+        Self {
+            registry: OwnershipRegistry::new(node_id_bytes),
+            tag_dht: TagDht::new(node_id_bytes, k_neighbors),
+            compute_dht: ComputeDht::new(),
+            node_id: node_id_bytes,
+            routing_table: RoutingTable::new(node_id_bytes),
+            gossip_config: GossipConfig::default(),
+            peer_registry: PeerRegistry::new(std::time::Duration::from_secs(30)),
+            handshake_queue: Vec::new(),
+            limbo_buffer: LimboBuffer::new(),
+            reputation: ReputationTable::new(),
+            rate_limiter: crate::gossip::PeerRateLimiter::with_defaults(),
+            mailbox_collect_limiter: crate::gossip::PeerRateLimiter::new(10, 60),
+            tag_lookup_limiter: crate::gossip::PeerRateLimiter::new(30, 60),
+            registry_query_limiter: crate::gossip::PeerRateLimiter::new(20, 60),
+            duplicate_tracker: DuplicateTracker::new(),
+            estimated_network_size: 0,
+            limbo_mint_ids: std::collections::HashSet::new(),
+            limbo_payment_ids: std::collections::HashSet::new(),
+            limbo_payment_times: HashMap::new(),
+            manifest_store: HashMap::new(),
+            retained_ownership_records: HashMap::new(),
+            retained_consumed_records: HashMap::new(),
+            limbo_entry_times: HashMap::new(),
+            payment_latency: PaymentLatencyTracker::new(1000),
+            pending_reforge_genesis: HashMap::new(),
+            wallet: None,
+            bitcoin_client: None,
+            wallet_path: None,
+            notifications: VecDeque::new(),
+            events: VecDeque::new(),
+            outbound_payments: HashMap::new(),
+            outbound_by_mint_id: HashMap::new(),
+            banishment: Arc::new(BanishmentManager::new()),
+            tag_cache: crate::tag_cache::TagCache::load_or_create(
+                std::path::PathBuf::from(".vess-artery").join("tag_cache.json"),
+            ),
+            mailbox_fwd: HashMap::new(),
+            mailbox_fwd_limiter: crate::gossip::PeerRateLimiter::new(5, 60),
+            unsafe_mode: is_testnet,
+            test_faucet_enabled: is_testnet,
+            is_testnet,
+        }
+    }
+
+    pub fn push_notification(&mut self, notification: WalletNotification) {
         info!(
             kind = %notification.kind,
             payment_id = %notification.payment_id,
@@ -3150,14 +3199,14 @@ impl ArteryState {
     }
 
     /// Re-queue a previously-drained notification without logging.
-    pub(crate) fn push_notification_raw(&mut self, notification: WalletNotification) {
+    pub fn push_notification_raw(&mut self, notification: WalletNotification) {
         if self.notifications.len() >= MAX_WALLET_NOTIFICATIONS {
             self.notifications.pop_front();
         }
         self.notifications.push_back(notification);
     }
 
-    pub(crate) fn take_notifications(&mut self, max: usize) -> Vec<WalletNotification> {
+    pub fn take_notifications(&mut self, max: usize) -> Vec<WalletNotification> {
         let count = max.max(1).min(self.notifications.len());
         let mut out = Vec::with_capacity(count);
         for _ in 0..count {
