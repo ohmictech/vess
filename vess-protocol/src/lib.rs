@@ -286,9 +286,38 @@ pub enum PulseMessage {
 
     /// Response to a [`NetworkStats`] request.
     NetworkStatsResponse(NetworkStatsResponse),
+
+    /// Network-wide banishment proof: evidence that a peer misbehaved.
+    /// Carries cryptographic proof (not just accusation). Every node
+    /// verifies independently and banishes if valid.
+    BanishmentProof(BanishmentProof),
+
+    /// Two-hop relay payment: sender → intermediate node → DHT shard.
+    /// The intermediate node unwraps and forwards the inner [`Payment`]
+    /// to the K-nearest peers of `target_shard_key`, breaking the direct
+    /// sender-recipient link at the network layer.
+    RelayPayment(RelayPayment),
 }
 
 // ── Payment ──────────────────────────────────────────────────────────
+
+/// Two-hop payment relay wrapper.
+///
+/// The sender encrypts a regular [`Payment`] and picks a random verified
+/// peer to act as intermediary. The intermediary unwraps and forwards the
+/// inner payment to the DHT shard keyed by `target_shard_key`, making it
+/// impossible for any single hop to correlate sender with recipient.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayPayment {
+    /// The inner payment (opaque to the relay node).
+    pub payment: Payment,
+    /// DHT routing key for the destination shard (typically `mailbox_key`).
+    pub target_shard_key: [u8; 32],
+    /// Remaining relay hops before the payment reaches the destination shard.
+    /// Each relay decrements; when 0 the payment is forwarded to the shard.
+    #[serde(default)]
+    pub ttl: u8,
+}
 
 /// A stealth-encrypted payment from sender to recipient.
 ///
@@ -848,6 +877,51 @@ pub struct HandshakeResponse {
     /// computational resources.
     #[serde(default)]
     pub pow_hash: Vec<u8>,
+}
+
+// ── Banishment ──────────────────────────────────────────────────────
+
+/// Type of protocol violation that triggered a banishment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BanishmentOffense {
+    /// Peer sent two conflicting OwnershipClaims for the same mint_id.
+    DoubleSpend,
+    /// Peer sent an OwnershipClaim with an invalid signature.
+    InvalidClaimSignature,
+    /// Peer sent a ReforgeAttestation that fails proof verification.
+    InvalidReforgeProof,
+    /// Peer sent a HandshakeResponse with an HMAC that doesn't match
+    /// any allowed protocol version.
+    ProtocolVersionMismatch,
+    /// Peer exceeded per-peer rate limits repeatedly (spam/flood).
+    RateLimitAbuse,
+    /// Generic: peer sent a pulse that failed validation.
+    InvalidMessage { reason: String },
+}
+
+/// Network-wide banishment proof.
+///
+/// Carries cryptographic evidence that a peer misbehaved. Every node
+/// that receives this message independently verifies the evidence and
+/// banishes the peer if valid. Sybils cannot fabricate evidence against
+/// honest nodes because the evidence requires the victim's signature
+/// or cryptographic proof of protocol violation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BanishmentProof {
+    /// The peer being accused.
+    pub peer_id: [u8; 32],
+    /// What they did.
+    pub offense: BanishmentOffense,
+    /// Cryptographic evidence (e.g. the conflicting claim, invalid
+    /// signature, or reforge proof that failed verification).
+    pub evidence: Vec<u8>,
+    /// The reporting node's signature over `(peer_id || offense || evidence_hash)`.
+    /// Prevents Sybils from generating fake reports en masse.
+    pub reporter_vk: Vec<u8>,
+    /// ML-DSA-65 signature by the reporter.
+    pub reporter_signature: Vec<u8>,
+    /// Unix timestamp when the offense was observed.
+    pub observed_at: u64,
 }
 
 // ── Limbo ────────────────────────────────────────────────────────────

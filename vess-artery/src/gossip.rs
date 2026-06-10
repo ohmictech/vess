@@ -207,6 +207,69 @@ impl PeerRateLimiter {
     }
 }
 
+// ── Global rate limiter ───────────────────────────────────────────
+
+/// Global inbound message rate limiter.
+///
+/// Unlike [`PeerRateLimiter`] which caps per-peer traffic, this caps total
+/// inbound messages across all peers to prevent CPU exhaustion from many
+/// individually-rate-limited Sybil peers attacking simultaneously.
+///
+/// Uses a token-bucket algorithm: tokens refill at `tokens_per_sec` rate,
+/// up to `burst_size`. Each inbound message consumes one token.
+pub struct GlobalRateLimiter {
+    /// Maximum tokens (burst capacity).
+    burst_size: u64,
+    /// Token refill rate per second.
+    tokens_per_sec: u64,
+    /// Current token count.
+    tokens: u64,
+    /// Last refill timestamp.
+    last_refill: std::time::Instant,
+}
+
+impl GlobalRateLimiter {
+    /// Create a new global rate limiter.
+    ///
+    /// `tokens_per_sec`: sustained message rate (e.g. 10_000).
+    /// `burst_size`: maximum burst (e.g. 50_000).
+    pub fn new(tokens_per_sec: u64, burst_size: u64) -> Self {
+        Self {
+            burst_size,
+            tokens_per_sec,
+            tokens: burst_size,
+            last_refill: std::time::Instant::now(),
+        }
+    }
+
+    /// Default: 10,000 msg/s sustained, 50,000 burst.
+    pub fn with_defaults() -> Self {
+        Self::new(10_000, 50_000)
+    }
+
+    /// Check if a message should be accepted under the global rate limit.
+    /// Returns `true` if allowed, `false` if the global cap is exceeded.
+    pub fn allow(&mut self) -> bool {
+        self.refill();
+        if self.tokens > 0 {
+            self.tokens -= 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn refill(&mut self) {
+        let elapsed = self.last_refill.elapsed().as_secs_f64();
+        if elapsed < 0.001 {
+            return;
+        }
+        let new_tokens = (elapsed * self.tokens_per_sec as f64) as u64;
+        self.tokens = (self.tokens + new_tokens).min(self.burst_size);
+        self.last_refill = std::time::Instant::now();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

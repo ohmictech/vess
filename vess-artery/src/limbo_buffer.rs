@@ -361,6 +361,7 @@ mod tests {
             bill_count: bill_ids.len() as u8,
             mailbox_key: None,
             direct_receipt_tag_hash: None,
+            program_receipt: None,
         }
     }
 

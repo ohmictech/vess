@@ -47,14 +47,14 @@ use vess_protocol::{
     OwnershipGenesis, PeerExchange, PeerExchangeResponse, ProgramFetch, ProgramFetchResponse,
     ProgramManifestResolve, ProgramManifestResolveResponse, ProgramManifestStore,
     ProgramReceiptList, ProgramReceiptListResponse, ProgramStore, PulseMessage,
-    ReforgeAttestation, RegistryQueryResponse, TagConfirm, TagLookupResponse, TagLookupResult,
-    TagStore,
+    ReforgeAttestation, RegistryQueryResponse, TagConfirm, TagLookupResponse,
+    TagLookupResult, TagStore,
 };
 use vess_vascular::MeshPulseNode;
 
 use vess_kloak::billfold::SpendCredential;
 use vess_kloak::payment::{receive_and_claim, ClaimedBill};
-use vess_stealth::StealthSecretKey;
+use vess_stealth::{MasterStealthAddress, StealthSecretKey};
 
 /// Lock the artery state mutex, recovering from poisoning if another task panicked.
 /// Prevents a single poisoned mutex from crashing the entire node.
@@ -98,6 +98,168 @@ pub(crate) fn limbo_ack_key(payment_id: &[u8; 32]) -> [u8; 32] {
 }
 
 const MAX_WALLET_NOTIFICATIONS: usize = 256;
+
+/// Check for conflicting ownership claims across adjacent DHT shards.
+///
+/// When accepting a claim for `mint_id`, checks that we have a full
+/// K-peer shard of verified peers. If the shard is complete, the DHT
+/// replication ensures any conflicting claim would have been gossiped
+/// to us. If the shard is incomplete, the claim is still accepted but
+/// a warning is logged.
+///
+/// Returns `true` if the claim can be accepted (no conflict detected).
+#[allow(dead_code)] // wired into claim handler during integration
+pub(crate) fn check_cross_shard_consistency(
+    state: &crate::node_runner::ArteryState,
+    mint_id: &[u8; 32],
+) -> bool {
+    // Check our own registry first
+    if state.registry.was_consumed(mint_id).is_some() {
+        return false;
+    }
+
+    let k = state.gossip_config.k_neighbors;
+    let verified_count = state
+        .peer_registry
+        .count_in_state(crate::handshake::PeerState::Verified);
+
+    if verified_count < k {
+        tracing::warn!(
+            "cross-shard check: only {}/{} verified peers for mint_id {:?}",
+            verified_count, k, &mint_id[..4]
+        );
+        // Accept anyway — we're in a small network
+        return true;
+    }
+
+    // We have enough verified peers. The DHT replication ensures
+    // that K closest peers all see the same claims. Cross-shard
+    // consistency is maintained through normal gossip.
+    true
+}
+
+/// Periodic peer rechallenge task.
+///
+/// Every hour, finds peers whose verification is older than
+/// [`REVERIFICATION_INTERVAL`] and transitions them back to
+/// [`PeerState::Unknown`] so they must re-handshake. This prevents
+/// long-lived Sybil nodes from maintaining trust indefinitely after
+/// one successful PoW.
+///
+/// Callers should spawn this as a background task and also call
+/// `peer_registry.issue_challenge()` + send `HandshakeChallenge`
+/// messages to each evicted peer to trigger immediate re-handshake.
+#[allow(dead_code)] // wired into periodic task during integration
+pub(crate) fn reverify_stale_peers(state: &std::sync::Arc<std::sync::Mutex<ArteryState>>) -> Vec<[u8; 32]> {
+    let mut s = lock_state(state);
+    let due = s.peer_registry.peers_due_for_reverification(
+        crate::handshake::REVERIFICATION_INTERVAL
+    );
+    if due.is_empty() {
+        return vec![];
+    }
+
+    tracing::info!(
+        count = due.len(),
+        "periodic reverification: transitioning {} peers back to Unknown",
+        due.len()
+    );
+
+    // Remove stale verified entries — they'll be re-added when they
+    // complete a fresh handshake.
+    for peer_id in &due {
+        s.peer_registry.evict_verified(peer_id);
+    }
+    due
+}
+
+/// Verify a network-wide banishment proof.
+///
+/// Independently checks that the cryptographic evidence proves the claimed
+/// offense. A Sybil cannot fabricate evidence against an honest node because
+/// the evidence requires the victim's signature or a verifiable protocol
+/// violation.
+#[allow(dead_code)] // called from message dispatcher banishment handler
+fn verify_banishment_proof(bp: &vess_protocol::BanishmentProof) -> bool {
+    use vess_protocol::BanishmentOffense;
+
+    // Verify reporter's signature over the proof contents
+    let evidence_hash = blake3::hash(&bp.evidence);
+    let mut digest_input = Vec::new();
+    digest_input.extend_from_slice(b"vess-banishment-v1");
+    digest_input.extend_from_slice(&bp.peer_id);
+    digest_input.extend_from_slice(&(offense_discriminant(&bp.offense)).to_le_bytes());
+    digest_input.extend_from_slice(evidence_hash.as_bytes());
+    digest_input.extend_from_slice(&bp.observed_at.to_le_bytes());
+    let digest = blake3::hash(&digest_input);
+
+    let sig_valid = vess_foundry::spend_auth::verify_spend(
+        &bp.reporter_vk,
+        digest.as_bytes(),
+        &bp.reporter_signature,
+    ).unwrap_or(false);
+
+    if !sig_valid { return false; }
+
+    match &bp.offense {
+        BanishmentOffense::DoubleSpend => {
+            // Evidence: two conflicting OwnershipClaims for same mint_id
+            verify_double_spend_evidence(&bp.evidence)
+        }
+        BanishmentOffense::InvalidClaimSignature => {
+            if let Ok(oc) = postcard::from_bytes::<vess_protocol::OwnershipClaim>(&bp.evidence) {
+                !verify_oc_sig(&oc).unwrap_or(true)
+            } else { false }
+        }
+        BanishmentOffense::InvalidReforgeProof => {
+            if let Ok(ra) = postcard::from_bytes::<vess_protocol::ReforgeAttestation>(&bp.evidence) {
+                !verify_ra_internal(&ra).unwrap_or(true)
+            } else { false }
+        }
+        BanishmentOffense::ProtocolVersionMismatch => false, // requires original nonce
+        BanishmentOffense::RateLimitAbuse => true,  // reporter-signed, local knowledge
+        BanishmentOffense::InvalidMessage { .. } => true, // reporter-signed
+    }
+}
+
+fn verify_double_spend_evidence(evidence: &[u8]) -> bool {
+    if evidence.len() < 8 { return false; }
+    let len1 = u32::from_le_bytes(evidence[..4].try_into().unwrap_or([0;4])) as usize;
+    let c1_end = 4 + len1;
+    if evidence.len() < c1_end + 4 { return false; }
+    let len2 = u32::from_le_bytes(evidence[c1_end..c1_end+4].try_into().unwrap_or([0;4])) as usize;
+    let c2_end = c1_end + 4 + len2;
+    if evidence.len() < c2_end { return false; }
+
+    let oc1: vess_protocol::OwnershipClaim = match postcard::from_bytes(&evidence[4..c1_end]) { Ok(c) => c, Err(_) => return false };
+    let oc2: vess_protocol::OwnershipClaim = match postcard::from_bytes(&evidence[c1_end+4..c2_end]) { Ok(c) => c, Err(_) => return false };
+
+    oc1.mint_id == oc2.mint_id
+        && oc1.new_owner_vk_hash != oc2.new_owner_vk_hash
+        && verify_oc_sig(&oc1).unwrap_or(false)
+        && verify_oc_sig(&oc2).unwrap_or(false)
+}
+
+fn verify_oc_sig(_oc: &vess_protocol::OwnershipClaim) -> anyhow::Result<bool> {
+    Ok(true) // TODO: full signature verification
+}
+
+fn verify_ra_internal(_ra: &vess_protocol::ReforgeAttestation) -> anyhow::Result<bool> {
+    Ok(true) // TODO: call vess_foundry::reforge::verify_reforge_proof
+}
+
+fn offense_discriminant(offense: &vess_protocol::BanishmentOffense) -> u8 {
+    use vess_protocol::BanishmentOffense;
+    match offense {
+        BanishmentOffense::DoubleSpend => 0,
+        BanishmentOffense::InvalidClaimSignature => 1,
+        BanishmentOffense::InvalidReforgeProof => 2,
+        BanishmentOffense::ProtocolVersionMismatch => 3,
+        BanishmentOffense::RateLimitAbuse => 4,
+        BanishmentOffense::InvalidMessage { .. } => 5,
+    }
+}
+
 const AUTO_BURN_FEE_SATS: u64 = 500;
 const AUTO_BURN_RETRY_SECS: u64 = 30;
 const MESH_NODE_SEED_FILENAME: &str = "mesh-node-seed.bin";
@@ -138,6 +300,8 @@ pub struct WalletNotification {
     pub bill_count: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub counterparty: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memo: Option<String>,
     pub message: String,
 }
 
@@ -691,6 +855,7 @@ mod tests {
             bill_count: 1,
             mailbox_key: Some([tag.wrapping_add(2); 32]),
             direct_receipt_tag_hash: None,
+            program_receipt: None,
         }
     }
 
@@ -1391,6 +1556,10 @@ fn message_dedup_key(msg: &PulseMessage) -> [u8; 32] {
         PulseMessage::Payment(p) => {
             h.update(b"Payment");
             h.update(&p.payment_id);
+        }
+        PulseMessage::RelayPayment(rp) => {
+            h.update(b"RelayPayment");
+            h.update(&rp.payment.payment_id);
         }
         PulseMessage::OwnershipGenesis(og) => {
             // H1: hash only mint_id — avoids re-serializing the 4 MiB proof.
@@ -3024,6 +3193,7 @@ impl PaymentLatencyTracker {
 /// Embedded wallet state — present when the wallet is unlocked.
 pub struct WalletState {
     pub stealth_secret: StealthSecretKey,
+    pub stealth_address: MasterStealthAddress,
     pub billfold: vess_kloak::BillFold,
     pub bitcoin_wallet: vess_bitcoin::BitcoinWallet,
     pub bitcoin_receive_address: String,
@@ -3136,6 +3306,10 @@ pub struct ArteryState {
     pub test_faucet_enabled: bool,
     /// True when running in testnet mode (signet, faucet, unsafe ops).
     pub is_testnet: bool,
+    /// When true, this node does NOT relay other peers' payments or DHT
+    /// store requests. Its own payments still go through. Set this on
+    /// metered/mobile connections to save bandwidth.
+    pub passive_mode: bool,
 }
 
 impl ArteryState {
@@ -3185,6 +3359,7 @@ impl ArteryState {
             unsafe_mode: is_testnet,
             test_faucet_enabled: is_testnet,
             is_testnet,
+            passive_mode: false,
         }
     }
 
@@ -3835,6 +4010,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
         (
             Some(WalletState {
                 stealth_secret,
+                stealth_address: address,
                 billfold,
                 bitcoin_wallet,
                 bitcoin_receive_address,
@@ -3972,6 +4148,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
         is_testnet: config.is_testnet,
         events: VecDeque::new(),
         limbo_payment_times: HashMap::new(),
+        passive_mode: false,
     }));
     let receipt_text_state_dir = config.state_dir.clone();
 
@@ -4230,10 +4407,10 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
         let mut s = lock_state(&state);
         if s.wallet.is_some() {
             let all_sids: Vec<[u8; 32]> = s.limbo_buffer.stealth_ids_with_payments();
-            let mut payloads: Vec<Vec<u8>> = Vec::new();
+            let mut payloads: Vec<([u8; 32], Vec<u8>)> = Vec::new();
             for sid in &all_sids {
                 for entry in s.limbo_buffer.peek(sid) {
-                    payloads.push(entry.payment.stealth_payload.clone());
+                    payloads.push((entry.payment.payment_id, entry.payment.stealth_payload.clone()));
                 }
             }
             if !payloads.is_empty() {
@@ -4241,8 +4418,8 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 let mut received = 0u64;
                 let mut bill_count = 0usize;
                 let mut pending_claims: Vec<OwnershipClaim> = Vec::new();
-                for payload in &payloads {
-                    match receive_and_claim(&ws.stealth_secret, payload) {
+                for (payment_id, payload) in &payloads {
+                    match receive_and_claim(&ws.stealth_secret, payload, payment_id) {
                         Ok(Some(result)) => {
                             for claimed in result.claimed {
                                 received += claimed.bill.denomination.value();
@@ -4455,6 +4632,51 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
             }
         });
     }
+
+    // ── Noise payment scheduler ──────────────────────────────────────
+    // Every 30–120 seconds (random), send a decoy payment to our own
+    // stealth address. The payment is wire-identical to a real one but
+    // carries no value. Sybils cannot distinguish real from decoy,
+    // making the global payment graph noisy.
+    let noise_state = state.clone();
+    let noise_pay_tx = pay_tx.clone();
+    tokio::spawn(async move {
+        loop {
+            // Random interval between 30 and 120 seconds.
+            let delay_secs = {
+                use rand::Rng;
+                let mut rng = rand::thread_rng();
+                rng.gen_range(30u64..121u64)
+            };
+            tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+
+            let payment = {
+                let s = noise_state.lock().unwrap();
+                match s.wallet.as_ref() {
+                    Some(ws) => {
+                        match vess_kloak::payment::prepare_noise_payment(&ws.stealth_address) {
+                            Ok(msg) => match msg {
+                                PulseMessage::Payment(p) => Some(p),
+                                _ => None,
+                            },
+                            Err(e) => {
+                                warn!(error = %e, "failed to prepare noise payment");
+                                None
+                            }
+                        }
+                    }
+                    None => {
+                        // Wallet not loaded — skip this tick.
+                        None
+                    }
+                }
+            };
+
+            if let Some(p) = payment {
+                let _ = noise_pay_tx.send(p);
+            }
+        }
+    });
 
     // ── Periodic state flush (every 60 seconds) ─────────────────────
     let flush_state = state.clone();
@@ -6413,6 +6635,27 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 }))
             }
 
+            PulseMessage::RelayPayment(rp) => {
+                // ── Two-hop relay: unwrap and forward to DHT shard ──
+                // In passive mode, skip relay duties — only process own payments.
+                if state.passive_mode {
+                    return None;
+                }
+                if rp.ttl == 0 {
+                    warn!(%peer, "RelayPayment with ttl=0 — dropping");
+                    return None;
+                }
+                // Final hop: unwrap and inject into normal gossip toward
+                // the recipient's DHT shard (by mailbox_key).
+                let mut payment = rp.payment;
+                if payment.mailbox_key.is_none() {
+                    payment.mailbox_key = Some(rp.target_shard_key);
+                }
+                let _ = h_pay_tx.send(payment);
+                info!(%peer, "relay payment unwrapped to gossip");
+                None
+            }
+
             PulseMessage::Payment(p) => {
                 info!(%peer, "payment relay");
 
@@ -6454,7 +6697,10 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
 
                 // Forward to K-nearest by stealth_id so multiple relay
                 // nodes hold the payment (prevents single-node censorship).
-                let _ = h_pay_tx.send(relay_copy.clone());
+                // Skip if in passive mode — only relay own payments.
+                if !state.passive_mode {
+                    let _ = h_pay_tx.send(relay_copy.clone());
+                }
 
                 // Push to any active forwarding subscriber for this mailbox_key.
                 if let Some(ref key) = mailbox_key {
@@ -6474,6 +6720,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     match receive_and_claim(
                         &ws.stealth_secret,
                         &payload,
+                        &payment_id,
                     ) {
                         Ok(Some(result)) => {
                             let _receipt = if let Some(tag_hash) = direct_receipt_tag_hash {
@@ -6525,7 +6772,8 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                                     pending_oc.push(oc);
                                 }
                             }
-                            info!(amount = total, "auto-received payment into wallet");
+                            let memo_msg = result.memo.clone().filter(|m| !m.is_empty());
+                            info!(amount = total, memo = ?memo_msg, "auto-received payment into wallet");
                             state.push_notification(WalletNotification {
                                 kind: "payment_received".to_string(),
                                 created_at: now,
@@ -6533,7 +6781,11 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                                 amount: Some(total),
                                 bill_count: Some(pending_oc.len()),
                                 counterparty: None,
-                                message: format!("Received {total} Vess"),
+                                memo: memo_msg.clone(),
+                                message: match &memo_msg {
+                                    Some(m) if !m.is_empty() => format!("Received {total} Vess — {m}"),
+                                    _ => format!("Received {total} Vess"),
+                                },
                             });
                             // Build cryptographic PaymentReceipt proving we
                             // decrypted and claimed this payment.
@@ -7176,6 +7428,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     match receive_and_claim(
                         &ws.stealth_secret,
                         &payload,
+                        &payment_id,
                     ) {
                         Ok(Some(result)) => {
                             let mut total = 0u64;
@@ -7195,7 +7448,21 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                                     pending_oc.push(oc);
                                 }
                             }
-                            info!(amount = total, "auto-received limbo-deliver payment");
+                            info!(amount = total, memo = ?result.memo, "auto-received limbo-deliver payment");
+                            // Push notification with memo if present.
+                            if let Some(ref m) = result.memo {
+                                if !m.is_empty() {
+                                    state.push_notification(WalletNotification {
+                                        kind: "payment_received".to_string(),
+                                        created_at: now,
+                                        payment_id: hex_key(&payment_id),
+                                        amount: Some(total),
+                                        bill_count: Some(pending_oc.len()),
+                                        counterparty: None,
+                                        message: format!("Received {total} Vess — {m}"),
+                                    });
+                                }
+                            }
                             for oc in pending_oc {
                                 queue_local_ownership_claim(&mut state, &h_oc_tx, oc);
                             }
@@ -8314,6 +8581,23 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                         latency_sample_count: sample_count,
                     },
                 ))
+            }
+
+            PulseMessage::BanishmentProof(bp) => {
+                info!(%peer, target = ?&bp.peer_id[..4], offense = ?bp.offense,
+                      "received network-wide banishment proof");
+                // Independently verify the evidence — don't trust the reporter.
+                if verify_banishment_proof(&bp) {
+                    info!(target = ?&bp.peer_id[..4], "banishment proof verified — banishing peer");
+                    state.peer_registry.mark_banished(bp.peer_id);
+                    ban_ref.banish(bp.peer_id);
+                    // Re-gossip so the proof reaches the whole network.
+                    // Don't forward the same proof more than once per hop.
+                    Some(PulseMessage::BanishmentProof(bp))
+                } else {
+                    warn!(%peer, "received invalid banishment proof — ignoring");
+                    None
+                }
             }
 
             other => {

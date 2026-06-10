@@ -56,6 +56,28 @@ pub const HANDSHAKE_POW_P_COST: u32 = 1;
 /// Argon2id output length for handshake PoW.
 pub const HANDSHAKE_POW_OUTPUT_LEN: usize = 32;
 
+/// Minimum memory cost for adaptive PoW (64 MiB).
+const ADAPTIVE_POW_MIN_M_COST: u32 = 64 * 1024;
+/// Maximum memory cost for adaptive PoW (4 GiB).
+const ADAPTIVE_POW_MAX_M_COST: u32 = 4 * 1024 * 1024;
+/// Network size above which PoW difficulty scales.
+const ADAPTIVE_POW_THRESHOLD: usize = 100;
+
+/// Compute adaptive handshake PoW parameters based on estimated network size.
+///
+/// For small networks (≤100 nodes), uses base difficulty (256 MiB).
+/// For larger networks, scales linearly: network_size / 100 × 256 MiB,
+/// capped at 4 GiB. This makes Sybil attacks progressively more expensive
+/// as the network grows.
+pub fn adaptive_handshake_pow_m_cost(estimated_network_size: usize) -> u32 {
+    if estimated_network_size <= ADAPTIVE_POW_THRESHOLD {
+        return HANDSHAKE_POW_M_COST;
+    }
+    let scale = estimated_network_size as u64 * 1024 / 100;
+    let scaled = (HANDSHAKE_POW_M_COST as u64 * scale / 1024) as u32;
+    scaled.clamp(ADAPTIVE_POW_MIN_M_COST, ADAPTIVE_POW_MAX_M_COST)
+}
+
 #[cfg(test)]
 /// Reduced parameters for unit tests (fast: 1 KiB × 1 iteration).
 pub const HANDSHAKE_POW_M_COST_TEST: u32 = 8; // 8 KiB
@@ -98,7 +120,9 @@ pub struct PeerEntry {
 // ── Peer registry ───────────────────────────────────────────────────
 
 /// How long a peer's verification stays valid before re-handshake is required.
-pub const REVERIFICATION_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60); // 24 hours
+/// 20 minutes — frequent enough that Sybil fleets must continuously burn
+/// resources, but long enough that honest nodes aren't overwhelmed.
+pub const REVERIFICATION_INTERVAL: Duration = Duration::from_secs(20 * 60); // 20 minutes
 
 /// Tracks handshake state for every known peer.
 ///
@@ -331,25 +355,50 @@ impl PeerRegistry {
             })
             .collect()
     }
+
+    /// Evict a verified peer back to Unknown state, forcing re-handshake.
+    /// Does nothing if the peer is not currently Verified.
+    pub fn evict_verified(&mut self, peer_id: &[u8; 32]) {
+        if let Some(entry) = self.peers.get(peer_id) {
+            if entry.state == PeerState::Verified {
+                self.peers.insert(
+                    *peer_id,
+                    PeerEntry {
+                        state: PeerState::Unknown,
+                        challenge_nonce: None,
+                        challenged_at: None,
+                        verified_at: None,
+                        handshake_failures: 0,
+                        last_handshake_at: entry.last_handshake_at,
+                    },
+                );
+            }
+        }
+    }
 }
 
 // ── Handshake PoW (Argon2id) ────────────────────────────────────────
 
 /// Derive the Argon2id input for handshake PoW.
 ///
-/// `password = Blake3("vess-handshake-pow-v0" || node_id || nonce)`
-/// `salt     = Blake3("vess-handshake-salt-v0" || nonce)`
+/// Binds the protocol version hash into the password so that PoW is
+/// tied to a specific code version. Changing the code invalidates all
+/// existing PoW — an attacker cannot precompute PoW for future versions.
+///
+/// `password = Blake3("vess-handshake-pow-v1" || PROTOCOL_VERSION_HASH || node_id || nonce)`
+/// `salt     = Blake3("vess-handshake-salt-v1" || nonce)`
 fn derive_pow_inputs(node_id: &[u8], nonce: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
     let password = {
         let mut h = blake3::Hasher::new();
-        h.update(b"vess-handshake-pow-v0");
+        h.update(b"vess-handshake-pow-v1");
+        h.update(&PROTOCOL_VERSION_HASH);
         h.update(node_id);
         h.update(nonce);
         *h.finalize().as_bytes()
     };
     let salt = {
         let mut h = blake3::Hasher::new();
-        h.update(b"vess-handshake-salt-v0");
+        h.update(b"vess-handshake-salt-v1");
         h.update(nonce);
         *h.finalize().as_bytes()
     };
@@ -365,6 +414,24 @@ pub fn compute_handshake_pow(node_id: &[u8], nonce: &[u8; 32]) -> Vec<u8> {
         nonce,
         HANDSHAKE_POW_T_COST,
         HANDSHAKE_POW_M_COST,
+        HANDSHAKE_POW_P_COST,
+    )
+}
+
+/// Compute handshake PoW with adaptive memory cost based on network size.
+///
+/// On small networks (≤100 nodes), identical to [`compute_handshake_pow`].
+/// On large networks, memory cost scales up to make Sybil attacks expensive.
+pub fn compute_handshake_pow_adaptive(
+    node_id: &[u8],
+    nonce: &[u8; 32],
+    estimated_network_size: usize,
+) -> Vec<u8> {
+    compute_handshake_pow_with_params(
+        node_id,
+        nonce,
+        HANDSHAKE_POW_T_COST,
+        adaptive_handshake_pow_m_cost(estimated_network_size),
         HANDSHAKE_POW_P_COST,
     )
 }

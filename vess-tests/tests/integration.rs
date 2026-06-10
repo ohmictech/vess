@@ -339,6 +339,7 @@ fn protocol_message_serialization() {
         bill_count: 0,
         mailbox_key: None,
         direct_receipt_tag_hash: None,
+        program_receipt: None,
     })];
 
     for msg in &messages {

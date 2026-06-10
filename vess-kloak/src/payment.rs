@@ -42,12 +42,16 @@ pub struct TransferPayload {
     pub memo: Option<String>,
 }
 use vess_stealth::{
-    open_stealth_payload, prepare_stealth_payload, scan_view_tag, MasterStealthAddress,
+    open_stealth_payload, MasterStealthAddress,
     StealthPayload, StealthSecretKey,
 };
 
 use crate::billfold::BillFold;
 use crate::selection::select_bills;
+
+/// Magic prefix prepended to noise/decoy payment plaintext.
+/// Recipients recognize this and silently discard the payment.
+const NOISE_MAGIC: &[u8] = b"VESS_NOISE_V0";
 
 /// In-flight payment state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -167,6 +171,64 @@ pub fn derive_mailbox_key(spend_ek: &[u8]) -> [u8; 32] {
     *h.finalize().as_bytes()
 }
 
+/// Check whether a decrypted payment plaintext is a noise/decoy payment.
+///
+/// Noise payments carry [`NOISE_MAGIC`] followed by random padding.
+/// Recipients should silently discard matches.
+pub fn is_noise_payment(plaintext: &[u8]) -> bool {
+    plaintext.starts_with(NOISE_MAGIC)
+}
+
+/// Prepare a noise (decoy) payment to your own stealth address.
+///
+/// This creates a [`PulseMessage::Payment`] that is **wire-identical** to a
+/// real payment — same stealth structure, same view tag scheme, same size
+/// profile. The plaintext contains [`NOISE_MAGIC`] so the recipient
+/// (yourself) recognizes it as noise and silently discards.
+///
+/// Noise payments have `bill_count: 0` and carry no real value.
+/// They exist solely to add entropy to the payment graph, making it
+/// impossible for passive observers (Sybils) to distinguish real
+/// transactions from decoys.
+pub fn prepare_noise_payment(own_address: &MasterStealthAddress) -> Result<PulseMessage> {
+    let payment_id: [u8; 32] = rand::random();
+
+    // Build noise plaintext: magic prefix + random padding bytes.
+    // The payload looks like random ciphertext to any observer.
+    let noise_body_len: usize = {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        32 + (rng.gen_range(0u8..65u8) as usize) // 32..=96 bytes of noise body
+    };
+    let mut noise_body = vec![0u8; NOISE_MAGIC.len() + noise_body_len];
+    noise_body[..NOISE_MAGIC.len()].copy_from_slice(NOISE_MAGIC);
+    {
+        use rand::RngCore;
+        rand::thread_rng().fill_bytes(&mut noise_body[NOISE_MAGIC.len()..]);
+    }
+
+    // Pad to uniform size so noise payments are byte-identical to real ones.
+    let plaintext = vess_stealth::pad_plaintext(&noise_body);
+
+    let stealth =
+        vess_stealth::prepare_stealth_payload_with_tag(own_address, &plaintext, &payment_id)?;
+
+    let mailbox_key = derive_mailbox_key(&own_address.spend_ek);
+
+    Ok(PulseMessage::Payment(Payment {
+        payment_id,
+        stealth_payload: postcard::to_allocvec(&stealth)
+            .map_err(|e| anyhow!("serialize stealth payload: {e}"))?,
+        view_tag: stealth.view_tag,
+        stealth_id: stealth.stealth_id,
+        created_at: now_unix(),
+        bill_count: 0,
+        mailbox_key: Some(mailbox_key),
+        direct_receipt_tag_hash: None,
+        program_receipt: None,
+    }))
+}
+
 // ── Sender-side operations ───────────────────────────────────────────
 
 /// Prepare a payment: select bills, build stealth payload, produce wire message.
@@ -192,9 +254,13 @@ pub fn prepare_payment(
     let plaintext =
         postcard::to_allocvec(&bill_data).map_err(|e| anyhow!("serialize bills: {e}"))?;
 
-    let stealth = prepare_stealth_payload(recipient, &plaintext)?;
+    // Pad to uniform size — kills bill_count observable on the wire.
+    let plaintext = vess_stealth::pad_plaintext(&plaintext);
 
-    let payment_id = derive_payment_id(&stealth);
+    // Generate payment_id first so it can be bound into the view tag
+    // for per-payment unlinkability.
+    let payment_id: [u8; 32] = rand::random();
+    let stealth = vess_stealth::prepare_stealth_payload_with_tag(recipient, &plaintext, &payment_id)?;
 
     let msg = PulseMessage::Payment(Payment {
         payment_id,
@@ -242,7 +308,9 @@ pub fn prepare_payment_with_transfer(
     // is the same one embedded in the final payload.
     let bills_owned: Vec<VessBill> = bill_data.iter().map(|b| (*b).clone()).collect();
 
-    let stealth_ctx = vess_stealth::generate_stealth_context(recipient)?;
+    // Generate payment_id first so the view tag binds to it
+    let payment_id: [u8; 32] = rand::random();
+    let stealth_ctx = vess_stealth::generate_stealth_context_with_tag(recipient, &payment_id)?;
     let recipient_stealth_id = stealth_ctx.stealth_id;
 
     let timestamp = now_unix();
@@ -272,6 +340,9 @@ pub fn prepare_payment_with_transfer(
     let plaintext = postcard::to_allocvec(&transfer_payload)
         .map_err(|e| anyhow!("serialize transfer payload: {e}"))?;
 
+    // Pad to uniform size.
+    let plaintext = vess_stealth::pad_plaintext(&plaintext);
+
     let stealth = stealth_ctx.encrypt(&plaintext)?;
     let payment_id = derive_payment_id(&stealth);
 
@@ -291,6 +362,133 @@ pub fn prepare_payment_with_transfer(
     Ok((msg, payment_id, selection.send_indices))
 }
 
+/// Max plaintext size (before padding) that fits in a uniform payment.
+const MAX_PLAINTEXT: usize = vess_stealth::PADDED_PLAINTEXT_SIZE - 2;
+
+/// Prepare a payment, automatically splitting into multiple payments if the
+/// transfer-auth payload exceeds the uniform size limit.
+///
+/// Returns one or more `(PulseMessage, payment_id)` pairs. The caller should
+/// send each message through the normal gossip pipeline. Each split payment
+/// is a complete, independent payment with its own stealth payload.
+pub fn prepare_payment_split(
+    billfold: &BillFold,
+    amount: u64,
+    recipient: &MasterStealthAddress,
+    credentials: &HashMap<[u8; 32], crate::billfold::SpendCredential>,
+    memo: Option<String>,
+) -> Result<Vec<(PulseMessage, [u8; 32])>> {
+    let selection = select_bills(billfold.bills(), amount)?;
+    let all_bills: Vec<VessBill> = selection
+        .send_indices
+        .iter()
+        .map(|&i| billfold.bills()[i].clone())
+        .collect();
+
+    // Quick check: small payments always fit.
+    if all_bills.len() <= 8 {
+        return prepare_payment_from_bills(&all_bills, recipient, credentials, memo)
+            .map(|(msg, pid)| vec![(msg, pid)]);
+    }
+
+    // Build TransferPayload to measure exact serialized size.
+    let payment_id: [u8; 32] = rand::random();
+    let stealth_ctx = vess_stealth::generate_stealth_context_with_tag(recipient, &payment_id)?;
+    let timestamp = now_unix();
+
+    let mut sender_vks = Vec::with_capacity(all_bills.len());
+    let mut transfer_sigs = Vec::with_capacity(all_bills.len());
+    for bill in &all_bills {
+        let cred = credentials
+            .get(&bill.mint_id)
+            .ok_or_else(|| anyhow!("missing spend credential for bill"))?;
+        let msg = spend_auth::transfer_message(&bill.mint_id, &stealth_ctx.stealth_id, timestamp);
+        let sig = spend_auth::sign_spend(&cred.spend_sk, &msg)?;
+        sender_vks.push(cred.spend_vk.clone());
+        transfer_sigs.push(sig);
+    }
+
+    let tp = TransferPayload {
+        bills: all_bills.clone(),
+        sender_vks,
+        transfer_sigs,
+        timestamp,
+        memo: memo.clone(),
+    };
+    let serialized = postcard::to_allocvec(&tp)
+        .map_err(|e| anyhow!("serialize transfer payload: {e}"))?;
+
+    if serialized.len() <= MAX_PLAINTEXT {
+        // Fits — single payment.
+        return prepare_payment_from_bills(&all_bills, recipient, credentials, memo)
+            .map(|(msg, pid)| vec![(msg, pid)]);
+    }
+
+    // Too large: split bills into two halves and recurse.
+    let mid = all_bills.len() / 2;
+    let left: Vec<VessBill> = all_bills[..mid].to_vec();
+    let right: Vec<VessBill> = all_bills[mid..].to_vec();
+
+    let mut results = Vec::new();
+    results.extend(prepare_payment_from_bills_split(&left, recipient, credentials, memo.clone())?);
+    results.extend(prepare_payment_from_bills_split(&right, recipient, credentials, memo)?);
+    Ok(results)
+}
+
+/// Split-aware variant of [`prepare_payment_from_bills`] — automatically
+/// splits into multiple payments if the transfer-auth payload exceeds
+/// the uniform size limit.
+pub fn prepare_payment_from_bills_split(
+    bills: &[VessBill],
+    recipient: &MasterStealthAddress,
+    credentials: &HashMap<[u8; 32], crate::billfold::SpendCredential>,
+    memo: Option<String>,
+) -> Result<Vec<(PulseMessage, [u8; 32])>> {
+    if bills.len() <= 8 {
+        return prepare_payment_from_bills(bills, recipient, credentials, memo)
+            .map(|(msg, pid)| vec![(msg, pid)]);
+    }
+
+    // Build TransferPayload to check size.
+    let payment_id: [u8; 32] = rand::random();
+    let stealth_ctx = vess_stealth::generate_stealth_context_with_tag(recipient, &payment_id)?;
+    let timestamp = now_unix();
+
+    let mut sender_vks = Vec::with_capacity(bills.len());
+    let mut transfer_sigs = Vec::with_capacity(bills.len());
+    for bill in bills {
+        let cred = credentials
+            .get(&bill.mint_id)
+            .ok_or_else(|| anyhow!("missing spend credential for bill"))?;
+        let msg = spend_auth::transfer_message(&bill.mint_id, &stealth_ctx.stealth_id, timestamp);
+        let sig = spend_auth::sign_spend(&cred.spend_sk, &msg)?;
+        sender_vks.push(cred.spend_vk.clone());
+        transfer_sigs.push(sig);
+    }
+
+    let tp = TransferPayload {
+        bills: bills.to_vec(),
+        sender_vks,
+        transfer_sigs,
+        timestamp,
+        memo: memo.clone(),
+    };
+    let serialized = postcard::to_allocvec(&tp)
+        .map_err(|e| anyhow!("serialize transfer payload: {e}"))?;
+
+    if serialized.len() <= MAX_PLAINTEXT {
+        return prepare_payment_from_bills(bills, recipient, credentials, memo)
+            .map(|(msg, pid)| vec![(msg, pid)]);
+    }
+
+    // Split in half and recurse.
+    let mid = bills.len() / 2;
+    let mut results = Vec::new();
+    results.extend(prepare_payment_from_bills_split(&bills[..mid], recipient, credentials, memo.clone())?);
+    results.extend(prepare_payment_from_bills_split(&bills[mid..], recipient, credentials, memo)?);
+    Ok(results)
+}
+
 /// Prepare a payment from explicit bills (no selection).
 ///
 /// Used after reforge-based change splitting, where the caller has
@@ -303,7 +501,9 @@ pub fn prepare_payment_from_bills(
 ) -> Result<(PulseMessage, [u8; 32])> {
     let bill_count = bills.len() as u8;
 
-    let stealth_ctx = vess_stealth::generate_stealth_context(recipient)?;
+    // Generate payment_id first so the view tag binds to it
+    let payment_id: [u8; 32] = rand::random();
+    let stealth_ctx = vess_stealth::generate_stealth_context_with_tag(recipient, &payment_id)?;
     let recipient_stealth_id = stealth_ctx.stealth_id;
 
     let timestamp = now_unix();
@@ -332,6 +532,9 @@ pub fn prepare_payment_from_bills(
 
     let plaintext = postcard::to_allocvec(&transfer_payload)
         .map_err(|e| anyhow!("serialize transfer payload: {e}"))?;
+
+    // Pad to uniform size.
+    let plaintext = vess_stealth::pad_plaintext(&plaintext);
 
     let stealth = stealth_ctx.encrypt(&plaintext)?;
     let payment_id = derive_payment_id(&stealth);
@@ -462,7 +665,7 @@ pub fn try_receive_payment(
     secret: &StealthSecretKey,
     payment: &Payment,
 ) -> Result<Option<Vec<VessBill>>> {
-    try_decrypt_stealth_payload(secret, &payment.stealth_payload)
+    try_decrypt_stealth_payload(secret, &payment.stealth_payload, &payment.payment_id)
 }
 
 /// Try to decrypt a raw stealth_payload blob into bills.
@@ -472,21 +675,36 @@ pub fn try_receive_payment(
 pub fn try_decrypt_stealth_payload(
     secret: &StealthSecretKey,
     stealth_payload: &[u8],
+    payment_id: &[u8; 32],
 ) -> Result<Option<Vec<VessBill>>> {
     // Deserialize the stealth payload.
     let stealth: StealthPayload = postcard::from_bytes(stealth_payload)
         .map_err(|e| anyhow!("deserialize stealth payload: {e}"))?;
 
-    // Quick scan.
-    if !scan_view_tag(secret, &stealth.ct_scan, stealth.view_tag)? {
+    // Quick scan with per-payment tag context for unlinkable view tags.
+    if !vess_stealth::scan_view_tag_with_context(secret, &stealth.ct_scan, stealth.view_tag, payment_id)? {
         return Ok(None);
     }
 
     // Full decrypt.
-    let (plaintext, _stealth_id, _recovery_key) = open_stealth_payload(secret, &stealth)?;
+    let (padded, _stealth_id, _recovery_key) = open_stealth_payload(secret, &stealth)?;
+
+    // Strip uniform-size padding.
+    let plaintext = match vess_stealth::unpad_plaintext(&padded) {
+        Some(pt) => pt,
+        None => {
+            // Legacy unpadded format: use as-is.
+            &padded
+        }
+    };
+
+    // Silently discard noise/decoy payments.
+    if is_noise_payment(plaintext) {
+        return Ok(None);
+    }
 
     let bills: Vec<VessBill> =
-        postcard::from_bytes(&plaintext).map_err(|e| anyhow!("deserialize bills: {e}"))?;
+        postcard::from_bytes(plaintext).map_err(|e| anyhow!("deserialize bills: {e}"))?;
 
     Ok(Some(bills))
 }
@@ -499,17 +717,30 @@ pub fn try_decrypt_stealth_payload(
 pub fn try_decrypt_transfer_payload(
     secret: &StealthSecretKey,
     stealth_payload: &[u8],
+    payment_id: &[u8; 32],
 ) -> Result<Option<DecryptedTransfer>> {
     let stealth: StealthPayload = postcard::from_bytes(stealth_payload)
         .map_err(|e| anyhow!("deserialize stealth payload: {e}"))?;
 
-    if !scan_view_tag(secret, &stealth.ct_scan, stealth.view_tag)? {
+    if !vess_stealth::scan_view_tag_with_context(secret, &stealth.ct_scan, stealth.view_tag, payment_id)? {
         return Ok(None);
     }
 
-    let (plaintext, stealth_id, recovery_key) = open_stealth_payload(secret, &stealth)?;
+    // Full decrypt.
+    let (padded, stealth_id, recovery_key) = open_stealth_payload(secret, &stealth)?;
 
-    let tp = postcard::from_bytes::<TransferPayload>(&plaintext)
+    // Strip uniform-size padding.
+    let plaintext = match vess_stealth::unpad_plaintext(&padded) {
+        Some(pt) => pt,
+        None => &padded,
+    };
+
+    // Silently discard noise/decoy payments.
+    if is_noise_payment(plaintext) {
+        return Ok(None);
+    }
+
+    let tp = postcard::from_bytes::<TransferPayload>(plaintext)
         .map_err(|e| anyhow!("stealth payload decrypted but not a valid TransferPayload: {e}"))?;
     Ok(Some(DecryptedTransfer::WithAuth(
         tp,
@@ -543,6 +774,8 @@ pub struct TransferClaimResult {
     pub claimed: Vec<ClaimedBill>,
     /// OwnershipClaim messages to broadcast to artery.
     pub ownership_claims: Vec<PulseMessage>,
+    /// Optional memo from the sender (e.g. order ID, invoice ref, note).
+    pub memo: Option<String>,
 }
 
 fn encrypt_bill_for_recovery(bill: &VessBill, recovery_key: Option<[u8; 32]>) -> Vec<u8> {
@@ -584,6 +817,7 @@ pub fn claim_transfer_bills(
     stealth_id: [u8; 32],
     recovery_key: Option<[u8; 32]>,
 ) -> Result<TransferClaimResult> {
+    let memo = payload.memo.clone();
     if payload.bills.len() != payload.sender_vks.len()
         || payload.bills.len() != payload.transfer_sigs.len()
     {
@@ -662,6 +896,7 @@ pub fn claim_transfer_bills(
     Ok(TransferClaimResult {
         claimed,
         ownership_claims,
+        memo,
     })
 }
 
@@ -708,8 +943,9 @@ pub fn build_genesis_messages(bills: &[(VessBill, Vec<u8>)], owner_vk: &[u8]) ->
 pub fn receive_and_claim(
     secret: &StealthSecretKey,
     stealth_payload: &[u8],
+    payment_id: &[u8; 32],
 ) -> Result<Option<TransferClaimResult>> {
-    match try_decrypt_transfer_payload(secret, stealth_payload)? {
+    match try_decrypt_transfer_payload(secret, stealth_payload, payment_id)? {
         Some(DecryptedTransfer::WithAuth(tp, stealth_id, recovery_key)) => {
             let result = claim_transfer_bills(tp, stealth_id, Some(recovery_key))?;
             Ok(Some(result))
@@ -828,6 +1064,7 @@ pub fn build_program_unlock_claims(
     Ok(TransferClaimResult {
         claimed,
         ownership_claims,
+        memo: None,
     })
 }
 
@@ -1063,5 +1300,42 @@ mod tests {
         assert!(bills.is_some());
         let received = bills.unwrap();
         assert!(!received.is_empty());
+    }
+
+    #[test]
+    fn noise_payment_round_trip() {
+        // 1. Recipient generates keys.
+        let (secret, address) = generate_master_keys();
+
+        // 2. Create a noise payment to self.
+        let msg = prepare_noise_payment(&address).unwrap();
+        let payment = match &msg {
+            PulseMessage::Payment(p) => p.clone(),
+            _ => panic!("expected Payment"),
+        };
+
+        // 3. Noise payment looks like a real payment on the wire.
+        assert_eq!(payment.bill_count, 0);
+        assert!(!payment.stealth_payload.is_empty());
+        assert!(payment.mailbox_key.is_some());
+
+        // 4. Serialize/deserialize round-trip (wire format).
+        let bytes = msg.to_bytes().unwrap();
+        let decoded = PulseMessage::from_bytes(&bytes).unwrap();
+        let decoded_payment = match &decoded {
+            PulseMessage::Payment(p) => p,
+            _ => panic!("expected Payment"),
+        };
+        assert_eq!(decoded_payment.payment_id, payment.payment_id);
+
+        // 5. Recipient tries to receive — should be silently discarded as noise.
+        let result = try_receive_payment(&secret, &payment).unwrap();
+        assert!(result.is_none(), "noise payment should be silently discarded");
+
+        // 6. is_noise_payment helper works on raw plaintext.
+        assert!(is_noise_payment(b"VESS_NOISE_V0\x00\x01\x02"));
+        assert!(is_noise_payment(b"VESS_NOISE_V0"));
+        assert!(!is_noise_payment(b"VESS_BILL"));
+        assert!(!is_noise_payment(b""));
     }
 }

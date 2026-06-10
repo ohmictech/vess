@@ -43,6 +43,7 @@ use chacha20poly1305::{
 use ml_kem::kem::{Decapsulate, Encapsulate};
 use ml_kem::{Encoded, EncodedSizeUser, KemCore, MlKem768};
 use rand::SeedableRng;
+use rand::RngCore;
 use rand_chacha::ChaCha20Rng;
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -100,6 +101,57 @@ pub struct StealthPayload {
     pub ciphertext: Vec<u8>,
     /// AEAD nonce (96 bits).
     pub nonce: [u8; 12],
+}
+
+// ── Uniform payment size padding ──────────────────────────────────────
+
+/// All plaintexts are padded to exactly this many bytes before AEAD encryption.
+///
+/// This guarantees every [`StealthPayload`] (and thus every payment on the
+/// wire) is identical in size regardless of bill count, killing the
+/// `bill_count` observable for traffic analysis.
+///
+/// 48 KB accommodates ~300 simple bills or ~9 transfer-authorized bills
+/// (each carrying an ML-DSA-65 VK + signature, ~5.4 KB/bill).
+/// Payments exceeding this limit are split by the sender.
+///
+/// Format: `[u16 LE actual_len] || plaintext || random_padding`
+pub const PADDED_PLAINTEXT_SIZE: usize = 49152;
+
+/// Pad `plaintext` to exactly [`PADDED_PLAINTEXT_SIZE`] bytes.
+///
+/// If the plaintext is too large, it is returned as-is with the length prefix
+/// (the caller should split oversized payments).
+pub fn pad_plaintext(plaintext: &[u8]) -> Vec<u8> {
+    let actual = plaintext.len();
+    if actual > PADDED_PLAINTEXT_SIZE.saturating_sub(2) {
+        // Too large for uniform padding — return length-prefixed as-is.
+        let mut out = Vec::with_capacity(actual + 2);
+        out.extend_from_slice(&(actual as u16).to_le_bytes());
+        out.extend_from_slice(plaintext);
+        return out;
+    }
+    let mut out = vec![0u8; PADDED_PLAINTEXT_SIZE];
+    out[..2].copy_from_slice(&(actual as u16).to_le_bytes());
+    out[2..2 + actual].copy_from_slice(plaintext);
+    // Fill tail with cryptographically random bytes to look like ciphertext.
+    rand::thread_rng().fill_bytes(&mut out[2 + actual..]);
+    out
+}
+
+/// Extract the original plaintext from a padded buffer.
+///
+/// Returns `None` if the buffer is shorter than 2 bytes or the declared
+/// length exceeds the buffer size.
+pub fn unpad_plaintext(padded: &[u8]) -> Option<&[u8]> {
+    if padded.len() < 2 {
+        return None;
+    }
+    let actual = u16::from_le_bytes([padded[0], padded[1]]) as usize;
+    if actual + 2 > padded.len() {
+        return None;
+    }
+    Some(&padded[2..2 + actual])
 }
 
 // ── Serialization helpers ─────────────────────────────────────────────
@@ -197,7 +249,8 @@ pub fn generate_master_keys_from_seed(seed: &[u8; 64]) -> (StealthSecretKey, Mas
 
 /// Pre-computed KEM context for two-phase stealth payload construction.
 ///
-/// Use [`generate_stealth_context`] to create one, inspect `stealth_id`,
+/// Use [`generate_stealth_context_with_tag`] to create one, inspect `stealth_id`,
+/// and optionally bind a per-payment tag context for unlinkable view tags.
 /// then call [`StealthContext::encrypt`] to produce the final
 /// [`StealthPayload`].  This avoids the need for a "preview" call that
 /// would yield a different `stealth_id` due to fresh random KEM keys.
@@ -215,7 +268,28 @@ pub struct StealthContext {
 /// Performs both KEM encapsulations up front so `stealth_id` is known
 /// before the plaintext is ready (e.g. when the plaintext depends on
 /// `stealth_id` itself, as in transfer-authorized payments).
+/// Generate a fresh stealth context for encrypting a payment to `address`.
+///
+/// `tag_context` is bound into the view tag to make it per-payment unlinkable.
+/// Pass the `payment_id` here so each payment has a different view tag,
+/// preventing an observer from clustering payments by recipient.
+pub fn generate_stealth_context_with_tag(
+    address: &MasterStealthAddress,
+    tag_context: &[u8],
+) -> Result<StealthContext> {
+    generate_stealth_context_impl(address, tag_context)
+}
+
+/// Generate a stealth context without a per-payment tag (legacy).
+/// Prefer [`generate_stealth_context_with_tag`] for new code.
 pub fn generate_stealth_context(address: &MasterStealthAddress) -> Result<StealthContext> {
+    generate_stealth_context_impl(address, b"")
+}
+
+fn generate_stealth_context_impl(
+    address: &MasterStealthAddress,
+    tag_context: &[u8],
+) -> Result<StealthContext> {
     let scan_ek = vec_to_ek(&address.scan_ek)?;
     let spend_ek = vec_to_ek(&address.spend_ek)?;
 
@@ -233,7 +307,7 @@ pub fn generate_stealth_context(address: &MasterStealthAddress) -> Result<Stealt
     Ok(StealthContext {
         ct_scan: ct_scan.to_vec(),
         ct_spend: ct_spend.to_vec(),
-        view_tag: compute_view_tag(ss_scan_bytes),
+        view_tag: compute_view_tag(ss_scan_bytes, tag_context),
         stealth_id: compute_stealth_id(ss_scan_bytes, ss_spend_bytes),
         aead_key: derive_aead_key(ss_scan_bytes),
         nonce_bytes: derive_nonce(ss_scan_bytes, ss_spend_bytes),
@@ -271,17 +345,44 @@ pub fn prepare_stealth_payload(
     generate_stealth_context(address)?.encrypt(plaintext)
 }
 
+/// Prepare a stealth payload with a per-payment tag context for unlinkable view tags.
+///
+/// `tag_context` (typically the `payment_id`) is bound into the view tag so
+/// each payment has a different tag, preventing observer clustering.
+pub fn prepare_stealth_payload_with_tag(
+    address: &MasterStealthAddress,
+    plaintext: &[u8],
+    tag_context: &[u8],
+) -> Result<StealthPayload> {
+    generate_stealth_context_with_tag(address, tag_context)?.encrypt(plaintext)
+}
+
 /// Quick-scan a view tag against the recipient's scan secret key.
 ///
 /// Returns `true` if the tag matches (potential match, 1/256 false positive).
 /// The recipient should call [`open_stealth_payload`] on matches.
-pub fn scan_view_tag(secret: &StealthSecretKey, ct_scan: &[u8], view_tag: u8) -> Result<bool> {
+/// Scan a view tag, checking whether a payment is potentially for this recipient.
+///
+/// `tag_context` must be the same value passed to `generate_stealth_context_with_tag`
+/// (typically the `payment_id`). Returns `true` if the tag matches (1/256 false positive).
+pub fn scan_view_tag_with_context(
+    secret: &StealthSecretKey,
+    ct_scan: &[u8],
+    view_tag: u8,
+    tag_context: &[u8],
+) -> Result<bool> {
     let dk = vec_to_dk(&secret.scan_dk)?;
     let ct = vec_to_ct(ct_scan)?;
     let ss_scan = dk
         .decapsulate(&ct)
         .map_err(|_| anyhow!("scan decapsulate failed"))?;
-    Ok(compute_view_tag(ss_scan.as_ref()) == view_tag)
+    Ok(compute_view_tag(ss_scan.as_ref(), tag_context) == view_tag)
+}
+
+/// Scan a view tag (legacy — without per-payment context).
+/// Prefer [`scan_view_tag_with_context`] for new code.
+pub fn scan_view_tag(secret: &StealthSecretKey, ct_scan: &[u8], view_tag: u8) -> Result<bool> {
+    scan_view_tag_with_context(secret, ct_scan, view_tag, b"")
 }
 
 /// Open a stealth payload, decrypting the enclosed bill.
@@ -330,9 +431,11 @@ pub fn open_stealth_payload(
 
 // ── Internal helpers ──────────────────────────────────────────────────
 
-fn compute_view_tag(ss_scan: &[u8]) -> u8 {
-    let h = blake3::hash(ss_scan);
-    h.as_bytes()[0]
+fn compute_view_tag(ss_scan: &[u8], tag_context: &[u8]) -> u8 {
+    let mut h = Hasher::new();
+    h.update(ss_scan);
+    h.update(tag_context);
+    h.finalize().as_bytes()[0]
 }
 
 fn compute_stealth_id(ss_scan: &[u8], ss_spend: &[u8]) -> [u8; 32] {
@@ -457,5 +560,48 @@ mod tests {
         let (decrypted, sid, _rk) = open_stealth_payload(&secret, &payload).unwrap();
         assert_eq!(decrypted, plaintext);
         assert_eq!(sid, payload.stealth_id);
+    }
+
+    #[test]
+    fn pad_unpad_round_trip() {
+        // Short plaintext
+        let original = b"hello";
+        let padded = pad_plaintext(original);
+        assert_eq!(padded.len(), PADDED_PLAINTEXT_SIZE);
+        let unpadded = unpad_plaintext(&padded).unwrap();
+        assert_eq!(unpadded, original);
+
+        // Empty plaintext
+        let padded = pad_plaintext(b"");
+        assert_eq!(padded.len(), PADDED_PLAINTEXT_SIZE);
+        let unpadded = unpad_plaintext(&padded).unwrap();
+        assert_eq!(unpadded, b"");
+
+        // Max-length plaintext
+        let max = vec![0x42u8; PADDED_PLAINTEXT_SIZE - 2];
+        let padded = pad_plaintext(&max);
+        assert_eq!(padded.len(), PADDED_PLAINTEXT_SIZE);
+        let unpadded = unpad_plaintext(&padded).unwrap();
+        assert_eq!(unpadded, &max[..]);
+    }
+
+    #[test]
+    fn uniform_stealth_payload_size() {
+        let (_secret, address) = generate_master_keys();
+
+        // Two different plaintexts of very different sizes → same ciphertext size.
+        let small = pad_plaintext(b"one bill");
+        let large = pad_plaintext(&vec![0xAAu8; 512]);
+
+        let p1 = prepare_stealth_payload_with_tag(&address, &small, b"pid1").unwrap();
+        let p2 = prepare_stealth_payload_with_tag(&address, &large, b"pid2").unwrap();
+
+        // The ciphertext portions should be identical in length.
+        assert_eq!(p1.ciphertext.len(), p2.ciphertext.len());
+        // All fixed fields should match in size too.
+        assert_eq!(p1.ct_scan.len(), p2.ct_scan.len());
+        assert_eq!(p1.ct_spend.len(), p2.ct_spend.len());
+        assert_eq!(p1.nonce.len(), p2.nonce.len());
+        assert_eq!(p1.stealth_id.len(), p2.stealth_id.len());
     }
 }

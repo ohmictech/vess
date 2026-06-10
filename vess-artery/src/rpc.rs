@@ -23,11 +23,12 @@ use vess_foundry::reforge::{reforge, ReforgeRequest};
 use vess_foundry::spend_auth::{generate_spend_keypair, vk_hash};
 use vess_kloak::auto_reforge::ConsolidationScheduler;
 use vess_kloak::billfold::SpendCredential;
-use vess_kloak::payment::prepare_payment_from_bills;
+use vess_kloak::payment::prepare_payment_from_bills_split;
 use vess_kloak::selection::{decompose_amount, select_bills_filtered, SelectionResult};
 use vess_mesh::MeshCarrierContact;
 use vess_protocol::{
-    ManifestStore, ProgramManifestStore, ProgramStore, PulseMessage, TagLookup, TagStore,
+    ManifestStore, ProgramManifestStore, ProgramStore, PulseMessage, TagLookup,
+    TagStore,
 };
 use vess_stealth::MasterStealthAddress;
 use vess_tag::{TagRecord, VessTag};
@@ -357,6 +358,11 @@ pub enum RpcRequest {
         #[serde(default)]
         tag: Option<String>,
     },
+    /// Toggle passive mode: stop relaying other peers' traffic to save
+    /// bandwidth on metered/mobile connections. Own payments still work.
+    SetPassiveMode {
+        enabled: bool,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -452,6 +458,7 @@ pub enum RpcData {
         bitcoin_pending_burns: usize,
         discovery_sources: Vec<String>,
         total_supply: u64,
+        passive_mode: bool,
     },
     WalletStatus {
         locked: bool,
@@ -479,6 +486,10 @@ pub enum RpcData {
     },
     TagCacheList {
         entries: Vec<crate::tag_cache::TagCacheEntryView>,
+    },
+    PassiveMode {
+        passive_mode: bool,
+        message: String,
     },
     Empty {},
 }
@@ -687,10 +698,26 @@ async fn handle_request(
         ),
         RpcRequest::TagCacheList => handle_tag_cache_list(state),
         RpcRequest::TagCacheClear { tag } => handle_tag_cache_clear(state, tag.as_deref()),
+        RpcRequest::SetPassiveMode { enabled } => handle_set_passive_mode(state, enabled),
     }
 }
 
 // ── Handlers ────────────────────────────────────────────────────────
+
+fn handle_set_passive_mode(state: &Arc<Mutex<ArteryState>>, enabled: bool) -> RpcResponse {
+    let mut s = lock_state(state);
+    s.passive_mode = enabled;
+    info!(enabled, "passive mode toggled");
+    let msg = if enabled {
+        "Passive mode ON: relaying only own payments, DHT store/relay disabled"
+    } else {
+        "Passive mode OFF: full relay and DHT participation restored"
+    };
+    RpcResponse::ok(RpcData::PassiveMode {
+        passive_mode: enabled,
+        message: msg.to_string(),
+    })
+}
 
 fn handle_balance(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
     let s = lock_state(&state);
@@ -869,6 +896,7 @@ fn handle_node_health(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
             .unwrap_or(0),
         discovery_sources,
         total_supply,
+        passive_mode: s.passive_mode,
     })
 }
 
@@ -1531,7 +1559,7 @@ async fn handle_send(
             );
         }
 
-        let (msg, pid) = match prepare_payment_from_bills(
+        let payments = match prepare_payment_from_bills_split(
             &send_bills,
             &recipient_address,
             &reforged_creds,
@@ -1540,6 +1568,18 @@ async fn handle_send(
             Ok(v) => v,
             Err(e) => return RpcResponse::err(format!("prepare payment failed: {e}")),
         };
+        if payments.is_empty() {
+            return RpcResponse::err("no payments produced");
+        }
+        let (msg, pid) = payments[0].clone();
+        for (extra_msg, _extra_pid) in &payments[1..] {
+            if let PulseMessage::Payment(ref p) = extra_msg {
+                let _ = senders.pay_tx.send(p.clone());
+            }
+        }
+        if payments.len() > 1 {
+            tracing::info!(count = payments.len(), "payment split into multiple messages");
+        }
 
         let sent_mints: Vec<[u8; 32]> = send_bills.iter().map(|b| b.mint_id).collect();
 
@@ -1679,7 +1719,7 @@ async fn handle_send(
             .iter()
             .map(|&i| ws.billfold.bills()[i].clone())
             .collect();
-        let (msg, pid) = match prepare_payment_from_bills(
+        let payments = match vess_kloak::payment::prepare_payment_from_bills_split(
             &send_bills,
             &recipient_address,
             cred_map,
@@ -1688,6 +1728,21 @@ async fn handle_send(
             Ok(v) => v,
             Err(e) => return RpcResponse::err(format!("prepare payment failed: {e}")),
         };
+
+        if payments.is_empty() {
+            return RpcResponse::err("no payments produced");
+        }
+
+        // First payment is the primary; any extras are relayed via gossip.
+        let (msg, pid) = payments[0].clone();
+        for (extra_msg, _extra_pid) in &payments[1..] {
+            if let PulseMessage::Payment(ref p) = extra_msg {
+                let _ = senders.pay_tx.send(p.clone());
+            }
+        }
+        if payments.len() > 1 {
+            info!(count = payments.len(), "payment split into multiple messages");
+        }
 
         let ws_mut = s.wallet.as_mut().unwrap();
         let mint_ids: Vec<[u8; 32]> = selection
@@ -1712,19 +1767,66 @@ async fn handle_send(
     (msg, payment_id, sent_mints, scan_ek)
     }; // mutex guard dropped here
 
-    // ── Relay: always gossip for reliability, direct for speed ──────
-    // Gossip relay provides retry-and-forward with dedup protection.
-    // Direct delivery is a best-effort speed boost for verified peers.
-    // Both paths are used — the recipient's limbo_payment_ids deduplicates.
+    // ── Relay: 2-hop mixnet + gossip fallback ──────────────────────
+    // Primary: send via random intermediate peers (2-hop relay) so no
+    // single node sees both sender and recipient DHT shard.
+    // Fallback: normal gossip to K shard peers for reliability.
     let delivery_method = if let PulseMessage::Payment(ref payment) = msg {
         let direct_ok =
             try_direct_delivery(state, node, payment, &recipient_scan_ek).await;
-        // Always queue for gossip relay regardless of direct outcome.
+
+        // ── 2-hop relay: pick 2-3 random verified peers as intermediaries ──
+        let relay_peers: Vec<vess_mesh::MeshCarrierContact> = {
+            let s = lock_state(&state);
+            let _now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let all_peers = s.routing_table.routable_peers(|id| {
+                s.peer_registry.state(id) == crate::PeerState::Verified
+            });
+            if all_peers.len() >= 2 {
+                let count = 2.min(all_peers.len());
+                let mut rng = rand::thread_rng();
+                let indices = rand::seq::index::sample(&mut rng, all_peers.len(), count);
+                indices.iter()
+                    .filter_map(|i| decode_contact_bytes(&all_peers[i].id_bytes).ok())
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        };
+
+        if !relay_peers.is_empty() {
+            let mailbox_key = payment.mailbox_key.unwrap_or(payment.stealth_id);
+            let relay_msg = PulseMessage::RelayPayment(vess_protocol::RelayPayment {
+                payment: payment.clone(),
+                target_shard_key: mailbox_key,
+                ttl: 1,
+            });
+            if let Ok(relay_bytes) = relay_msg.to_bytes() {
+                let arc_bytes = std::sync::Arc::new(relay_bytes);
+                for contact in &relay_peers {
+                    let n = node.clone();
+                    let b = arc_bytes.clone();
+                    let c = contact.clone();
+                    tokio::spawn(async move {
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_secs(3),
+                            n.send_raw_pulses_to_peer(&c, &[b]),
+                        ).await;
+                    });
+                }
+                info!(count = relay_peers.len(), "payment relayed via 2-hop mixnet");
+            }
+        }
+
+        // Always queue for gossip relay too (redundancy).
         let _ = senders.pay_tx.send(payment.clone());
         if direct_ok {
-            "direct+gossip"
+            if relay_peers.is_empty() { "direct+gossip" } else { "direct+relay+gossip" }
         } else {
-            "gossip"
+            if relay_peers.is_empty() { "gossip" } else { "relay+gossip" }
         }
     } else {
         "none"
@@ -1872,7 +1974,7 @@ async fn handle_send_direct(
                 );
             }
 
-            let (msg, pid) = match prepare_payment_from_bills(
+            let payments = match prepare_payment_from_bills_split(
                 &send_bills,
                 &recipient_address,
                 &reforged_creds,
@@ -1881,6 +1983,18 @@ async fn handle_send_direct(
                 Ok(v) => v,
                 Err(e) => return RpcResponse::err(format!("prepare payment failed: {e}")),
             };
+            if payments.is_empty() {
+                return RpcResponse::err("no payments produced");
+            }
+            let (msg, pid) = payments[0].clone();
+            for (extra_msg, _extra_pid) in &payments[1..] {
+                if let PulseMessage::Payment(ref p) = extra_msg {
+                    let _ = senders.pay_tx.send(p.clone());
+                }
+            }
+            if payments.len() > 1 {
+                tracing::info!(count = payments.len(), "direct payment split into multiple messages");
+            }
 
 
             // Broadcast reforge attestation + ownership genesis.
@@ -2008,7 +2122,7 @@ async fn handle_send_direct(
                 .iter()
                 .map(|&i| ws.billfold.bills()[i].clone())
                 .collect();
-            let (msg, pid) = match prepare_payment_from_bills(
+            let payments = match prepare_payment_from_bills_split(
                 &send_bills,
                 &recipient_address,
                 &cred_map,
@@ -2017,6 +2131,18 @@ async fn handle_send_direct(
                 Ok(v) => v,
                 Err(e) => return RpcResponse::err(format!("prepare payment failed: {e}")),
             };
+            if payments.is_empty() {
+                return RpcResponse::err("no payments produced");
+            }
+            let (msg, pid) = payments[0].clone();
+            for (extra_msg, _extra_pid) in &payments[1..] {
+                if let PulseMessage::Payment(ref p) = extra_msg {
+                    let _ = senders.pay_tx.send(p.clone());
+                }
+            }
+            if payments.len() > 1 {
+                tracing::info!(count = payments.len(), "direct payment split into multiple messages");
+            }
 
             let ws_mut = s.wallet.as_mut().unwrap();
             let mint_ids: Vec<[u8; 32]> = selection
@@ -2239,6 +2365,7 @@ async fn handle_wallet_unlock(
         let spend_seed = vess_kloak::recovery::spend_seed_from_raw_seed(&raw_seed);
         s.wallet = Some(WalletState {
             stealth_secret,
+            stealth_address: address,
             billfold,
             bitcoin_wallet,
             bitcoin_receive_address,
@@ -2282,10 +2409,10 @@ async fn handle_wallet_unlock(
 
         // Sweep existing limbo entries through the newly unlocked wallet.
         let all_sids: Vec<[u8; 32]> = s.limbo_buffer.stealth_ids_with_payments();
-        let mut payloads: Vec<Vec<u8>> = Vec::new();
+        let mut payloads: Vec<([u8; 32], Vec<u8>)> = Vec::new();
         for sid in &all_sids {
             for entry in s.limbo_buffer.peek(sid) {
-                payloads.push(entry.payment.stealth_payload.clone());
+                payloads.push((entry.payment.payment_id, entry.payment.stealth_payload.clone()));
             }
         }
         if !payloads.is_empty() {
@@ -2293,8 +2420,8 @@ async fn handle_wallet_unlock(
             let mut received = 0u64;
             let mut bill_count = 0usize;
             let mut pending_claims = Vec::new();
-            for payload in &payloads {
-                match receive_and_claim(&ws.stealth_secret, payload) {
+            for (payment_id, payload) in &payloads {
+                match receive_and_claim(&ws.stealth_secret, payload, payment_id) {
                     Ok(Some(result)) => {
                         for claimed in result.claimed {
                             received += claimed.bill.denomination.value();
