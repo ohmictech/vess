@@ -300,8 +300,6 @@ pub struct WalletNotification {
     pub bill_count: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub counterparty: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub memo: Option<String>,
     pub message: String,
 }
 
@@ -637,6 +635,95 @@ fn validate_bitcoin_burn_genesis(
     }
 
     Ok(bundle_commitment)
+}
+
+/// Verify the [`ProofOfVessOwnership`] attached to a [`TagLookup`] request.
+///
+/// Supports two paths:
+/// 1. **Bitcoin burn**: validates the burn proof (same as `OwnershipGenesis`)
+/// 2. **Vess bill ownership**: looks up `mint_id` in the registry, verifies
+///    the `owner_vk` matches the registered owner
+///
+/// In both cases, the `owner_sig` must be valid over `tag_hash || nonce`.
+fn verify_tag_lookup_ownership_proof(
+    tag_hash: &[u8; 32],
+    nonce: &[u8; 16],
+    proof: &vess_protocol::ProofOfVessOwnership,
+    state: &ArteryState,
+) -> Result<(), &'static str> {
+    // Verify the owner's signature over the lookup parameters.
+    let mut h = blake3::Hasher::new();
+    h.update(b"vess-tag-lookup-proof-v0");
+    h.update(tag_hash);
+    h.update(nonce);
+    let sig_msg: [u8; 32] = *h.finalize().as_bytes();
+
+    match vess_foundry::spend_auth::verify_spend(&proof.owner_vk, &sig_msg, &proof.owner_sig) {
+        Ok(true) => {}
+        Ok(false) => return Err("ownership proof signature invalid"),
+        Err(_) => return Err("ownership proof signature verification error"),
+    }
+
+    // Validate the ownership claim itself.
+    match (&proof.burn, &proof.mint_id) {
+        (Some(burn), _) => {
+            // Bitcoin burn path — validate the burn proof.
+            validate_burn_proof_standalone(burn, state.bitcoin_client.as_ref())?;
+        }
+        (None, Some(mint_id)) => {
+            // Vess bill ownership path — verify mint_id is registered.
+            let record = state.registry.get(mint_id)
+                .ok_or("mint_id not found in ownership registry")?;
+            let expected_vk_hash = vess_foundry::spend_auth::vk_hash(&proof.owner_vk);
+            if record.current_owner_vk_hash != expected_vk_hash {
+                return Err("owner_vk does not match registry record");
+            }
+        }
+        (None, None) => {
+            return Err("ownership proof missing both burn and mint_id");
+        }
+    }
+
+    Ok(())
+}
+
+/// Validate a Bitcoin burn proof without an associated OwnershipGenesis
+/// (used by TagLookup ownership proofs).
+fn validate_burn_proof_standalone(
+    burn: &vess_protocol::BitcoinBurnBundleProof,
+    bitcoin_client: Option<&vess_bitcoin::BitcoinLightClient>,
+) -> Result<(), &'static str> {
+    if burn.burn_amount_sats == 0 {
+        return Err("zero-value bitcoin burn");
+    }
+    let minimum_confirmations = min_bitcoin_burn_confirmations(burn.network);
+    if burn.required_confirmations < minimum_confirmations
+        || burn.confirmations < burn.required_confirmations
+    {
+        return Err("bitcoin burn confirmation depth insufficient");
+    }
+    if burn.corroborating_peer_count < min_bitcoin_burn_corroborating_peers(burn.network) {
+        return Err("bitcoin burn corroboration insufficient");
+    }
+    if let Some(client) = bitcoin_client {
+        if !client.has_block_header(&burn.block_hash) {
+            return Err("bitcoin burn block hash not in local header chain");
+        }
+    }
+    if burn.chain_work == [0u8; 32] {
+        return Err("bitcoin burn proof missing chainwork");
+    }
+    if burn.output_values.is_empty() || burn.output_values.len() > 64 {
+        return Err("invalid bitcoin burn output count");
+    }
+    if bitcoin_burn_merkle_root(burn) != burn.merkle_root {
+        return Err("bitcoin burn merkle proof mismatch");
+    }
+    let expected_payload = expected_bitcoin_burn_payload(burn);
+    if burn.burn_commitment_payload.as_slice() != expected_payload {
+        return Err("bitcoin burn commitment payload mismatch");
+    }
+    Ok(())
 }
 
 pub(crate) fn load_bitcoin_wallet_state(
@@ -6608,18 +6695,58 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
             }
 
             PulseMessage::TagLookup(tl) => {
-                // Rate-limit TagLookup to prevent tag enumeration.
+                // Tier 1: rate-limit only — anyone can check existence.
                 if !state.tag_lookup_limiter.allow(&peer_id) {
                     warn!(%peer, "tag lookup rate-limited");
                     return Some(PulseMessage::TagLookupResponse(TagLookupResponse {
                         tag_hash: tl.tag_hash,
                         nonce: tl.nonce,
                         result: None,
+                        requires_proof: false,
                     }));
                 }
-                info!(%peer, "tag lookup");
-                let result = state.tag_dht.lookup_by_hash(&tl.tag_hash);
-                let lookup_result = result.map(|record| TagLookupResult {
+
+                let record = state.tag_dht.lookup_by_hash(&tl.tag_hash);
+
+                // Tag not found — free response.
+                let Some(record) = record else {
+                    return Some(PulseMessage::TagLookupResponse(TagLookupResponse {
+                        tag_hash: tl.tag_hash,
+                        nonce: tl.nonce,
+                        result: None,
+                        requires_proof: false,
+                    }));
+                };
+
+                // Tag found — Tier 2: require ProofOfVessOwnership for the address.
+                if !state.is_testnet {
+                    match &tl.burn_proof {
+                        Some(proof) => {
+                            if let Err(reason) = verify_tag_lookup_ownership_proof(
+                                &tl.tag_hash, &tl.nonce, proof, &state,
+                            ) {
+                                warn!(%peer, %reason, "tag lookup: invalid proof — returning requires_proof");
+                                return Some(PulseMessage::TagLookupResponse(TagLookupResponse {
+                                    tag_hash: tl.tag_hash,
+                                    nonce: tl.nonce,
+                                    result: None,
+                                    requires_proof: true,
+                                }));
+                            }
+                        }
+                        None => {
+                            return Some(PulseMessage::TagLookupResponse(TagLookupResponse {
+                                tag_hash: tl.tag_hash,
+                                nonce: tl.nonce,
+                                result: None,
+                                requires_proof: true,
+                            }));
+                        }
+                    }
+                }
+
+                info!(%peer, "tag lookup resolved");
+                let lookup_result = TagLookupResult {
                     scan_ek: record.master_address.scan_ek.clone(),
                     spend_ek: record.master_address.spend_ek.clone(),
                     registered_at: record.registered_at,
@@ -6627,11 +6754,12 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     pow_hash: record.pow_hash.clone(),
                     registrant_vk: record.registrant_vk.clone(),
                     signature: record.signature.clone(),
-                });
+                };
                 Some(PulseMessage::TagLookupResponse(TagLookupResponse {
                     tag_hash: tl.tag_hash,
                     nonce: tl.nonce,
-                    result: lookup_result,
+                    result: Some(lookup_result),
+                    requires_proof: false,
                 }))
             }
 
@@ -6781,10 +6909,9 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                                 amount: Some(total),
                                 bill_count: Some(pending_oc.len()),
                                 counterparty: None,
-                                memo: memo_msg.clone(),
                                 message: match &memo_msg {
-                                    Some(m) if !m.is_empty() => format!("Received {total} Vess — {m}"),
-                                    _ => format!("Received {total} Vess"),
+                                    Some(m) => format!("Received {total} Vess — {m}"),
+                                    None => format!("Received {total} Vess"),
                                 },
                             });
                             // Build cryptographic PaymentReceipt proving we

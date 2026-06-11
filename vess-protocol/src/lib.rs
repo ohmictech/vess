@@ -410,6 +410,32 @@ pub struct TagLookup {
     pub tag_hash: [u8; 32],
     /// Nonce for request deduplication.
     pub nonce: [u8; 16],
+    /// Optional proof that the requester owns a Vess bill (from burn or
+    /// transfer). Nodes require this to prevent Sybil-based tag enumeration.
+    /// Absent in testnet mode.
+    #[serde(default)]
+    pub burn_proof: Option<ProofOfVessOwnership>,
+}
+
+/// Cryptographic proof that a tag lookup requester is a real Vess user
+/// who owns at least one bill (from a Bitcoin burn or a prior transfer).
+/// Nodes verify this before serving a [`TagLookup`], making mass
+/// enumeration economically infeasible.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProofOfVessOwnership {
+    /// Bitcoin burn proof (if this bill came from a burn). At least one
+    /// of `burn` or `mint_id` must be present.
+    #[serde(default)]
+    pub burn: Option<BitcoinBurnBundleProof>,
+    /// Mint ID of a Vess bill the requester owns (for non-burn bills).
+    #[serde(default)]
+    pub mint_id: Option<[u8; 32]>,
+    /// ML-DSA-65 public key of the bill owner.
+    pub owner_vk: Vec<u8>,
+    /// ML-DSA-65 signature over
+    /// `Blake3("vess-tag-lookup-proof-v0" || tag_hash || nonce)`
+    /// proving the requester owns the bill and authorizes this lookup.
+    pub owner_sig: Vec<u8>,
 }
 
 /// Response to a tag lookup.
@@ -419,8 +445,13 @@ pub struct TagLookupResponse {
     pub tag_hash: [u8; 32],
     /// The lookup nonce (echoed).
     pub nonce: [u8; 16],
-    /// The result — None if tag not found.
+    /// The result — None if tag not found or proof is required.
     pub result: Option<TagLookupResult>,
+    /// True when the tag exists but the requester needs a valid
+    /// [`ProofOfVessOwnership`] to receive the full result.
+    /// Allows existence checks without bill ownership.
+    #[serde(default)]
+    pub requires_proof: bool,
 }
 
 /// A successful tag lookup result.
@@ -1486,6 +1517,7 @@ mod tests {
         let msg = PulseMessage::TagLookup(TagLookup {
             tag_hash,
             nonce: [0xFF; 16],
+            burn_proof: None,
         });
         let bytes = msg.to_bytes().unwrap();
         let decoded = PulseMessage::from_bytes(&bytes).unwrap();

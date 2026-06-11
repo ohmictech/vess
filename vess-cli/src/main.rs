@@ -729,6 +729,7 @@ async fn lookup_tag_on_reachable_peer(
     let lookup = PulseMessage::TagLookup(TagLookup {
         tag_hash: *blake3::hash(tag_str.as_bytes()).as_bytes(),
         nonce: rand::random(),
+        burn_proof: None,
     });
     let mut failures = 0usize;
 

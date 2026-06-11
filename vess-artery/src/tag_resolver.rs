@@ -193,7 +193,7 @@ mod tests {
         TagLookupResponse {
             tag_hash: *blake3::hash(tag.as_bytes()).as_bytes(),
             nonce: [0u8; 16],
-            result: None,
+            result: None, requires_proof: false,
         }
     }
 
@@ -309,3 +309,5 @@ mod tests {
         }
     }
 }
+
+

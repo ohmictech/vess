@@ -425,6 +425,8 @@ pub enum RpcData {
         spend_ek: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         hardened: Option<bool>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        requires_proof: bool,
     },
     Send {
         payment_id: String,
@@ -984,7 +986,7 @@ async fn resolve_tag(
     state: &Arc<Mutex<ArteryState>>,
     node: &MeshPulseNode,
     tag_str: &str,
-) -> Option<MasterStealthAddress> {
+) -> (Option<MasterStealthAddress>, bool) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -994,10 +996,10 @@ async fn resolve_tag(
     {
         let mut s = lock_state(&state);
         if let Some(cached) = s.tag_cache.get(tag_str, now) {
-            return Some(MasterStealthAddress {
+            return (Some(MasterStealthAddress {
                 scan_ek: cached.scan_ek,
                 spend_ek: cached.spend_ek,
-            });
+            }), false);
         }
     }
 
@@ -1011,7 +1013,7 @@ async fn resolve_tag(
             };
             s.tag_cache
                 .insert(tag_str, addr.scan_ek.clone(), addr.spend_ek.clone(), now);
-            return Some(addr);
+            return (Some(addr), false);
         }
     }
 
@@ -1028,7 +1030,7 @@ async fn resolve_tag(
         let s = lock_state(&state);
         let peers = s.routing_table.routable_peers(|_| true);
         if peers.is_empty() {
-            return None;
+            return (None, false);
         }
         let peer_hashes: Vec<[u8; 32]> = peers.iter().map(|p| p.id_hash).collect();
         // Get 2K nearest, then randomly select K from them.
@@ -1048,13 +1050,13 @@ async fn resolve_tag(
     };
 
     if targets.is_empty() {
-        return None;
+        return (None, false);
     }
 
     let required_confirmations = std::cmp::min(crate::QUORUM_THRESHOLD, targets.len()).max(1);
 
     // Send `TagLookup` concurrently to all selected peers.
-    let lookup_msg = PulseMessage::TagLookup(TagLookup { tag_hash, nonce });
+    let lookup_msg = PulseMessage::TagLookup(TagLookup { tag_hash, nonce, burn_proof: None });
 
     let mut tasks = Vec::with_capacity(targets.len());
     for (contact, id_hash) in targets {
@@ -1077,6 +1079,7 @@ async fn resolve_tag(
     let mut relaxed_candidate: Option<MasterStealthAddress> = None;
     let mut relaxed_fingerprint: Option<[u8; 32]> = None;
     let mut relaxed_conflict = false;
+    let mut tag_requires_proof = false;
     for join_result in results {
         let Ok((id_hash, timeout_result)) = join_result else {
             continue;
@@ -1087,6 +1090,11 @@ async fn resolve_tag(
         // Ignore responses with wrong nonce (could be stale).
         if tlr.nonce != nonce {
             continue;
+        }
+
+        // Track whether any peer requires proof (tag exists but address is gated).
+        if tlr.requires_proof {
+            tag_requires_proof = true;
         }
 
         let validated_address = match &tlr.result {
@@ -1121,14 +1129,14 @@ async fn resolve_tag(
                     address.spend_ek.clone(),
                     now,
                 );
-                return Some(address);
+                return (Some(address), false);
             }
             TagResolution::Conflict { .. } => {
                 warn!(
                     tag = tag_str,
                     "tag lookup: conflicting records from network"
                 );
-                return None;
+                return (None, false);
             }
             _ => {} // Pending or NotFound — keep collecting
         }
@@ -1143,11 +1151,11 @@ async fn resolve_tag(
                 address.spend_ek.clone(),
                 now,
             );
-            return Some(address);
+            return (Some(address), false);
         }
     }
 
-    None
+    (None, tag_requires_proof)
 }
 
 async fn handle_tag_lookup(
@@ -1158,20 +1166,27 @@ async fn handle_tag_lookup(
     let tag_str = tag.strip_prefix('+').unwrap_or(tag);
 
     match resolve_tag(state, node, tag_str).await {
-        Some(addr) => RpcResponse::ok(RpcData::TagLookup {
+        (Some(addr), _) => RpcResponse::ok(RpcData::TagLookup {
             found: true,
             tag: tag_str.to_owned(),
             scan_ek: Some(to_hex(&addr.scan_ek)),
             spend_ek: Some(to_hex(&addr.spend_ek)),
             hardened: None,
+            requires_proof: false,
         }),
-        None => RpcResponse::ok(RpcData::TagLookup {
-            found: false,
-            tag: tag_str.to_owned(),
-            scan_ek: None,
-            spend_ek: None,
-            hardened: None,
-        }),
+        (None, requires_proof) => {
+            // If requires_proof is true, the tag exists but the caller lacks
+            // a valid ProofOfVessOwnership. Report found:true so the wallet
+            // knows the tag is taken (important for pre-claim availability checks).
+            RpcResponse::ok(RpcData::TagLookup {
+                found: requires_proof,
+                tag: tag_str.to_owned(),
+                scan_ek: None,
+                spend_ek: None,
+                hardened: None,
+                requires_proof,
+            })
+        }
     }
 }
 
@@ -1472,8 +1487,8 @@ async fn handle_send(
     // Done outside the mutex so the async network query doesn't block
     // the state lock.
     let recipient_address = match resolve_tag(state, node, tag_str).await {
-        Some(addr) => addr,
-        None => return RpcResponse::err(format!("tag +{tag_str} not found")),
+        (Some(addr), _) => addr,
+        (None, _) => return RpcResponse::err(format!("tag +{tag_str} not found")),
     };
 
     // ── Prepare payment inside a block so the mutex guard is dropped
@@ -1895,8 +1910,8 @@ async fn handle_send_direct(
 
     // ── Resolve tag (cache → local DHT → active DHT query) ──────────
     let recipient_address = match resolve_tag(state, node, tag_str).await {
-        Some(addr) => addr,
-        None => return RpcResponse::err(format!("tag +{tag_str} not found")),
+        (Some(addr), _) => addr,
+        (None, _) => return RpcResponse::err(format!("tag +{tag_str} not found")),
     };
 
     let (mut msg, payment_id, sent_mints) = {

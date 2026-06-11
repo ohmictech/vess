@@ -115,6 +115,10 @@ pub struct PeerEntry {
     /// When the last handshake attempt was made (success or failure).
     /// Used for backoff calculation.
     pub last_handshake_at: Option<Instant>,
+    /// True if this peer has submitted a valid Bitcoin burn proof,
+    /// proving they are a real Vess user (not a Sybil). Required for
+    /// TagLookup queries.
+    pub has_proven_burn: bool,
 }
 
 // ── Peer registry ───────────────────────────────────────────────────
@@ -189,6 +193,7 @@ impl PeerRegistry {
                 verified_at: None,
                 handshake_failures: failures,
                 last_handshake_at: Some(Instant::now()),
+                has_proven_burn: false,
             },
         );
         nonce
@@ -226,6 +231,7 @@ impl PeerRegistry {
                     verified_at: Some(Instant::now()),
                     handshake_failures: 0,
                     last_handshake_at: Some(Instant::now()),
+                    has_proven_burn: false,
                 },
             );
             true
@@ -245,6 +251,7 @@ impl PeerRegistry {
                 verified_at: Some(Instant::now()),
                 handshake_failures: 0,
                 last_handshake_at: Some(Instant::now()),
+                has_proven_burn: false,
             },
         );
     }
@@ -267,6 +274,7 @@ impl PeerRegistry {
                 verified_at: None,
                 handshake_failures: failures,
                 last_handshake_at: Some(Instant::now()),
+                has_proven_burn: false,
             },
         );
     }
@@ -370,6 +378,7 @@ impl PeerRegistry {
                         verified_at: None,
                         handshake_failures: 0,
                         last_handshake_at: entry.last_handshake_at,
+                        has_proven_burn: false,
                     },
                 );
             }
@@ -823,3 +832,4 @@ mod tests {
         assert!(stale.is_empty());
     }
 }
+

@@ -387,6 +387,7 @@ fn tag_lookup_round_trip() {
     let lookup = PulseMessage::TagLookup(TagLookup {
         tag_hash: bob_hash,
         nonce: [0x42; 16],
+        burn_proof: None,
     });
 
     let bytes = lookup.to_bytes().unwrap();
@@ -429,6 +430,7 @@ fn tag_lookup_round_trip() {
         tag_hash: *blake3::hash(b"unknown").as_bytes(),
         nonce: [0x00; 16],
         result: None,
+        requires_proof: false,
     });
 
     let bytes = not_found.to_bytes().unwrap();
@@ -1002,3 +1004,5 @@ fn bill_selection_high_value() {
     assert_eq!(result.total_selected, 200_000);
     assert_eq!(result.change, 0);
 }
+
+
