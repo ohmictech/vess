@@ -230,6 +230,23 @@ enum Command {
     /// Manage the local VessTag address book (persistent tag → stealth address cache).
     #[command(subcommand)]
     TagCache(TagCacheCmd),
+
+    /// Cancel a pending outbound payment and recover reserved bills.
+    CancelPayment {
+        /// Payment ID (hex) of the outbound payment to cancel.
+        payment_id: String,
+    },
+
+    /// List pending outbound payments that haven't been claimed yet.
+    PendingPayments,
+
+    /// Toggle passive mode: save bandwidth on metered/mobile connections.
+    /// In passive mode the node only relays its own payments.
+    PassiveMode {
+        /// Enable or disable passive mode.
+        #[arg(long)]
+        enable: bool,
+    },
 }
 
 const LOCAL_BACKUP_FORMAT_VERSION: u32 = 1;
@@ -500,6 +517,7 @@ async fn dispatch_command(cli: &Cli) -> Result<()> {
                 reset_transient_peer_state: *reset_transient_peer_state,
                 is_testnet: *testnet,
                 test: false,
+                bootstrap_dns: vec![],
             };
             vess_artery::node_runner::run_node(config).await?;
             Ok(())
@@ -509,7 +527,56 @@ async fn dispatch_command(cli: &Cli) -> Result<()> {
             TagCacheCmd::List => cmd_tag_cache_list(&cli).await,
             TagCacheCmd::Clear { tag } => cmd_tag_cache_clear(&cli, tag.as_deref()).await,
         },
+        Some(Command::CancelPayment { payment_id }) => cmd_cancel_payment(&cli, payment_id).await,
+        Some(Command::PendingPayments) => cmd_pending_payments(&cli).await,
+        Some(Command::PassiveMode { enable }) => cmd_passive_mode(&cli, *enable).await,
     }
+}
+
+async fn cmd_cancel_payment(cli: &Cli, payment_id: &str) -> Result<()> {
+    let port = rpc_port(cli);
+    let resp = rpc_call(port, &json!({"method": "cancel_payment", "payment_id": payment_id})).await?;
+    if cli.json {
+        println!("{resp}");
+    } else if resp["ok"] == true {
+        let released = resp["released_bills"].as_u64().unwrap_or(0);
+        let amount = resp["recovered_amount"].as_u64().unwrap_or(0);
+        println!("Cancelled payment {payment_id}: {released} bills worth {amount} Vess recovered.");
+    } else {
+        anyhow::bail!("{}", resp["error"].as_str().unwrap_or("unknown error"));
+    }
+    Ok(())
+}
+
+async fn cmd_pending_payments(cli: &Cli) -> Result<()> {
+    let port = rpc_port(cli);
+    let resp = rpc_call(port, &json!({"method": "pending_payments"})).await?;
+    if cli.json {
+        println!("{resp}");
+    } else if resp["ok"] == true {
+        let payments = resp["payments"].as_array().map(|a| a.len()).unwrap_or(0);
+        if payments == 0 {
+            println!("No pending outbound payments.");
+        } else {
+            println!("{:#}", resp);
+        }
+    } else {
+        anyhow::bail!("{}", resp["error"].as_str().unwrap_or("unknown error"));
+    }
+    Ok(())
+}
+
+async fn cmd_passive_mode(cli: &Cli, enable: bool) -> Result<()> {
+    let port = rpc_port(cli);
+    let resp = rpc_call(port, &json!({"method": "set_passive_mode", "enabled": enable})).await?;
+    if cli.json {
+        println!("{resp}");
+    } else if resp["ok"] == true {
+        println!("{}", resp["message"].as_str().unwrap_or("Passive mode toggled."));
+    } else {
+        anyhow::bail!("{}", resp["error"].as_str().unwrap_or("unknown error"));
+    }
+    Ok(())
 }
 
 // ── Subcommand implementations ──────────────────────────────────────

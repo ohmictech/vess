@@ -240,12 +240,42 @@ fn verify_double_spend_evidence(evidence: &[u8]) -> bool {
         && verify_oc_sig(&oc2).unwrap_or(false)
 }
 
-fn verify_oc_sig(_oc: &vess_protocol::OwnershipClaim) -> anyhow::Result<bool> {
-    Ok(true) // TODO: full signature verification
+fn verify_oc_sig(oc: &vess_protocol::OwnershipClaim) -> anyhow::Result<bool> {
+    // Reconstruct the transfer message that the previous owner signed.
+    let msg = vess_foundry::spend_auth::transfer_message(
+        &oc.mint_id,
+        &oc.stealth_id,
+        oc.timestamp,
+    );
+    if oc.transfer_sig.is_empty() || oc.prev_owner_vk.is_empty() {
+        return Ok(false);
+    }
+    vess_foundry::spend_auth::verify_spend(&oc.prev_owner_vk, &msg, &oc.transfer_sig)
 }
 
-fn verify_ra_internal(_ra: &vess_protocol::ReforgeAttestation) -> anyhow::Result<bool> {
-    Ok(true) // TODO: call vess_foundry::reforge::verify_reforge_proof
+fn verify_ra_internal(ra: &vess_protocol::ReforgeAttestation) -> anyhow::Result<bool> {
+    if ra.consumed_mint_ids.len() != ra.consume_sigs.len() {
+        return Ok(false);
+    }
+    if ra.owner_vk.is_empty() {
+        return Ok(false);
+    }
+    // Reconstruct the consume message for each mint_id and verify.
+    for (i, mint_id) in ra.consumed_mint_ids.iter().enumerate() {
+        let digest = {
+            let mut h = blake3::Hasher::new();
+            h.update(b"vess-reforge-consume-v0");
+            h.update(mint_id);
+            h.update(&ra.reforge_id);
+            *h.finalize().as_bytes()
+        };
+        if !vess_foundry::spend_auth::verify_spend(&ra.owner_vk, &digest, &ra.consume_sigs[i])
+            .unwrap_or(false)
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn offense_discriminant(offense: &vess_protocol::BanishmentOffense) -> u8 {
@@ -2616,6 +2646,7 @@ impl DhtSeedCursor {
             max_programs: MAX_DHT_SEED_PROGRAMS as u16,
             max_program_manifests: MAX_DHT_SEED_PROGRAM_MANIFESTS as u16,
             max_compute_receipts: MAX_DHT_SEED_COMPUTE_RECEIPTS as u16,
+            burn_proof: None,
         }
     }
 
@@ -3164,6 +3195,9 @@ pub struct NodeConfig {
     pub state_dir: PathBuf,
     /// Bootstrap peer mesh contacts to connect to on startup.
     pub bootstrap: Vec<String>,
+    /// DNS seed domains to resolve for bootstrap peers (e.g. "seed.vess.network").
+    /// Each domain is resolved via A/AAAA records on the default Vess port.
+    pub bootstrap_dns: Vec<String>,
     /// Optional channel to signal the node's mesh node ID once online.
     /// Useful for tests that need to connect before `run_node` blocks.
     pub ready_tx: Option<tokio::sync::oneshot::Sender<String>>,
@@ -3219,6 +3253,7 @@ impl Default for NodeConfig {
             reset_transient_peer_state: false,
             is_testnet: false,
             test: false,
+            bootstrap_dns: Vec::new(),
         }
     }
 }
@@ -3397,6 +3432,8 @@ pub struct ArteryState {
     /// store requests. Its own payments still go through. Set this on
     /// metered/mobile connections to save bandwidth.
     pub passive_mode: bool,
+    /// Local-only payment history persisted to disk.
+    pub payment_history: vess_kloak::payment::PaymentHistory,
 }
 
 impl ArteryState {
@@ -3447,6 +3484,7 @@ impl ArteryState {
             test_faucet_enabled: is_testnet,
             is_testnet,
             passive_mode: false,
+            payment_history: vess_kloak::payment::PaymentHistory::default(),
         }
     }
 
@@ -4236,6 +4274,10 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
         events: VecDeque::new(),
         limbo_payment_times: HashMap::new(),
         passive_mode: false,
+        payment_history: {
+            let history_path = config.state_dir.join("payment_history.json");
+            vess_kloak::payment::PaymentHistory::load(&history_path)
+        },
     }));
     let receipt_text_state_dir = config.state_dir.clone();
 
@@ -4952,6 +4994,9 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 s.flush_wallet();
                 // M1: Flush tag cache if any get() hits marked it dirty.
                 s.tag_cache.flush_if_dirty();
+                // Persist payment history to disk.
+                let history_path = flush_storage_dir.join("payment_history.json");
+                s.payment_history.save(&history_path);
                 // Publish wallet manifest to DHT for seed-based recovery.
                 if let Some(key) = s.publish_manifest_to_dht(&flush_manifest_tx) {
                     info!(dht_key = %hex_key(&key), "wallet manifest published to DHT");
@@ -4981,6 +5026,22 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
 
     // ── Bootstrap discovery ─────────────────────────────────────────
     let mut all_bootstrap = config.bootstrap.clone();
+
+    // Resolve DNS seed domains.
+    for domain in &config.bootstrap_dns {
+        match tokio::net::lookup_host(format!("{domain}:0")).await {
+            Ok(addrs) => {
+                for addr in addrs {
+                    let contact = format!("{}:{}", addr.ip(), crate::local_discovery::LAN_DISCOVERY_PORT);
+                    all_bootstrap.push(contact);
+                }
+                info!(%domain, count = all_bootstrap.len(), "resolved DNS seed");
+            }
+            Err(e) => {
+                warn!(%domain, error = %e, "failed to resolve DNS seed domain");
+            }
+        }
+    }
     // Append testnet seed peers when running in testnet mode.
     if config.is_testnet {
         // Placeholder — add seed node contacts here once deployed.
@@ -6914,6 +6975,13 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                                     None => format!("Received {total} Vess"),
                                 },
                             });
+                            // Record in payment history.
+                            state.payment_history.record_received(
+                                &hex_key(&payment_id),
+                                total,
+                                None,
+                                memo_msg.clone(),
+                            );
                             // Build cryptographic PaymentReceipt proving we
                             // decrypted and claimed this payment.
                             let receipt_digest = {
@@ -7055,6 +7123,48 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 if req.requester_node_id != peer_id {
                     warn!(%peer, "DHT seed request node id does not match transport peer");
                     return None;
+                }
+
+                // Require ProofOfVessOwnership for mainnet seed requests.
+                if !state.is_testnet {
+                    match &req.burn_proof {
+                        Some(proof) => {
+                            let sig_msg = {
+                                let mut h = blake3::Hasher::new();
+                                h.update(b"dht-seed-request-v0");
+                                h.update(&req.requester_node_id);
+                                *h.finalize().as_bytes()
+                            };
+                            if let Err(reason) = verify_tag_lookup_ownership_proof(
+                                &sig_msg, &[0u8; 16], proof, &state,
+                            ) {
+                                warn!(%peer, %reason, "DHT seed request rejected: invalid proof");
+                                return Some(PulseMessage::DhtSeedResponse(DhtSeedResponse {
+                                    responder_node_id: state.node_id,
+                                    tags: vec![],
+                                    manifests: vec![],
+                                    ownership_records: vec![],
+                                    consumed_records: vec![],
+                                    programs: vec![],
+                                    program_manifests: vec![],
+                                    compute_receipts: vec![],
+                                }));
+                            }
+                        }
+                        None => {
+                            warn!(%peer, "DHT seed request rejected: no burn proof");
+                            return Some(PulseMessage::DhtSeedResponse(DhtSeedResponse {
+                                responder_node_id: state.node_id,
+                                tags: vec![],
+                                manifests: vec![],
+                                ownership_records: vec![],
+                                consumed_records: vec![],
+                                programs: vec![],
+                                program_manifests: vec![],
+                                compute_receipts: vec![],
+                            }));
+                        }
+                    }
                 }
 
                 let peer_ids: Vec<[u8; 32]> = state

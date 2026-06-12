@@ -1175,6 +1175,124 @@ fn now_unix() -> u64 {
         .as_secs()
 }
 
+// ── Payment history ──────────────────────────────────────────────────
+
+/// A single entry in the wallet's local payment history.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaymentHistoryEntry {
+    /// Payment ID.
+    pub payment_id: String,
+    /// Unix timestamp when the payment was sent or received.
+    pub timestamp: u64,
+    /// Amount in Vess.
+    pub amount: u64,
+    /// "sent" or "received".
+    pub direction: String,
+    /// Counterparty tag or address.
+    #[serde(default)]
+    pub counterparty: Option<String>,
+    /// Optional memo attached to the payment.
+    #[serde(default)]
+    pub memo: Option<String>,
+    /// Payment status: "pending", "confirmed", "cancelled", or "refunded".
+    #[serde(default)]
+    pub status: String,
+}
+
+/// Local-only payment history persisted to a JSON file.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct PaymentHistory {
+    entries: Vec<PaymentHistoryEntry>,
+}
+
+impl PaymentHistory {
+    /// Load payment history from disk, or return an empty one.
+    pub fn load(path: &std::path::Path) -> Self {
+        match std::fs::read_to_string(path) {
+            Ok(data) => serde_json::from_str(&data).unwrap_or_default(),
+            Err(_) => Self::default(),
+        }
+    }
+
+    /// Save payment history to disk.
+    pub fn save(&self, path: &std::path::Path) {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(data) = serde_json::to_string_pretty(self) {
+            let _ = std::fs::write(path, data);
+        }
+    }
+
+    /// Record a sent payment.
+    pub fn record_sent(
+        &mut self,
+        payment_id: &str,
+        amount: u64,
+        counterparty: Option<String>,
+        memo: Option<String>,
+    ) {
+        self.entries.push(PaymentHistoryEntry {
+            payment_id: payment_id.to_string(),
+            timestamp: now_unix(),
+            amount,
+            direction: "sent".to_string(),
+            counterparty,
+            memo,
+            status: "pending".to_string(),
+        });
+    }
+
+    /// Record a received payment.
+    pub fn record_received(
+        &mut self,
+        payment_id: &str,
+        amount: u64,
+        counterparty: Option<String>,
+        memo: Option<String>,
+    ) {
+        self.entries.push(PaymentHistoryEntry {
+            payment_id: payment_id.to_string(),
+            timestamp: now_unix(),
+            amount,
+            direction: "received".to_string(),
+            counterparty,
+            memo,
+            status: "confirmed".to_string(),
+        });
+    }
+
+    /// Mark a sent payment as confirmed.
+    pub fn confirm(&mut self, payment_id: &str) {
+        for entry in &mut self.entries {
+            if entry.payment_id == payment_id && entry.direction == "sent" {
+                entry.status = "confirmed".to_string();
+            }
+        }
+    }
+
+    /// Mark a payment as cancelled/refunded.
+    pub fn mark_cancelled(&mut self, payment_id: &str) {
+        for entry in &mut self.entries {
+            if entry.payment_id == payment_id {
+                entry.status = "cancelled".to_string();
+            }
+        }
+    }
+
+    /// Return all entries, newest first.
+    pub fn all(&self) -> &[PaymentHistoryEntry] {
+        &self.entries
+    }
+
+    /// Return entries in chronological order, newest first.
+    pub fn list(&self) -> Vec<&PaymentHistoryEntry> {
+        let mut entries: Vec<&PaymentHistoryEntry> = self.entries.iter().collect();
+        entries.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        entries
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

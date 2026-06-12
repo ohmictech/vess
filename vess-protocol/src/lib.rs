@@ -718,6 +718,10 @@ pub struct DhtSeedRequest {
     /// Maximum compute receipts to return.
     #[serde(default)]
     pub max_compute_receipts: u16,
+    /// Proof that the requester owns a Vess bill (prevents Sybil-based
+    /// DHT shard collection during bootstrap). Absent in testnet mode.
+    #[serde(default)]
+    pub burn_proof: Option<ProofOfVessOwnership>,
 }
 
 /// A tag DHT record transferred during seed sync.
@@ -1545,6 +1549,7 @@ mod tests {
             max_programs: 14,
             max_program_manifests: 15,
             max_compute_receipts: 16,
+            burn_proof: None,
         });
         let bytes = msg.to_bytes().unwrap();
         let decoded = PulseMessage::from_bytes(&bytes).unwrap();

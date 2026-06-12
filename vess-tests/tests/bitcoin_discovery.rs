@@ -529,6 +529,7 @@ async fn five_nodes_discover_via_bitcoin_seed_and_register_tags() {
             reset_transient_peer_state: false,
             is_testnet: false,
             test: false,
+            bootstrap_dns: vec![],
         };
 
         let task = tokio::spawn(async move { run_node(config).await });

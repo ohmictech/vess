@@ -412,6 +412,7 @@ fn tag_lookup_round_trip() {
             pow_nonce: [0u8; 32],
             pow_hash: Vec::new(),
         }),
+        requires_proof: false,
     });
 
     let bytes = response.to_bytes().unwrap();
@@ -618,6 +619,7 @@ fn tag_resolver_quorum_flow() {
             pow_nonce: [0u8; 32],
             pow_hash: Vec::new(),
         }),
+        requires_proof: false,
     };
 
     // Add responses from 5 different nodes.
@@ -672,6 +674,7 @@ fn tag_resolver_conflict_detection() {
                 pow_nonce: [0u8; 32],
                 pow_hash: Vec::new(),
             }),
+            requires_proof: false,
         };
         resolver.add_response(node_id, &resp);
     }
@@ -692,6 +695,7 @@ fn tag_resolver_conflict_detection() {
                 pow_nonce: [0u8; 32],
                 pow_hash: Vec::new(),
             }),
+            requires_proof: false,
         };
         let result = resolver.add_response(node_id, &resp);
 

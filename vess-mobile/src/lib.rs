@@ -256,6 +256,7 @@ pub fn start_node(config: NodeConfig) -> Result<NodeStatus, VessError> {
         reset_transient_peer_state: false,
         is_testnet,
         test: false,
+        bootstrap_dns: vec![],
     };
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();

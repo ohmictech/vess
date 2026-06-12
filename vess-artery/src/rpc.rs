@@ -363,6 +363,17 @@ pub enum RpcRequest {
     SetPassiveMode {
         enabled: bool,
     },
+    /// Cancel a pending outbound payment and release its reserved bills.
+    CancelPayment {
+        payment_id: String,
+    },
+    /// List pending outbound payments.
+    PendingPayments,
+    /// List payment history (sent and received).
+    PaymentHistory {
+        #[serde(default)]
+        max: Option<usize>,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -494,6 +505,17 @@ pub enum RpcData {
         message: String,
     },
     Empty {},
+    PaymentHistory {
+        entries: Vec<vess_kloak::payment::PaymentHistoryEntry>,
+    },
+    CancelPayment {
+        payment_id: String,
+        released_bills: usize,
+        recovered_amount: u64,
+    },
+    PendingPayments {
+        payments: Vec<OutboundPaymentView>,
+    },
 }
 
 impl RpcResponse {
@@ -701,10 +723,23 @@ async fn handle_request(
         RpcRequest::TagCacheList => handle_tag_cache_list(state),
         RpcRequest::TagCacheClear { tag } => handle_tag_cache_clear(state, tag.as_deref()),
         RpcRequest::SetPassiveMode { enabled } => handle_set_passive_mode(state, enabled),
+        RpcRequest::CancelPayment { payment_id } => handle_cancel_payment(state, &payment_id),
+        RpcRequest::PendingPayments => handle_pending_payments(state),
+        RpcRequest::PaymentHistory { max } => handle_payment_history(state, max),
     }
 }
 
 // ── Handlers ────────────────────────────────────────────────────────
+
+/// Simplified view of an outbound payment for RPC responses.
+#[derive(Debug, Clone, Serialize)]
+pub struct OutboundPaymentView {
+    pub payment_id: String,
+    pub amount: u64,
+    pub recipient: String,
+    pub bill_count: usize,
+    pub status: String,
+}
 
 fn handle_set_passive_mode(state: &Arc<Mutex<ArteryState>>, enabled: bool) -> RpcResponse {
     let mut s = lock_state(state);
@@ -719,6 +754,57 @@ fn handle_set_passive_mode(state: &Arc<Mutex<ArteryState>>, enabled: bool) -> Rp
         passive_mode: enabled,
         message: msg.to_string(),
     })
+}
+
+fn handle_cancel_payment(state: &Arc<Mutex<ArteryState>>, payment_id_hex: &str) -> RpcResponse {
+    let payment_id = match crate::persistence::unhex_key(payment_id_hex) {
+        Ok(pid) => pid,
+        Err(e) => return RpcResponse::err(format!("invalid payment_id hex: {e}")),
+    };
+    let mut s = lock_state(state);
+    let record = match s.outbound_payments.remove(&payment_id) {
+        Some(r) => r,
+        None => return RpcResponse::err("payment not found"),
+    };
+    let mint_ids: Vec<[u8; 32]> = record.pending_mint_ids.iter().copied().collect();
+    let count = mint_ids.len();
+    let amount = record.amount;
+    if let Some(ref mut ws) = s.wallet {
+        ws.billfold.release(&mint_ids);
+    }
+    for mid in &mint_ids {
+        s.outbound_by_mint_id.remove(mid);
+    }
+    s.payment_history.mark_cancelled(payment_id_hex);
+    RpcResponse::ok(RpcData::CancelPayment {
+        payment_id: payment_id_hex.to_string(),
+        released_bills: count,
+        recovered_amount: amount,
+    })
+}
+
+fn handle_pending_payments(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
+    let s = lock_state(state);
+    let payments: Vec<OutboundPaymentView> = s.outbound_payments.values()
+        .map(|r| OutboundPaymentView {
+            payment_id: crate::persistence::hex_key(&r.payment_id),
+            amount: r.amount,
+            recipient: r.recipient.clone(),
+            bill_count: r.pending_mint_ids.len(),
+            status: "pending".to_string(),
+        })
+        .collect();
+    RpcResponse::ok(RpcData::PendingPayments { payments })
+}
+
+fn handle_payment_history(state: &Arc<Mutex<ArteryState>>, max: Option<usize>) -> RpcResponse {
+    let s = lock_state(state);
+    let mut entries: Vec<vess_kloak::payment::PaymentHistoryEntry> =
+        s.payment_history.list().into_iter().cloned().collect();
+    if let Some(m) = max {
+        entries.truncate(m);
+    }
+    RpcResponse::ok(RpcData::PaymentHistory { entries })
 }
 
 fn handle_balance(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
@@ -1849,6 +1935,12 @@ async fn handle_send(
 
     let mut s = lock_state(&state);
     s.record_outbound_payment(payment_id, amount, recipient_tag.to_string(), &sent_mints);
+    s.payment_history.record_sent(
+        &hex_key(&payment_id),
+        amount,
+        Some(recipient_tag.to_string()),
+        None,
+    );
     s.push_notification(crate::node_runner::WalletNotification {
         kind: "payment_sent".to_string(),
         created_at: std::time::SystemTime::now()
