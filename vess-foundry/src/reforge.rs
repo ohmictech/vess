@@ -204,6 +204,17 @@ pub fn reforge(request: ReforgeRequest) -> Result<ReforgeResult> {
         ));
     }
 
+    // All inputs must share the same asset. Outputs inherit it.
+    let asset = request.inputs[0].asset;
+    for bill in &request.inputs[1..] {
+        if bill.asset != asset {
+            return Err(anyhow!(
+                "asset mismatch: cannot reforge {} with {}",
+                bill.asset, asset
+            ));
+        }
+    }
+
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -295,7 +306,7 @@ pub fn reforge(request: ReforgeRequest) -> Result<ReforgeResult> {
                     mint_id,
                     chain_tip,
                     chain_depth: 0,
-                    asset: Asset::Btc,
+                    asset,
                 },
                 proof_bytes,
             )
@@ -337,7 +348,7 @@ mod tests {
             mint_id: [0xAA; 32],
             chain_tip: [0xDD; 32],
             chain_depth: 0,
-            asset: crate::Asset::Btc,
+            asset: crate::Asset::Btc, // test helper default
         }
     }
 

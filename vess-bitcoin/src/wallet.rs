@@ -63,6 +63,7 @@ pub struct PendingTimeLock {
     pub lock_blocks: u64,
     pub cltv_block_height: u64,
     pub vess_amount: u64,
+    pub vichor_burned: u64,
     pub fee_sats: u64,
     pub created_at: u64,
     pub last_broadcast_at: Option<u64>,
@@ -124,6 +125,7 @@ struct PersistedPendingTimeLock {
     lock_blocks: u64,
     cltv_block_height: u64,
     vess_amount: u64,
+    vichor_burned: u64,
     fee_sats: u64,
     created_at: u64,
     last_broadcast_at: Option<u64>,
@@ -400,13 +402,23 @@ impl BitcoinWallet {
     ///
     /// # Arguments
     /// - `percentage` — fraction of spendable balance to lock (1.0–100.0).
-    /// - `duration_years` — how many years to lock (0.1–10.0). Default: 1.0.
+    /// - `duration_years` — how many years to lock, in 0.1 increments
+    ///   (0.1–10.0). 1.0 = 1 year (default), 1.5 = 1.5 years, etc.
     /// - `fee_sats` — miner fee in satoshis.
     /// - `current_height` — latest known Bitcoin block height.
     /// - `now` — Unix timestamp for the pending record.
     ///
-    /// The amount locked = spendable_balance × (percentage / 100.0), minus fee.
-    /// Vess minted = locked_sats × lock_blocks / BLOCKS_PER_YEAR.
+    /// # Vichor gate
+    ///
+    /// Locks ≤1 year are free. Duration is in 0.1-year increments.
+    /// Beyond 1 year: 10 Vichor per full year, 1 per 0.1 step.
+    ///
+    /// ```text
+    /// vichor_required = max(0, (years - 1.0) × 10)
+    /// ```
+    ///
+    /// 1.0 = 0, 1.1 = 1, 2.0 = 10, 5.0 = 40, 10.0 = 90.
+    /// Long-term speculators subsidize the network before accessing leverage.
     ///
     /// Returns the pending time-lock ready for broadcast.
     pub fn mint_timelock(
@@ -416,6 +428,8 @@ impl BitcoinWallet {
         fee_sats: u64,
         current_height: u64,
         now: u64,
+        vichor_burned: u64,
+        vichor_burn_digest: Option<[u8; 32]>,
     ) -> Result<PendingTimeLock> {
         // Validate percentage
         if percentage <= 0.0 || percentage > 100.0 {
@@ -424,13 +438,30 @@ impl BitcoinWallet {
             ));
         }
 
-        // Validate and clamp duration
+        // Validate and clamp duration — must be in 0.1 year increments.
         let duration_years = duration_years.clamp(0.1, 10.0);
+        // Round to nearest 0.1 to enforce discrete increments.
+        let duration_years = (duration_years * 10.0).round() / 10.0;
         let lock_blocks = (duration_years * vess_foundry::BLOCKS_PER_YEAR as f64) as u64;
         if lock_blocks < vess_foundry::MIN_LOCK_BLOCKS {
             return Err(anyhow!(
                 "duration too short: {duration_years} years = {lock_blocks} blocks (min {})",
                 vess_foundry::MIN_LOCK_BLOCKS
+            ));
+        }
+
+        // Vichor gate: free ≤1 year, then 10 Vichor/year in 0.1 increments.
+        let vichor_required = vess_foundry::vichor_required_for_years(duration_years);
+        if vichor_burned < vichor_required {
+            return Err(anyhow!(
+                "duration {duration_years} years requires {vichor_required} Vichor burned, got {vichor_burned}"
+            ));
+        }
+        // If Vichor is required, the burn proof MUST be cryptographically
+        // committed in the Bitcoin transaction's OP_RETURN.
+        if vichor_required > 0 && vichor_burn_digest.is_none() {
+            return Err(anyhow!(
+                "duration >1 year requires a VichorBurnProof committed in the time-lock transaction"
             ));
         }
 
@@ -472,6 +503,7 @@ impl BitcoinWallet {
             current_height,
             &bitcoin_pubkey,
             first_owner_vk_hash,
+            vichor_burn_digest,
         )?;
 
         let pending = PendingTimeLock {
@@ -485,6 +517,7 @@ impl BitcoinWallet {
             lock_blocks,
             cltv_block_height,
             vess_amount,
+            vichor_burned,
             fee_sats,
             created_at: now,
             last_broadcast_at: None,
@@ -646,6 +679,7 @@ impl BitcoinWallet {
         current_height: u64,
         owner_pubkey: &bitcoin::PublicKey,
         first_owner_vk_hash: [u8; 32],
+        vichor_burn_digest: Option<[u8; 32]>,
     ) -> Result<TimeLockTransactionPlan> {
         if locked_sats == 0 {
             return Err(anyhow!("timelock amount must be greater than zero"));
@@ -675,6 +709,7 @@ impl BitcoinWallet {
             None,
             lock_blocks,
             vess_amount,
+            vichor_burn_digest,
         )
     }
 
@@ -786,6 +821,7 @@ impl BitcoinWallet {
         first_owner_vk_hash: [u8; 32],
         lock_blocks: u64,
         vess_amount: u64,
+        vichor_burn_digest: Option<[u8; 32]>,
     ) -> Result<TimeLockTransactionPlan> {
         self.build_timelock_transaction_with_change(
             selected_utxos,
@@ -796,6 +832,7 @@ impl BitcoinWallet {
             None,
             lock_blocks,
             vess_amount,
+            vichor_burn_digest,
         )
     }
 
@@ -809,9 +846,17 @@ impl BitcoinWallet {
         change_script_pubkey: Option<ScriptBuf>,
         lock_blocks: u64,
         vess_amount: u64,
+        vichor_burn_digest: Option<[u8; 32]>,
     ) -> Result<TimeLockTransactionPlan> {
         if locked_sats == 0 {
             return Err(anyhow!("timelock amount must be greater than zero"));
+        }
+
+        // Locks >1 year require a VichorBurnProof committed in OP_RETURN.
+        if lock_blocks > vess_foundry::BLOCKS_PER_YEAR && vichor_burn_digest.is_none() {
+            return Err(anyhow!(
+                "time-lock >1 year ({lock_blocks} blocks) requires a VichorBurnProof"
+            ));
         }
 
         let total_input_sats: u64 = selected_utxos.iter().map(|utxo| utxo.value_sats).sum();
@@ -831,6 +876,7 @@ impl BitcoinWallet {
             locked_sats,
             lock_blocks,
             &canonical_output_values,
+            vichor_burn_digest.as_ref(),
         );
 
         let mut outputs = vec![
@@ -961,6 +1007,7 @@ impl BitcoinWallet {
             lock_blocks: pending.lock_blocks,
             cltv_block_height: pending.cltv_block_height,
             vess_amount: pending.vess_amount,
+            vichor_burned: pending.vichor_burned,
             fee_sats: pending.fee_sats,
             created_at: pending.created_at,
             last_broadcast_at: pending.last_broadcast_at,
@@ -988,6 +1035,7 @@ impl BitcoinWallet {
             lock_blocks: persisted.lock_blocks,
             cltv_block_height: persisted.cltv_block_height,
             vess_amount: persisted.vess_amount,
+            vichor_burned: persisted.vichor_burned,
             fee_sats: persisted.fee_sats,
             created_at: persisted.created_at,
             last_broadcast_at: persisted.last_broadcast_at,
@@ -1214,6 +1262,7 @@ mod tests {
         let _ = Txid::all_zeros();
     }
 }
+
 
 
 

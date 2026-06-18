@@ -3,30 +3,68 @@
 
 # Vess
 
-**Bitcoin-backed post-quantum digital cash.**
+**Bitcoin time-credit protocol — post-quantum, feeless, fair-launch.**
 
-Vess upgrades Bitcoin sats into private, feeless bearer bills. 1 sat = 1 Vess. The conversion is one-way: a burn transaction commits to the first owner, and from that point the value moves inside Vess as encrypted bills on a distributed hash table, with no public transfer history.
+Vess turns locked Bitcoin into spendable time-credits. Lock BTC via
+`OP_CHECKLOCKTIMEVERIFY` and receive Vess — 1 sat locked for 1 year = 1 Vess.
+The BTC returns after the lock expires. No burn, no bridge, no custodian.
 
 ## How It Works
 
-1. **Deposit BTC** — Your node tracks incoming Bitcoin via its embedded light client.
-2. **Burn** — It builds a burn transaction committing to the Vess bill decomposition.
-3. **Genesis** — After confirmation, `OwnershipGenesis` records are gossiped to the DHT.
-4. **Spend** — Bills become private bearer instruments sent via stealth addresses.
-5. **Claim** — The recipient broadcasts an `OwnershipClaim` to finalize receipt.
+1. **Lock BTC** — Your wallet builds a CLTV time-lock transaction. BTC sits at your own address, locked for 0.1–10 years.
+2. **Mint Vess** — When the lock confirms, ownership records are gossiped to the DHT. `Vess = locked_sats × lock_blocks / 52,560`.
+3. **Spend** — Vess bills are bearer instruments sent via tags (e.g. `+ALICE`), QR, NFC, BLE, or any transport.
+4. **Claim** — The recipient broadcasts an `OwnershipClaim` to the DHT to finalize receipt.
 
-Users are identified by human-readable **+vesstags** (e.g. `+alice`), which resolve
-to post-quantum stealth addresses on the DHT. Tags require a small PoW to claim,
-preventing Sybil squatting.
+## Vess & Vichor
 
-All of this is managed through the interactive shell — create a wallet, tag yourself,
-start the node, and send value, all from the same session:
+Vess and Vichor are two independent assets with distinct purposes.
 
----
+| | Vess | Vichor |
+|---|---|---|
+| **What** | Time-credit (sat-block) | Network stock |
+| **Supply** | Unlimited (backed by BTC locks) | Fixed 1,000,000,000 |
+| **Launch** | Fair — same formula for everyone | Dev holds initial supply |
+| **Purpose** | Spending, payments | Gating long locks, funding dev |
+
+### Vichor Gate
+
+Locks ≤1 year are free. Beyond that, Vichor must be burned:
+
+```
+Duration    Vichor Required
+────────    ───────────────
+≤1.0 year   0 (free)
+ 1.1 years  1
+ 2.0 years  10
+ 5.0 years  40
+10.0 years  90
+```
+
+Vichor is burned by transferring it to a provably unspendable address
+(`VICHOR_BURN_VK_HASH`). The burn proof is committed in the Bitcoin
+time-lock transaction's `OP_RETURN`, binding it to a specific mint.
+
+Speculators who want high-leverage long-term locks must buy Vichor from
+the market, funding protocol development while making the remaining
+Vichor supply scarcer.
+
+### Self-Contained Liquidity
+
+Vichor never needs a CEX or DEX. The Swap DHT (`vess-swap-v0|btc|vichor`)
+is the only exchange it needs — same keys, same wallet, same network.
+
+## Tags
+
+Human-readable identities (e.g. `+ALICE`). Uppercase display eliminates
+`I`/`l`/`1` confusion. Immutable — once registered, the tag→address mapping
+is permanent.
+
+- Lowercase alphanumeric only, 3–20 chars
+- Argon2id PoW (2 GiB) to claim
+- No expiry, no pruning, no lockout
 
 ## Quick Start
-
-### Build from source
 
 ```bash
 git clone https://github.com/ohmictech/vess.git
@@ -34,108 +72,22 @@ cd vess
 cargo build --release --package vess-cli
 ```
 
-The binary lands at `target/release/vess.exe` (Windows) or `target/release/vess` (Linux/macOS).
-
-### Interactive mode (recommended)
-
-The interactive shell is the primary way to run a node and manage your wallet.
-Just run `vess` with no arguments:
-
-```bash
-vess
-```
-
-This starts the node **and** drops you into the interactive prompt. Everything
-happens inside this session — no need to juggle terminal windows or keep track
-of RPC ports:
-
----
-
 ## Architecture
 
 Nodes form a peer-to-peer mesh with post-quantum handshakes (ML-KEM-768 + Falcon).
-Handshakes are retried with exponential backoff on failure and only permanently
-banished after 3 consecutive failures.
+Ownership state is replicated deterministically across the DHT. Payments try
+direct delivery first, falling back to gossip relay.
 
-Ownership state is replicated deterministically across the DHT rather than through
-global consensus. On peer verification, the node automatically pages through the
-peer's DHT shard for seed catch-up, with quorum-based installation requiring
-≥2 peers to agree on each record.
+- **No consensus** — deterministic registry rules
+- **No fees** — no gas, no mempool, no fee auction
+- **No burn** — BTC returns after CLTV expiry
+- **No bridge** — native Bitcoin script
+- **No CEX** — swap DHT is the exchange
 
-Payments try direct delivery first when the recipient is a known verified peer,
-falling back to gossip relay through the mesh. The interactive shell surfaces
-real-time events and notifications as the node operates.
+## Transport
 
----
-
-## Why Vess
-
-Bitcoin is excellent at scarce issuance and terrible at private spending. Every
-payment lands on a public graph. Every UTXO cluster becomes a surveillance
-surface. Every reuse mistake is permanent.
-
-Vess is the sovereign spending layer for sats — a one-way upgrade from
-transparent UTXOs into private bearer cash:
-
-| Bitcoin | Vess |
-|---|---|
-| Public transaction graph | No transfer history |
-| Fee market | Feeless |
-| ~10 min confirmation | Instant |
-| ECDSA / Schnorr | ML-DSA-65 (post-quantum) |
-| Full node ~700 GB | Full node runs on a phone |
-| Account/UTXO model | Bearer bills |
-
-Vess is **not** a sidechain, rollup, federated mint, or multisig bridge.
-It is a one-way conversion into private post-quantum cash.
-
----
-
-## Ownership & Payments
-
-### Ownership
-
-Each bill has a permanent `mint_id`, a `chain_tip`, a `chain_depth`, and an
-owner verification key hash. Genesis binds the first owner. Transfers advance
-the chain with post-quantum signatures. Double spending is prevented by
-deterministic registry rules rather than probabilistic consensus.
-
-### Payments
-
-Payments are encrypted proposals sent to a recipient stealth address. The sender
-retains control until the recipient broadcasts an `OwnershipClaim`. This gives
-Vess deterministic conflict resolution, offline-tolerant delivery, and no
-mempool or fee auction.
-
----
-
-## Privacy
-
-Vess transfers are never published to a public ledger.
-
-- **Stealth addressing** — Every payment uses one-time addresses.
-- **Hashed tags** — `+tags` are Blake3-hashed before entering the DHT.
-- **Ownership registries** — Store current state, not transfer history.
-- **Bearer bills** — No accounts, no address reuse.
-- **Dual-layer stealth** — Both the mesh handshake and the value transfer use ephemeral keys.
-- **Denomination discipline** — Bills are minted in standard denominations (1, 2, 5, 20, 500...), with no change — only splitting and combining.
-
----
-
-## Smart Contracts
-
-Vess supports deterministic covenants via [**VessLogic**](docs/vess-logic.md),
-a line-by-line predicate language. Programs are deployed to the DHT under
-human-readable names (e.g. `+vl_market1`) and bills can be locked to them.
-Unlocking requires an `OwnershipClaim` with a valid witness and compute receipt.
-
-See the full language reference in **[docs/vess-logic.md](docs/vess-logic.md)**.
-
-```bash
-vess deploy ./covenant.vess --name +vl_market1
-```
-
----
+Vess bills are ~180 bytes. Transfers are ~3.5 KB. Both fit in a QR code.
+Payments are transport-agnostic: QR, NFC, BLE, USB, HTTPS — anything goes.
 
 ## Cryptography
 
@@ -149,32 +101,21 @@ All Vess-native operations are post-quantum.
 | Hashing | Blake3 |
 | Wallet KDF | Argon2id |
 | Symmetric encryption | ChaCha20-Poly1305 |
-| Bitcoin integration | Native P2P + SegWit |
+| Bitcoin integration | Native P2P + SegWit + CLTV |
 
----
+## Why Vess
 
-## Security Assumptions
+| Bitcoin | Vess |
+|---|---|
+| Public transaction graph | No transfer history |
+| Fee market | Feeless |
+| ~10 min confirmation | Instant |
+| ECDSA / Schnorr | ML-DSA-65 (post-quantum) |
+| BTC is spent | BTC is locked, then returned |
+| Single asset | Vess (time-credit) + Vichor (stock) |
 
-Vess nodes trust:
-
-- **Bitcoin** for final settlement of burns (same security model as Bitcoin).
-- **Post-quantum cryptography** (ML-KEM-768, ML-DSA-65, Falcon) for all Vess-native operations.
-- **The DHT quorum** — ownership state requires agreement from a majority of replicating peers before acceptance.
-- **Argon2id PoW** — handshake proof-of-work raises the cost of Sybil identities.
-
-Vess nodes do **not** trust any single peer, coordinator, sequencer, or validator.
-
----
-
-## Specification
-
-The frozen V1 protocol specification is in **[docs/v1-spec.md](docs/v1-spec.md)**.
-
----
-
-> Keep your lives free from the love of money and be content with what you have,
-> because God has said, 'Never will I leave you; never will I forsake you.'
-> — Hebrews 13:5
+Vess is **not** a sidechain, rollup, federated mint, or multisig bridge.
+It is Bitcoin-native time-credit with self-contained liquidity.
 
 ## License
 

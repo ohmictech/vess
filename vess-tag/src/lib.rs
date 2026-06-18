@@ -69,9 +69,16 @@ impl VessTag {
         self.0.is_empty()
     }
 
-    /// Display form with `+` prefix (e.g. `+alice`).
+    /// Display form with `+` prefix in lowercase (e.g. `+alice`). Use this
+    /// for serialization and logging. For UI display, use [`display_upper`].
     pub fn display(&self) -> String {
         format!("+{}", self.0)
+    }
+
+    /// UI-friendly display: `+` prefix in uppercase (e.g. `+ALICE`).
+    /// Uppercase eliminates `i`/`l`/`1` and `o`/`0` ambiguity.
+    pub fn display_upper(&self) -> String {
+        format!("+{}", self.0.to_ascii_uppercase())
     }
 
     /// DHT key for this tag: `Blake3(tag_string)`.
@@ -88,10 +95,16 @@ impl std::fmt::Display for VessTag {
 
 // ── Argon2id Proof-of-Work ────────────────────────────────────────────
 
-/// How long an unhardened tag survives before pruning: 7 days in seconds.
-/// Short TTL raises the cost of tag squatting — squatters must re-register
-/// weekly (paying PoW each time) or harden via real economic activity.
-pub const TAG_PRUNE_SECS: u64 = 7 * 24 * 3600;
+/// Overwrite payment proof: to claim an unhardened tag from its current
+/// registrant, the overwriter must provide a payment receipt (mint_id +
+/// recipient_owner_vk) proving they received Vess to the tag's master
+/// stealth address. This makes squatting economically expensive — the
+/// only way to steal a tag is to actually use it.
+///
+/// Once the current registrant receives a payment, they can harden the
+/// tag by setting `hardened_at`, making it permanently immutable.
+///
+/// Tags never expire. No pruning. No lockout.
 
 /// Argon2id memory cost: 2 GiB in KiB.
 pub const TAG_POW_M_COST: u32 = 2_097_152;
@@ -245,6 +258,22 @@ pub fn address_fingerprint(addr: &MasterStealthAddress) -> [u8; 32] {
 /// Small enough to replicate across K artery nodes responsible for the
 /// tag's DHT region. The plaintext tag name never leaves the client —
 /// only the Blake3 hash is stored and transmitted.
+///
+/// # Lifecycle
+///
+/// ```text
+/// Register (PoW) → Unhardened → Payment received → Hardened (forever)
+///                       │                              │
+///                       │  Anyone can overwrite         │  Immutable
+///                       │  by receiving payment         │
+///                       │  to the tag's address         │
+/// ```
+///
+/// Tags never expire. An unhardened tag can be overwritten by anyone
+/// who proves they received a Vess payment to the tag's master address.
+/// Once hardened (payment received by the registrant), the tag is locked
+/// forever. This prevents lockout — your tag is yours until someone
+/// actually uses it economically.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TagRecord {
     /// Blake3 hash of the tag string. The plaintext is never stored
@@ -259,17 +288,27 @@ pub struct TagRecord {
     /// Unix timestamp of registration.
     pub registered_at: u64,
     /// ML-DSA-65 verification key of the registrant.
-    /// Included in the digest to make the record self-authenticating.
     #[serde(default)]
     pub registrant_vk: Vec<u8>,
     /// ML-DSA-65 signature over `digest()` by the registrant.
-    /// Allows clients to verify the record hasn't been tampered with.
     #[serde(default)]
     pub signature: Vec<u8>,
-    /// Unix timestamp when the tag was hardened (confirmed with payment proof).
-    /// `None` means the tag is still unhardened and subject to pruning.
+    /// Unix timestamp when hardened (payment received). Once set, the tag
+    /// is permanently locked and cannot be overwritten.
     #[serde(default)]
     pub hardened_at: Option<u64>,
+}
+
+impl TagRecord {
+    /// Whether this tag is permanently hardened.
+    pub fn is_hardened(&self) -> bool {
+        self.hardened_at.is_some()
+    }
+
+    /// Whether this tag can be overwritten.
+    pub fn can_be_overwritten(&self) -> bool {
+        !self.is_hardened()
+    }
 }
 
 impl TagRecord {

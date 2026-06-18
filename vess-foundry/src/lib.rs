@@ -42,31 +42,22 @@ use serde::{Deserialize, Serialize};
 
 /// The asset backing a Vess bill — locked at birth and never changed.
 ///
-/// Bills of different assets cannot be combined or exchanged directly;
-/// they must go through a DEX off-chain first. The denomination value
-/// always represents the smallest unit of the asset (satoshis for BTC,
-/// wei for ETH, base units for ERC-20 tokens).
+/// Bills of different assets cannot be combined directly.
+/// The denomination value always represents the smallest unit of the asset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Asset {
-    /// Native Bitcoin (1 denomination unit = 1 satoshi).
+    /// Bitcoin time-locked credit (1 denomination unit = 1 Vess).
     Btc,
-    /// Native Ether (1 denomination unit = 1 wei).
-    Eth,
-    /// An ERC-20 token identified by its 20-byte contract address.
-    Erc20([u8; 20]),
-    /// Vichor — pool-share token earned by staking Vess in the liquidity pool.
-    /// 1,000,000,000 total supply; each unit represents a proportional claim
-    /// on the total staked Vess pool.
+    /// Vichor — fixed-supply (1B) network stock. Held initially by dev,
+    /// sold on the swap DHT, burned to turbo BTC time-lock mints.
     Vichor,
 }
 
 impl Asset {
-    /// Short identifier for serialization: "btc", "eth", "erc20:<hex>"
+    /// Short identifier for serialization: "btc", "vichor"
     pub fn name(&self) -> String {
         match self {
             Asset::Btc => "btc".to_string(),
-            Asset::Eth => "eth".to_string(),
-            Asset::Erc20(addr) => format!("erc20:{}", hex::encode(addr)),
             Asset::Vichor => "vichor".to_string(),
         }
     }
@@ -75,19 +66,7 @@ impl Asset {
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "btc" | "BTC" => Some(Asset::Btc),
-            "eth" | "ETH" => Some(Asset::Eth),
             "vichor" | "VICHOR" | "Vichor" => Some(Asset::Vichor),
-            other if other.starts_with("erc20:") || other.starts_with("ERC20:") => {
-                let hex_str = &other[6..];
-                let bytes = hex::decode(hex_str).ok()?;
-                if bytes.len() == 20 {
-                    let mut addr = [0u8; 20];
-                    addr.copy_from_slice(&bytes);
-                    Some(Asset::Erc20(addr))
-                } else {
-                    None
-                }
-            }
             _ => None,
         }
     }
@@ -110,8 +89,6 @@ impl std::fmt::Display for Asset {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Asset::Btc => write!(f, "BTC"),
-            Asset::Eth => write!(f, "ETH"),
-            Asset::Erc20(addr) => write!(f, "ERC20({})", hex::encode(addr)),
             Asset::Vichor => write!(f, "VICHOR"),
         }
     }
@@ -399,23 +376,65 @@ pub fn bitcoin_timelock_outputs_hash(output_values: &[u64]) -> [u8; 32] {
 
 /// Compute the commitment payload for a bitcoin time-lock transaction.
 ///
-/// Commits to the first owner, locked amount, lock duration in blocks,
-/// and the canonical denomination bundle.
+/// Commits to the first owner, locked amount, lock duration, canonical
+/// denomination bundle, and optionally a Vichor burn proof.
 ///
-/// `payload = Blake3("vess-timelock-bundle-v1" || first_owner_vk_hash || locked_sats_le || lock_blocks_le || outputs_hash)`
+/// `payload = Blake3("vess-timelock-bundle-v1" || owner_vk_hash || locked_sats_le || lock_blocks_le || outputs_hash || [vichor_burn_digest])`
 pub fn bitcoin_timelock_payload_commitment(
     first_owner_vk_hash: &[u8; 32],
     locked_sats: u64,
     lock_blocks: u64,
     output_values: &[u64],
+    vichor_burn_digest: Option<&[u8; 32]>,
 ) -> [u8; 32] {
     let outputs_hash = bitcoin_timelock_outputs_hash(output_values);
     let mut h = blake3::Hasher::new();
-    h.update(b"vess-timelock-bundle-v1");
+    h.update(b"vess-timelock-bundle-v2");
     h.update(first_owner_vk_hash);
     h.update(&locked_sats.to_le_bytes());
     h.update(&lock_blocks.to_le_bytes());
     h.update(&outputs_hash);
+    if let Some(d) = vichor_burn_digest {
+        h.update(d);
+    } else {
+        h.update(&[0u8; 32]); // zeroed slot = no Vichor burned
+    }
+    *h.finalize().as_bytes()
+}
+
+/// Compute the signing message for a Vichor burn proof.
+///
+/// `msg = Blake3("vess-vichor-burn-sig-v1" || mint_ids... || total_burned || mint_commitment)`
+pub fn vichor_burn_signing_message(
+    burned_mint_ids: &[[u8; 32]],
+    total_burned: u64,
+    mint_commitment: &[u8; 32],
+) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"vess-vichor-burn-sig-v1");
+    for id in burned_mint_ids {
+        h.update(id);
+    }
+    h.update(&total_burned.to_le_bytes());
+    h.update(mint_commitment);
+    *h.finalize().as_bytes()
+}
+
+/// Compute the digest of a Vichor burn proof for commitment binding.
+///
+/// `digest = Blake3("vess-vichor-burn-v1" || mint_ids... || total_burned || mint_commitment)`
+pub fn vichor_burn_digest(
+    burned_mint_ids: &[[u8; 32]],
+    total_burned: u64,
+    mint_commitment: &[u8; 32],
+) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"vess-vichor-burn-v1");
+    for id in burned_mint_ids {
+        h.update(id);
+    }
+    h.update(&total_burned.to_le_bytes());
+    h.update(mint_commitment);
     *h.finalize().as_bytes()
 }
 
@@ -431,6 +450,78 @@ pub fn bitcoin_timelock_mint_id(txid: &[u8; 32], output_index: u32) -> [u8; 32] 
     h.update(txid);
     h.update(&output_index.to_le_bytes());
     *h.finalize().as_bytes()
+}
+
+// ── Vichor genesis ──────────────────────────────────────────────────
+
+/// Total Vichor supply — matches `vess_protocol::VICHOR_TOTAL_SUPPLY`.
+pub const VICHOR_TOTAL_SUPPLY: u64 = 1_000_000_000;
+
+/// Compute the signing message for a Vichor genesis proof.
+///
+/// `msg = Blake3("vess-vichor-genesis-v1" || nonce || total_supply || owner_vk_hash)`
+pub fn vichor_genesis_signing_message(
+    nonce: &[u8; 32],
+    total_supply: u64,
+    owner_vk_hash: &[u8; 32],
+) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"vess-vichor-genesis-v1");
+    h.update(nonce);
+    h.update(&total_supply.to_le_bytes());
+    h.update(owner_vk_hash);
+    *h.finalize().as_bytes()
+}
+
+/// Derive the mint_id for the single Vichor genesis bill.
+///
+/// `mint_id = Blake3("vess-vichor-mint-id-v1" || nonce)`
+pub fn vichor_genesis_mint_id(nonce: &[u8; 32]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"vess-vichor-mint-id-v1");
+    h.update(nonce);
+    *h.finalize().as_bytes()
+}
+
+/// How many Vichor are required to time-lock for a given duration.
+///
+/// Years must be in 0.1 increments (1.0, 1.1, 1.2, …, 10.0).
+/// 10 Vichor per full year, 1 per 0.1 decimal step.
+///
+/// ```text
+/// vichor = max(0, (years - 1.0) × 10)
+/// ```
+///
+/// Free tier: ≤1.0 year costs 0 Vichor.
+///
+/// # Examples
+///
+/// - 0.5 years → 0 Vichor (free)
+/// - 1.0 year  → 0 Vichor (free)
+/// - 1.1 years → 1 Vichor
+/// - 1.5 years → 5 Vichor
+/// - 2.0 years → 10 Vichor
+/// - 5.0 years → 40 Vichor
+/// - 10.0 years → 90 Vichor
+///
+/// This forces long-term speculators to subsidize the network before
+/// they can access high-leverage timeframes.
+pub fn vichor_required_for_years(years: f64) -> u64 {
+    if years <= 1.0 {
+        0
+    } else {
+        ((years - 1.0) * 10.0) as u64
+    }
+}
+
+/// Provably unspendable verification key hash. Any Vichor bill transferred
+/// to this owner is permanently burned. Matches `vess_protocol::VICHOR_BURN_VK_HASH`.
+pub const VICHOR_BURN_VK_HASH: [u8; 32] = [0u8; 32];
+
+/// Verify that a Vichor bill has been burned — its current owner is
+/// the canonical burn address.
+pub fn is_vichor_burned(owner_vk_hash: &[u8; 32]) -> bool {
+    owner_vk_hash == &VICHOR_BURN_VK_HASH
 }
 
 /// Compute the genesis ownership chain tip.
@@ -547,7 +638,7 @@ mod tests {
         let outputs = vec![50_000, 2_000, 500, 50];
 
         let payload = bitcoin_timelock_payload_commitment(
-            &owner_hash, locked_sats, BLOCKS_PER_YEAR, &outputs,
+            &owner_hash, locked_sats, BLOCKS_PER_YEAR, &outputs, None,
         );
         let outputs_hash = bitcoin_timelock_outputs_hash(&outputs);
 
@@ -556,25 +647,25 @@ mod tests {
         assert_ne!(
             payload,
             bitcoin_timelock_payload_commitment(
-                &[0x22u8; 32], locked_sats, BLOCKS_PER_YEAR, &outputs,
+                &[0x22u8; 32], locked_sats, BLOCKS_PER_YEAR, &outputs, None,
             )
         );
         assert_ne!(
             payload,
             bitcoin_timelock_payload_commitment(
-                &owner_hash, locked_sats + 1, BLOCKS_PER_YEAR, &outputs,
+                &owner_hash, locked_sats + 1, BLOCKS_PER_YEAR, &outputs, None,
             )
         );
         assert_ne!(
             payload,
             bitcoin_timelock_payload_commitment(
-                &owner_hash, locked_sats, MIN_LOCK_BLOCKS, &outputs,
+                &owner_hash, locked_sats, MIN_LOCK_BLOCKS, &outputs, None,
             )
         );
         assert_ne!(
             payload,
             bitcoin_timelock_payload_commitment(
-                &owner_hash, locked_sats, BLOCKS_PER_YEAR, &[52_550],
+                &owner_hash, locked_sats, BLOCKS_PER_YEAR, &[52_550], None,
             )
         );
     }

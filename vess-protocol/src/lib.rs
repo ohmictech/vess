@@ -141,27 +141,94 @@ pub struct LocalTestFaucetProof {
     pub nonce: [u8; 32],
 }
 
-/// Ethereum burn proof: the VessBurn contract emitted a `Burned` event.
-/// The event log on Ethereum serves as the burn proof — no separate
-/// confirmation mechanism is needed beyond the log's inclusion in a block.
+/// One-time genesis proof for the Vichor supply.
+///
+/// Vichor is a fixed-supply (1,000,000,000) network stock token. The entire
+/// supply is created in a single genesis event and held by the dev address.
+/// The dev sells Vichor on the swap DHT at market rates.
+///
+/// # Uniqueness
+///
+/// Only **one** `VichorGenesis` is ever valid. Uniqueness is enforced by:
+///
+/// 1. **Canonical nonce** — `VICHOR_GENESIS_NONCE` is baked into the protocol.
+///    Any proof with a different nonce is rejected. There is exactly one
+///    valid proof, ever.
+/// 2. **Dev key** — the `owner_vk` must match `VICHOR_GENESIS_VK`. Only the
+///    canonical dev key can sign the genesis.
+/// 3. **Total supply** — must equal `VICHOR_TOTAL_SUPPLY` (1,000,000,000).
+///
+/// Even the dev cannot print more Vichor — the nonce and supply are fixed
+/// at the protocol level.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EthereumBurnProof {
-    /// Transaction hash of the ETH burn (from burnEth or burnToken).
-    pub tx_hash: [u8; 32],
-    /// Ethereum block number containing the burn transaction.
-    pub block_number: u64,
-    /// Ethereum block hash.
-    pub block_hash: [u8; 32],
-    /// Log index of the Burned event within the block.
-    pub log_index: u64,
-    /// The contract that emitted the event (VessBurn address).
-    pub contract_address: [u8; 20],
-    /// Token address (0x0 for native ETH, ERC-20 address otherwise).
-    pub token_address: [u8; 20],
-    /// Amount burned (in wei or token smallest unit).
-    pub amount: u64,
-    /// The 32-byte recipient commitment (Blake3 of stealth address).
-    pub recipient_commitment: [u8; 32],
+pub struct VichorGenesisProof {
+    /// Must equal [`VICHOR_GENESIS_NONCE`]. Any other value is invalid.
+    pub nonce: [u8; 32],
+    /// Total supply: must equal [`VICHOR_TOTAL_SUPPLY`].
+    pub total_supply: u64,
+    /// Must match the canonical dev key.
+    pub owner_vk: Vec<u8>,
+    /// Blake3 hash of owner_vk.
+    pub owner_vk_hash: [u8; 32],
+    /// ML-DSA-65 signature by owner_vk over the genesis message.
+    pub owner_sig: Vec<u8>,
+}
+
+/// Total Vichor supply — fixed at genesis, never increases.
+pub const VICHOR_TOTAL_SUPPLY: u64 = 1_000_000_000;
+
+/// Canonical nonce for the Vichor genesis proof. Only proofs with this
+/// exact nonce are valid. Changing this would create a different genesis,
+/// which the network will reject.
+pub const VICHOR_GENESIS_NONCE: [u8; 32] = *b"vess-vichor-genesis-v1----------";
+
+/// Provably unspendable verification key. Any Vichor bill transferred to
+/// this owner is permanently burned — no one can sign a subsequent claim.
+/// `Blake3("vess-vichor-burn-v1")` → 32 bytes of nothingness.
+pub const VICHOR_BURN_VK_HASH: [u8; 32] = [
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// Proof that Vichor bills have been permanently burned.
+///
+/// Used to unlock time-lock durations beyond 1 year. The burn proof
+/// references one or more Vichor bills in the ownership registry and
+/// proves the owner authorizes their destruction. Once burned, the
+/// Proof that Vichor has been burned to unlock a time-lock duration.
+///
+/// The burn happens **before** the BTC time-lock: Vichor bills are transferred
+/// to `VICHOR_BURN_VK_HASH` via an OwnershipClaim, the DHT marks them consumed,
+/// and this proof is produced. The `mint_timelock` function then references
+/// this proof — it checks that `total_burned >= vichor_required(duration)`.
+///
+/// # Replay protection
+///
+/// `mint_commitment` is a random nonce generated before either the burn
+/// or the time-lock exists. It links the burn proof to a specific mint
+/// without requiring the txid upfront. The digest is embedded in the
+/// Bitcoin OP_RETURN — reusing the same burn for a different mint would
+/// require forging the commitment.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VichorBurnProof {
+    /// Mint IDs of the Vichor bills being burned. Must be active in the
+    /// ownership registry and owned by `owner_vk`.
+    pub burned_mint_ids: Vec<[u8; 32]>,
+    /// Total Vichor amount burned (sum of burned bill denominations).
+    /// The minting node checks: `total_burned >= vichor_required(duration_years)`.
+    pub total_burned: u64,
+    /// ML-DSA-65 verification key of the burner.
+    pub owner_vk: Vec<u8>,
+    /// Blake3 hash of owner_vk.
+    pub owner_vk_hash: [u8; 32],
+    /// ML-DSA-65 signature over the burn message.
+    pub owner_sig: Vec<u8>,
+    /// Random nonce linking this burn to a specific time-lock mint.
+    /// Generated before either step — used in the burn proof digest and
+    /// the Bitcoin OP_RETURN commitment.
+    pub mint_commitment: [u8; 32],
 }
 
 /// Proof object used to justify genesis registration of a bill.
@@ -176,11 +243,11 @@ pub enum GenesisProof {
     /// - reforge proof
     Vess(Vec<u8>),
 
-    /// Bitcoin time-lock proof: CLTV-locked BTC creates sat-year Vess credits.
+    /// Bitcoin time-lock proof: CLTV-locked BTC creates sat-block Vess credits.
     BitcoinTimeLock(BitcoinTimeLockProof),
 
-    /// Ethereum burn proof from a VessBurn contract event log.
-    EthereumBurn(EthereumBurnProof),
+    /// One-time Vichor genesis: 1B supply held by dev, sold on swap DHT.
+    VichorGenesis(VichorGenesisProof),
 
     /// Local testing faucet proof. Accepted only when explicitly enabled by
     /// the node operator.
