@@ -797,7 +797,18 @@ fn dirs_next() -> Option<std::path::PathBuf> {
     {
         std::env::var_os("USERPROFILE").map(std::path::PathBuf::from)
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "android")]
+    {
+        // Android: HOME is typically unset for apps. Use the app's
+        // data directory set by the JVM via ANDROID_DATA, or fall
+        // back to a known-writable path.
+        std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("ANDROID_DATA"))
+            .or_else(|| std::env::var_os("EXTERNAL_STORAGE"))
+            .map(std::path::PathBuf::from)
+            .or_else(|| Some(std::path::PathBuf::from("/data/local/tmp")))
+    }
+    #[cfg(all(not(target_os = "windows"), not(target_os = "android")))]
     {
         std::env::var_os("HOME").map(std::path::PathBuf::from)
     }

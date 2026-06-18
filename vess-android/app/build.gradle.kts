@@ -61,11 +61,14 @@ dependencies {
     implementation("net.java.dev.jna:jna:5.16.0@aar")
 
     // Biometric authentication
-    implementation("androidx.biometric:biometric:1.2.0")
+    implementation("androidx.biometric:biometric:1.1.0")
 
     // Security (EncryptedSharedPreferences fallback)
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
 
     // Core
     implementation("androidx.core:core-ktx:1.15.0")
+
+    // AppCompat (needed for BiometricPrompt which requires FragmentActivity)
+    implementation("androidx.appcompat:appcompat:1.7.0")
 }

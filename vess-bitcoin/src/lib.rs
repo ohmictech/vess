@@ -86,7 +86,7 @@ pub fn verify_checkpoint(height: u64, hash: &BlockHash, is_testnet: bool) -> boo
 mod wallet;
 
 pub use wallet::{
-    BitcoinWallet, BurnTransactionPlan, DerivedAddress, Keychain, OwnedUtxo, PendingBurn,
+    BitcoinWallet, TimeLockTransactionPlan, DerivedAddress, Keychain, OwnedUtxo, PendingTimeLock,
     WalletTransactionUpdate,
 };
 
@@ -227,7 +227,7 @@ struct VessSeedAuthReputation {
 }
 
 #[derive(Debug, Clone)]
-pub struct BurnConfirmationProof {
+pub struct TimeLockConfirmationProof {
     pub txid: Txid,
     pub block_hash: BlockHash,
     pub block_height: u64,
@@ -759,11 +759,11 @@ impl BitcoinLightClient {
             .map_err(|_| anyhow!("bitcoin light client broadcast channel closed"))?
     }
 
-    pub async fn request_burn_confirmation(
+    pub async fn request_timelock_confirmation(
         &self,
         txid: Txid,
         earliest_time: u64,
-    ) -> Result<Option<BurnConfirmationProof>> {
+    ) -> Result<Option<TimeLockConfirmationProof>> {
         let (candidate_headers, best_height, required_confirmations) = {
             let chain = self.header_chain.lock().unwrap();
             (
@@ -798,7 +798,7 @@ impl BitcoinLightClient {
                     }
                     peers.len() as u32
                 };
-                return Ok(Some(BurnConfirmationProof {
+                return Ok(Some(TimeLockConfirmationProof {
                     txid,
                     block_hash,
                     block_height: height as u64,
@@ -2929,3 +2929,4 @@ mod tests {
         assert!(auth_key_is_banned(&auth_vk, &reputation, 101));
     }
 }
+

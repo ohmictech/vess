@@ -4,3 +4,12 @@ $HOME/
 .vscode
 /target-full-rebuild
 /scripts
+
+# Android
+vess-android/.gradle/
+vess-android/app/build/
+vess-android/build/
+vess-android/*.apk
+vess-android/*.aab
+vess-android/local.properties
+vess-android/app/src/main/jniLibs/

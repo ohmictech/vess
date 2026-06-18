@@ -40,6 +40,87 @@ pub mod vm;
 use hex;
 use serde::{Deserialize, Serialize};
 
+/// The asset backing a Vess bill — locked at birth and never changed.
+///
+/// Bills of different assets cannot be combined or exchanged directly;
+/// they must go through a DEX off-chain first. The denomination value
+/// always represents the smallest unit of the asset (satoshis for BTC,
+/// wei for ETH, base units for ERC-20 tokens).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Asset {
+    /// Native Bitcoin (1 denomination unit = 1 satoshi).
+    Btc,
+    /// Native Ether (1 denomination unit = 1 wei).
+    Eth,
+    /// An ERC-20 token identified by its 20-byte contract address.
+    Erc20([u8; 20]),
+    /// Vichor — pool-share token earned by staking Vess in the liquidity pool.
+    /// 1,000,000,000 total supply; each unit represents a proportional claim
+    /// on the total staked Vess pool.
+    Vichor,
+}
+
+impl Asset {
+    /// Short identifier for serialization: "btc", "eth", "erc20:<hex>"
+    pub fn name(&self) -> String {
+        match self {
+            Asset::Btc => "btc".to_string(),
+            Asset::Eth => "eth".to_string(),
+            Asset::Erc20(addr) => format!("erc20:{}", hex::encode(addr)),
+            Asset::Vichor => "vichor".to_string(),
+        }
+    }
+
+    /// Parse from a short identifier string.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "btc" | "BTC" => Some(Asset::Btc),
+            "eth" | "ETH" => Some(Asset::Eth),
+            "vichor" | "VICHOR" | "Vichor" => Some(Asset::Vichor),
+            other if other.starts_with("erc20:") || other.starts_with("ERC20:") => {
+                let hex_str = &other[6..];
+                let bytes = hex::decode(hex_str).ok()?;
+                if bytes.len() == 20 {
+                    let mut addr = [0u8; 20];
+                    addr.copy_from_slice(&bytes);
+                    Some(Asset::Erc20(addr))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+}
+
+impl Serialize for Asset {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.name())
+    }
+}
+
+impl<'de> Deserialize<'de> for Asset {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        Asset::parse(&s).ok_or_else(|| serde::de::Error::custom(format!("invalid asset: {s}")))
+    }
+}
+
+impl std::fmt::Display for Asset {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Asset::Btc => write!(f, "BTC"),
+            Asset::Eth => write!(f, "ETH"),
+            Asset::Erc20(addr) => write!(f, "ERC20({})", hex::encode(addr)),
+            Asset::Vichor => write!(f, "VICHOR"),
+        }
+    }
+}
+
+impl Default for Asset {
+    fn default() -> Self { Asset::Btc }
+}
+
 /// Bill denomination following the 1-2-5 series: any `d × 10^k` where
 /// `d ∈ {1, 2, 5}` and `k ≥ 0`, up to the `u64` limit.
 ///
@@ -226,6 +307,11 @@ pub struct VessBill {
     /// compute `chain_depth + 1` when building their OwnershipClaim.
     #[serde(default)]
     pub chain_depth: u64,
+    /// Origin asset: BTC, ETH, or an ERC-20 token address.
+    /// Bills of different assets cannot be combined. Defaults to BTC
+    /// for backward compatibility with pre-multi-asset wallets.
+    #[serde(default)]
+    pub asset: Asset,
 }
 
 impl VessBill {
@@ -263,59 +349,85 @@ pub fn derive_mint_id(digest: &[u8; 32], nonce: &[u8; 32]) -> [u8; 32] {
     *h.finalize().as_bytes()
 }
 
-/// Compute the canonical 1-2-5 output values for a Bitcoin burn amount.
+/// Bitcoin blocks per year (365.25 days × 144 blocks/day ≈ 52,560).
+pub const BLOCKS_PER_YEAR: u64 = 52_560;
+
+/// Minimum timelock duration in blocks (~0.1 years).
+pub const MIN_LOCK_BLOCKS: u64 = 5_256;
+
+/// Maximum timelock duration in blocks (~10 years).
+pub const MAX_LOCK_BLOCKS: u64 = 525_600;
+
+/// Compute the Vess amount from locked sats and lock duration in blocks.
+///
+/// ```text
+/// vess = locked_sats × lock_blocks / BLOCKS_PER_YEAR
+/// ```
+///
+/// # Examples
+///
+/// - 100 sats × 52,560 blocks / 52,560 = 100 Vess
+/// - 100 sats × 525,600 blocks / 52,560 = 1,000 Vess
+/// - 100 sats × 5,256 blocks / 52,560 = 10 Vess
+pub fn compute_vess_amount(locked_sats: u64, lock_blocks: u64) -> u64 {
+    (locked_sats as u128 * lock_blocks as u128 / BLOCKS_PER_YEAR as u128) as u64
+}
+
+/// Compute the canonical 1-2-5 output values for a bitcoin time-lock amount.
 ///
 /// This reuses the same optimal denomination breakdown already used by
 /// native Vess aggregation so there is exactly one canonical bill split
 /// policy in the protocol.
-pub fn bitcoin_burn_output_values(total_sats: u64) -> Vec<u64> {
-    mint::optimal_breakdown(total_sats)
+pub fn bitcoin_timelock_output_values(vess_amount: u64) -> Vec<u64> {
+    mint::optimal_breakdown(vess_amount)
         .into_iter()
         .map(Denomination::value)
         .collect()
 }
 
-/// Hash the canonical output bundle for a Bitcoin burn.
+/// Hash the canonical output bundle for a bitcoin time-lock.
 ///
-/// `outputs_hash = Blake3("vess-burn-outputs-v1" || value_0_le || value_1_le || ...)`
-pub fn bitcoin_burn_outputs_hash(output_values: &[u64]) -> [u8; 32] {
+/// `outputs_hash = Blake3("vess-timelock-outputs-v1" || value_0_le || value_1_le || ...)`
+pub fn bitcoin_timelock_outputs_hash(output_values: &[u64]) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
-    h.update(b"vess-burn-outputs-v1");
+    h.update(b"vess-timelock-outputs-v1");
     for value in output_values {
         h.update(&value.to_le_bytes());
     }
     *h.finalize().as_bytes()
 }
 
-/// Compute the 32-byte OP_RETURN commitment payload for a Bitcoin burn.
+/// Compute the commitment payload for a bitcoin time-lock transaction.
 ///
-/// This commits to the first owner, the total burned sat amount, and the
-/// exact canonical denomination bundle.
+/// Commits to the first owner, locked amount, lock duration in blocks,
+/// and the canonical denomination bundle.
 ///
-/// `payload = Blake3("vess-burn-bundle-v2" || first_owner_vk_hash || burn_amount_sats_le || outputs_hash)`
-pub fn bitcoin_burn_payload_commitment(
+/// `payload = Blake3("vess-timelock-bundle-v1" || first_owner_vk_hash || locked_sats_le || lock_blocks_le || outputs_hash)`
+pub fn bitcoin_timelock_payload_commitment(
     first_owner_vk_hash: &[u8; 32],
-    burn_amount_sats: u64,
+    locked_sats: u64,
+    lock_blocks: u64,
     output_values: &[u64],
 ) -> [u8; 32] {
-    let outputs_hash = bitcoin_burn_outputs_hash(output_values);
+    let outputs_hash = bitcoin_timelock_outputs_hash(output_values);
     let mut h = blake3::Hasher::new();
-    h.update(b"vess-burn-bundle-v2");
+    h.update(b"vess-timelock-bundle-v1");
     h.update(first_owner_vk_hash);
-    h.update(&burn_amount_sats.to_le_bytes());
+    h.update(&locked_sats.to_le_bytes());
+    h.update(&lock_blocks.to_le_bytes());
     h.update(&outputs_hash);
     *h.finalize().as_bytes()
 }
 
-/// Derive the deterministic mint_id for a Bitcoin-burn bundle output.
+/// Derive the deterministic mint_id for a bitcoin time-lock bundle output.
 ///
-/// `mint_id = Blake3("vess-bitcoin-burn-mint-id-v1" || txid || output_index_le)`
+/// `mint_id = Blake3("vess-timelock-mint-id-v1" || txid || output_index_le)`
 ///
-/// The Bitcoin txid anchors the shared burn event, while `output_index`
-/// distinguishes sibling Vess bills derived from the same burn.
-pub fn bitcoin_burn_mint_id(txid: &[u8; 32], output_index: u32) -> [u8; 32] {
+/// The Bitcoin txid anchors the shared time-lock event, while `output_index`
+/// distinguishes sibling Vess bills derived from the same lock.
+pub fn bitcoin_timelock_mint_id(txid: &[u8; 32], output_index: u32) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
-    h.update(b"vess-bitcoin-burn-mint-id-v1");
+    h.update(b"vess-timelock-mint-id-v1");
     h.update(txid);
     h.update(&output_index.to_le_bytes());
     *h.finalize().as_bytes()
@@ -373,62 +485,97 @@ pub fn advance_chain_tip(
 #[cfg(test)]
 mod tests {
     use super::{
-        bitcoin_burn_mint_id, bitcoin_burn_output_values, bitcoin_burn_outputs_hash,
-        bitcoin_burn_payload_commitment,
+        bitcoin_timelock_mint_id, bitcoin_timelock_output_values,
+        bitcoin_timelock_outputs_hash, bitcoin_timelock_payload_commitment,
+        compute_vess_amount, BLOCKS_PER_YEAR, MIN_LOCK_BLOCKS, MAX_LOCK_BLOCKS,
     };
 
     #[test]
-    fn bitcoin_burn_uses_canonical_breakdown() {
+    fn compute_vess_amount_sat_blocks() {
+        // 100 sats × 52,560 blocks = 100 Vess
+        assert_eq!(compute_vess_amount(100, BLOCKS_PER_YEAR), 100);
+        // 100 sats × 525,600 blocks = 1,000 Vess (10×)
+        assert_eq!(compute_vess_amount(100, MAX_LOCK_BLOCKS), 1_000);
+        // 100 sats × 5,256 blocks = 10 Vess (0.1×)
+        assert_eq!(compute_vess_amount(100, MIN_LOCK_BLOCKS), 10);
+        // 1 BTC × 52,560 blocks = 100,000,000 Vess
+        assert_eq!(compute_vess_amount(100_000_000, BLOCKS_PER_YEAR), 100_000_000);
+        // 1 sat × 1 block = 0 Vess (rounds down, need at least 526 blocks for 1 Vess per 100 sats)
+        assert_eq!(compute_vess_amount(1, 1), 0);
+        // 100 sats × 526 blocks = 1 Vess (minimum precision)
+        assert_eq!(compute_vess_amount(100, 526), 1);
+        // Min lock: 100 sats × 5,256 blocks / 52,560 = 10 Vess
+        assert_eq!(compute_vess_amount(100, MIN_LOCK_BLOCKS), 10);
+        // Max lock: 100 sats × 525,600 blocks / 52,560 = 1,000 Vess
+        assert_eq!(compute_vess_amount(100, MAX_LOCK_BLOCKS), 1_000);
+    }
+
+    #[test]
+    fn bitcoin_timelock_uses_canonical_breakdown() {
         assert_eq!(
-            bitcoin_burn_output_values(52_550),
+            bitcoin_timelock_output_values(52_550),
             vec![50_000, 2_000, 500, 50]
         );
-        assert_eq!(bitcoin_burn_output_values(3), vec![2, 1]);
+        assert_eq!(bitcoin_timelock_output_values(3), vec![2, 1]);
     }
 
     #[test]
-    fn bitcoin_burn_output_mint_ids_are_indexed() {
+    fn bitcoin_timelock_output_mint_ids_are_indexed() {
         let txid = [0x42u8; 32];
-        let first = bitcoin_burn_mint_id(&txid, 0);
-        let second = bitcoin_burn_mint_id(&txid, 1);
+        let first = bitcoin_timelock_mint_id(&txid, 0);
+        let second = bitcoin_timelock_mint_id(&txid, 1);
 
         assert_ne!(first, second);
-        assert_eq!(first, bitcoin_burn_mint_id(&txid, 0));
+        assert_eq!(first, bitcoin_timelock_mint_id(&txid, 0));
     }
 
     #[test]
-    fn bitcoin_burn_mint_ids_are_txid_anchored() {
+    fn bitcoin_timelock_mint_ids_are_txid_anchored() {
         let txid = [0x42u8; 32];
         let other_txid = [0x24u8; 32];
 
         assert_ne!(
-            bitcoin_burn_mint_id(&txid, 0),
-            bitcoin_burn_mint_id(&other_txid, 0)
+            bitcoin_timelock_mint_id(&txid, 0),
+            bitcoin_timelock_mint_id(&other_txid, 0)
         );
     }
 
     #[test]
-    fn bitcoin_burn_payload_commits_to_owner_and_outputs() {
+    fn bitcoin_timelock_payload_commits_to_owner_and_outputs() {
         let owner_hash = [0x11u8; 32];
-        let burn_amount_sats = 52_550;
+        let locked_sats = 52_550;
         let outputs = vec![50_000, 2_000, 500, 50];
 
-        let payload = bitcoin_burn_payload_commitment(&owner_hash, burn_amount_sats, &outputs);
-        let outputs_hash = bitcoin_burn_outputs_hash(&outputs);
+        let payload = bitcoin_timelock_payload_commitment(
+            &owner_hash, locked_sats, BLOCKS_PER_YEAR, &outputs,
+        );
+        let outputs_hash = bitcoin_timelock_outputs_hash(&outputs);
 
         assert_eq!(payload.len(), 32);
         assert_ne!(payload, outputs_hash);
         assert_ne!(
             payload,
-            bitcoin_burn_payload_commitment(&[0x22u8; 32], burn_amount_sats, &outputs)
+            bitcoin_timelock_payload_commitment(
+                &[0x22u8; 32], locked_sats, BLOCKS_PER_YEAR, &outputs,
+            )
         );
         assert_ne!(
             payload,
-            bitcoin_burn_payload_commitment(&owner_hash, burn_amount_sats + 1, &outputs)
+            bitcoin_timelock_payload_commitment(
+                &owner_hash, locked_sats + 1, BLOCKS_PER_YEAR, &outputs,
+            )
         );
         assert_ne!(
             payload,
-            bitcoin_burn_payload_commitment(&owner_hash, burn_amount_sats, &[52_550])
+            bitcoin_timelock_payload_commitment(
+                &owner_hash, locked_sats, MIN_LOCK_BLOCKS, &outputs,
+            )
+        );
+        assert_ne!(
+            payload,
+            bitcoin_timelock_payload_commitment(
+                &owner_hash, locked_sats, BLOCKS_PER_YEAR, &[52_550],
+            )
         );
     }
 }

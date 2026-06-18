@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Result};
+use rand::Rng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -18,13 +19,13 @@ use tokio::net::TcpListener;
 use tracing::{info, warn};
 use zeroize::Zeroizing;
 
-use vess_compute::{ProgramManifest, StoredProgram};
 use vess_foundry::reforge::{reforge, ReforgeRequest};
 use vess_foundry::spend_auth::{generate_spend_keypair, vk_hash};
 use vess_kloak::auto_reforge::ConsolidationScheduler;
 use vess_kloak::billfold::SpendCredential;
 use vess_kloak::payment::prepare_payment_from_bills_split;
 use vess_kloak::selection::{decompose_amount, select_bills_filtered, SelectionResult};
+use vess_ethereum;
 use vess_mesh::MeshCarrierContact;
 use vess_protocol::{
     ManifestStore, ProgramManifestStore, ProgramStore, PulseMessage, TagLookup,
@@ -197,7 +198,9 @@ pub(crate) fn wallet_tag_store(
 #[derive(Clone)]
 pub(crate) struct QueueSenders {
     pub manifest_tx: tokio::sync::mpsc::UnboundedSender<ManifestStore>,
+    #[allow(dead_code)]
     pub program_tx: tokio::sync::mpsc::UnboundedSender<ProgramStore>,
+    #[allow(dead_code)]
     pub program_manifest_tx: tokio::sync::mpsc::UnboundedSender<ProgramManifestStore>,
     pub tag_store_tx: tokio::sync::mpsc::UnboundedSender<TagStore>,
     pub tag_confirm_tx: tokio::sync::mpsc::UnboundedSender<vess_protocol::TagConfirm>,
@@ -347,11 +350,6 @@ pub enum RpcRequest {
         dht_key_hex: String,
         encrypted_manifest_hex: String,
     },
-    ProgramDeploy {
-        program: StoredProgram,
-        #[serde(default)]
-        manifest: Option<ProgramManifest>,
-    },
     TagCacheList,
     TagCacheClear {
         /// Tag to remove (e.g. "alice" or "+alice"). Omit to clear all.
@@ -373,6 +371,20 @@ pub enum RpcRequest {
     PaymentHistory {
         #[serde(default)]
         max: Option<usize>,
+    },
+    /// Propose an atomic swap offer (stored in the DHT).
+    SwapPropose {
+        offer_asset: String,
+        offer_amount: u64,
+        want_asset: String,
+        want_amount: u64,
+        recipient: String,
+        expires_in_secs: Option<u64>,
+    },
+    /// List swap offers for an asset pair.
+    SwapList {
+        asset_a: String,
+        asset_b: String,
     },
 }
 
@@ -493,10 +505,6 @@ pub enum RpcData {
         test_faucet_enabled: bool,
         audit_warnings: Vec<String>,
     },
-    ProgramDeploy {
-        prog_id: String,
-        name: String,
-    },
     TagCacheList {
         entries: Vec<crate::tag_cache::TagCacheEntryView>,
     },
@@ -515,6 +523,14 @@ pub enum RpcData {
     },
     PendingPayments {
         payments: Vec<OutboundPaymentView>,
+    },
+    SwapPropose {
+        hash_lock: String,
+        dht_key: String,
+        expires_at: u64,
+    },
+    SwapList {
+        offers: Vec<vess_protocol::SwapOffer>,
     },
 }
 
@@ -713,19 +729,16 @@ async fn handle_request(
             &encrypted_manifest_hex,
             &senders.manifest_tx,
         ),
-        RpcRequest::ProgramDeploy { program, manifest } => handle_program_deploy(
-            state,
-            program,
-            manifest,
-            &senders.program_tx,
-            &senders.program_manifest_tx,
-        ),
         RpcRequest::TagCacheList => handle_tag_cache_list(state),
         RpcRequest::TagCacheClear { tag } => handle_tag_cache_clear(state, tag.as_deref()),
         RpcRequest::SetPassiveMode { enabled } => handle_set_passive_mode(state, enabled),
         RpcRequest::CancelPayment { payment_id } => handle_cancel_payment(state, &payment_id),
         RpcRequest::PendingPayments => handle_pending_payments(state),
         RpcRequest::PaymentHistory { max } => handle_payment_history(state, max),
+        RpcRequest::SwapPropose { offer_asset, offer_amount, want_asset, want_amount, recipient, expires_in_secs } => {
+            handle_swap_propose(state, node, &offer_asset, offer_amount, &want_asset, want_amount, &recipient, expires_in_secs).await
+        }
+        RpcRequest::SwapList { asset_a, asset_b } => handle_swap_list(state, node, &asset_a, &asset_b).await,
     }
 }
 
@@ -805,6 +818,71 @@ fn handle_payment_history(state: &Arc<Mutex<ArteryState>>, max: Option<usize>) -
         entries.truncate(m);
     }
     RpcResponse::ok(RpcData::PaymentHistory { entries })
+}
+
+async fn handle_swap_propose(
+    state: &Arc<Mutex<ArteryState>>,
+    _node: &MeshPulseNode,
+    offer_asset: &str,
+    offer_amount: u64,
+    want_asset: &str,
+    want_amount: u64,
+    recipient: &str,
+    expires_in_secs: Option<&u64>,
+) -> RpcResponse {
+    let secret: [u8; 32] = rand::thread_rng().gen();
+    let hash_lock: [u8; 32] = *blake3::hash(&secret).as_bytes();
+    let expires_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        + expires_in_secs.copied().unwrap_or(86400);
+
+    let node_id = {
+        let s = lock_state(state);
+        s.node_id.to_vec()
+    };
+
+    let offer = vess_protocol::SwapOffer {
+        offer_asset: offer_asset.to_string(),
+        offer_amount,
+        want_asset: want_asset.to_string(),
+        want_amount,
+        recipient: recipient.to_string(),
+        hash_lock,
+        expires_at,
+        offerer_node_id: node_id,
+    };
+
+    let dht_key = offer.dht_key();
+    let mut s = lock_state(state);
+    s.swap_offers.entry(dht_key).or_default().push(offer.clone());
+    let _ = s.swap_offer_tx.send(offer.clone());
+
+    RpcResponse::ok(RpcData::SwapPropose {
+        hash_lock: crate::persistence::hex_key(&hash_lock),
+        dht_key: crate::persistence::hex_key(&dht_key),
+        expires_at,
+    })
+}
+
+async fn handle_swap_list(
+    state: &Arc<Mutex<ArteryState>>,
+    _node: &MeshPulseNode,
+    asset_a: &str,
+    asset_b: &str,
+) -> RpcResponse {
+    let dht_key = vess_protocol::swap_dht_key(asset_a, asset_b);
+    let s = lock_state(state);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let offers: Vec<vess_protocol::SwapOffer> = s.swap_offers
+        .get(&dht_key)
+        .map(|v| v.iter().filter(|o| o.expires_at > now).cloned().collect())
+        .unwrap_or_default();
+    RpcResponse::ok(RpcData::SwapList { offers })
 }
 
 fn handle_balance(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
@@ -941,7 +1019,7 @@ fn handle_node_health(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
         .map(|ws| ws.billfold.watch_only_balance())
         .unwrap_or(0);
 
-    let total_supply = s.registry.total_supply();
+    let total_supply = s.total_btc_supply.max(s.registry.total_supply());
 
     // Report which discovery sources may have been active.
     let discovery_sources: Vec<String> = {
@@ -2470,6 +2548,8 @@ async fn handle_wallet_unlock(
         let mut s = lock_state(&state);
         s.wallet_path = Some(wallet_path.clone());
         let spend_seed = vess_kloak::recovery::spend_seed_from_raw_seed(&raw_seed);
+        let eth_raw_key = vess_kloak::recovery::eth_key_from_raw_seed(&raw_seed);
+        let eth_address = Some(format!("{:?}", vess_ethereum::wallet::eth_address_from_seed(&raw_seed)));
         s.wallet = Some(WalletState {
             stealth_secret,
             stealth_address: address,
@@ -2480,6 +2560,9 @@ async fn handle_wallet_unlock(
             enc_key,
             spend_seed: Some(spend_seed),
             mailbox_key,
+            eth_raw_key: Some(eth_raw_key),
+            eth_address,
+            last_eth_balance_wei: 0,
         });
 
         if let Some((tag_str, tag_store)) = wallet_tag_store.clone() {
@@ -2943,6 +3026,7 @@ fn handle_local_test_faucet(
                     mint_id,
                     chain_tip,
                     chain_depth: 0,
+                    asset: vess_foundry::Asset::Btc,
                 };
                 let cred = SpendCredential {
                     spend_vk: owner_vk.clone(),
@@ -3090,55 +3174,6 @@ fn handle_manifest_store(
     });
 
     RpcResponse::ok(RpcData::Empty {})
-}
-
-fn handle_program_deploy(
-    state: &Arc<Mutex<ArteryState>>,
-    program: StoredProgram,
-    manifest: Option<ProgramManifest>,
-    program_tx: &tokio::sync::mpsc::UnboundedSender<ProgramStore>,
-    program_manifest_tx: &tokio::sync::mpsc::UnboundedSender<ProgramManifestStore>,
-) -> RpcResponse {
-    let prog_id = program.prog_id();
-    let Some(manifest) = manifest else {
-        return RpcResponse::err("program deploy requires a named program manifest");
-    };
-    if manifest.latest_prog_id != prog_id {
-        return RpcResponse::err("program manifest latest_prog_id must match the deployed program");
-    }
-    if !manifest.versions.iter().any(|version| version.prog_id == prog_id) {
-        return RpcResponse::err("program manifest versions must include the deployed program");
-    }
-
-    let name = manifest.name.to_string();
-    let mut s = lock_state(&state);
-    let stored_program = match s.compute_dht.store_program(program.clone()) {
-        Ok(inserted) => inserted,
-        Err(error) => return RpcResponse::err(format!("program deploy rejected: {error}")),
-    };
-    let stored_manifest = match s.compute_dht.store_manifest(manifest.clone()) {
-        Ok(inserted) => inserted,
-        Err(error) => return RpcResponse::err(format!("program manifest rejected: {error}")),
-    };
-    drop(s);
-
-    if stored_program {
-        let _ = program_tx.send(ProgramStore {
-            program,
-            hops_remaining: 8,
-        });
-    }
-    if stored_manifest {
-        let _ = program_manifest_tx.send(ProgramManifestStore {
-            manifest,
-            hops_remaining: 8,
-        });
-    }
-
-    RpcResponse::ok(RpcData::ProgramDeploy {
-        prog_id: hex_key(prog_id.as_bytes()),
-        name,
-    })
 }
 
 // ── Tag cache handlers ───────────────────────────────────────────────

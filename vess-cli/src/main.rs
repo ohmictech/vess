@@ -19,10 +19,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing_subscriber::EnvFilter;
 
-use vess_compute::{
-    compute_program_pow, ProgramDefinition, ProgramManifest, ProgramName, ProgramVersionPointer,
-    ProofSystem, StoredProgram, VessLogicProgram,
-};
 use vess_kloak::persistence::{
     list_wallets, named_wallet_path, read_active_wallet_path, set_active_wallet_path,
     WalletDescriptor, WalletFile,
@@ -132,33 +128,6 @@ enum Command {
         tag: String,
     },
 
-    /// Deploy a decentralized program from a local directory.
-    Deploy {
-        /// Program root directory, or a single `.vess` source file.
-        directory: PathBuf,
-        /// Human-facing program name to publish, for example `+vl_market1`.
-        #[arg(long)]
-        name: String,
-        /// Program entrypoints exposed by the artifact.
-        #[arg(long, value_delimiter = ',', default_value = "main")]
-        entrypoints: Vec<String>,
-        /// Proof system identifier.
-        #[arg(long, default_value = "vess-stark-v1")]
-        proof_system: String,
-        /// Maximum cycle budget expected by the program.
-        #[arg(long, default_value_t = 1_000_000)]
-        max_cycles: u64,
-        /// Maximum memory footprint expected by the program.
-        #[arg(long, default_value_t = 2_147_483_648u64)]
-        max_memory_bytes: u64,
-        /// Mark the program as allowed to own bills directly.
-        #[arg(long)]
-        supports_program_owned_bills: bool,
-        /// Manifest version number when publishing a named program.
-        #[arg(long, default_value_t = 1)]
-        version: u32,
-    },
-
     /// Send a raw Pulse to a remote node (low-level).
     Pulse {
         /// Target node's serialized mesh contact.
@@ -239,6 +208,14 @@ enum Command {
 
     /// List pending outbound payments that haven't been claimed yet.
     PendingPayments,
+
+    /// Show local payment history with amounts, memos, and status.
+    #[command(alias = "history")]
+    PaymentHistory {
+        /// Maximum number of entries to show (default: 20).
+        #[arg(long, default_value = "20")]
+        max: usize,
+    },
 
     /// Toggle passive mode: save bandwidth on metered/mobile connections.
     /// In passive mode the node only relays its own payments.
@@ -457,29 +434,6 @@ async fn dispatch_command(cli: &Cli) -> Result<()> {
             .await
         }
         Some(Command::RegisterTag { tag }) => cmd_register_tag(&cli, tag).await,
-        Some(Command::Deploy {
-            directory,
-            name,
-            entrypoints,
-            proof_system,
-            max_cycles,
-            max_memory_bytes,
-            supports_program_owned_bills,
-            version,
-        }) => {
-            cmd_deploy(
-                &cli,
-                directory,
-                name,
-                entrypoints,
-                proof_system,
-                *max_cycles,
-                *max_memory_bytes,
-                *supports_program_owned_bills,
-                *version,
-            )
-            .await
-        }
         Some(Command::Pulse { target, message }) => cmd_pulse(&cli, target, message).await,
         Some(Command::Listen) => cmd_listen(&cli).await,
         Some(Command::Status) => cmd_status(&cli).await,
@@ -518,6 +472,9 @@ async fn dispatch_command(cli: &Cli) -> Result<()> {
                 is_testnet: *testnet,
                 test: false,
                 bootstrap_dns: vec![],
+                eth_rpc_url: None,
+                eth_burn_contract: None,
+                eth_chain_id: None,
             };
             vess_artery::node_runner::run_node(config).await?;
             Ok(())
@@ -529,6 +486,7 @@ async fn dispatch_command(cli: &Cli) -> Result<()> {
         },
         Some(Command::CancelPayment { payment_id }) => cmd_cancel_payment(&cli, payment_id).await,
         Some(Command::PendingPayments) => cmd_pending_payments(&cli).await,
+        Some(Command::PaymentHistory { max }) => cmd_payment_history(&cli, *max).await,
         Some(Command::PassiveMode { enable }) => cmd_passive_mode(&cli, *enable).await,
     }
 }
@@ -562,6 +520,37 @@ async fn cmd_pending_payments(cli: &Cli) -> Result<()> {
         }
     } else {
         anyhow::bail!("{}", resp["error"].as_str().unwrap_or("unknown error"));
+    }
+    Ok(())
+}
+
+async fn cmd_payment_history(cli: &Cli, max: usize) -> Result<()> {
+    let port = rpc_port(cli);
+    let resp = rpc_call(port, &json!({"method": "payment_history", "max": max})).await?;
+    if cli.json {
+        println!("{resp}");
+        return Ok(());
+    }
+    let entries = resp["entries"].as_array().cloned().unwrap_or_default();
+    if entries.is_empty() {
+        println!("No payment history.");
+        return Ok(());
+    }
+    println!("{0: <16} {1: >8} {2: <8} {3: <12} {4: <20} {5}", "TIMESTAMP", "AMOUNT", "DIR", "STATUS", "COUNTERPARTY", "MEMO");
+    println!("{:-<80}", "");
+    for entry in &entries {
+        let ts = entry["timestamp"].as_u64().unwrap_or(0);
+        let amount = entry["amount"].as_u64().unwrap_or(0);
+        let dir = entry["direction"].as_str().unwrap_or("?");
+        let status = entry["status"].as_str().unwrap_or("?");
+        let counterparty = entry["counterparty"].as_str().unwrap_or("-");
+        let memo = entry["memo"].as_str().unwrap_or("-");
+        // Format timestamp as readable date
+        let dt = chrono::DateTime::from_timestamp(ts as i64, 0)
+            .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
+            .unwrap_or_else(|| ts.to_string());
+        let truncated_memo = if memo.len() > 30 { format!("{}...", &memo[..27]) } else { memo.to_string() };
+        println!("{dt: <16} {amount: >8} {dir: <8} {status: <12} {counterparty: <20} {truncated_memo}");
     }
     Ok(())
 }
@@ -842,233 +831,6 @@ fn rpc_port(cli: &Cli) -> u16 {
 
 fn should_use_rpc(cli: &Cli) -> bool {
     cli.rpc.is_some() || std::env::var_os(VESS_RPC_PORT_ENV).is_some()
-}
-
-fn parse_proof_system(value: &str) -> Result<ProofSystem> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "vess-stark-v1" => Ok(ProofSystem::VessStarkV1),
-        "vess-stark-aggregate-v1" => Ok(ProofSystem::VessStarkAggregateV1),
-        other => anyhow::bail!(
-            "unsupported proof system {other}; use vess-stark-v1 or vess-stark-aggregate-v1"
-        ),
-    }
-}
-
-fn normalized_program_rel_path(root: &Path, path: &Path) -> Result<String> {
-    let rel = path
-        .strip_prefix(root)
-        .with_context(|| format!("{} is not inside {}", path.display(), root.display()))?;
-    Ok(rel
-        .components()
-        .map(|component| component.as_os_str().to_string_lossy().into_owned())
-        .collect::<Vec<_>>()
-        .join("/"))
-}
-
-fn collect_program_directory_entries(
-    root: &Path,
-    dir: &Path,
-    entries: &mut Vec<(String, Vec<u8>)>,
-) -> Result<()> {
-    for entry in std::fs::read_dir(dir)
-        .with_context(|| format!("read program directory {}", dir.display()))?
-    {
-        let entry = entry?;
-        let path = entry.path();
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
-            collect_program_directory_entries(root, &path, entries)?;
-        } else if file_type.is_file() {
-            let rel = normalized_program_rel_path(root, &path)?;
-            let bytes = std::fs::read(&path)
-                .with_context(|| format!("read program file {}", path.display()))?;
-            entries.push((rel, bytes));
-        }
-    }
-    Ok(())
-}
-
-fn collect_program_source_files(dir: &Path, sources: &mut Vec<PathBuf>) -> Result<()> {
-    for entry in std::fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
-        let entry = entry?;
-        let path = entry.path();
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
-            collect_program_source_files(&path, sources)?;
-        } else if file_type.is_file()
-            && path
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .map(|ext| ext.eq_ignore_ascii_case("vess"))
-                .unwrap_or(false)
-        {
-            sources.push(path);
-        }
-    }
-    Ok(())
-}
-
-fn load_vesslogic_program(path: &Path) -> Result<Option<VessLogicProgram>> {
-    let canonical = path
-        .canonicalize()
-        .with_context(|| format!("canonicalize {}", path.display()))?;
-    if canonical.is_file() {
-        let is_vess = canonical
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .map(|ext| ext.eq_ignore_ascii_case("vess"))
-            .unwrap_or(false);
-        if !is_vess {
-            return Ok(None);
-        }
-        let source = std::fs::read_to_string(&canonical)
-            .with_context(|| format!("read {}", canonical.display()))?;
-        return Ok(Some(VessLogicProgram::parse(&source)?));
-    }
-    if !canonical.is_dir() {
-        anyhow::bail!("program path {} is neither a file nor a directory", canonical.display());
-    }
-
-    let mut sources = Vec::new();
-    collect_program_source_files(&canonical, &mut sources)?;
-    match sources.len() {
-        0 => Ok(None),
-        1 => {
-            let source = std::fs::read_to_string(&sources[0])
-                .with_context(|| format!("read {}", sources[0].display()))?;
-            Ok(Some(VessLogicProgram::parse(&source)?))
-        }
-        _ => anyhow::bail!(
-            "program directory {} contains multiple .vess files; keep exactly one VessLogic source per deploy root",
-            canonical.display()
-        ),
-    }
-}
-
-fn program_bundle_from_directory(directory: &Path) -> Result<Vec<u8>> {
-    let directory = directory
-        .canonicalize()
-        .with_context(|| format!("canonicalize {}", directory.display()))?;
-    if !directory.is_dir() {
-        anyhow::bail!("program path {} is not a directory", directory.display());
-    }
-
-    let mut entries = Vec::new();
-    collect_program_directory_entries(&directory, &directory, &mut entries)?;
-    if entries.is_empty() {
-        anyhow::bail!("program directory {} is empty", directory.display());
-    }
-    entries.sort_by(|left, right| left.0.cmp(&right.0));
-
-    let mut bundle = Vec::new();
-    for (path, bytes) in entries {
-        bundle.extend_from_slice(&(path.len() as u64).to_le_bytes());
-        bundle.extend_from_slice(path.as_bytes());
-        bundle.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-        bundle.extend_from_slice(&bytes);
-    }
-    Ok(bundle)
-}
-
-fn tagged_program_hash(tag: &[u8], bytes: &[u8]) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(tag);
-    hasher.update(&(bytes.len() as u64).to_le_bytes());
-    hasher.update(bytes);
-    *hasher.finalize().as_bytes()
-}
-
-fn load_optional_program_file(directory: &Path, name: &str) -> Result<Option<Vec<u8>>> {
-    let path = directory.join(name);
-    if !path.exists() {
-        return Ok(None);
-    }
-    if !path.is_file() {
-        anyhow::bail!("{} exists but is not a file", path.display());
-    }
-    Ok(Some(
-        std::fs::read(&path).with_context(|| format!("read program file {}", path.display()))?,
-    ))
-}
-
-fn build_program_definition_from_directory(
-    directory: &Path,
-    entrypoints: &[String],
-    proof_system: ProofSystem,
-    max_cycles: u64,
-    max_memory_bytes: u64,
-    supports_program_owned_bills: bool,
-) -> Result<ProgramDefinition> {
-    let canonical_dir = directory
-        .canonicalize()
-        .with_context(|| format!("canonicalize {}", directory.display()))?;
-    let base_dir = if canonical_dir.is_dir() {
-        canonical_dir.clone()
-    } else {
-        canonical_dir
-            .parent()
-            .ok_or_else(|| anyhow::anyhow!("{} has no parent directory", canonical_dir.display()))?
-            .to_path_buf()
-    };
-    let metadata_bytes = load_optional_program_file(&base_dir, "metadata.json")?;
-    let abi_bytes = load_optional_program_file(&base_dir, "abi.json")?;
-    let public_inputs_bytes = load_optional_program_file(&base_dir, "public_inputs.json")?;
-    let public_outputs_bytes = load_optional_program_file(&base_dir, "public_outputs.json")?;
-
-    if let Some(vesslogic_program) = load_vesslogic_program(&canonical_dir)? {
-        let compiled = vesslogic_program.compile();
-        return Ok(ProgramDefinition {
-            code: compiled.clone(),
-            proof_system,
-            public_input_schema_hash: tagged_program_hash(
-                b"vess-program-public-inputs-v1",
-                public_inputs_bytes.as_deref().unwrap_or(&compiled),
-            ),
-            public_output_schema_hash: tagged_program_hash(
-                b"vess-program-public-outputs-v1",
-                public_outputs_bytes.as_deref().unwrap_or(&compiled),
-            ),
-            metadata_hash: tagged_program_hash(
-                b"vess-program-metadata-v1",
-                metadata_bytes.as_deref().unwrap_or(&compiled),
-            ),
-            abi_hash: tagged_program_hash(
-                b"vess-program-abi-v1",
-                abi_bytes.as_deref().unwrap_or(&compiled),
-            ),
-            max_cycles,
-            max_memory_bytes,
-            supports_program_owned_bills,
-            entrypoints: vesslogic_program.entrypoints(),
-        });
-    }
-
-    let bundle = program_bundle_from_directory(&canonical_dir)?;
-
-    Ok(ProgramDefinition {
-        code: bundle.clone(),
-        proof_system,
-        public_input_schema_hash: tagged_program_hash(
-            b"vess-program-public-inputs-v1",
-            public_inputs_bytes.as_deref().unwrap_or(&bundle),
-        ),
-        public_output_schema_hash: tagged_program_hash(
-            b"vess-program-public-outputs-v1",
-            public_outputs_bytes.as_deref().unwrap_or(&bundle),
-        ),
-        metadata_hash: tagged_program_hash(
-            b"vess-program-metadata-v1",
-            metadata_bytes.as_deref().unwrap_or(&bundle),
-        ),
-        abi_hash: tagged_program_hash(
-            b"vess-program-abi-v1",
-            abi_bytes.as_deref().unwrap_or(&bundle),
-        ),
-        max_cycles,
-        max_memory_bytes,
-        supports_program_owned_bills,
-        entrypoints: entrypoints.to_vec(),
-    })
 }
 
 async fn cmd_init(cli: &Cli, tag_str: &str, wallet_name: Option<&str>) -> Result<()> {
@@ -1391,6 +1153,7 @@ async fn cmd_recover(cli: &Cli, words: &str, wallet_name: Option<&str>) -> Resul
                 mint_id: entry.mint_id,
                 chain_tip: rec.chain_tip,
                 chain_depth: 0,
+                asset: vess_foundry::Asset::Btc,
             };
 
             if verbose {
@@ -1964,87 +1727,6 @@ async fn cmd_register_tag(cli: &Cli, tag_str: &str) -> Result<()> {
                 "hardening_error": hardening_error,
             })
         );
-    }
-    Ok(())
-}
-
-async fn cmd_deploy(
-    cli: &Cli,
-    directory: &Path,
-    name: &str,
-    entrypoints: &[String],
-    proof_system: &str,
-    max_cycles: u64,
-    max_memory_bytes: u64,
-    supports_program_owned_bills: bool,
-    version: u32,
-) -> Result<()> {
-    let proof_system = parse_proof_system(proof_system)?;
-    let definition = build_program_definition_from_directory(
-        directory,
-        entrypoints,
-        proof_system,
-        max_cycles,
-        max_memory_bytes,
-        supports_program_owned_bills,
-    )?;
-    let prog_id = definition.prog_id();
-
-    if !cli.json {
-        println!("Deploying program from {}", directory.display());
-        println!("Computing Argon2id proof-of-work (this takes ~10 seconds and 2 GiB RAM)…");
-    }
-
-    let (pow_nonce, pow_hash) = compute_program_pow(&prog_id, None)?;
-    let published_at = now_unix();
-    let name = ProgramName::new(name)?;
-    let program = StoredProgram {
-        definition,
-        published_at,
-        pow_nonce,
-        pow_hash,
-        publisher_vk: None,
-        signature: Vec::new(),
-        last_bill_sent_at: None,
-    };
-    let manifest = ProgramManifest {
-        name,
-        latest_prog_id: prog_id,
-        versions: vec![ProgramVersionPointer {
-            version,
-            prog_id,
-            changelog_hash: [0u8; 32],
-        }],
-        created_at: published_at,
-        updated_at: published_at,
-        publisher_vk: None,
-        signature: Vec::new(),
-    };
-
-    let port = rpc_port(cli);
-    let resp = rpc_call(
-        port,
-        &json!({
-            "method": "program_deploy",
-            "program": program,
-            "manifest": manifest,
-        }),
-    )
-    .await?;
-
-    if resp["ok"] != true {
-        anyhow::bail!(
-            "{}",
-            resp["error"].as_str().unwrap_or("program deploy failed")
-        );
-    }
-
-    if cli.json {
-        println!("{resp}");
-    } else {
-        println!("Program deployed.");
-        println!("Program ID: {}", resp["prog_id"].as_str().unwrap_or("?"));
-        println!("Name:       {}", resp["name"].as_str().unwrap_or("?"));
     }
     Ok(())
 }
@@ -3210,6 +2892,7 @@ async fn wizard_recover(
                     mint_id: entry.mint_id,
                     chain_tip: rec.chain_tip,
                     chain_depth: 0,
+                    asset: vess_foundry::Asset::Btc,
                 };
                 billfold.deposit(bill);
                 if entry.dht_index >= max_dht_index {
@@ -3555,6 +3238,13 @@ async fn cmd_interactive(cli: &Cli) -> Result<()> {
                     .unwrap_or(false);
                 cmd_notifications(cli, follow, 1_000, 64).await
             }
+            "history" | "hist" => {
+                let max = args
+                    .first()
+                    .and_then(|a| a.parse::<usize>().ok())
+                    .unwrap_or(20);
+                cmd_payment_history(cli, max).await
+            }
             _ => {
                 if matches!(cmd, "start" | "stop") {
                     println!(
@@ -3857,6 +3547,7 @@ fn print_interactive_help() {
     println!("  explain [topic]        Explain core Vess concepts");
     println!("  inventory              Show wallet bill inventory");
     println!("  notifications [follow] Show recent notifications or follow them live");
+    println!("  history [count]        Show recent payment history with memos");
     println!("  help                   Show this help");
     println!("  exit                   Close Vess");
 }

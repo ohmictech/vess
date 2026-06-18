@@ -270,7 +270,7 @@ fun WalletCreatedScreen(vm: VessViewModel, state: VessUiState) {
                 Text("RECOVERY PHRASE", color = Color(0xFFFF6B6B), fontWeight = FontWeight.Bold, fontSize = 12.sp)
                 Spacer(Modifier.height(8.dp))
                 Text(
-                    state.recoveryPhrase,
+                    state.recoveryPhraseInput,
                     color = Color.White,
                     fontFamily = FontFamily.Monospace,
                     fontSize = 16.sp,

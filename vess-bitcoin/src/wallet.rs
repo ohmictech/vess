@@ -41,25 +41,28 @@ pub struct OwnedUtxo {
 }
 
 #[derive(Debug, Clone)]
-pub struct BurnTransactionPlan {
+pub struct TimeLockTransactionPlan {
     pub transaction: Transaction,
     pub consumed_utxos: Vec<OwnedUtxo>,
-    pub burn_commitment_payload: [u8; 32],
+    pub commitment_payload: [u8; 32],
     pub canonical_output_values: Vec<u64>,
     pub first_owner_vk_hash: [u8; 32],
-    pub burn_amount_sats: u64,
+    pub locked_sats: u64,
     pub fee_sats: u64,
 }
 
 #[derive(Debug, Clone)]
-pub struct PendingBurn {
+pub struct PendingTimeLock {
     pub txid: Txid,
     pub transaction: Transaction,
     pub consumed_utxos: Vec<OwnedUtxo>,
     pub first_owner_vk: Vec<u8>,
     pub first_owner_sk: Vec<u8>,
     pub first_owner_vk_hash: [u8; 32],
-    pub burn_amount_sats: u64,
+    pub locked_sats: u64,
+    pub lock_blocks: u64,
+    pub cltv_block_height: u64,
+    pub vess_amount: u64,
     pub fee_sats: u64,
     pub created_at: u64,
     pub last_broadcast_at: Option<u64>,
@@ -67,18 +70,30 @@ pub struct PendingBurn {
     pub last_error: Option<String>,
 }
 
+/// A standard Bitcoin send (non-time-lock).
+#[derive(Debug, Clone)]
+pub struct SentTransaction {
+    pub txid: Txid,
+    pub transaction: Transaction,
+    pub recipient: Address,
+    pub amount_sats: u64,
+    pub fee_sats: u64,
+    pub sent_at: u64,
+    pub confirmed: bool,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct WalletTransactionUpdate {
     pub discovered_utxos: Vec<OwnedUtxo>,
-    pub seen_pending_burns: Vec<Txid>,
-    pub conflicted_pending_burns: Vec<Txid>,
+    pub seen_pending_timelocks: Vec<Txid>,
+    pub conflicted_pending_timelocks: Vec<Txid>,
 }
 
 impl WalletTransactionUpdate {
     pub fn has_state_change(&self) -> bool {
         !self.discovered_utxos.is_empty()
-            || !self.seen_pending_burns.is_empty()
-            || !self.conflicted_pending_burns.is_empty()
+            || !self.seen_pending_timelocks.is_empty()
+            || !self.conflicted_pending_timelocks.is_empty()
     }
 }
 
@@ -99,13 +114,16 @@ struct PersistedOwnedUtxo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct PersistedPendingBurn {
+struct PersistedPendingTimeLock {
     transaction: Vec<u8>,
     consumed_utxos: Vec<PersistedOwnedUtxo>,
     first_owner_vk: Vec<u8>,
     first_owner_sk: Vec<u8>,
     first_owner_vk_hash: [u8; 32],
-    burn_amount_sats: u64,
+    locked_sats: u64,
+    lock_blocks: u64,
+    cltv_block_height: u64,
+    vess_amount: u64,
     fee_sats: u64,
     created_at: u64,
     last_broadcast_at: Option<u64>,
@@ -119,7 +137,7 @@ struct PersistedBitcoinWallet {
     next_external_index: u32,
     next_internal_index: u32,
     utxos: Vec<PersistedOwnedUtxo>,
-    pending_burns: Vec<PersistedPendingBurn>,
+    pending_timelocks: Vec<PersistedPendingTimeLock>,
 }
 
 #[derive(Debug, Clone)]
@@ -130,7 +148,7 @@ pub struct BitcoinWallet {
     next_internal_index: u32,
     known_scripts: HashMap<ScriptBuf, DerivedKey>,
     utxos: HashMap<OutPoint, OwnedUtxo>,
-    pending_burns: HashMap<Txid, PendingBurn>,
+    pending_timelocks: HashMap<Txid, PendingTimeLock>,
 }
 
 impl BitcoinNetwork {
@@ -167,7 +185,7 @@ impl BitcoinWallet {
             next_internal_index: 0,
             known_scripts: HashMap::new(),
             utxos: HashMap::new(),
-            pending_burns: HashMap::new(),
+            pending_timelocks: HashMap::new(),
         })
     }
 
@@ -194,8 +212,8 @@ impl BitcoinWallet {
                 .cloned()
                 .map(Self::persist_owned_utxo)
                 .collect(),
-            pending_burns: self
-                .pending_burns
+            pending_timelocks: self
+                .pending_timelocks
                 .values()
                 .cloned()
                 .map(Self::persist_pending_burn)
@@ -219,7 +237,7 @@ impl BitcoinWallet {
         self.next_internal_index = state.next_internal_index;
         self.known_scripts.clear();
         self.utxos.clear();
-        self.pending_burns.clear();
+        self.pending_timelocks.clear();
 
         for index in 0..self.next_external_index {
             let derived = self.derive_address(Keychain::External, index)?;
@@ -234,9 +252,9 @@ impl BitcoinWallet {
             let utxo = self.restore_owned_utxo(&persisted)?;
             self.utxos.insert(utxo.outpoint, utxo);
         }
-        for persisted in state.pending_burns {
+        for persisted in state.pending_timelocks {
             let pending = self.restore_pending_burn(&persisted)?;
-            self.pending_burns.insert(pending.txid, pending);
+            self.pending_timelocks.insert(pending.txid, pending);
         }
 
         Ok(())
@@ -285,12 +303,12 @@ impl BitcoinWallet {
             .sum()
     }
 
-    pub fn pending_burn_count(&self) -> usize {
-        self.pending_burns.len()
+    pub fn pending_timelock_count(&self) -> usize {
+        self.pending_timelocks.len()
     }
 
-    pub fn pending_burns(&self) -> Vec<PendingBurn> {
-        let mut pending: Vec<_> = self.pending_burns.values().cloned().collect();
+    pub fn pending_timelocks(&self) -> Vec<PendingTimeLock> {
+        let mut pending: Vec<_> = self.pending_timelocks.values().cloned().collect();
         pending.sort_by_key(|burn| burn.created_at);
         pending
     }
@@ -301,13 +319,13 @@ impl BitcoinWallet {
         utxos
     }
 
-    pub fn pending_burns_ready_for_broadcast(
+    pub fn pending_timelocks_ready_for_broadcast(
         &self,
         now: u64,
         retry_interval_secs: u64,
-    ) -> Vec<PendingBurn> {
+    ) -> Vec<PendingTimeLock> {
         let mut pending: Vec<_> = self
-            .pending_burns
+            .pending_timelocks
             .values()
             .filter(|burn| {
                 burn.last_broadcast_at
@@ -326,12 +344,12 @@ impl BitcoinWallet {
             tx.input.iter().map(|input| input.previous_output).collect();
         let mut update = WalletTransactionUpdate::default();
 
-        if self.pending_burns.contains_key(&txid) {
-            update.seen_pending_burns.push(txid);
+        if self.pending_timelocks.contains_key(&txid) {
+            update.seen_pending_timelocks.push(txid);
         }
 
         let conflicted: Vec<Txid> = self
-            .pending_burns
+            .pending_timelocks
             .iter()
             .filter_map(|(pending_txid, pending)| {
                 if *pending_txid == txid {
@@ -345,9 +363,9 @@ impl BitcoinWallet {
             })
             .collect();
         for pending_txid in &conflicted {
-            self.pending_burns.remove(pending_txid);
+            self.pending_timelocks.remove(pending_txid);
         }
-        update.conflicted_pending_burns = conflicted;
+        update.conflicted_pending_timelocks = conflicted;
 
         for input in &tx.input {
             self.utxos.remove(&input.previous_output);
@@ -378,106 +396,285 @@ impl BitcoinWallet {
         update
     }
 
-    pub fn queue_auto_burn_if_needed(
+    /// Mint Vess by time-locking a percentage of available BTC.
+    ///
+    /// # Arguments
+    /// - `percentage` — fraction of spendable balance to lock (1.0–100.0).
+    /// - `duration_years` — how many years to lock (0.1–10.0). Default: 1.0.
+    /// - `fee_sats` — miner fee in satoshis.
+    /// - `current_height` — latest known Bitcoin block height.
+    /// - `now` — Unix timestamp for the pending record.
+    ///
+    /// The amount locked = spendable_balance × (percentage / 100.0), minus fee.
+    /// Vess minted = locked_sats × lock_blocks / BLOCKS_PER_YEAR.
+    ///
+    /// Returns the pending time-lock ready for broadcast.
+    pub fn mint_timelock(
         &mut self,
+        percentage: f64,
+        duration_years: f64,
         fee_sats: u64,
+        current_height: u64,
         now: u64,
-    ) -> Result<Option<PendingBurn>> {
-        let available = self.available_tracked_utxos();
-        if available.is_empty() {
-            return Ok(None);
+    ) -> Result<PendingTimeLock> {
+        // Validate percentage
+        if percentage <= 0.0 || percentage > 100.0 {
+            return Err(anyhow!(
+                "percentage must be between 0 and 100, got {percentage}"
+            ));
         }
 
-        let total_input_sats: u64 = available.iter().map(|utxo| utxo.value_sats).sum();
-        if total_input_sats <= fee_sats {
-            return Ok(None);
+        // Validate and clamp duration
+        let duration_years = duration_years.clamp(0.1, 10.0);
+        let lock_blocks = (duration_years * vess_foundry::BLOCKS_PER_YEAR as f64) as u64;
+        if lock_blocks < vess_foundry::MIN_LOCK_BLOCKS {
+            return Err(anyhow!(
+                "duration too short: {duration_years} years = {lock_blocks} blocks (min {})",
+                vess_foundry::MIN_LOCK_BLOCKS
+            ));
         }
 
-        let burn_amount_sats = total_input_sats - fee_sats;
+        let spendable = self.spendable_tracked_balance();
+        if spendable <= fee_sats {
+            return Err(anyhow!(
+                "spendable balance {spendable} sats insufficient to cover fee {fee_sats}"
+            ));
+        }
+
+        let target_sats = ((spendable as f64) * (percentage / 100.0)) as u64;
+        let locked_sats = target_sats.saturating_sub(fee_sats);
+        if locked_sats == 0 {
+            return Err(anyhow!(
+                "fee {fee_sats} consumes entire target amount {target_sats} sats"
+            ));
+        }
+
+        let cltv_block_height = current_height + lock_blocks;
+        let vess_amount = vess_foundry::compute_vess_amount(locked_sats, lock_blocks);
+        if vess_amount == 0 {
+            return Err(anyhow!(
+                "lock produces 0 Vess — increase amount or duration"
+            ));
+        }
+
         let (first_owner_vk, first_owner_sk) = vess_foundry::spend_auth::generate_spend_keypair();
         let first_owner_vk_hash = vess_foundry::spend_auth::vk_hash(&first_owner_vk);
-        let plan = self.build_burn_transaction_from_utxos(
-            available.clone(),
-            burn_amount_sats,
+
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let owner_privkey = self.derive_private_key(Keychain::External, 0)?;
+        let owner_pubkey = owner_privkey.inner.public_key(&secp);
+        let bitcoin_pubkey = bitcoin::PublicKey::new(owner_pubkey);
+
+        let plan = self.build_timelock_transaction(
+            locked_sats,
             fee_sats,
-            Self::fixed_burn_script(),
+            cltv_block_height,
+            current_height,
+            &bitcoin_pubkey,
             first_owner_vk_hash,
         )?;
 
-        let pending = PendingBurn {
+        let pending = PendingTimeLock {
             txid: plan.transaction.compute_txid(),
             transaction: plan.transaction,
             consumed_utxos: plan.consumed_utxos,
             first_owner_vk,
             first_owner_sk,
             first_owner_vk_hash,
-            burn_amount_sats,
+            locked_sats,
+            lock_blocks,
+            cltv_block_height,
+            vess_amount,
             fee_sats,
             created_at: now,
             last_broadcast_at: None,
             broadcast_attempts: 0,
             last_error: None,
         };
-        self.pending_burns.insert(pending.txid, pending.clone());
-        Ok(Some(pending))
+        self.pending_timelocks.insert(pending.txid, pending.clone());
+        Ok(pending)
     }
 
-    pub fn mark_pending_burn_broadcast_success(&mut self, txid: &Txid, now: u64) {
-        if let Some(pending) = self.pending_burns.get_mut(txid) {
+    pub fn mark_pending_timelock_broadcast_success(&mut self, txid: &Txid, now: u64) {
+        if let Some(pending) = self.pending_timelocks.get_mut(txid) {
             pending.last_broadcast_at = Some(now);
             pending.broadcast_attempts = pending.broadcast_attempts.saturating_add(1);
             pending.last_error = None;
         }
     }
 
-    pub fn mark_pending_burn_broadcast_failure(&mut self, txid: &Txid, now: u64, error: String) {
-        if let Some(pending) = self.pending_burns.get_mut(txid) {
+    pub fn mark_pending_timelock_broadcast_failure(&mut self, txid: &Txid, now: u64, error: String) {
+        if let Some(pending) = self.pending_timelocks.get_mut(txid) {
             pending.last_broadcast_at = Some(now);
             pending.broadcast_attempts = pending.broadcast_attempts.saturating_add(1);
             pending.last_error = Some(error);
         }
     }
 
-    pub fn remove_pending_burn(&mut self, txid: &Txid) -> Option<PendingBurn> {
-        self.pending_burns.remove(txid)
+    pub fn remove_pending_timelock(&mut self, txid: &Txid) -> Option<PendingTimeLock> {
+        self.pending_timelocks.remove(txid)
     }
 
-    pub fn fixed_burn_script() -> ScriptBuf {
-        ScriptBuf::from_bytes(vec![0]).to_p2wsh()
-    }
-
-    pub fn build_burn_transaction(
+    /// Build a standard Bitcoin transaction sending `amount_sats` to `recipient`.
+    ///
+    /// Selects UTXOs, creates outputs [recipient, change], signs all inputs.
+    /// Returns the signed transaction ready for broadcast.
+    pub fn send_to_address(
         &mut self,
-        burn_amount_sats: u64,
+        recipient: &Address,
+        amount_sats: u64,
         fee_sats: u64,
-        burn_script_pubkey: ScriptBuf,
-        first_owner_vk_hash: [u8; 32],
-    ) -> Result<BurnTransactionPlan> {
-        if burn_amount_sats == 0 {
-            return Err(anyhow!("burn amount must be greater than zero"));
+    ) -> Result<Transaction> {
+        if amount_sats == 0 {
+            return Err(anyhow!("send amount must be greater than zero"));
         }
 
-        let target_total = burn_amount_sats
+        let target_total = amount_sats
             .checked_add(fee_sats)
-            .ok_or_else(|| anyhow!("burn amount + fee overflow"))?;
+            .ok_or_else(|| anyhow!("send amount + fee overflow"))?;
 
         let selected_utxos = self.select_utxos(target_total)?;
         let total_input_sats: u64 = selected_utxos.iter().map(|utxo| utxo.value_sats).sum();
-        let change_sats = total_input_sats.saturating_sub(target_total);
+        let change_sats = total_input_sats - target_total;
 
-        let mut change_script = None;
+        let mut outputs = vec![TxOut {
+            value: Amount::from_sat(amount_sats),
+            script_pubkey: recipient.script_pubkey(),
+        }];
+
         if change_sats > 0 {
             let change = self.issue_change_address()?;
-            change_script = Some(change.script_pubkey);
+            outputs.push(TxOut {
+                value: Amount::from_sat(change_sats),
+                script_pubkey: change.script_pubkey,
+            });
         }
 
-        self.build_burn_transaction_from_utxos_with_change(
+        let mut tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: selected_utxos
+                .iter()
+                .map(|utxo| TxIn {
+                    previous_output: utxo.outpoint,
+                    script_sig: ScriptBuf::default(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: Witness::default(),
+                })
+                .collect(),
+            output: outputs,
+        };
+
+        self.sign_p2wpkh_inputs(&mut tx, &selected_utxos)?;
+        Ok(tx)
+    }
+
+    /// Sweep all available UTXOs to `recipient`, minus `fee_sats`.
+    ///
+    /// Sends the entire spendable balance. Returns the signed transaction
+    /// and the total amount sent.
+    pub fn sweep_to_address(
+        &mut self,
+        recipient: &Address,
+        fee_sats: u64,
+    ) -> Result<(Transaction, u64)> {
+        let utxos = self.available_tracked_utxos();
+        if utxos.is_empty() {
+            return Err(anyhow!("no spendable UTXOs available"));
+        }
+
+        let total_input_sats: u64 = utxos.iter().map(|utxo| utxo.value_sats).sum();
+        if total_input_sats <= fee_sats {
+            return Err(anyhow!(
+                "balance {total_input_sats} sats insufficient to cover fee {fee_sats}"
+            ));
+        }
+
+        let amount_sats = total_input_sats - fee_sats;
+
+        let outputs = vec![TxOut {
+            value: Amount::from_sat(amount_sats),
+            script_pubkey: recipient.script_pubkey(),
+        }];
+
+        let mut tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: utxos
+                .iter()
+                .map(|utxo| TxIn {
+                    previous_output: utxo.outpoint,
+                    script_sig: ScriptBuf::default(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: Witness::default(),
+                })
+                .collect(),
+            output: outputs,
+        };
+
+        self.sign_p2wpkh_inputs(&mut tx, &utxos)?;
+        Ok((tx, amount_sats))
+    }
+
+    /// Build a CLTV time-lock script that locks funds until `cltv_height`.
+    ///
+    /// Script: `<cltv_height> OP_CHECKLOCKTIMEVERIFY OP_DROP <pubkey> OP_CHECKSIG`
+    ///
+    /// The funds can only be spent by `pubkey` after block `cltv_height`.
+    pub fn build_timelock_script(
+        pubkey: &bitcoin::PublicKey,
+        cltv_height: u64,
+    ) -> ScriptBuf {
+        let height_blocks = bitcoin::blockdata::locktime::absolute::Height::from_consensus(
+            cltv_height as u32,
+        )
+        .expect("CLTV height must fit in u32");
+        bitcoin::blockdata::script::Builder::new()
+            .push_lock_time(height_blocks.into())
+            .push_opcode(bitcoin::blockdata::opcodes::all::OP_CLTV)
+            .push_opcode(bitcoin::blockdata::opcodes::all::OP_DROP)
+            .push_key(pubkey)
+            .push_opcode(bitcoin::blockdata::opcodes::all::OP_CHECKSIG)
+            .into_script()
+    }
+
+    pub fn build_timelock_transaction(
+        &mut self,
+        locked_sats: u64,
+        fee_sats: u64,
+        cltv_block_height: u64,
+        current_height: u64,
+        owner_pubkey: &bitcoin::PublicKey,
+        first_owner_vk_hash: [u8; 32],
+    ) -> Result<TimeLockTransactionPlan> {
+        if locked_sats == 0 {
+            return Err(anyhow!("timelock amount must be greater than zero"));
+        }
+        if cltv_block_height <= current_height {
+            return Err(anyhow!(
+                "CLTV height {cltv_block_height} must be above current height {current_height}"
+            ));
+        }
+
+        let lock_blocks = cltv_block_height - current_height;
+        let vess_amount = vess_foundry::compute_vess_amount(locked_sats, lock_blocks);
+        let timelock_script = Self::build_timelock_script(owner_pubkey, cltv_block_height);
+
+        let target_total = locked_sats
+            .checked_add(fee_sats)
+            .ok_or_else(|| anyhow!("timelock amount + fee overflow"))?;
+
+        let selected_utxos = self.select_utxos(target_total)?;
+
+        self.build_timelock_transaction_with_change(
             selected_utxos,
-            burn_amount_sats,
+            locked_sats,
             fee_sats,
-            burn_script_pubkey,
+            timelock_script,
             first_owner_vk_hash,
-            change_script,
+            None,
+            lock_blocks,
+            vess_amount,
         )
     }
 
@@ -504,7 +701,7 @@ impl BitcoinWallet {
 
     fn available_tracked_utxos(&self) -> Vec<OwnedUtxo> {
         let reserved: HashSet<OutPoint> = self
-            .pending_burns
+            .pending_timelocks
             .values()
             .flat_map(|pending| pending.consumed_utxos.iter().map(|utxo| utxo.outpoint))
             .collect();
@@ -580,39 +777,45 @@ impl BitcoinWallet {
         ))
     }
 
-    fn build_burn_transaction_from_utxos(
+    fn build_timelock_transaction_internal(
         &self,
         selected_utxos: Vec<OwnedUtxo>,
-        burn_amount_sats: u64,
+        locked_sats: u64,
         fee_sats: u64,
-        burn_script_pubkey: ScriptBuf,
+        timelock_script_pubkey: ScriptBuf,
         first_owner_vk_hash: [u8; 32],
-    ) -> Result<BurnTransactionPlan> {
-        self.build_burn_transaction_from_utxos_with_change(
+        lock_blocks: u64,
+        vess_amount: u64,
+    ) -> Result<TimeLockTransactionPlan> {
+        self.build_timelock_transaction_with_change(
             selected_utxos,
-            burn_amount_sats,
+            locked_sats,
             fee_sats,
-            burn_script_pubkey,
+            timelock_script_pubkey,
             first_owner_vk_hash,
             None,
+            lock_blocks,
+            vess_amount,
         )
     }
 
-    fn build_burn_transaction_from_utxos_with_change(
+    fn build_timelock_transaction_with_change(
         &self,
         selected_utxos: Vec<OwnedUtxo>,
-        burn_amount_sats: u64,
+        locked_sats: u64,
         fee_sats: u64,
-        burn_script_pubkey: ScriptBuf,
+        timelock_script_pubkey: ScriptBuf,
         first_owner_vk_hash: [u8; 32],
         change_script_pubkey: Option<ScriptBuf>,
-    ) -> Result<BurnTransactionPlan> {
-        if burn_amount_sats == 0 {
-            return Err(anyhow!("burn amount must be greater than zero"));
+        lock_blocks: u64,
+        vess_amount: u64,
+    ) -> Result<TimeLockTransactionPlan> {
+        if locked_sats == 0 {
+            return Err(anyhow!("timelock amount must be greater than zero"));
         }
 
         let total_input_sats: u64 = selected_utxos.iter().map(|utxo| utxo.value_sats).sum();
-        let target_total = burn_amount_sats
+        let target_total = locked_sats
             .checked_add(fee_sats)
             .ok_or_else(|| anyhow!("burn amount + fee overflow"))?;
         if total_input_sats < target_total {
@@ -622,21 +825,22 @@ impl BitcoinWallet {
         }
         let change_sats = total_input_sats - target_total;
 
-        let canonical_output_values = vess_foundry::bitcoin_burn_output_values(burn_amount_sats);
-        let burn_commitment_payload = vess_foundry::bitcoin_burn_payload_commitment(
+        let canonical_output_values = vess_foundry::bitcoin_timelock_output_values(vess_amount);
+        let commitment_payload = vess_foundry::bitcoin_timelock_payload_commitment(
             &first_owner_vk_hash,
-            burn_amount_sats,
+            locked_sats,
+            lock_blocks,
             &canonical_output_values,
         );
 
         let mut outputs = vec![
             TxOut {
-                value: Amount::from_sat(burn_amount_sats),
-                script_pubkey: burn_script_pubkey,
+                value: Amount::from_sat(locked_sats),
+                script_pubkey: timelock_script_pubkey,
             },
             TxOut {
                 value: Amount::from_sat(0),
-                script_pubkey: ScriptBuf::new_op_return(burn_commitment_payload),
+                script_pubkey: ScriptBuf::new_op_return(commitment_payload),
             },
         ];
         if let Some(change_script) = change_script_pubkey {
@@ -669,13 +873,13 @@ impl BitcoinWallet {
 
         self.sign_p2wpkh_inputs(&mut unsigned_tx, &selected_utxos)?;
 
-        Ok(BurnTransactionPlan {
+        Ok(TimeLockTransactionPlan {
             transaction: unsigned_tx,
             consumed_utxos: selected_utxos,
-            burn_commitment_payload,
+            commitment_payload,
             canonical_output_values,
             first_owner_vk_hash,
-            burn_amount_sats,
+            locked_sats,
             fee_sats,
         })
     }
@@ -742,8 +946,8 @@ impl BitcoinWallet {
         })
     }
 
-    fn persist_pending_burn(pending: PendingBurn) -> Result<PersistedPendingBurn> {
-        Ok(PersistedPendingBurn {
+    fn persist_pending_burn(pending: PendingTimeLock) -> Result<PersistedPendingTimeLock> {
+        Ok(PersistedPendingTimeLock {
             transaction: serialize(&pending.transaction),
             consumed_utxos: pending
                 .consumed_utxos
@@ -753,7 +957,10 @@ impl BitcoinWallet {
             first_owner_vk: pending.first_owner_vk,
             first_owner_sk: pending.first_owner_sk,
             first_owner_vk_hash: pending.first_owner_vk_hash,
-            burn_amount_sats: pending.burn_amount_sats,
+            locked_sats: pending.locked_sats,
+            lock_blocks: pending.lock_blocks,
+            cltv_block_height: pending.cltv_block_height,
+            vess_amount: pending.vess_amount,
             fee_sats: pending.fee_sats,
             created_at: pending.created_at,
             last_broadcast_at: pending.last_broadcast_at,
@@ -762,11 +969,11 @@ impl BitcoinWallet {
         })
     }
 
-    fn restore_pending_burn(&self, persisted: &PersistedPendingBurn) -> Result<PendingBurn> {
+    fn restore_pending_burn(&self, persisted: &PersistedPendingTimeLock) -> Result<PendingTimeLock> {
         let transaction: Transaction =
             deserialize(&persisted.transaction).context("deserialize persisted pending burn tx")?;
         let txid = transaction.compute_txid();
-        Ok(PendingBurn {
+        Ok(PendingTimeLock {
             txid,
             transaction,
             consumed_utxos: persisted
@@ -777,7 +984,10 @@ impl BitcoinWallet {
             first_owner_vk: persisted.first_owner_vk.clone(),
             first_owner_sk: persisted.first_owner_sk.clone(),
             first_owner_vk_hash: persisted.first_owner_vk_hash,
-            burn_amount_sats: persisted.burn_amount_sats,
+            locked_sats: persisted.locked_sats,
+            lock_blocks: persisted.lock_blocks,
+            cltv_block_height: persisted.cltv_block_height,
+            vess_amount: persisted.vess_amount,
             fee_sats: persisted.fee_sats,
             created_at: persisted.created_at,
             last_broadcast_at: persisted.last_broadcast_at,
@@ -830,7 +1040,7 @@ mod tests {
     }
 
     #[test]
-    fn build_burn_transaction_signs_inputs_and_commits_payload() {
+    fn build_timelock_transaction_signs_inputs_and_commits_payload() {
         let mut wallet = BitcoinWallet::from_vess_seed(BitcoinNetwork::Testnet, &seed()).unwrap();
         let receive = wallet.issue_receive_address().unwrap();
         let funding_tx = Transaction {
@@ -846,20 +1056,20 @@ mod tests {
 
         let owner_hash = [9u8; 32];
         let plan = wallet
-            .build_burn_transaction(40_000, 500, BitcoinWallet::fixed_burn_script(), owner_hash)
+            .build_timelock_transaction(40_000, 500, BitcoinWallet::fixed_timelock_script(), owner_hash)
             .unwrap();
 
-        assert_eq!(plan.burn_amount_sats, 40_000);
+        assert_eq!(plan.locked_sats, 40_000);
         assert_eq!(plan.fee_sats, 500);
         assert_eq!(plan.transaction.input.len(), 1);
         assert!(!plan.transaction.input[0].witness.is_empty());
         assert_eq!(plan.transaction.output[0].value.to_sat(), 40_000);
         assert_eq!(
-            plan.burn_commitment_payload,
-            vess_foundry::bitcoin_burn_payload_commitment(
+            plan.commitment_payload,
+            vess_foundry::bitcoin_timelock_payload_commitment(
                 &owner_hash,
                 40_000,
-                &vess_foundry::bitcoin_burn_output_values(40_000)
+                &vess_foundry::bitcoin_timelock_output_values(40_000)
             )
         );
     }
@@ -880,14 +1090,14 @@ mod tests {
         wallet.record_transaction(&funding_tx);
 
         let pending = wallet.queue_auto_burn_if_needed(500, 123).unwrap().unwrap();
-        assert_eq!(pending.burn_amount_sats, 49_500);
+        assert_eq!(pending.locked_sats, 49_500);
         assert_eq!(pending.transaction.output.len(), 2);
         assert_eq!(wallet.spendable_tracked_balance(), 0);
         assert_eq!(wallet.pending_burn_count(), 1);
     }
 
     #[test]
-    fn state_round_trip_restores_indexes_utxos_and_pending_burns() {
+    fn state_round_trip_restores_indexes_utxos_and_pending_timelocks() {
         let mut wallet = BitcoinWallet::from_vess_seed(BitcoinNetwork::Testnet, &seed()).unwrap();
         let receive = wallet.issue_receive_address().unwrap();
         let funding_tx = Transaction {
@@ -995,7 +1205,7 @@ mod tests {
         };
 
         let update = wallet.record_transaction(&conflicting_tx);
-        assert_eq!(update.conflicted_pending_burns, vec![pending.txid]);
+        assert_eq!(update.conflicted_pending_timelocks, vec![pending.txid]);
         assert_eq!(wallet.pending_burn_count(), 0);
     }
 
@@ -1004,3 +1214,8 @@ mod tests {
         let _ = Txid::all_zeros();
     }
 }
+
+
+
+
+

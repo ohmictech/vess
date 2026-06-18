@@ -309,7 +309,7 @@ class VessViewModel(application: Application) : AndroidViewModel(application) {
             } catch (_: VessException) { }
             try {
                 val status = VessCore.getStatus()
-                _state.value = _state.value.copy(nodeStatus = status, peerCount = status.peerCount)
+                _state.value = _state.value.copy(nodeStatus = status, peerCount = status.peerCount.toLong())
             } catch (_: VessException) { }
             try {
                 val notes = VessCore.getNotifications()

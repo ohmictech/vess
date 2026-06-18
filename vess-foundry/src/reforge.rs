@@ -24,7 +24,7 @@
 //! mint_ids are derived from the compound proof digest. Input mint_ids
 //! are consumed (deleted from the ownership registry).
 
-use crate::{Denomination, VessBill};
+use crate::{Asset, Denomination, VessBill};
 use anyhow::{anyhow, Result};
 use blake3::Hasher;
 use serde::{Deserialize, Serialize};
@@ -291,10 +291,11 @@ pub fn reforge(request: ReforgeRequest) -> Result<ReforgeResult> {
                     digest,
                     created_at: now,
                     stealth_id: *stealth_id,
-                    dht_index: 0, // Assigned by wallet when stored in DHT.
+                    dht_index: 0,
                     mint_id,
                     chain_tip,
                     chain_depth: 0,
+                    asset: Asset::Btc,
                 },
                 proof_bytes,
             )
@@ -336,6 +337,7 @@ mod tests {
             mint_id: [0xAA; 32],
             chain_tip: [0xDD; 32],
             chain_depth: 0,
+            asset: crate::Asset::Btc,
         }
     }
 

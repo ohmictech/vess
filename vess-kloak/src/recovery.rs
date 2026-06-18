@@ -198,6 +198,18 @@ pub fn spend_seed_from_raw_seed(seed: &[u8; 64]) -> [u8; 32] {
     *h.finalize().as_bytes()
 }
 
+/// Derive a 32-byte Ethereum private key from a raw seed.
+///
+/// Domain-separated so the ETH key is independent from the encryption
+/// key and spend seed. The same BIP39 phrase always produces the same
+/// Ethereum address, making it recoverable without the wallet file.
+pub fn eth_key_from_raw_seed(seed: &[u8; 64]) -> [u8; 32] {
+    let mut h = Hasher::new();
+    h.update(seed);
+    h.update(b"vess-eth-key-v0");
+    *h.finalize().as_bytes()
+}
+
 /// Deterministically recover ML-KEM master keys from a recovery phrase.
 ///
 /// This regenerates the exact same keypairs that were created during

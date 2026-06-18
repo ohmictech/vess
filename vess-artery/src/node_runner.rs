@@ -400,8 +400,8 @@ fn bitcoin_network_tag(network: BitcoinNetwork) -> &'static [u8] {
     }
 }
 
-fn bitcoin_burn_bundle_commitment(burn: &vess_protocol::BitcoinBurnBundleProof) -> [u8; 32] {
-    let payload_hash = blake3::hash(&burn.burn_commitment_payload);
+fn bitcoin_timelock_bundle_commitment(burn: &vess_protocol::BitcoinTimeLockProof) -> [u8; 32] {
+    let payload_hash = blake3::hash(&burn.commitment_payload);
     let mut h = blake3::Hasher::new();
     h.update(b"vess-bitcoin-burn-bundle-v0");
     h.update(bitcoin_network_tag(burn.network));
@@ -409,7 +409,7 @@ fn bitcoin_burn_bundle_commitment(burn: &vess_protocol::BitcoinBurnBundleProof) 
     h.update(&burn.block_hash);
     h.update(&burn.merkle_root);
     h.update(&burn.merkle_index.to_le_bytes());
-    h.update(&burn.burn_amount_sats.to_le_bytes());
+    h.update(&burn.locked_sats.to_le_bytes());
     h.update(&burn.first_owner_vk_hash);
     for node in &burn.merkle_proof {
         h.update(node);
@@ -421,29 +421,29 @@ fn bitcoin_burn_bundle_commitment(burn: &vess_protocol::BitcoinBurnBundleProof) 
     *h.finalize().as_bytes()
 }
 
-fn expected_bitcoin_burn_payload(burn: &vess_protocol::BitcoinBurnBundleProof) -> [u8; 32] {
-    vess_foundry::bitcoin_burn_payload_commitment(
+fn expected_bitcoin_timelock_payload(burn: &vess_protocol::BitcoinTimeLockProof) -> [u8; 32] {
+    vess_foundry::bitcoin_timelock_payload_commitment(
         &burn.first_owner_vk_hash,
-        burn.burn_amount_sats,
+        burn.locked_sats,
         &burn.output_values,
     )
 }
 
-fn min_bitcoin_burn_confirmations(network: BitcoinNetwork) -> u32 {
+fn min_bitcoin_timelock_confirmations(network: BitcoinNetwork) -> u32 {
     match network {
         BitcoinNetwork::Mainnet | BitcoinNetwork::Testnet | BitcoinNetwork::Signet => 6,
         BitcoinNetwork::Regtest => 1,
     }
 }
 
-fn min_bitcoin_burn_corroborating_peers(network: BitcoinNetwork) -> u32 {
+fn min_bitcoin_timelock_corroborating_peers(network: BitcoinNetwork) -> u32 {
     match network {
         BitcoinNetwork::Mainnet | BitcoinNetwork::Testnet | BitcoinNetwork::Signet => 2,
         BitcoinNetwork::Regtest => 1,
     }
 }
 
-fn bitcoin_burn_merkle_root(burn: &vess_protocol::BitcoinBurnBundleProof) -> [u8; 32] {
+fn bitcoin_timelock_merkle_root(burn: &vess_protocol::BitcoinTimeLockProof) -> [u8; 32] {
     let mut current = burn.txid;
     let mut index = burn.merkle_index;
     for sibling in &burn.merkle_proof {
@@ -501,14 +501,14 @@ fn protocol_bitcoin_network(network: vess_bitcoin::BitcoinNetwork) -> BitcoinNet
     }
 }
 
-fn confirmed_burn_outputs(
+fn confirmed_timelock_outputs(
     pending: &vess_bitcoin::PendingBurn,
     confirmation: &vess_bitcoin::BurnConfirmationProof,
     network: vess_bitcoin::BitcoinNetwork,
     hops_remaining: u8,
 ) -> Result<(Vec<OwnershipGenesis>, Vec<vess_foundry::VessBill>)> {
-    let output_values = vess_foundry::bitcoin_burn_output_values(pending.burn_amount_sats);
-    let burn = vess_protocol::BitcoinBurnBundleProof {
+    let output_values = vess_foundry::bitcoin_timelock_output_values(pending.locked_sats);
+    let burn = vess_protocol::BitcoinTimeLockProof {
         network: protocol_bitcoin_network(network),
         txid: *pending.txid.as_byte_array(),
         block_hash: *confirmation.block_hash.as_byte_array(),
@@ -520,24 +520,24 @@ fn confirmed_burn_outputs(
         merkle_root: *confirmation.merkle_root.as_byte_array(),
         merkle_proof: confirmation.merkle_proof.clone(),
         merkle_index: confirmation.merkle_index,
-        burn_amount_sats: pending.burn_amount_sats,
+        burn_amount_sats: pending.locked_sats,
         first_owner_vk: pending.first_owner_vk.clone(),
         first_owner_vk_hash: pending.first_owner_vk_hash,
         output_values: output_values.clone(),
-        burn_commitment_payload: vess_foundry::bitcoin_burn_payload_commitment(
+        burn_commitment_payload: vess_foundry::bitcoin_timelock_payload_commitment(
             &pending.first_owner_vk_hash,
-            pending.burn_amount_sats,
+            pending.locked_sats,
             &output_values,
         )
         .to_vec(),
     };
-    let digest = bitcoin_burn_bundle_commitment(&burn);
+    let digest = bitcoin_timelock_bundle_commitment(&burn);
     let created_at = confirmation.header_time as u64;
 
     let mut genesis_records = Vec::with_capacity(output_values.len());
     let mut bills = Vec::with_capacity(output_values.len());
     for (output_index, denomination_value) in output_values.iter().copied().enumerate() {
-        let mint_id = vess_foundry::bitcoin_burn_mint_id(&burn.txid, output_index as u32);
+        let mint_id = vess_foundry::bitcoin_timelock_mint_id(&burn.txid, output_index as u32);
         let chain_tip = vess_foundry::genesis_chain_tip(&mint_id, &pending.first_owner_vk_hash);
         let denomination =
             vess_foundry::Denomination::from_value(denomination_value).ok_or_else(|| {
@@ -551,7 +551,7 @@ fn confirmed_burn_outputs(
             owner_vk: pending.first_owner_vk.clone(),
             program_owner: None,
             denomination_value,
-            genesis_proof: GenesisProof::BitcoinBurn(burn.clone()),
+            genesis_proof: GenesisProof::BitcoinTimeLock(burn.clone()),
             digest,
             hops_remaining,
             chain_depth: 0,
@@ -574,9 +574,9 @@ fn confirmed_burn_outputs(
     Ok((genesis_records, bills))
 }
 
-fn validate_bitcoin_burn_genesis(
+fn validate_bitcoin_timelock_genesis(
     og: &OwnershipGenesis,
-    burn: &vess_protocol::BitcoinBurnBundleProof,
+    burn: &vess_protocol::BitcoinTimeLockProof,
     bitcoin_client: Option<&vess_bitcoin::BitcoinLightClient>,
 ) -> std::result::Result<[u8; 32], &'static str> {
     const MAX_BURN_OUTPUTS: usize = 64;
@@ -584,18 +584,18 @@ fn validate_bitcoin_burn_genesis(
     const MAX_BURN_MERKLE_DEPTH: usize = 64;
     const MAX_OWNER_VK_BYTES: usize = 4096;
 
-    if burn.burn_amount_sats == 0 {
+    if burn.locked_sats == 0 {
         return Err("zero-value bitcoin burn");
     }
 
-    let minimum_confirmations = min_bitcoin_burn_confirmations(burn.network);
+    let minimum_confirmations = min_bitcoin_timelock_confirmations(burn.network);
     if burn.required_confirmations < minimum_confirmations
         || burn.confirmations < burn.required_confirmations
     {
         return Err("bitcoin burn confirmation depth insufficient");
     }
 
-    if burn.corroborating_peer_count < min_bitcoin_burn_corroborating_peers(burn.network) {
+    if burn.corroborating_peer_count < min_bitcoin_timelock_corroborating_peers(burn.network) {
         return Err("bitcoin burn corroboration insufficient");
     }
 
@@ -616,14 +616,14 @@ fn validate_bitcoin_burn_genesis(
         return Err("invalid bitcoin burn output count");
     }
 
-    if burn.burn_commitment_payload.len() != BURN_PAYLOAD_BYTES
+    if burn.commitment_payload.len() != BURN_PAYLOAD_BYTES
         || burn.merkle_proof.len() > MAX_BURN_MERKLE_DEPTH
         || burn.first_owner_vk.len() > MAX_OWNER_VK_BYTES
     {
         return Err("bitcoin burn proof exceeds size limits");
     }
 
-    if bitcoin_burn_merkle_root(burn) != burn.merkle_root {
+    if bitcoin_timelock_merkle_root(burn) != burn.merkle_root {
         return Err("bitcoin burn merkle proof mismatch");
     }
 
@@ -631,8 +631,8 @@ fn validate_bitcoin_burn_genesis(
         return Err("bitcoin burn first owner key mismatch");
     }
 
-    let expected_payload = expected_bitcoin_burn_payload(burn);
-    if burn.burn_commitment_payload.as_slice() != expected_payload {
+    let expected_payload = expected_bitcoin_timelock_payload(burn);
+    if burn.commitment_payload.as_slice() != expected_payload {
         return Err("bitcoin burn OP_RETURN payload mismatch");
     }
 
@@ -640,7 +640,7 @@ fn validate_bitcoin_burn_genesis(
         return Err("bitcoin burn owner_vk_hash mismatch");
     }
 
-    let canonical_output_values = vess_foundry::bitcoin_burn_output_values(burn.burn_amount_sats);
+    let canonical_output_values = vess_foundry::bitcoin_timelock_output_values(burn.locked_sats);
     if burn.output_values != canonical_output_values {
         return Err("bitcoin burn output decomposition is not canonical");
     }
@@ -654,12 +654,12 @@ fn validate_bitcoin_burn_genesis(
         return Err("bitcoin burn denomination mismatch");
     }
 
-    let bundle_commitment = bitcoin_burn_bundle_commitment(burn);
+    let bundle_commitment = bitcoin_timelock_bundle_commitment(burn);
     if bundle_commitment != og.digest {
         return Err("bitcoin burn commitment mismatch");
     }
 
-    let expected_mint_id = vess_foundry::bitcoin_burn_mint_id(&burn.txid, og.output_index);
+    let expected_mint_id = vess_foundry::bitcoin_timelock_mint_id(&burn.txid, og.output_index);
     if expected_mint_id != og.mint_id {
         return Err("bitcoin burn mint_id derivation mismatch");
     }
@@ -695,10 +695,10 @@ fn verify_tag_lookup_ownership_proof(
     }
 
     // Validate the ownership claim itself.
-    match (&proof.burn, &proof.mint_id) {
+    match (&proof.timelock, &proof.mint_id) {
         (Some(burn), _) => {
             // Bitcoin burn path — validate the burn proof.
-            validate_burn_proof_standalone(burn, state.bitcoin_client.as_ref())?;
+            validate_timelock_proof_standalone(burn, state.bitcoin_client.as_ref())?;
         }
         (None, Some(mint_id)) => {
             // Vess bill ownership path — verify mint_id is registered.
@@ -719,20 +719,20 @@ fn verify_tag_lookup_ownership_proof(
 
 /// Validate a Bitcoin burn proof without an associated OwnershipGenesis
 /// (used by TagLookup ownership proofs).
-fn validate_burn_proof_standalone(
-    burn: &vess_protocol::BitcoinBurnBundleProof,
+fn validate_timelock_proof_standalone(
+    burn: &vess_protocol::BitcoinTimeLockProof,
     bitcoin_client: Option<&vess_bitcoin::BitcoinLightClient>,
 ) -> Result<(), &'static str> {
-    if burn.burn_amount_sats == 0 {
+    if burn.locked_sats == 0 {
         return Err("zero-value bitcoin burn");
     }
-    let minimum_confirmations = min_bitcoin_burn_confirmations(burn.network);
+    let minimum_confirmations = min_bitcoin_timelock_confirmations(burn.network);
     if burn.required_confirmations < minimum_confirmations
         || burn.confirmations < burn.required_confirmations
     {
         return Err("bitcoin burn confirmation depth insufficient");
     }
-    if burn.corroborating_peer_count < min_bitcoin_burn_corroborating_peers(burn.network) {
+    if burn.corroborating_peer_count < min_bitcoin_timelock_corroborating_peers(burn.network) {
         return Err("bitcoin burn corroboration insufficient");
     }
     if let Some(client) = bitcoin_client {
@@ -746,11 +746,11 @@ fn validate_burn_proof_standalone(
     if burn.output_values.is_empty() || burn.output_values.len() > 64 {
         return Err("invalid bitcoin burn output count");
     }
-    if bitcoin_burn_merkle_root(burn) != burn.merkle_root {
+    if bitcoin_timelock_merkle_root(burn) != burn.merkle_root {
         return Err("bitcoin burn merkle proof mismatch");
     }
-    let expected_payload = expected_bitcoin_burn_payload(burn);
-    if burn.burn_commitment_payload.as_slice() != expected_payload {
+    let expected_payload = expected_bitcoin_timelock_payload(burn);
+    if burn.commitment_payload.as_slice() != expected_payload {
         return Err("bitcoin burn commitment payload mismatch");
     }
     Ok(())
@@ -792,12 +792,12 @@ fn queue_auto_burn_if_needed(state: &mut ArteryState) -> Vec<vess_bitcoin::Pendi
             kind: "bitcoin_burn_queued".to_string(),
             created_at: now,
             payment_id: pending_burn.txid.to_string(),
-            amount: Some(pending_burn.burn_amount_sats),
+            amount: Some(pending_burn.locked_sats),
             bill_count: Some(pending_burn.transaction.output.len()),
             counterparty: None,
             message: format!(
                 "Queued automatic Bitcoin burn {} for {} sats.",
-                pending_burn.txid, pending_burn.burn_amount_sats
+                pending_burn.txid, pending_burn.locked_sats
             ),
         });
     }
@@ -828,12 +828,12 @@ async fn broadcast_pending_burns(
                         kind: "bitcoin_burn_broadcast".to_string(),
                         created_at: now,
                         payment_id: txid.to_string(),
-                        amount: Some(pending.burn_amount_sats),
+                        amount: Some(pending.locked_sats),
                         bill_count: Some(pending.transaction.output.len()),
                         counterparty: None,
                         message: format!(
                             "Broadcast automatic Bitcoin burn {} for {} sats.",
-                            txid, pending.burn_amount_sats
+                            txid, pending.locked_sats
                         ),
                     });
                 }
@@ -855,7 +855,7 @@ async fn broadcast_pending_burns(
                         kind: "bitcoin_burn_broadcast_failed".to_string(),
                         created_at: now,
                         payment_id: pending.txid.to_string(),
-                        amount: Some(pending.burn_amount_sats),
+                        amount: Some(pending.locked_sats),
                         bill_count: Some(pending.transaction.output.len()),
                         counterparty: None,
                         message: format!(
@@ -877,13 +877,13 @@ mod tests {
     use std::collections::{HashMap, VecDeque};
     use std::sync::{Arc, Mutex};
 
-    fn sample_burn_bundle() -> (vess_protocol::BitcoinBurnBundleProof, OwnershipGenesis) {
+    fn sample_burn_bundle() -> (vess_protocol::BitcoinTimeLockProof, OwnershipGenesis) {
         let txid = [0x11; 32];
         let owner_vk = vec![0x42; 64];
         let owner_vk_hash = vess_foundry::spend_auth::vk_hash(&owner_vk);
         let burn_amount_sats = 17;
-        let output_values = vess_foundry::bitcoin_burn_output_values(burn_amount_sats);
-        let burn = vess_protocol::BitcoinBurnBundleProof {
+        let output_values = vess_foundry::bitcoin_timelock_output_values(burn_amount_sats);
+        let burn = vess_protocol::BitcoinTimeLockProof {
             network: BitcoinNetwork::Regtest,
             txid,
             block_hash: [0x22; 32],
@@ -899,15 +899,15 @@ mod tests {
             first_owner_vk: owner_vk.clone(),
             first_owner_vk_hash: owner_vk_hash,
             output_values: output_values.clone(),
-            burn_commitment_payload: vess_foundry::bitcoin_burn_payload_commitment(
+            burn_commitment_payload: vess_foundry::bitcoin_timelock_payload_commitment(
                 &owner_vk_hash,
                 burn_amount_sats,
                 &output_values,
             )
             .to_vec(),
         };
-        let digest = bitcoin_burn_bundle_commitment(&burn);
-        let mint_id = vess_foundry::bitcoin_burn_mint_id(&txid, 0);
+        let digest = bitcoin_timelock_bundle_commitment(&burn);
+        let mint_id = vess_foundry::bitcoin_timelock_mint_id(&txid, 0);
         let og = OwnershipGenesis {
             mint_id,
             chain_tip: vess_foundry::genesis_chain_tip(&mint_id, &owner_vk_hash),
@@ -915,7 +915,7 @@ mod tests {
             owner_vk,
             program_owner: None,
             denomination_value: output_values[0],
-            genesis_proof: GenesisProof::BitcoinBurn(burn.clone()),
+            genesis_proof: GenesisProof::BitcoinTimeLock(burn.clone()),
             digest,
             hops_remaining: 0,
             chain_depth: 0,
@@ -1085,7 +1085,7 @@ mod tests {
     #[test]
     fn bitcoin_burn_bundle_accepts_canonical_genesis_binding() {
         let (burn, og) = sample_burn_bundle();
-        let bundle_commitment = validate_bitcoin_burn_genesis(&og, &burn, None).unwrap();
+        let bundle_commitment = validate_bitcoin_timelock_genesis(&og, &burn, None).unwrap();
         assert_eq!(bundle_commitment, og.digest);
     }
 
@@ -1096,16 +1096,16 @@ mod tests {
         burn.required_confirmations = 6;
         burn.confirmations = 5;
 
-        let error = validate_bitcoin_burn_genesis(&og, &burn, None).unwrap_err();
+        let error = validate_bitcoin_timelock_genesis(&og, &burn, None).unwrap_err();
         assert_eq!(error, "bitcoin burn confirmation depth insufficient");
     }
 
     #[test]
     fn bitcoin_burn_bundle_rejects_payload_mismatch() {
         let (mut burn, og) = sample_burn_bundle();
-        burn.burn_commitment_payload[0] ^= 0xff;
+        burn.commitment_payload[0] ^= 0xff;
 
-        let error = validate_bitcoin_burn_genesis(&og, &burn, None).unwrap_err();
+        let error = validate_bitcoin_timelock_genesis(&og, &burn, None).unwrap_err();
         assert_eq!(error, "bitcoin burn OP_RETURN payload mismatch");
     }
 
@@ -1117,7 +1117,7 @@ mod tests {
         burn.confirmations = 6;
         burn.corroborating_peer_count = 1;
 
-        let error = validate_bitcoin_burn_genesis(&og, &burn, None).unwrap_err();
+        let error = validate_bitcoin_timelock_genesis(&og, &burn, None).unwrap_err();
         assert_eq!(error, "bitcoin burn corroboration insufficient");
     }
 
@@ -2399,7 +2399,7 @@ fn proof_hash_and_nonce_from_genesis(og: &OwnershipGenesis) -> Option<([u8; 32],
                 None
             }
         }
-        GenesisProof::BitcoinBurn(_) => Some((og.digest, og.digest)),
+        GenesisProof::BitcoinTimeLock(_) => Some((og.digest, og.digest)),
         GenesisProof::LocalTestFaucet(proof) => {
             let mut h = blake3::Hasher::new();
             h.update(b"vess-local-test-faucet-proof-v0");
@@ -4676,7 +4676,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                         }
                     };
 
-                    let (genesis_records, bills) = match confirmed_burn_outputs(
+                    let (genesis_records, bills) = match confirmed_timelock_outputs(
                         &pending,
                         &confirmation,
                         vess_bitcoin::BitcoinNetwork::Mainnet,
@@ -8227,7 +8227,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                             return None;
                         }
                     }
-                    GenesisProof::BitcoinBurn(burn) => match validate_bitcoin_burn_genesis(&og, burn, state.bitcoin_client.as_ref()) {
+                    GenesisProof::BitcoinTimeLock(burn) => match validate_bitcoin_timelock_genesis(&og, burn, state.bitcoin_client.as_ref()) {
                         Ok(bundle_commitment) => {
                             proof_nonce = bundle_commitment;
                             proof_hash = bundle_commitment;
@@ -8884,3 +8884,5 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
     node.shutdown().await;
     Ok(node_id_str)
 }
+
+

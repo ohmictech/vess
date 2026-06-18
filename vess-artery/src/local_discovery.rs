@@ -308,7 +308,7 @@ pub fn bind_lan_discovery_socket(port: u16) -> Result<UdpSocket> {
     socket
         .set_reuse_address(true)
         .context("enable LAN discovery UDP address reuse")?;
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "android")))]
     {
         let _ = socket.set_reuse_port(true);
     }

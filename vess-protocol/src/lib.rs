@@ -16,6 +16,7 @@
 //! - Compute program / receipt records — programmable DHT-published compute.
 
 use serde::{Deserialize, Serialize};
+use blake3;
 
 pub use vess_compute::{
     ComputeJobRequest, ComputeJobResult, ComputeReceipt, ProgramAddress, ProgramDefinition,
@@ -23,7 +24,7 @@ pub use vess_compute::{
     ProgramSpendWitness, ProofSystem, StarkProofEnvelope, StoredProgram,
 };
 
-/// Bitcoin network identifier used by burn-backed bill genesis proofs.
+/// Bitcoin network identifier used by time-lock-backed bill genesis proofs.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum BitcoinNetwork {
     Mainnet,
@@ -32,18 +33,36 @@ pub enum BitcoinNetwork {
     Regtest,
 }
 
-/// Shared proof for all Vess bills derived from a single Bitcoin burn.
+/// Proof that a Bitcoin transaction is time-locked via OP_CHECKLOCKTIMEVERIFY.
 ///
-/// The burn commits atomically to the first Vess owner and the exact
-/// canonical 1-2-5 bill decomposition of the burned satoshi amount.
-/// Each resulting bill carries this bundle proof plus its `output_index`.
+/// Instead of burning BTC with OP_RETURN, the owner locks BTC to their own
+/// address for a future block height. This creates **sat-block time credits**:
+///
+/// ```text
+/// vess = locked_sats × lock_blocks / BLOCKS_PER_YEAR
+/// ```
+///
+/// Lock 100 sats for 52,560 blocks (≈1 year) → 100 Vess.
+/// Lock 100 sats for 525,600 blocks (≈10 years) → 1,000 Vess.
+/// Lock 100 sats for 5,256 blocks (≈0.1 years) → 10 Vess.
+///
+/// The BTC is not destroyed — it returns to the owner after the CLTV
+/// block height expires. The time-lock proof is verified via SPV.
+///
+/// # Limits
+///
+/// - Minimum lock: 5,256 blocks (≈0.1 years)
+/// - Maximum lock: 525,600 blocks (≈10 years)
+///
+/// This proof is the trust anchor for Vess bill genesis. Every node MUST
+/// verify it before accepting the associated bills into the DHT.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BitcoinBurnBundleProof {
-    /// Bitcoin network the burn was observed on.
+pub struct BitcoinTimeLockProof {
+    /// Bitcoin network the lock was observed on.
     pub network: BitcoinNetwork,
-    /// Transaction ID of the burn transaction.
+    /// Transaction ID of the time-lock transaction.
     pub txid: [u8; 32],
-    /// Block hash containing the burn transaction.
+    /// Block hash containing the time-lock transaction.
     pub block_hash: [u8; 32],
     /// Height of the containing block in the validated header chain.
     #[serde(default)]
@@ -54,8 +73,7 @@ pub struct BitcoinBurnBundleProof {
     /// Minimum confirmations required by the validating Bitcoin light client.
     #[serde(default)]
     pub required_confirmations: u32,
-    /// Number of distinct Bitcoin peers that corroborated the tx/block data
-    /// used to assemble this burn proof.
+    /// Number of distinct Bitcoin peers that corroborated the tx/block data.
     #[serde(default)]
     pub corroborating_peer_count: u32,
     /// Cumulative validated chainwork at the containing block, big-endian.
@@ -67,18 +85,49 @@ pub struct BitcoinBurnBundleProof {
     pub merkle_proof: Vec<[u8; 32]>,
     /// Leaf index of `txid` in the block's merkle tree.
     pub merkle_index: u32,
-    /// Total irreversibly burned amount in satoshis.
-    pub burn_amount_sats: u64,
-    /// Full ML-DSA-65 verification key of the first Vess owner.
+    /// Amount of satoshis locked (not burned — returned after timelock).
+    pub locked_sats: u64,
+    /// Duration of the timelock in Bitcoin blocks.
+    /// `lock_blocks = cltv_block_height − confirmation_block_height`
+    pub lock_blocks: u64,
+    /// The CLTV block height encoded in the transaction output.
+    pub cltv_block_height: u64,
+    /// The Vess amount this lock produces.
+    /// `vess = locked_sats × lock_blocks / BLOCKS_PER_YEAR`
+    pub vess_amount: u64,
+    /// Full ML-DSA-65 verification key of the first Vess owner (the locker).
     pub first_owner_vk: Vec<u8>,
     /// Blake3 hash of the first owner's ML-DSA-65 verification key.
     pub first_owner_vk_hash: [u8; 32],
-    /// Canonical 1-2-5 bill values for this burn amount.
+    /// Canonical 1-2-5 bill values for this Vess amount.
     pub output_values: Vec<u64>,
-    /// 32-byte OP_RETURN payload committing to the first owner, the total
-    /// burned sat amount, and the canonical largest-first 1-2-5 denomination
-    /// bundle.
-    pub burn_commitment_payload: Vec<u8>,
+    /// Commitment payload in the CLTV output (e.g. OP_RETURN or
+    /// the output script itself, committing to the owner and terms).
+    pub commitment_payload: Vec<u8>,
+}
+
+/// Bitcoin blocks per year (365.25 days × 144 blocks/day ≈ 52,560).
+pub const BLOCKS_PER_YEAR: u64 = 52_560;
+
+/// Minimum timelock duration in blocks (~0.1 years).
+pub const MIN_LOCK_BLOCKS: u64 = 5_256;
+
+/// Maximum timelock duration in blocks (~10 years).
+pub const MAX_LOCK_BLOCKS: u64 = 525_600;
+
+/// Compute the Vess amount from locked sats and lock duration in blocks.
+///
+/// ```text
+/// vess = locked_sats × lock_blocks / BLOCKS_PER_YEAR
+/// ```
+///
+/// # Examples
+///
+/// - 100 sats × 52,560 blocks / 52,560 = 100 Vess
+/// - 100 sats × 525,600 blocks / 52,560 = 1,000 Vess
+/// - 100 sats × 5,256 blocks / 52,560 = 10 Vess
+pub fn compute_vess_amount(locked_sats: u64, lock_blocks: u64) -> u64 {
+    (locked_sats as u128 * lock_blocks as u128 / BLOCKS_PER_YEAR as u128) as u64
 }
 
 /// Development-only proof for local faucet bills.
@@ -90,6 +139,29 @@ pub struct BitcoinBurnBundleProof {
 pub struct LocalTestFaucetProof {
     /// Random nonce used to derive the faucet bill identity.
     pub nonce: [u8; 32],
+}
+
+/// Ethereum burn proof: the VessBurn contract emitted a `Burned` event.
+/// The event log on Ethereum serves as the burn proof — no separate
+/// confirmation mechanism is needed beyond the log's inclusion in a block.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EthereumBurnProof {
+    /// Transaction hash of the ETH burn (from burnEth or burnToken).
+    pub tx_hash: [u8; 32],
+    /// Ethereum block number containing the burn transaction.
+    pub block_number: u64,
+    /// Ethereum block hash.
+    pub block_hash: [u8; 32],
+    /// Log index of the Burned event within the block.
+    pub log_index: u64,
+    /// The contract that emitted the event (VessBurn address).
+    pub contract_address: [u8; 20],
+    /// Token address (0x0 for native ETH, ERC-20 address otherwise).
+    pub token_address: [u8; 20],
+    /// Amount burned (in wei or token smallest unit).
+    pub amount: u64,
+    /// The 32-byte recipient commitment (Blake3 of stealth address).
+    pub recipient_commitment: [u8; 32],
 }
 
 /// Proof object used to justify genesis registration of a bill.
@@ -104,8 +176,11 @@ pub enum GenesisProof {
     /// - reforge proof
     Vess(Vec<u8>),
 
-    /// Bitcoin burn bundle proof shared across all outputs of one burn.
-    BitcoinBurn(BitcoinBurnBundleProof),
+    /// Bitcoin time-lock proof: CLTV-locked BTC creates sat-year Vess credits.
+    BitcoinTimeLock(BitcoinTimeLockProof),
+
+    /// Ethereum burn proof from a VessBurn contract event log.
+    EthereumBurn(EthereumBurnProof),
 
     /// Local testing faucet proof. Accepted only when explicitly enabled by
     /// the node operator.
@@ -297,6 +372,13 @@ pub enum PulseMessage {
     /// to the K-nearest peers of `target_shard_key`, breaking the direct
     /// sender-recipient link at the network layer.
     RelayPayment(RelayPayment),
+
+    /// Atomic swap offer for trustless cross-asset exchange.
+    /// Stored in the DHT keyed by Blake3("vess-swap-v0" || asset_a || asset_b).
+    SwapOffer(SwapOffer),
+
+    /// Response to a swap offer query.
+    SwapOfferResponse(SwapOfferResponse),
 }
 
 // ── Payment ──────────────────────────────────────────────────────────
@@ -376,6 +458,28 @@ pub struct Payment {
     /// rights to another party (e.g. escrow seller, auction winner).
     #[serde(default)]
     pub program_receipt: Option<ProgramReceipt>,
+
+    /// Optional hash lock for atomic swaps. When set, the recipient must
+    /// include the Blake3 preimage in their OwnershipClaim to unlock.
+    #[serde(default)]
+    pub hash_lock: Option<[u8; 32]>,
+}
+
+impl Default for Payment {
+    fn default() -> Self {
+        Self {
+            payment_id: [0u8; 32],
+            stealth_payload: Vec::new(),
+            view_tag: 0,
+            stealth_id: [0u8; 32],
+            created_at: 0,
+            bill_count: 0,
+            mailbox_key: None,
+            direct_receipt_tag_hash: None,
+            program_receipt: None,
+            hash_lock: None,
+        }
+    }
 }
 
 // ── Tag Operations ───────────────────────────────────────────────────
@@ -423,10 +527,10 @@ pub struct TagLookup {
 /// enumeration economically infeasible.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProofOfVessOwnership {
-    /// Bitcoin burn proof (if this bill came from a burn). At least one
-    /// of `burn` or `mint_id` must be present.
+    /// Bitcoin time-lock proof (if this bill came from a time-lock).
+    /// At least one of `timelock` or `mint_id` must be present.
     #[serde(default)]
-    pub burn: Option<BitcoinBurnBundleProof>,
+    pub timelock: Option<BitcoinTimeLockProof>,
     /// Mint ID of a Vess bill the requester owns (for non-burn bills).
     #[serde(default)]
     pub mint_id: Option<[u8; 32]>,
@@ -1192,6 +1296,74 @@ pub struct OwnershipClaim {
     /// Accumulated propagation work.
     #[serde(default)]
     pub accumulated_work: Option<u64>,
+    /// Optional preimage for hash-locked payments (atomic swaps).
+    /// Must satisfy Blake3(preimage) == Payment.hash_lock.
+    #[serde(default)]
+    pub hash_preimage: Option<[u8; 32]>,
+}
+
+impl Default for OwnershipClaim {
+    fn default() -> Self {
+        Self {
+            mint_id: [0u8; 32],
+            stealth_id: [0u8; 32],
+            prev_owner_vk: Vec::new(),
+            prev_owner_program: None,
+            transfer_sig: Vec::new(),
+            new_owner_vk_hash: [0u8; 32],
+            new_owner_vk: Vec::new(),
+            new_owner_program: None,
+            new_chain_tip: [0u8; 32],
+            timestamp: 0,
+            hops_remaining: 0,
+            chain_depth: 0,
+            encrypted_bill: Vec::new(),
+            program_spend_witness: None,
+            pow_nonce: None,
+            pow_hash: None,
+            accumulated_work: None,
+            hash_preimage: None,
+        }
+    }
+}
+
+// ── Atomic Swap ─────────────────────────────────────────────────────
+
+/// A posted offer to swap one asset for another via atomic hash-locked
+/// payments. Stored in the DHT at Blake3("vess-swap-v0" || min(a,b) || max(a,b)).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SwapOffer {
+    pub offer_asset: String,
+    pub offer_amount: u64,
+    pub want_asset: String,
+    pub want_amount: u64,
+    pub recipient: String,
+    pub hash_lock: [u8; 32],
+    pub expires_at: u64,
+    pub offerer_node_id: Vec<u8>,
+}
+
+impl SwapOffer {
+    pub fn dht_key(&self) -> [u8; 32] {
+        swap_dht_key(&self.offer_asset, &self.want_asset)
+    }
+}
+
+pub fn swap_dht_key(a: &str, b: &str) -> [u8; 32] {
+    let (first, second) = if a < b { (a, b) } else { (b, a) };
+    let mut h = blake3::Hasher::new();
+    h.update(b"vess-swap-v0");
+    h.update(first.as_bytes());
+    h.update(b"|");
+    h.update(second.as_bytes());
+    *h.finalize().as_bytes()
+}
+
+/// Response to a SwapOffer query. Returns matching offers stored by this node.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SwapOfferResponse {
+    /// Matching swap offers for the requested pair.
+    pub offers: Vec<SwapOffer>,
 }
 
 // ── Reforge Attestation ──────────────────────────────────────────────
@@ -1503,6 +1675,7 @@ mod tests {
             mailbox_key: None,
             direct_receipt_tag_hash: None,
             program_receipt: None,
+            hash_lock: None,
         });
         let bytes = msg.to_bytes().unwrap();
         let decoded = PulseMessage::from_bytes(&bytes).unwrap();
@@ -1608,6 +1781,7 @@ mod tests {
                 mailbox_key: None,
                 direct_receipt_tag_hash: None,
             program_receipt: None,
+            hash_lock: None,
         });
             let bytes = msg.to_bytes().unwrap();
             prop_assume!(!bytes.is_empty());

@@ -81,6 +81,14 @@ pub struct TagInfo {
     pub stealth_address: String,
 }
 
+#[derive(uniffi::Record)]
+pub struct EthBurnResult {
+    /// Transaction hash of the burn submission.
+    pub tx_hash: String,
+    /// The Vess stealth address commitment (32 hex bytes).
+    pub recipient: String,
+}
+
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 #[uniffi(flat_error)]
 pub enum VessError {
@@ -257,6 +265,9 @@ pub fn start_node(config: NodeConfig) -> Result<NodeStatus, VessError> {
         is_testnet,
         test: false,
         bootstrap_dns: vec![],
+        eth_rpc_url: None,
+        eth_burn_contract: None,
+        eth_chain_id: None,
     };
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -369,6 +380,154 @@ pub fn get_stealth_address() -> Result<String, VessError> {
     let data = std::fs::read_to_string(&active_path).map_err(|_| VessError::WalletError)?;
     let wf: WalletFile = serde_json::from_str(&data).map_err(|_| VessError::WalletError)?;
     Ok(encode_stealth_address(&wf.master_address))
+}
+
+// ── Ethereum bridge ──────────────────────────────────────────────────
+
+fn parse_eth_address(s: &str) -> Result<vess_ethereum::Address, VessError> {
+    s.parse::<vess_ethereum::Address>().map_err(|_| VessError::ConfigError)
+}
+
+fn parse_u256(s: &str) -> Result<vess_ethereum::U256, VessError> {
+    vess_ethereum::U256::from_dec_str(s).map_err(|_| VessError::ConfigError)
+}
+
+fn load_eth_config() -> Result<(String, vess_ethereum::Address, u64), VessError> {
+    let rpc_url = std::env::var("VESS_ETH_RPC")
+        .unwrap_or_else(|_| "https://eth.llamarpc.com".to_string());
+    let contract_addr = std::env::var("VESS_ETH_BURN_CONTRACT")
+        .unwrap_or_else(|_| "0x0000000000000000000000000000000000000000".to_string())
+        .parse::<vess_ethereum::Address>()
+        .map_err(|_| VessError::ConfigError)?;
+    let chain_id: u64 = std::env::var("VESS_ETH_CHAIN_ID")
+        .unwrap_or_else(|_| "1".to_string())
+        .parse()
+        .map_err(|_| VessError::ConfigError)?;
+    Ok((rpc_url, contract_addr, chain_id))
+}
+
+#[uniffi::export]
+pub fn get_eth_address() -> Result<String, VessError> {
+    let active_path = vess_kloak::persistence::read_active_wallet_path()
+        .map_err(|_| VessError::WalletError)?
+        .ok_or(VessError::WalletError)?;
+    let data = std::fs::read_to_string(&active_path).map_err(|_| VessError::WalletError)?;
+    let wf: WalletFile = serde_json::from_str(&data).map_err(|_| VessError::WalletError)?;
+    let raw_seed = wf.unlock_with_password("").or_else(|_| {
+        std::env::var("VESS_WALLET_PASSWORD")
+            .map_err(|_| anyhow::anyhow!("no password"))
+            .and_then(|p| wf.unlock_with_password(&p))
+    }).map_err(|_| VessError::WalletError)?;
+    Ok(format!("{:?}", vess_ethereum::wallet::eth_address_from_seed(&raw_seed)))
+}
+
+#[uniffi::export]
+pub async fn get_eth_balance(rpc_url: Option<String>) -> Result<String, VessError> {
+    let (rpc, _, _) = load_eth_config()?;
+    let url = rpc_url.unwrap_or(rpc);
+    let addr = get_eth_address()?.parse::<vess_ethereum::Address>().map_err(|_| VessError::ConfigError)?;
+    let bal = vess_ethereum::wallet::eth_balance(&url, addr)
+        .await
+        .map_err(|_| VessError::InternalError)?;
+    Ok(bal.to_string())
+}
+
+#[uniffi::export]
+pub async fn get_erc20_balance(token_addr: String, rpc_url: Option<String>) -> Result<String, VessError> {
+    let (rpc, _, _) = load_eth_config()?;
+    let url = rpc_url.unwrap_or(rpc);
+    let token = parse_eth_address(&token_addr)?;
+    let wal_addr = get_eth_address()?.parse::<vess_ethereum::Address>().map_err(|_| VessError::ConfigError)?;
+    let bal = vess_ethereum::wallet::erc20_balance(&url, token, wal_addr)
+        .await
+        .map_err(|_| VessError::InternalError)?;
+    Ok(bal.to_string())
+}
+
+#[uniffi::export]
+pub async fn burn_eth(
+    amount_wei: String,
+    recipient_commitment: String,
+    rpc_url: Option<String>,
+    contract_addr: Option<String>,
+    chain_id: Option<u64>,
+) -> Result<EthBurnResult, VessError> {
+    let (rpc, default_contract, default_chain) = load_eth_config()?;
+    let url = rpc_url.unwrap_or(rpc);
+    let contract = match contract_addr {
+        Some(a) => parse_eth_address(&a)?,
+        None => default_contract,
+    };
+    let chain = chain_id.unwrap_or(default_chain);
+    let amount = parse_u256(&amount_wei)?;
+    let recipient: [u8; 32] = hex::decode(recipient_commitment.trim_start_matches("0x"))
+        .map_err(|_| VessError::ConfigError)?
+        .try_into()
+        .map_err(|_| VessError::ConfigError)?;
+
+    let active_path = vess_kloak::persistence::read_active_wallet_path()
+        .map_err(|_| VessError::WalletError)?
+        .ok_or(VessError::WalletError)?;
+    let data = std::fs::read_to_string(&active_path).map_err(|_| VessError::WalletError)?;
+    let wf: WalletFile = serde_json::from_str(&data).map_err(|_| VessError::WalletError)?;
+    let raw_seed = wf.unlock_with_password("").or_else(|_| {
+        std::env::var("VESS_WALLET_PASSWORD")
+            .map_err(|_| anyhow::anyhow!("no password"))
+            .and_then(|p| wf.unlock_with_password(&p))
+    }).map_err(|_| VessError::WalletError)?;
+    let eth_key = vess_kloak::recovery::eth_key_from_raw_seed(&raw_seed);
+
+    let tx = vess_ethereum::wallet::burn_eth(&eth_key, &url, contract, amount, &recipient, chain)
+        .await
+        .map_err(|_| VessError::InternalError)?;
+    Ok(EthBurnResult {
+        tx_hash: format!("{:?}", tx),
+        recipient: hex::encode(recipient),
+    })
+}
+
+#[uniffi::export]
+pub async fn burn_erc20(
+    token_addr: String,
+    amount: String,
+    recipient_commitment: String,
+    rpc_url: Option<String>,
+    contract_addr: Option<String>,
+    chain_id: Option<u64>,
+) -> Result<EthBurnResult, VessError> {
+    let (rpc, default_contract, default_chain) = load_eth_config()?;
+    let url = rpc_url.unwrap_or(rpc);
+    let contract = match contract_addr {
+        Some(a) => parse_eth_address(&a)?,
+        None => default_contract,
+    };
+    let chain = chain_id.unwrap_or(default_chain);
+    let token = parse_eth_address(&token_addr)?;
+    let amt = parse_u256(&amount)?;
+    let recipient: [u8; 32] = hex::decode(recipient_commitment.trim_start_matches("0x"))
+        .map_err(|_| VessError::ConfigError)?
+        .try_into()
+        .map_err(|_| VessError::ConfigError)?;
+
+    let active_path = vess_kloak::persistence::read_active_wallet_path()
+        .map_err(|_| VessError::WalletError)?
+        .ok_or(VessError::WalletError)?;
+    let data = std::fs::read_to_string(&active_path).map_err(|_| VessError::WalletError)?;
+    let wf: WalletFile = serde_json::from_str(&data).map_err(|_| VessError::WalletError)?;
+    let raw_seed = wf.unlock_with_password("").or_else(|_| {
+        std::env::var("VESS_WALLET_PASSWORD")
+            .map_err(|_| anyhow::anyhow!("no password"))
+            .and_then(|p| wf.unlock_with_password(&p))
+    }).map_err(|_| VessError::WalletError)?;
+    let eth_key = vess_kloak::recovery::eth_key_from_raw_seed(&raw_seed);
+
+    let tx = vess_ethereum::wallet::burn_erc20(&eth_key, &url, contract, token, amt, &recipient, chain)
+        .await
+        .map_err(|_| VessError::InternalError)?;
+    Ok(EthBurnResult {
+        tx_hash: format!("{:?}", tx),
+        recipient: hex::encode(recipient),
+    })
 }
 
 uniffi::setup_scaffolding!();

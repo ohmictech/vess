@@ -226,6 +226,7 @@ pub fn prepare_noise_payment(own_address: &MasterStealthAddress) -> Result<Pulse
         mailbox_key: Some(mailbox_key),
         direct_receipt_tag_hash: None,
         program_receipt: None,
+        hash_lock: None,
     }))
 }
 
@@ -273,6 +274,7 @@ pub fn prepare_payment(
         mailbox_key: Some(derive_mailbox_key(&recipient.spend_ek)),
         direct_receipt_tag_hash: None,
         program_receipt: None,
+        ..Default::default()
     });
 
     Ok((msg, payment_id, selection.send_indices))
@@ -357,6 +359,7 @@ pub fn prepare_payment_with_transfer(
         mailbox_key: Some(derive_mailbox_key(&recipient.spend_ek)),
         direct_receipt_tag_hash: None,
         program_receipt: None,
+        ..Default::default()
     });
 
     Ok((msg, payment_id, selection.send_indices))
@@ -550,6 +553,7 @@ pub fn prepare_payment_from_bills(
         mailbox_key: Some(derive_mailbox_key(&recipient.spend_ek)),
         direct_receipt_tag_hash: None,
         program_receipt: None,
+        ..Default::default()
     });
 
     Ok((msg, payment_id))
@@ -878,6 +882,7 @@ pub fn claim_transfer_bills(
             pow_nonce: None,
             pow_hash: None,
             accumulated_work: None,
+            ..Default::default()
         });
         ownership_claims.push(claim);
 
@@ -994,6 +999,7 @@ pub fn build_program_lock_claims(
             pow_nonce: None,
             pow_hash: None,
             accumulated_work: None,
+            ..Default::default()
         }));
     }
 
@@ -1049,6 +1055,7 @@ pub fn build_program_unlock_claims(
             pow_nonce: None,
             pow_hash: None,
             accumulated_work: None,
+            ..Default::default()
         }));
 
         let mut updated_bill = bill.clone();

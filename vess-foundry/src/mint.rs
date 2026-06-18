@@ -11,7 +11,7 @@
 
 use crate::proof;
 use crate::vm;
-use crate::{Denomination, VessBill};
+use crate::{Asset, Denomination, VessBill};
 use blake3::Hasher;
 use rand::RngCore;
 use tracing;
@@ -160,10 +160,11 @@ pub fn try_mint(denom: Denomination, owner_vk_hash: &[u8; 32]) -> MintOutcome {
             digest: trace.digest,
             created_at: now,
             stealth_id,
-            dht_index: 0, // Assigned by the wallet when stored in DHT.
+            dht_index: 0,
             mint_id,
             chain_tip,
             chain_depth: 0,
+            asset: Asset::Btc,
         },
         proof_bytes,
     }
@@ -358,6 +359,7 @@ pub fn try_mint_d1(owner_vk_hash: &[u8; 32]) -> Option<CompletedSolve> {
         mint_id,
         chain_tip,
         chain_depth: 0,
+        asset: Asset::Btc,
     };
 
     Some(CompletedSolve { bill, nonce })
@@ -561,6 +563,7 @@ pub fn aggregate_solves(
                     mint_id,
                     chain_tip,
                     chain_depth: 0,
+                    asset: Asset::Btc,
                 },
                 proof_bytes,
             ));
@@ -603,6 +606,7 @@ pub fn aggregate_solves(
                     mint_id,
                     chain_tip,
                     chain_depth: 0,
+                    asset: Asset::Btc,
                 },
                 proof_bytes,
             ));
