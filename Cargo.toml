@@ -12,4 +12,7 @@ members = [
     "vess-tests",
     "vess-mobile",
 ]
+exclude = [
+    "vess-ui/src-tauri",
+]
 resolver = "2"
