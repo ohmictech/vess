@@ -14,7 +14,6 @@ vess-stealth = { path = "../vess-stealth" }
 vess-tag = { path = "../vess-tag", features = ["test-pow"] }
 vess-protocol = { path = "../vess-protocol" }
 vess-vascular = { path = "../vess-vascular" }
-vess-compute = { path = "../vess-compute", features = ["test-pow"] }
 vess-bitcoin = { path = "../vess-bitcoin" }
 anyhow = "1"
 rand = "0.8"

@@ -494,23 +494,28 @@ pub fn vichor_genesis_mint_id(nonce: &[u8; 32]) -> [u8; 32] {
 ///
 /// Free tier: ≤1.0 year costs 0 Vichor.
 ///
+/// Formula: V(y) = (y − 1)² × 10  (quadratic, 0.1yr increments)
+///
 /// # Examples
 ///
 /// - 0.5 years → 0 Vichor (free)
 /// - 1.0 year  → 0 Vichor (free)
 /// - 1.1 years → 1 Vichor
-/// - 1.5 years → 5 Vichor
+/// - 1.5 years → 2 Vichor
 /// - 2.0 years → 10 Vichor
-/// - 5.0 years → 40 Vichor
-/// - 10.0 years → 90 Vichor
+/// - 5.0 years → 160 Vichor
+/// - 10.0 years → 810 Vichor
 ///
-/// This forces long-term speculators to subsidize the network before
-/// they can access high-leverage timeframes.
+/// The quadratic curve makes long locks increasingly expensive —
+/// marginal cost grows linearly with duration. This creates natural
+/// market tiers where speculators must buy Vichor from the market,
+/// funding protocol development.
 pub fn vichor_required_for_years(years: f64) -> u64 {
     if years <= 1.0 {
         0
     } else {
-        ((years - 1.0) * 10.0) as u64
+        let excess = years - 1.0;
+        (excess * excess * 10.0) as u64
     }
 }
 

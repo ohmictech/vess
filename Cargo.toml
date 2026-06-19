@@ -3,8 +3,6 @@ members = [
     "vess-bitcoin",
     "vess-mesh",
     "vess-vascular",
-    "vess-cli",
-    "vess-compute",
     "vess-foundry",
     "vess-stealth",
     "vess-tag",

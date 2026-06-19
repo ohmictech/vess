@@ -9,7 +9,6 @@ vess-stealth = { path = "../vess-stealth" }
 vess-foundry = { path = "../vess-foundry" }
 vess-tag = { path = "../vess-tag" }
 vess-protocol = { path = "../vess-protocol" }
-vess-compute = { path = "../vess-compute" }
 blake3 = "1"
 argon2 = "0.5"
 bip39 = "2"

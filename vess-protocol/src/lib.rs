@@ -18,12 +18,6 @@
 use serde::{Deserialize, Serialize};
 use blake3;
 
-pub use vess_compute::{
-    ComputeJobRequest, ComputeJobResult, ComputeReceipt, ProgramAddress, ProgramDefinition,
-    ProgramId, ProgramManifest, ProgramName, ProgramOwnershipCondition,
-    ProgramSpendWitness, ProofSystem, StarkProofEnvelope, StoredProgram,
-};
-
 /// Bitcoin network identifier used by time-lock-backed bill genesis proofs.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum BitcoinNetwork {
@@ -337,45 +331,6 @@ pub enum PulseMessage {
     /// Store an encrypted wallet manifest in the DHT for recovery.
     ManifestStore(ManifestStore),
 
-    /// Store an immutable compute program in the DHT.
-    ProgramStore(ProgramStore),
-
-    /// Fetch an immutable compute program by `prog_id`.
-    ProgramFetch(ProgramFetch),
-
-    /// Response to a [`ProgramFetch`] request.
-    ProgramFetchResponse(ProgramFetchResponse),
-
-    /// Store a mutable compute program manifest / name record in the DHT.
-    ProgramManifestStore(ProgramManifestStore),
-
-    /// Resolve a human-facing program name.
-    ProgramManifestResolve(ProgramManifestResolve),
-
-    /// Response to a [`ProgramManifestResolve`] request.
-    ProgramManifestResolveResponse(ProgramManifestResolveResponse),
-
-    /// Reserved program-execution job request message.
-    ComputeJobRequest(ComputeJobRequest),
-
-    /// Reserved response to a [`ComputeJobRequest`] message.
-    ComputeJobResult(ComputeJobResult),
-
-    /// Store a compute receipt in the DHT.
-    ComputeReceiptStore(ComputeReceiptStore),
-
-    /// Fetch a compute receipt by receipt ID.
-    ComputeReceiptFetch(ComputeReceiptFetch),
-
-    /// Response to a [`ComputeReceiptFetch`] request.
-    ComputeReceiptFetchResponse(ComputeReceiptFetchResponse),
-
-    /// List receipt IDs tied to one immutable program.
-    ProgramReceiptList(ProgramReceiptList),
-
-    /// Response to a [`ProgramReceiptList`] request.
-    ProgramReceiptListResponse(ProgramReceiptListResponse),
-
     /// Recover an encrypted wallet manifest from the DHT.
     ManifestRecover(ManifestRecover),
 
@@ -398,11 +353,6 @@ pub enum PulseMessage {
     /// a payment.  Signed with the recipient's spend_sk so the sender can
     /// verify locally without waiting for DHT gossip.
     PaymentReceipt(PaymentReceipt),
-
-    /// Cryptographic receipt proving a program covenant accepted deposited
-    /// bills. Signed by the claim submitter. Can be forwarded inside a
-    /// Payment to authorize another party to unlock the program.
-    ProgramReceipt(ProgramReceipt),
 
     /// Privacy-preserving acknowledgment that a payment has been stored
     /// in a limbo buffer on a peer in the recipient's K-nearest DHT shard.
@@ -517,15 +467,6 @@ pub struct Payment {
     pub direct_receipt_tag_hash: Option<[u8; 32]>,
 
     /// Optional program receipt authorizing the recipient to attempt a
-    /// program unlock. When present, the recipient can use this receipt
-    /// as bearer authorization to satisfy the program's `[withdraw]`
-    /// predicate with a valid [`ProgramSpendWitness`].
-    ///
-    /// Set by a previous depositor who wants to transfer their claim
-    /// rights to another party (e.g. escrow seller, auction winner).
-    #[serde(default)]
-    pub program_receipt: Option<ProgramReceipt>,
-
     /// Optional hash lock for atomic swaps. When set, the recipient must
     /// include the Blake3 preimage in their OwnershipClaim to unlock.
     #[serde(default)]
@@ -543,7 +484,6 @@ impl Default for Payment {
             bill_count: 0,
             mailbox_key: None,
             direct_receipt_tag_hash: None,
-            program_receipt: None,
             hash_lock: None,
         }
     }
@@ -738,66 +678,6 @@ pub struct MailboxForwardAck {
     pub queued_forwarded: u32,
 }
 
-// ── Compute ─────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProgramStore {
-    pub program: StoredProgram,
-    pub hops_remaining: u8,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProgramFetch {
-    pub prog_id: ProgramId,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProgramFetchResponse {
-    pub program: Option<StoredProgram>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProgramManifestStore {
-    pub manifest: ProgramManifest,
-    pub hops_remaining: u8,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProgramManifestResolve {
-    pub name: ProgramName,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProgramManifestResolveResponse {
-    pub manifest: Option<ProgramManifest>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ComputeReceiptStore {
-    pub receipt: ComputeReceipt,
-    pub hops_remaining: u8,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ComputeReceiptFetch {
-    pub receipt_id: [u8; 32],
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ComputeReceiptFetchResponse {
-    pub receipt: Option<ComputeReceipt>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProgramReceiptList {
-    pub prog_id: ProgramId,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProgramReceiptListResponse {
-    pub receipt_ids: Vec<[u8; 32]>,
-}
-
 // ── Registry Query ───────────────────────────────────────────────────
 
 /// Query whether specific mint_ids are active in the ownership registry.
@@ -930,9 +810,6 @@ pub struct DhtSeedOwnershipRecord {
     pub current_owner_vk_hash: [u8; 32],
     /// Full current owner verification key.
     pub current_owner_vk: Vec<u8>,
-    /// Optional program predicate that currently owns the bill.
-    #[serde(default)]
-    pub current_owner_program: Option<ProgramOwnershipCondition>,
     /// Denomination value for supply tracking.
     pub denomination_value: u64,
     /// Unix timestamp when this record was last updated.
@@ -979,27 +856,6 @@ pub struct DhtSeedConsumedRecord {
     pub digest: [u8; 32],
 }
 
-/// An immutable program record transferred during seed sync.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DhtSeedProgramRecord {
-    pub prog_id: ProgramId,
-    pub program: StoredProgram,
-}
-
-/// A program manifest record transferred during seed sync.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DhtSeedProgramManifestRecord {
-    pub dht_key: [u8; 32],
-    pub manifest: ProgramManifest,
-}
-
-/// A compute receipt record transferred during seed sync.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DhtSeedComputeReceiptRecord {
-    pub receipt_id: [u8; 32],
-    pub receipt: ComputeReceipt,
-}
-
 /// Initial DHT data returned by a seed/bootstrap peer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DhtSeedResponse {
@@ -1015,15 +871,6 @@ pub struct DhtSeedResponse {
     /// Consumed-bill tombstones the requester should store.
     #[serde(default)]
     pub consumed_records: Vec<DhtSeedConsumedRecord>,
-    /// Immutable compute programs the requester should store.
-    #[serde(default)]
-    pub programs: Vec<DhtSeedProgramRecord>,
-    /// Program manifests the requester should store.
-    #[serde(default)]
-    pub program_manifests: Vec<DhtSeedProgramManifestRecord>,
-    /// Compute receipts the requester should store.
-    #[serde(default)]
-    pub compute_receipts: Vec<DhtSeedComputeReceiptRecord>,
 }
 
 // ── Kademlia FIND_NODE ───────────────────────────────────────────────
@@ -1245,9 +1092,6 @@ pub struct OwnershipGenesis {
     pub owner_vk_hash: [u8; 32],
     /// Full ML-DSA-65 verification key of the minter (for future transfer verification).
     pub owner_vk: Vec<u8>,
-    /// Optional program predicate that owns the bill from genesis.
-    #[serde(default)]
-    pub program_owner: Option<ProgramOwnershipCondition>,
     /// Denomination value for supply tracking.
     pub denomination_value: u64,
     /// Typed genesis proof for this bill.
@@ -1285,7 +1129,6 @@ impl Default for OwnershipGenesis {
             chain_tip: [0u8; 32],
             owner_vk_hash: [0u8; 32],
             owner_vk: Vec::new(),
-            program_owner: None,
             denomination_value: 0,
             genesis_proof: GenesisProof::Vess(Vec::new()),
             digest: [0u8; 32],
@@ -1303,10 +1146,7 @@ impl Default for OwnershipGenesis {
 ///
 /// The receiver broadcasts this to rotate ownership in the artery registry.
 /// The artery verifies the previous owner's transfer signature, computes
-/// the expected new chain tip, and updates the registry. For program-owned
-/// bills this is also the main proof-verification path: the claim carries
-/// `prev_owner_program` plus an optional `program_spend_witness`, and nodes
-/// verify that witness while distributing the claim.
+/// the expected new chain tip, and updates the registry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OwnershipClaim {
     /// Permanent bill identity.
@@ -1317,9 +1157,6 @@ pub struct OwnershipClaim {
     /// The artery checks `Blake3(prev_owner_vk) == stored current_owner_vk_hash`.
     #[serde(default)]
     pub prev_owner_vk: Vec<u8>,
-    /// Optional program predicate that currently owns the bill.
-    #[serde(default)]
-    pub prev_owner_program: Option<ProgramOwnershipCondition>,
     /// Transfer authorization signature from the previous owner.
     /// Signs `transfer_message(mint_id, stealth_id, timestamp)`.
     #[serde(default)]
@@ -1329,9 +1166,6 @@ pub struct OwnershipClaim {
     /// Full ML-DSA-65 verification key of the new owner (stored for next transfer).
     #[serde(default)]
     pub new_owner_vk: Vec<u8>,
-    /// Optional program predicate that becomes the new owner.
-    #[serde(default)]
-    pub new_owner_program: Option<ProgramOwnershipCondition>,
     /// Expected new chain tip: `Blake3(prev_chain_tip || new_owner_vk_hash || sig_hash)`.
     pub new_chain_tip: [u8; 32],
     /// Unix timestamp (must match the signed transfer message).
@@ -1349,11 +1183,6 @@ pub struct OwnershipClaim {
     /// the DHT if they lose their local copy.
     #[serde(default)]
     pub encrypted_bill: Vec<u8>,
-    /// Optional compute receipt witness authorizing a program-owned bill move.
-    /// When present, nodes validate it as part of `OwnershipClaim`
-    /// distribution before accepting the ownership rotation.
-    #[serde(default)]
-    pub program_spend_witness: Option<ProgramSpendWitness>,
     /// Argon2id PoW nonce for claim anti-spam.
     #[serde(default)]
     pub pow_nonce: Option<[u8; 32]>,
@@ -1375,17 +1204,14 @@ impl Default for OwnershipClaim {
             mint_id: [0u8; 32],
             stealth_id: [0u8; 32],
             prev_owner_vk: Vec::new(),
-            prev_owner_program: None,
             transfer_sig: Vec::new(),
             new_owner_vk_hash: [0u8; 32],
             new_owner_vk: Vec::new(),
-            new_owner_program: None,
             new_chain_tip: [0u8; 32],
             timestamp: 0,
             hops_remaining: 0,
             chain_depth: 0,
             encrypted_bill: Vec::new(),
-            program_spend_witness: None,
             pow_nonce: None,
             pow_hash: None,
             accumulated_work: None,
@@ -1652,39 +1478,6 @@ pub struct PaymentReceipt {
     pub signature: Vec<u8>,
 }
 
-/// Cryptographic receipt proving a program covenant accepted deposited bills.
-///
-/// Generated when bills land in a program's ownership (e.g. escrow, auction,
-/// vault). The receipt is signed by the claim submitter's spend key and can
-/// be forwarded inside a [`Payment`] to another party, authorizing them to
-/// attempt a program unlock with a valid [`ProgramSpendWitness`].
-///
-/// This turns program receipts into **bearer credentials** — whoever holds
-/// a valid receipt can try to satisfy the program's `[withdraw]` predicate.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProgramReceipt {
-    /// The program that accepted the deposit.
-    pub program_id: vess_compute::ProgramId,
-    /// Human-readable program name (e.g. "vl_escrow1").
-    pub program_name: String,
-    /// Echoed payment ID from the original Payment message.
-    pub payment_id: [u8; 32],
-    /// Mint IDs now owned by the program.
-    pub claimed_mint_ids: Vec<[u8; 32]>,
-    /// Total value deposited.
-    pub total_amount: u64,
-    /// The program's resulting state commitment after this deposit.
-    /// Programs can use this to track cumulative state.
-    pub resulting_state: Vec<u8>,
-    /// The depositor's owner verification key (claim submitter).
-    pub depositor_owner_vk: Vec<u8>,
-    /// Unix timestamp.
-    pub timestamp: u64,
-    /// ML-DSA-65 signature over the receipt digest:
-    /// `Blake3("vess-program-receipt-v0" || program_id || program_name || payment_id || claimed_mint_ids || total_amount || resulting_state || depositor_owner_vk || timestamp)`
-    pub signature: Vec<u8>,
-}
-
 /// Encrypted acknowledgment from a limbo-holding peer to the sender.
 ///
 /// When a peer stores a payment in limbo for a recipient's mailbox key,
@@ -1741,7 +1534,6 @@ mod tests {
             bill_count: 1,
             mailbox_key: None,
             direct_receipt_tag_hash: None,
-            program_receipt: None,
             hash_lock: None,
         });
         let bytes = msg.to_bytes().unwrap();
@@ -1847,7 +1639,6 @@ mod tests {
                 bill_count,
                 mailbox_key: None,
                 direct_receipt_tag_hash: None,
-            program_receipt: None,
             hash_lock: None,
         });
             let bytes = msg.to_bytes().unwrap();

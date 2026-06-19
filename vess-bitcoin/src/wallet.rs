@@ -450,7 +450,7 @@ impl BitcoinWallet {
             ));
         }
 
-        // Vichor gate: free ≤1 year, then 10 Vichor/year in 0.1 increments.
+        // Vichor gate: free ≤1 year, then quadratic (y-1)²×10 in 0.1 increments.
         let vichor_required = vess_foundry::vichor_required_for_years(duration_years);
         if vichor_burned < vichor_required {
             return Err(anyhow!(

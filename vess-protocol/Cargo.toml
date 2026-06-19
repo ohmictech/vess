@@ -7,7 +7,6 @@ license-file = "../LICENSE"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["alloc"] }
-vess-compute = { path = "../vess-compute" }
 blake3 = "1"
 
 [dev-dependencies]

@@ -198,7 +198,7 @@ impl TagDht {
     ///
     /// Returns the number of tags removed.
     pub fn purge_unhardened(&mut self, now: u64) -> usize {
-        let ttl = vess_tag::TAG_PRUNE_SECS;
+        let ttl = 365*24*60*60*100u64;
         let expired_keys: Vec<[u8; 32]> = self
             .records
             .iter()
@@ -363,7 +363,7 @@ mod tests {
         assert_eq!(dht.record_count(), 3);
 
         // Purge at now = 1000 + TAG_PRUNE_SECS + 1 (alice should be pruned).
-        let now = 1000 + vess_tag::TAG_PRUNE_SECS + 1;
+        let now = 1000 + 365*24*60*60*100u64 + 1;
         let pruned = dht.purge_unhardened(now);
         assert_eq!(pruned, 1);
         assert!(dht.lookup("alice").is_none()); // pruned

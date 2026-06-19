@@ -15,7 +15,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::billfold::SpendCredential;
-use vess_compute::{ProgramOwnershipCondition, ProgramSpendWitness};
 use vess_foundry::spend_auth;
 use vess_foundry::VessBill;
 use vess_protocol::{Payment, PulseMessage};
@@ -225,7 +224,6 @@ pub fn prepare_noise_payment(own_address: &MasterStealthAddress) -> Result<Pulse
         bill_count: 0,
         mailbox_key: Some(mailbox_key),
         direct_receipt_tag_hash: None,
-        program_receipt: None,
         hash_lock: None,
     }))
 }
@@ -273,7 +271,6 @@ pub fn prepare_payment(
         bill_count,
         mailbox_key: Some(derive_mailbox_key(&recipient.spend_ek)),
         direct_receipt_tag_hash: None,
-        program_receipt: None,
         ..Default::default()
     });
 
@@ -358,7 +355,6 @@ pub fn prepare_payment_with_transfer(
         bill_count,
         mailbox_key: Some(derive_mailbox_key(&recipient.spend_ek)),
         direct_receipt_tag_hash: None,
-        program_receipt: None,
         ..Default::default()
     });
 
@@ -552,7 +548,6 @@ pub fn prepare_payment_from_bills(
         bill_count,
         mailbox_key: Some(derive_mailbox_key(&recipient.spend_ek)),
         direct_receipt_tag_hash: None,
-        program_receipt: None,
         ..Default::default()
     });
 
@@ -868,17 +863,14 @@ pub fn claim_transfer_bills(
             mint_id: bill.mint_id,
             stealth_id,
             prev_owner_vk: payload.sender_vks[i].clone(),
-            prev_owner_program: None,
             transfer_sig: payload.transfer_sigs[i].clone(),
             new_owner_vk_hash: new_vk_hash,
             new_owner_vk: new_vk.clone(),
-            new_owner_program: None,
             new_chain_tip,
             timestamp: payload.timestamp,
             hops_remaining: 6,
             chain_depth: new_depth,
             encrypted_bill,
-            program_spend_witness: None,
             pow_nonce: None,
             pow_hash: None,
             accumulated_work: None,
@@ -923,7 +915,6 @@ pub fn build_genesis_messages(bills: &[(VessBill, Vec<u8>)], owner_vk: &[u8]) ->
                 chain_tip: bill.chain_tip,
                 owner_vk_hash,
                 owner_vk: owner_vk.to_vec(),
-                program_owner: None,
                 denomination_value: bill.denomination.value(),
                 genesis_proof: vess_protocol::GenesisProof::Vess(proof_bytes.clone()),
                 digest: bill.digest,
@@ -957,122 +948,6 @@ pub fn receive_and_claim(
         }
         None => Ok(None),
     }
-}
-
-/// Build ownership claims that lock bills to a program-owned condition.
-pub fn build_program_lock_claims(
-    bills: &[VessBill],
-    credentials: &HashMap<[u8; 32], SpendCredential>,
-    condition: &ProgramOwnershipCondition,
-) -> Result<Vec<PulseMessage>> {
-    let timestamp = now_unix();
-    let destination = condition.controller.address_id();
-    let new_owner_commitment = condition.owner_commitment();
-    let mut claims = Vec::with_capacity(bills.len());
-
-    for bill in bills {
-        let cred = credentials
-            .get(&bill.mint_id)
-            .ok_or_else(|| anyhow!("missing spend credential for bill mint_id"))?;
-        let msg = spend_auth::transfer_message(&bill.mint_id, &destination, timestamp);
-        let sig = spend_auth::sign_spend(&cred.spend_sk, &msg)?;
-        let new_chain_tip = vess_foundry::advance_chain_tip(
-            &bill.chain_tip,
-            &new_owner_commitment,
-            &sig,
-        );
-        claims.push(PulseMessage::OwnershipClaim(vess_protocol::OwnershipClaim {
-            mint_id: bill.mint_id,
-            stealth_id: destination,
-            prev_owner_vk: cred.spend_vk.clone(),
-            prev_owner_program: None,
-            transfer_sig: sig,
-            new_owner_vk_hash: new_owner_commitment,
-            new_owner_vk: Vec::new(),
-            new_owner_program: Some(condition.clone()),
-            new_chain_tip,
-            timestamp,
-            hops_remaining: 6,
-            chain_depth: bill.chain_depth + 1,
-            encrypted_bill: Vec::new(),
-            program_spend_witness: None,
-            pow_nonce: None,
-            pow_hash: None,
-            accumulated_work: None,
-            ..Default::default()
-        }));
-    }
-
-    Ok(claims)
-}
-
-/// Claim bills currently owned by a program predicate using a compute receipt witness.
-pub fn build_program_unlock_claims(
-    bills: &[VessBill],
-    previous_condition: &ProgramOwnershipCondition,
-    witness: &ProgramSpendWitness,
-    recipient_stealth_id: [u8; 32],
-    next_owner: &SpendCredential,
-    recovery_key: Option<[u8; 32]>,
-) -> Result<TransferClaimResult> {
-    let next_owner_vk_hash = spend_auth::vk_hash(&next_owner.spend_vk);
-    if next_owner_vk_hash != witness.next_owner_commitment {
-        anyhow::bail!("program spend witness next owner commitment does not match supplied spend key");
-    }
-
-    let mut claimed = Vec::with_capacity(bills.len());
-    let mut ownership_claims = Vec::with_capacity(bills.len());
-    let witness_hash = witness.witness_hash();
-
-    for bill in bills {
-        if !witness.authorized_mint_ids.contains(&bill.mint_id) {
-            anyhow::bail!("program spend witness does not authorize mint_id");
-        }
-
-        let new_depth = bill.chain_depth + 1;
-        let new_chain_tip = vess_foundry::advance_chain_tip_with_hash(
-            &bill.chain_tip,
-            &next_owner_vk_hash,
-            &witness_hash,
-        );
-        let encrypted_bill = encrypt_bill_for_recovery(bill, recovery_key);
-
-        ownership_claims.push(PulseMessage::OwnershipClaim(vess_protocol::OwnershipClaim {
-            mint_id: bill.mint_id,
-            stealth_id: recipient_stealth_id,
-            prev_owner_vk: Vec::new(),
-            prev_owner_program: Some(previous_condition.clone()),
-            transfer_sig: Vec::new(),
-            new_owner_vk_hash: next_owner_vk_hash,
-            new_owner_vk: next_owner.spend_vk.clone(),
-            new_owner_program: None,
-            new_chain_tip,
-            timestamp: witness.receipt.created_at,
-            hops_remaining: 6,
-            chain_depth: new_depth,
-            encrypted_bill,
-            program_spend_witness: Some(witness.clone()),
-            pow_nonce: None,
-            pow_hash: None,
-            accumulated_work: None,
-            ..Default::default()
-        }));
-
-        let mut updated_bill = bill.clone();
-        updated_bill.chain_tip = new_chain_tip;
-        updated_bill.chain_depth = new_depth;
-        claimed.push(ClaimedBill {
-            bill: updated_bill,
-            spend_vk: next_owner.spend_vk.clone(),
-            spend_sk: next_owner.spend_sk.clone(),
-        });
-    }
-
-    Ok(TransferClaimResult {
-        claimed,
-        ownership_claims,
-        memo: None,
-    })
 }
 
 // ── Bill Verification ───────────────────────────────────────────────

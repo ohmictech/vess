@@ -37,8 +37,10 @@ Duration    Vichor Required
 ≤1.0 year   0 (free)
  1.1 years  1
  2.0 years  10
- 5.0 years  40
-10.0 years  90
+ 3.0 years  40
+ 5.0 years  160
+ 7.0 years  360
+10.0 years  810
 ```
 
 Vichor is burned by transferring it to a provably unspendable address
@@ -83,11 +85,6 @@ direct delivery first, falling back to gossip relay.
 - **No burn** — BTC returns after CLTV expiry
 - **No bridge** — native Bitcoin script
 - **No CEX** — swap DHT is the exchange
-
-## Transport
-
-Vess bills are ~180 bytes. Transfers are ~3.5 KB. Both fit in a QR code.
-Payments are transport-agnostic: QR, NFC, BLE, USB, HTTPS — anything goes.
 
 ## Cryptography
 

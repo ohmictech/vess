@@ -25,10 +25,9 @@ use vess_kloak::auto_reforge::ConsolidationScheduler;
 use vess_kloak::billfold::SpendCredential;
 use vess_kloak::payment::prepare_payment_from_bills_split;
 use vess_kloak::selection::{decompose_amount, select_bills_filtered, SelectionResult};
-use vess_ethereum;
 use vess_mesh::MeshCarrierContact;
 use vess_protocol::{
-    ManifestStore, ProgramManifestStore, ProgramStore, PulseMessage, TagLookup,
+    ManifestStore, PulseMessage, TagLookup,
     TagStore,
 };
 use vess_stealth::MasterStealthAddress;
@@ -198,10 +197,6 @@ pub(crate) fn wallet_tag_store(
 #[derive(Clone)]
 pub(crate) struct QueueSenders {
     pub manifest_tx: tokio::sync::mpsc::UnboundedSender<ManifestStore>,
-    #[allow(dead_code)]
-    pub program_tx: tokio::sync::mpsc::UnboundedSender<ProgramStore>,
-    #[allow(dead_code)]
-    pub program_manifest_tx: tokio::sync::mpsc::UnboundedSender<ProgramManifestStore>,
     pub tag_store_tx: tokio::sync::mpsc::UnboundedSender<TagStore>,
     pub tag_confirm_tx: tokio::sync::mpsc::UnboundedSender<vess_protocol::TagConfirm>,
     pub og_tx: tokio::sync::mpsc::UnboundedSender<vess_protocol::OwnershipGenesis>,
@@ -1515,7 +1510,6 @@ fn fire_opportunistic_consolidations(
                 chain_tip,
                 owner_vk_hash,
                 owner_vk: new_cred.spend_vk.clone(),
-                program_owner: None,
                 denomination_value: new_bill.denomination.value(),
                 genesis_proof: vess_protocol::GenesisProof::Vess(proof_bytes),
                 digest: new_bill.digest,
@@ -1826,8 +1820,7 @@ async fn handle_send(
                         chain_tip,
                         owner_vk_hash,
                         owner_vk: cred.spend_vk.clone(),
-                        program_owner: None,
-                        denomination_value: bill.denomination.value(),
+                                denomination_value: bill.denomination.value(),
                         genesis_proof: vess_protocol::GenesisProof::Vess(proof_bytes.clone()),
                         digest: bill.digest,
                         hops_remaining: 6,
@@ -1853,8 +1846,7 @@ async fn handle_send(
                         chain_tip,
                         owner_vk_hash,
                         owner_vk: cred.spend_vk.clone(),
-                        program_owner: None,
-                        denomination_value: bill.denomination.value(),
+                                denomination_value: bill.denomination.value(),
                         genesis_proof: vess_protocol::GenesisProof::Vess(proof_bytes),
                         digest: bill.digest,
                         hops_remaining: 6,
@@ -2242,8 +2234,7 @@ async fn handle_send_direct(
                             chain_tip,
                             owner_vk_hash,
                             owner_vk: cred.spend_vk.clone(),
-                            program_owner: None,
-                            denomination_value: bill.denomination.value(),
+                                        denomination_value: bill.denomination.value(),
                             genesis_proof: vess_protocol::GenesisProof::Vess(proof_bytes.clone()),
                             digest: bill.digest,
                             hops_remaining: 6,
@@ -2268,8 +2259,7 @@ async fn handle_send_direct(
                             chain_tip,
                             owner_vk_hash,
                             owner_vk: cred.spend_vk.clone(),
-                            program_owner: None,
-                            denomination_value: bill.denomination.value(),
+                                        denomination_value: bill.denomination.value(),
                             genesis_proof: vess_protocol::GenesisProof::Vess(proof_bytes),
                             digest: bill.digest,
                             hops_remaining: 6,
@@ -2548,8 +2538,6 @@ async fn handle_wallet_unlock(
         let mut s = lock_state(&state);
         s.wallet_path = Some(wallet_path.clone());
         let spend_seed = vess_kloak::recovery::spend_seed_from_raw_seed(&raw_seed);
-        let eth_raw_key = vess_kloak::recovery::eth_key_from_raw_seed(&raw_seed);
-        let eth_address = Some(format!("{:?}", vess_ethereum::wallet::eth_address_from_seed(&raw_seed)));
         s.wallet = Some(WalletState {
             stealth_secret,
             stealth_address: address,
@@ -2560,9 +2548,6 @@ async fn handle_wallet_unlock(
             enc_key,
             spend_seed: Some(spend_seed),
             mailbox_key,
-            eth_raw_key: Some(eth_raw_key),
-            eth_address,
-            last_eth_balance_wei: 0,
         });
 
         if let Some((tag_str, tag_store)) = wallet_tag_store.clone() {
@@ -3038,8 +3023,7 @@ fn handle_local_test_faucet(
                         chain_tip,
                         owner_vk_hash,
                         owner_vk,
-                        program_owner: None,
-                        denomination_value: denomination.value(),
+                                denomination_value: denomination.value(),
                         genesis_proof: vess_protocol::GenesisProof::LocalTestFaucet(
                             vess_protocol::LocalTestFaucetProof { nonce },
                         ),
@@ -3127,7 +3111,6 @@ fn handle_ownership_genesis(
             chain_tip,
             owner_vk_hash,
             owner_vk,
-            program_owner: None,
             denomination_value,
             genesis_proof: vess_protocol::GenesisProof::Vess(proof),
             digest,

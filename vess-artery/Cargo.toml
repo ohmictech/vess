@@ -5,7 +5,7 @@ edition = "2021"
 license-file = "../LICENSE"
 
 [features]
-test-pow = ["vess-tag/test-pow", "vess-compute/test-pow"]
+test-pow = ["vess-tag/test-pow"]
 test-mint = ["vess-foundry/test-mint"]
 
 [dependencies]
@@ -17,7 +17,6 @@ vess-protocol = { path = "../vess-protocol" }
 vess-tag = { path = "../vess-tag" }
 vess-vascular = { path = "../vess-vascular" }
 vess-kloak = { path = "../vess-kloak" }
-vess-compute = { path = "../vess-compute" }
 argon2 = "0.5"
 blake3 = "1"
 cuckoofilter = "0.5"
