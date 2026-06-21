@@ -1,14 +1,14 @@
 <script lang="ts">
-  import Dashboard from "./lib/components/Dashboard.svelte";
+  import HexWallet from "./lib/components/HexWallet.svelte";
   import SendPanel from "./lib/components/SendPanel.svelte";
   import ReceivePanel from "./lib/components/ReceivePanel.svelte";
   import TagsPanel from "./lib/components/TagsPanel.svelte";
   import NodeStatus from "./lib/components/NodeStatus.svelte";
   import MintPanel from "./lib/components/MintPanel.svelte";
 
-  type Tab = "dashboard" | "send" | "receive" | "tags" | "mint" | "node";
+  type Tab = "wallet" | "send" | "receive" | "tags" | "mint" | "node" | "swap";
 
-  let activeTab: Tab = "dashboard";
+  let activeTab: Tab = "wallet";
   let sidebarOpen = false;
 
   function onNavigate(tab: Tab) {
@@ -17,7 +17,7 @@
   }
 
   const tabs = [
-    { id: "dashboard" as Tab, label: "Dashboard", icon: "🏠", short: "Home" },
+    { id: "wallet" as Tab, label: "Wallet", icon: "◆", short: "Home" },
     { id: "send" as Tab, label: "Send", icon: "📤", short: "Send" },
     { id: "receive" as Tab, label: "Receive", icon: "📥", short: "Recv" },
     { id: "tags" as Tab, label: "Tags", icon: "🏷️", short: "Tags" },
@@ -28,12 +28,12 @@
 
 <svelte:window on:resize={() => sidebarOpen = false} />
 
-<div class="flex flex-col md:flex-row h-dvh overflow-hidden bg-gray-950">
+<div class="flex flex-col md:flex-row h-dvh overflow-hidden bg-[#1a1a1a]">
   <!-- Mobile header bar -->
-  <header class="md:hidden flex items-center justify-between px-4 py-3 bg-gray-900 border-b border-gray-800 shrink-0">
+  <header class="md:hidden flex items-center justify-between px-4 py-3 bg-[#1c2224] border-b border-[#2a3033] shrink-0">
     <button
       on:click={() => sidebarOpen = !sidebarOpen}
-      class="p-2 -ml-2 rounded-lg hover:bg-gray-800 transition-colors"
+      class="p-2 -ml-2 rounded-lg hover:bg-[#252d30] transition-colors"
       aria-label="Menu"
     >
       <svg class="w-6 h-6 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -41,22 +41,22 @@
       </svg>
     </button>
     <div class="flex items-center gap-2">
-      <span class="text-amber-400 text-xl">◆</span>
+      <span class="text-[#5fb5d2] text-xl">◆</span>
       <span class="text-white font-bold">Vess</span>
     </div>
-    <div class="w-10" /> <!-- spacer for centering -->
+    <div class="w-10"></div> <!-- spacer for centering -->
   </header>
 
   <!-- Desktop sidebar + Mobile overlay sidebar -->
   <aside
-    class="fixed inset-y-0 left-0 z-40 w-64 bg-gray-900 border-r border-gray-800 flex flex-col p-4 transition-transform duration-200 md:static md:translate-x-0"
+    class="fixed inset-y-0 left-0 z-40 w-64 bg-[#1c2224] border-r border-[#2a3033] flex flex-col p-4 transition-transform duration-200 md:static md:translate-x-0"
     class:-translate-x-full={!sidebarOpen}
     class:translate-x-0={sidebarOpen}
   >
     <!-- Close button - mobile only -->
     <button
       on:click={() => sidebarOpen = false}
-      class="md:hidden self-end p-1 mb-2 rounded-lg hover:bg-gray-800 transition-colors"
+      class="md:hidden self-end p-1 mb-2 rounded-lg hover:bg-[#252d30] transition-colors"
       aria-label="Close menu"
     >
       <svg class="w-5 h-5 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -65,7 +65,7 @@
     </button>
 
     <div class="text-xl font-bold mb-8 flex items-center gap-2">
-      <span class="text-amber-400 text-2xl">◆</span>
+      <span class="text-[#5fb5d2] text-2xl">◆</span>
       <span class="text-white">Vess</span>
     </div>
 
@@ -73,10 +73,10 @@
       {#each tabs as item}
         <button
           class="flex items-center gap-3 px-4 py-2.5 rounded-lg text-left transition-colors"
-          class:text-amber-400={activeTab === item.id}
-          class:bg-gray-800={activeTab === item.id}
+          class:text-[#5fb5d2]={activeTab === item.id}
+          class:bg-[#252d30]={activeTab === item.id}
           class:text-gray-400={activeTab !== item.id}
-          class:hover:bg-gray-800={activeTab !== item.id}
+          class:hover:bg-[#252d30]={activeTab !== item.id}
           on:click={() => onNavigate(item.id)}
         >
           <span class="text-lg">{item.icon}</span>
@@ -85,7 +85,7 @@
       {/each}
     </nav>
 
-    <div class="text-xs text-gray-600 mt-4 border-t border-gray-800 pt-4 hidden md:block">
+    <div class="text-xs text-gray-600 mt-4 border-t border-[#2a3033] pt-4 hidden md:block">
       Vess Protocol &mdash; CLTV Time-Credit
     </div>
   </aside>
@@ -98,13 +98,13 @@
       on:keydown={(e) => e.key === 'Escape' && (sidebarOpen = false)}
       role="button"
       tabindex="0"
-    />
+    ></div>
   {/if}
 
   <!-- Main content -->
-  <main class="flex-1 overflow-y-auto p-4 md:p-6 pb-20 md:pb-6">
-    {#if activeTab === "dashboard"}
-      <Dashboard />
+  <main class="flex-1 overflow-hidden p-0 md:p-0 pb-20 md:pb-0">
+    {#if activeTab === "wallet"}
+      <HexWallet onNavigate={(t) => onNavigate(t as Tab)} />
     {:else if activeTab === "send"}
       <SendPanel />
     {:else if activeTab === "receive"}
@@ -115,15 +115,19 @@
       <MintPanel />
     {:else if activeTab === "node"}
       <NodeStatus />
+    {:else if activeTab === "swap"}
+      <div class="flex items-center justify-center h-full text-gray-500 text-sm">
+        Swap coming soon
+      </div>
     {/if}
   </main>
 
   <!-- Mobile bottom tab bar -->
-  <nav class="md:hidden fixed bottom-0 inset-x-0 z-40 bg-gray-900 border-t border-gray-800 flex justify-around items-center px-2 py-1.5 safe-area-bottom">
+  <nav class="md:hidden fixed bottom-0 inset-x-0 z-40 bg-[#1c2224] border-t border-[#2a3033] flex justify-around items-center px-2 py-1.5 safe-area-bottom">
     {#each tabs as item}
       <button
         class="flex flex-col items-center gap-0.5 py-1 px-2 rounded-lg min-w-0 flex-1 transition-colors"
-        class:text-amber-400={activeTab === item.id}
+        class:text-[#5fb5d2]={activeTab === item.id}
         class:text-gray-500={activeTab !== item.id}
         on:click={() => onNavigate(item.id)}
       >

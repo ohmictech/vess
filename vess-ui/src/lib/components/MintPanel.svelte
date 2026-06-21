@@ -35,7 +35,7 @@
 <div class="w-full max-w-lg mx-auto">
   <h1 class="text-2xl font-bold mb-6">Time-Lock Mint</h1>
 
-  <div class="bg-gray-900 rounded-xl border border-gray-800 p-6 space-y-4">
+  <div class="bg-[#1c2224] rounded-xl border border-[#2a3033] p-6 space-y-4">
     <p class="text-sm text-gray-400">Lock BTC via CLTV and receive Vess time-credits. Your BTC returns after the lock expires.</p>
 
     <div>
@@ -44,7 +44,7 @@
         type="number"
         bind:value={amountSats}
         min="1"
-        class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-white focus:outline-none focus:border-amber-500"
+        class="w-full bg-[#252d30] border border-[#323a3e] rounded-lg px-3 py-2 text-white focus:outline-none focus:border-[#5fb5d2]"
       />
     </div>
 
@@ -56,7 +56,7 @@
         min="0.1"
         max="10"
         step="0.1"
-        class="w-full accent-amber-500"
+        class="w-full accent-[#5fb5d2]"
       />
       <div class="flex justify-between text-xs text-gray-600 mt-1">
         <span>0.1 yr</span>
@@ -64,10 +64,10 @@
       </div>
     </div>
 
-    <div class="bg-gray-800 rounded-lg p-4 space-y-2 text-sm">
+    <div class="bg-[#252d30] rounded-lg p-4 space-y-2 text-sm">
       <div class="flex justify-between">
         <span class="text-gray-400">Vichor Required</span>
-        <span class:text-amber-400={vichorRequired > 0} class:text-gray-500={vichorRequired === 0}>
+        <span class:text-[#5fb5d2]={vichorRequired > 0} class:text-gray-500={vichorRequired === 0}>
           {vichorRequired}
         </span>
       </div>
@@ -79,16 +79,16 @@
             bind:value={vichorBurned}
             min="0"
             max={vichorRequired}
-            class="w-full bg-gray-700 border border-gray-600 rounded px-2 py-1 text-white text-sm focus:outline-none focus:border-amber-500"
+            class="w-full bg-[#323a3e] border border-[#3d474b] rounded px-2 py-1 text-white text-sm focus:outline-none focus:border-[#5fb5d2]"
           />
           {#if vichorDeficit > 0}
             <p class="text-red-400 text-xs mt-1">Need {vichorDeficit} more Vichor</p>
           {/if}
         </div>
       {/if}
-      <div class="flex justify-between pt-2 border-t border-gray-700">
+      <div class="flex justify-between pt-2 border-t border-[#323a3e]">
         <span class="text-gray-400">Vess to Mint</span>
-        <span class="text-amber-400 font-semibold">~{vessAmount}</span>
+        <span class="text-[#5fb5d2] font-semibold">~{vessAmount}</span>
       </div>
     </div>
 
@@ -96,8 +96,8 @@
       on:click={handleMint}
       disabled={minting || !canMint}
       class="w-full py-3 rounded-lg font-semibold transition-colors disabled:opacity-50"
-      class:bg-amber-500:hover:bg-amber-600:text-black={!minting}
-      class:bg-gray-700:text-gray-400={minting}
+      class:bg-[#5fb5d2]:hover:bg-[#4a9db8]:text-black={!minting}
+      class:bg-[#323a3e]:text-gray-400={minting}
     >
       {minting ? "Creating Time-Lock..." : "Create Time-Lock"}
     </button>

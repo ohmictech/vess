@@ -30,17 +30,17 @@
   {:else}
     <!-- Balance cards — stack on mobile, row on desktop -->
     <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 md:gap-4 mb-6 md:mb-8">
-      <div class="bg-gray-900 rounded-xl p-4 md:p-5 border border-gray-800">
+      <div class="bg-[#1c2224] rounded-xl p-4 md:p-5 border border-[#2a3033]">
         <div class="text-sm text-gray-500 mb-1">Vess Balance</div>
-        <div class="text-2xl md:text-3xl font-bold text-amber-400">{balance?.balance ?? 0}</div>
+        <div class="text-2xl md:text-3xl font-bold text-[#5fb5d2]">{balance?.balance ?? 0}</div>
         <div class="text-xs text-gray-600 mt-1">sat-block credits</div>
       </div>
-      <div class="bg-gray-900 rounded-xl p-4 md:p-5 border border-gray-800">
+      <div class="bg-[#1c2224] rounded-xl p-4 md:p-5 border border-[#2a3033]">
         <div class="text-sm text-gray-500 mb-1">Bills</div>
         <div class="text-2xl md:text-3xl font-bold text-white">{balance?.bill_count ?? 0}</div>
         <div class="text-xs text-gray-600 mt-1">bearer instruments</div>
       </div>
-      <div class="bg-gray-900 rounded-xl p-4 md:p-5 border border-gray-800 sm:col-span-2 lg:col-span-1">
+      <div class="bg-[#1c2224] rounded-xl p-4 md:p-5 border border-[#2a3033] sm:col-span-2 lg:col-span-1">
         <div class="text-sm text-gray-500 mb-1">Watch-Only</div>
         <div class="text-2xl md:text-3xl font-bold text-gray-300">{balance?.watch_only_balance ?? 0}</div>
         <div class="text-xs text-gray-600 mt-1">unclaimed bills</div>
@@ -48,7 +48,7 @@
     </div>
 
     <!-- Bill list -->
-    <div class="bg-gray-900 rounded-xl border border-gray-800 p-4 md:p-5">
+    <div class="bg-[#1c2224] rounded-xl border border-[#2a3033] p-4 md:p-5">
       <h2 class="text-lg font-semibold mb-4">Bills</h2>
       {#if bills.length === 0}
         <p class="text-gray-500 text-sm">No bills yet. Lock some BTC via Time-Lock Mint.</p>
@@ -58,7 +58,7 @@
           <div class="inline-block min-w-full align-middle px-4 md:px-0">
             <table class="w-full text-sm">
               <thead>
-                <tr class="text-gray-500 border-b border-gray-800">
+                <tr class="text-gray-500 border-b border-[#2a3033]">
                   <th class="text-left py-2 pr-4 whitespace-nowrap">Denomination</th>
                   <th class="text-left py-2 pr-4 whitespace-nowrap">Asset</th>
                   <th class="text-left py-2 pr-4 hidden sm:table-cell">Mint ID</th>
@@ -67,10 +67,10 @@
               </thead>
               <tbody>
                 {#each bills as bill}
-                  <tr class="border-b border-gray-800/50 hover:bg-gray-800/30">
+                  <tr class="border-b border-[#2a3033]/50 hover:bg-[#252d30]/30">
                     <td class="py-2 pr-4 font-medium">{bill.denomination}</td>
                     <td class="py-2 pr-4">
-                      <span class="px-2 py-0.5 rounded text-xs {bill.asset === 'btc' ? 'bg-amber-900/30 text-amber-400' : 'bg-purple-900/30 text-purple-400'}">
+                      <span class="px-2 py-0.5 rounded text-xs {bill.asset === 'btc' ? 'bg-[#5fb5d2]/20 text-[#5fb5d2]' : 'bg-[#ccff00]/20 text-[#ccff00]'}">
                         {bill.asset}
                       </span>
                     </td>

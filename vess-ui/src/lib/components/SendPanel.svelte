@@ -41,16 +41,16 @@
 <div class="w-full max-w-lg mx-auto">
   <h1 class="text-2xl font-bold mb-6">Send Vess</h1>
 
-  <div class="bg-gray-900 rounded-xl border border-gray-800 p-6 space-y-4">
+  <div class="bg-[#1c2224] rounded-xl border border-[#2a3033] p-6 space-y-4">
     <div>
       <label class="block text-sm text-gray-400 mb-1">Recipient Tag</label>
       <div class="flex gap-2">
         <input
           bind:value={recipientTag}
           placeholder="+ALICE"
-          class="flex-1 bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-white placeholder-gray-600 focus:outline-none focus:border-amber-500"
+          class="flex-1 bg-[#252d30] border border-[#323a3e] rounded-lg px-3 py-2 text-white placeholder-[#5a6468] focus:outline-none focus:border-[#5fb5d2]"
         />
-        <button on:click={handleLookup} class="px-3 py-2 bg-gray-800 hover:bg-gray-700 rounded-lg text-sm transition-colors">
+        <button on:click={handleLookup} class="px-3 py-2 bg-[#252d30] hover:bg-[#323a3e] rounded-lg text-sm transition-colors">
           Lookup
         </button>
       </div>
@@ -65,7 +65,7 @@
         type="number"
         bind:value={amount}
         min="1"
-        class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-white placeholder-gray-600 focus:outline-none focus:border-amber-500"
+        class="w-full bg-[#252d30] border border-[#323a3e] rounded-lg px-3 py-2 text-white placeholder-[#5a6468] focus:outline-none focus:border-[#5fb5d2]"
       />
     </div>
 
@@ -74,7 +74,7 @@
       <input
         bind:value={memo}
         placeholder='e.g. "Invoice #123"'
-        class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-white placeholder-gray-600 focus:outline-none focus:border-amber-500"
+        class="w-full bg-[#252d30] border border-[#323a3e] rounded-lg px-3 py-2 text-white placeholder-[#5a6468] focus:outline-none focus:border-[#5fb5d2]"
       />
     </div>
 
@@ -82,8 +82,8 @@
       on:click={handleSend}
       disabled={sending || !recipientTag || !amount}
       class="w-full py-3 rounded-lg font-semibold transition-colors disabled:opacity-50"
-      class:bg-amber-500:hover:bg-amber-600:text-black={!sending}
-      class:bg-gray-700:text-gray-400={sending}
+      class:bg-[#5fb5d2]:hover:bg-[#4a9db8]:text-black={!sending}
+      class:bg-[#323a3e]:text-gray-400={sending}
     >
       {sending ? "Sending..." : "Send"}
     </button>

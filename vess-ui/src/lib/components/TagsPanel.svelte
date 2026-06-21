@@ -39,7 +39,7 @@
   <h1 class="text-2xl font-bold mb-6">Tags</h1>
 
   <!-- Register -->
-  <div class="bg-gray-900 rounded-xl border border-gray-800 p-6 mb-6">
+  <div class="bg-[#1c2224] rounded-xl border border-[#2a3033] p-6 mb-6">
     <h2 class="text-lg font-semibold mb-4">Register Tag</h2>
     <div class="flex gap-2">
       <span class="flex items-center text-gray-500">+</span>
@@ -47,12 +47,12 @@
         bind:value={tag}
         placeholder="alice"
         maxlength="20"
-        class="flex-1 bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-white placeholder-gray-600 focus:outline-none focus:border-amber-500"
+        class="flex-1 bg-[#252d30] border border-[#323a3e] rounded-lg px-3 py-2 text-white placeholder-[#5a6468] focus:outline-none focus:border-[#5fb5d2]"
       />
       <button
         on:click={handleRegister}
         disabled={registering || !tag}
-        class="px-4 py-2 bg-amber-500 hover:bg-amber-600 text-black rounded-lg font-medium transition-colors disabled:opacity-50"
+        class="px-4 py-2 bg-[#5fb5d2] hover:bg-[#4a9db8] text-black rounded-lg font-medium transition-colors disabled:opacity-50"
       >
         {registering ? "Mining PoW..." : "Register"}
       </button>
@@ -67,15 +67,15 @@
   </div>
 
   <!-- Lookup -->
-  <div class="bg-gray-900 rounded-xl border border-gray-800 p-6">
+  <div class="bg-[#1c2224] rounded-xl border border-[#2a3033] p-6">
     <h2 class="text-lg font-semibold mb-4">Lookup Tag</h2>
     <div class="flex gap-2">
       <input
         bind:value={lookupTagName}
         placeholder="+ALICE"
-        class="flex-1 bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-white placeholder-gray-600 focus:outline-none focus:border-amber-500"
+        class="flex-1 bg-[#252d30] border border-[#323a3e] rounded-lg px-3 py-2 text-white placeholder-[#5a6468] focus:outline-none focus:border-[#5fb5d2]"
       />
-      <button on:click={handleLookup} class="px-4 py-2 bg-gray-800 hover:bg-gray-700 rounded-lg font-medium transition-colors">
+      <button on:click={handleLookup} class="px-4 py-2 bg-[#252d30] hover:bg-[#323a3e] rounded-lg font-medium transition-colors">
         Lookup
       </button>
     </div>

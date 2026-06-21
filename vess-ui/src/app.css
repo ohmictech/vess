@@ -1,8 +1,8 @@
 @import "tailwindcss";
 
 :root {
-  --accent: #f59e0b;
-  --accent-dark: #d97706;
+  --accent: #5fb5d2;
+  --accent-dark: #4a9db8;
   --safe-area-top: env(safe-area-inset-top, 0px);
   --safe-area-bottom: env(safe-area-inset-bottom, 0px);
   --safe-area-left: env(safe-area-inset-left, 0px);
@@ -39,4 +39,25 @@ input, textarea {
   }
 }
 
-html, body { overflow: hidden; height: 100%; }
+html, body, #app {
+  overflow: hidden;
+  height: 100%;
+  background: #1a1a1a;
+}
+
+/* Sci-fi scanline overlay (subtle) */
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 9999;
+  background: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 2px,
+    rgba(0,0,0,0.015) 2px,
+    rgba(0,0,0,0.015) 4px
+  );
+  opacity: 0.5;
+}
