@@ -1,12 +1,18 @@
 <script lang="ts">
   import { registerTag, lookupTag } from "../rpc/client";
 
+  export let asset: "vess" | "bitcoin" | "vichor" = "vess";
+
   let tag = "";
   let lookupTagName = "";
   let lookupResult = "";
   let registering = false;
   let result = "";
   let error = "";
+
+  $: assetColor = asset === "vess" ? "#5fb5d2" : asset === "vichor" ? "#ccff00" : "#f28e13";
+  $: inputClass = "flex-1 rounded-lg px-3 py-2 text-[#1a1a1a] placeholder-[#3d484c] focus:outline-none transition-colors";
+  $: inputStyle = `background: ${assetColor}18`;
 
   async function handleRegister() {
     if (!tag) return;
@@ -47,7 +53,8 @@
         bind:value={tag}
         placeholder="alice"
         maxlength="20"
-        class="flex-1 bg-[#252d30] border border-[#323a3e] rounded-lg px-3 py-2 text-white placeholder-[#5a6468] focus:outline-none focus:border-[#5fb5d2]"
+        class={inputClass}
+        style={inputStyle}
       />
       <button
         on:click={handleRegister}
@@ -73,7 +80,8 @@
       <input
         bind:value={lookupTagName}
         placeholder="+ALICE"
-        class="flex-1 bg-[#252d30] border border-[#323a3e] rounded-lg px-3 py-2 text-white placeholder-[#5a6468] focus:outline-none focus:border-[#5fb5d2]"
+        class={inputClass}
+        style={inputStyle}
       />
       <button on:click={handleLookup} class="px-4 py-2 bg-[#252d30] hover:bg-[#323a3e] rounded-lg font-medium transition-colors">
         Lookup

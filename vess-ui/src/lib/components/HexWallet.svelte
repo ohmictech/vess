@@ -5,13 +5,14 @@
   // ── Types ──────────────────────────────────────────────
   type Asset = "vess" | "bitcoin" | "vichor";
   type Mode = "idle" | "pressed" | "dragging";
-  type ActionId = "send" | "add" | "swap" | "settings";
+  type ActionId = "send" | "add" | "mint" | "settings";
 
   interface AssetInfo {
     label: string;
     color: string;
     glow: string;
     icon: string;
+    ticker: string;
   }
 
   interface HexItem {
@@ -32,27 +33,28 @@
   });
 
   // ── State ─────────────────────────────────────────────
-  let selected: Asset = "vess";
+  export let selectedAsset: Asset = "vess";
   let mode: Mode = "idle";
   let dragTarget: number | null = null;
 
   const ASSETS: Record<Asset, AssetInfo> = {
-    vess:   { label: "Vess",    color: "#5fb5d2", glow: "rgba(95,181,210,0.35)",   icon: "◆" },
-    bitcoin:{ label: "Bitcoin", color: "#f28e13", glow: "rgba(242,142,19,0.35)",   icon: "₿" },
-    vichor: { label: "Vichor",  color: "#ccff00", glow: "rgba(204,255,0,0.35)",    icon: "⬡" },
+    vess:   { label: "Vess",    color: "#5fb5d2", glow: "rgba(95,181,210,0.35)",   icon: "/vessicon.png",    ticker: "/vessicon.png" },
+    bitcoin:{ label: "Bitcoin", color: "#f28e13", glow: "rgba(242,142,19,0.35)",   icon: "/bitcoinicon.png", ticker: "/saticon.png" },
+    vichor: { label: "Vichor",  color: "#ccff00", glow: "rgba(204,255,0,0.35)",    icon: "/vichoricon.png",  ticker: "/vichoricon.png" },
   };
 
   const ACTION_COLORS: Record<ActionId, string> = {
     send:     "#3b82f6",
     add:      "#10b981",
-    swap:     "#ef4444",
+    mint:     "#eab308",
     settings: "#6b7280",
   };
 
   // ── Hexagon geometry (pointy-top) ─────────────────────
-  const R = 30;                         // hex radius in SVG units
+  const R = 42;                         // hex radius in SVG units
   const SQRT3 = Math.sqrt(3);
-  const CENTER = { x: 0, y: 80 };       // ~30% from viewBox bottom
+  const SPACING = 1.1;                  // gap multiplier between hexagons
+  const CENTER = { x: 0, y: 112 };      // ~26% from viewBox bottom
 
   // Pre-compute 6 neighbor offsets (axial coords → pixel)
   const NEIGHBOR_AXIAL = [
@@ -66,13 +68,26 @@
 
   function axialToPixel(q: number, r: number) {
     return {
-      x: CENTER.x + SQRT3 * (q + r / 2) * R,
-      y: CENTER.y + 1.5 * r * R,
+      x: CENTER.x + SQRT3 * (q + r / 2) * R * SPACING,
+      y: CENTER.y + 1.5 * r * R * SPACING,
     };
   }
 
   const NEIGHBOR_PX = NEIGHBOR_AXIAL.map(({ q, r }) => axialToPixel(q, r));
   const ALL_POSITIONS = [CENTER, ...NEIGHBOR_PX];
+
+  // Push a position radially outward from center by a given amount
+  function pushOut(pos: { x: number; y: number }, amount: number) {
+    const dx = pos.x - CENTER.x;
+    const dy = pos.y - CENTER.y;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    if (dist < 0.01) return { x: pos.x, y: pos.y };
+    const factor = 1 + amount / dist;
+    return {
+      x: CENTER.x + dx * factor,
+      y: CENTER.y + dy * factor,
+    };
+  }
 
   // SVG hexagon path (pointy-top, first vertex at top)
   function hexPath(r: number): string {
@@ -81,28 +96,44 @@
       const a = (Math.PI / 180) * (60 * i - 90);
       pts.push(`${(r * Math.cos(a)).toFixed(3)},${(r * Math.sin(a)).toFixed(3)}`);
     }
-    return pts.join(" ");
+    return `M${pts.join(" L")} Z`;
+  }
+
+  // Per-asset image positioning (multipliers of R)
+  const IMG_LAYOUT: Record<Asset, { ox: number; oy: number; w: number; h: number }> = {
+    vess:    { ox: -0.42, oy: -0.44, w: 0.84, h: 0.84 },
+    bitcoin: { ox: -0.43, oy: -0.46, w: 0.86, h: 0.86 },
+    vichor:  { ox: -0.32, oy: -0.42, w: 0.64, h: 0.64 },
+  };
+
+  function imgLayout(asset: Asset) {
+    const l = IMG_LAYOUT[asset];
+    return {
+      x: l.ox * R,
+      y: l.oy * R,
+      w: l.w * R,
+      h: l.h * R,
+    };
   }
 
   const DARK_ICON = "#1c2224";           // panel navy for icons on asset hexes & action drag targets
 
   const H = hexPath(R);                 // outer hex path
-  const HI = hexPath(R * 0.82);         // inner (icon area) hex path
 
   // ── Derived: outer assets ─────────────────────────────
-  $: otherAssets = (["vess", "bitcoin", "vichor"] as Asset[]).filter(a => a !== selected);
+  $: otherAssets = (["vess", "bitcoin", "vichor"] as Asset[]).filter(a => a !== selectedAsset);
 
   // ── Build hex item for each grid position ─────────────
   $: items = ALL_POSITIONS.map((pos, i): HexItem => {
     if (i === 0) {
       // Center — current selected asset
-      const a = ASSETS[selected];
-      return { id: selected, label: a.label, color: a.color, glow: a.glow, icon: a.icon, isAsset: true, isCenter: true };
+      const a = ASSETS[selectedAsset];
+      return { id: selectedAsset, label: a.label, color: a.color, glow: a.glow, icon: a.icon, isAsset: true, isCenter: true };
     }
     switch (i) {
       case 1: return { id: "send",  label: "Send",  color: ACTION_COLORS.send,  glow: "rgba(59,130,246,0.3)",  icon: "➤", isAsset: false, isCenter: false };
-      case 2: return { id: "add",   label: "Add",   color: ACTION_COLORS.add,   glow: "rgba(16,185,129,0.3)",  icon: "+", isAsset: false, isCenter: false };
-      case 3: return { id: "swap",  label: "Swap",  color: ACTION_COLORS.swap,  glow: "rgba(239,68,68,0.3)",   icon: "⇄", isAsset: false, isCenter: false };
+      case 2: return { id: "add",   label: "Receive", color: ACTION_COLORS.add,   glow: "rgba(16,185,129,0.3)",  icon: "↓", isAsset: false, isCenter: false };
+      case 3: return { id: "mint",  label: "Mint",    color: ACTION_COLORS.mint,  glow: "rgba(234,179,8,0.3)",   icon: "+", isAsset: false, isCenter: false };
       case 4: return { id: "settings", label: "Settings", color: ACTION_COLORS.settings, glow: "rgba(107,114,128,0.3)", icon: "⚙", isAsset: false, isCenter: false };
       case 5: {
         const a = ASSETS[otherAssets[0]];
@@ -117,10 +148,10 @@
   });
 
   // ── Amount text ───────────────────────────────────────
-  $: currentAsset = ASSETS[selected];
+  $: currentAsset = ASSETS[selectedAsset];
   $: displayAmount = (() => {
-    if (!balance) return "---";
-    switch (selected) {
+    if (!balance) return "0";
+    switch (selectedAsset) {
       case "vess":    return String(balance.balance ?? 0);
       case "bitcoin": return (balance.watch_only_balance ?? 0).toFixed(8);
       case "vichor":  return String(balance.vichor_balance ?? 0);
@@ -188,14 +219,21 @@
     if (!item) return;
 
     if (item.isAsset && !item.isCenter) {
-      // Swap: set selected to that asset
-      selected = item.id as Asset;
+      // Swap: set selectedAsset to that asset
+      selectedAsset = item.id as Asset;
     } else if (!item.isAsset) {
       // Action
       switch (item.id) {
         case "send":     onNavigate("send"); break;
-        case "add":      onNavigate("mint"); break;
-        case "swap":     onNavigate("swap"); break;
+        case "add":
+          if (selectedAsset === "bitcoin") onNavigate("bitcoin_receive");
+          else onNavigate("receive");
+          break;
+        case "mint":
+          if (selectedAsset === "bitcoin") onNavigate("buy_btc");
+          else if (selectedAsset === "vichor") onNavigate("buy_vichor");
+          else onNavigate("mint");
+          break;
         case "settings": onNavigate("node"); break;
       }
     }
@@ -214,15 +252,20 @@
     class:visible={mode !== "idle"}
     style="color: {currentAsset.color}; text-shadow: 0 0 32px {currentAsset.glow}"
   >
-    <span class="amount-label">{currentAsset.label}</span>
-    <span class="amount-value">{displayAmount}</span>
+    <div class="amount-row">
+      <div
+        class="amount-ticker"
+        style="mask-image: url({currentAsset.ticker}); -webkit-mask-image: url({currentAsset.ticker})"
+      ></div>
+      <span class="amount-value">{displayAmount}</span>
+    </div>
   </div>
 
   <!-- SVG hexagonal grid -->
   <svg
     bind:this={svgEl}
     class="hex-svg"
-    viewBox="-120 -170 240 380"
+    viewBox="-160 -220 320 500"
     preserveAspectRatio="xMidYMid meet"
     on:pointerdown={onDown}
     on:pointermove={onMove}
@@ -235,6 +278,14 @@
       <!-- Glow filter for outer hexagons -->
       <filter id="hexGlow" x="-60%" y="-60%" width="220%" height="220%">
         <feGaussianBlur in="SourceGraphic" stdDeviation="2.5" />
+      </filter>
+      <!-- Glow filter for center hex -->
+      <filter id="centerGlow" x="-80%" y="-80%" width="260%" height="260%">
+        <feGaussianBlur in="SourceGraphic" stdDeviation="6" result="blur" />
+      </filter>
+      <!-- Lighter glow for tooltip text -->
+      <filter id="textGlow" x="-40%" y="-40%" width="180%" height="180%">
+        <feGaussianBlur in="SourceGraphic" stdDeviation="0.5" />
       </filter>
       <!-- Subtle noise texture for sci-fi feel -->
       <filter id="noise">
@@ -263,67 +314,104 @@
     <g opacity="0.06">
       <line x1="-200" y1="0" x2="200" y2="0" stroke="currentColor" stroke-width="0.3" />
       <line x1="0" y1="-200" x2="0" y2="200" stroke="currentColor" stroke-width="0.3" />
-      <circle cx="0" cy={CENTER.y} r={R * 1.8} fill="none" stroke="currentColor" stroke-width="0.3" stroke-dasharray="3 6" />
+      <circle cx="0" cy={CENTER.y} r={R * SPACING * 1.9} fill="none" stroke="currentColor" stroke-width="0.3" stroke-dasharray="3 6" />
     </g>
 
-    {#each items as item, i}
+    <!-- Outer hexagons — render first (behind center), float out on press -->
+    {#each items.slice(1) as item, idx}
+      {@const i = idx + 1}
       {@const pos = ALL_POSITIONS[i]}
-      {@const isCenter = i === 0}
       {@const isTarget = mode === "dragging" && dragTarget === i}
-      {@const isOuter = !isCenter}
-      {@const visible = isCenter || mode !== "idle"}
+      {@const targetOuterIdx = dragTarget !== null ? dragTarget - 1 : -1}
+      {@const isAdjacent = dragTarget !== null && !isTarget && (
+        idx === (targetOuterIdx - 1 + 6) % 6 || idx === (targetOuterIdx + 1) % 6
+      )}
+      {@const pushedPos = isTarget ? pushOut(pos, 8) : isAdjacent ? pushOut(pos, 4) : pos}
+      {@const pushDx = pushedPos.x - pos.x}
+      {@const pushDy = pushedPos.y - pos.y}
+      {@const tooltipPos = pushOut(pos, R + 24)}
       {@const assetFill = item.isAsset ? item.color : "transparent"}
       {@const assetFillOpacity = item.isAsset ? 0.9 : 0}
       {@const iconColor = item.isAsset ? DARK_ICON : (isTarget ? DARK_ICON : item.color)}
 
       <g
-        transform="translate({pos.x.toFixed(2)},{pos.y.toFixed(2)})"
-        class="hex-group"
-        class:hex-hidden={!visible}
-        class:hex-target={isTarget}
-        class:hex-center={isCenter}
-        style="color: {item.color}"
+        class="hex-float-wrapper"
+        class:hex-floated={mode !== "idle"}
+        style="transform-origin: {CENTER.x}px {CENTER.y}px"
       >
-        <!-- Hex background fill (solid for assets, subtle for actions) -->
-        <path
-          d={H}
-          fill={assetFill}
-          opacity={assetFillOpacity}
-          class="hex-fill-solid"
-        />
-
-        <!-- Hex border -->
-        <path
-          d={H}
-          fill="none"
-          stroke="currentColor"
-          stroke-width={item.isAsset ? 1.5 : 1.2}
-          opacity={item.isAsset ? 1 : (isCenter ? 0.8 : 0.5)}
-          class="hex-border"
-        />
-
-        <!-- Action hex: subtle fill normally, solid fill on drag target -->
-        {#if !item.isAsset}
+        <g
+          transform="translate({pos.x.toFixed(2)},{pos.y.toFixed(2)})"
+          class="hex-group"
+          style="color: {item.color}"
+        >
+          <g
+            class="hex-scale"
+            class:hex-bumped={isTarget || isAdjacent}
+            class:hex-target={isTarget}
+            style="--push-x: {pushDx.toFixed(1)}; --push-y: {pushDy.toFixed(1)}; --scale: {isTarget ? 1.08 : 1}"
+          >
+          <!-- Hex background fill (solid for assets, subtle for actions) -->
           <path
             d={H}
-            fill="currentColor"
-            opacity={isTarget ? 0.88 : (isCenter ? 0.08 : 0.05)}
-            class="hex-fill"
+            fill={assetFill}
+            opacity={assetFillOpacity}
+            class="hex-fill-solid"
           />
-        {/if}
 
-        <!-- Asset hex: shimmer sweep on drag target -->
-        {#if item.isAsset && isTarget}
+          <!-- Hex border -->
           <path
             d={H}
-            fill="url(#shimmer)"
-            opacity="1"
-            class="hex-shimmer"
+            fill="none"
+            stroke="currentColor"
+            stroke-width={item.isAsset ? 1.5 : 1.2}
+            opacity={item.isAsset ? 1 : 0.5}
+            class="hex-border"
           />
-        {/if}
 
-        <!-- Glow ring (outer hexes on hover) -->
-        {#if isOuter}
+          <!-- Action hex: subtle fill normally, solid fill on drag target -->
+          {#if !item.isAsset}
+            <path
+              d={H}
+              fill="currentColor"
+              opacity={isTarget ? 0.88 : 0.05}
+              class="hex-fill"
+            />
+          {/if}
+
+          <!-- Asset hex: shimmer sweep on drag target -->
+          {#if item.isAsset && isTarget}
+            <path
+              d={H}
+              fill="url(#shimmer)"
+              opacity="1"
+              class="hex-shimmer"
+            />
+          {/if}
+
+          <!-- Energy beam from center to drag target -->
+          {#if isTarget}
+            {@const bdx = CENTER.x - pos.x}
+            {@const bdy = CENTER.y - pos.y}
+            {@const bdist = Math.sqrt(bdx * bdx + bdy * bdy)}
+            {@const bnx = -bdy / bdist}
+            {@const bny = bdx / bdist}
+            {@const cw = R * 0.55}
+            {@const hw = R * 0.2}
+            <defs>
+              <linearGradient id="beam-{i}" x1="{bdx}" y1="{bdy}" x2="0" y2="0" gradientUnits="userSpaceOnUse">
+                <stop offset="0%" stop-color={ASSETS[selectedAsset].color} stop-opacity="0.5" />
+                <stop offset="50%" stop-color={item.color} stop-opacity="0.4" />
+                <stop offset="100%" stop-color={item.color} stop-opacity="0.08" />
+              </linearGradient>
+            </defs>
+            <path
+              d="M{bdx + bnx * cw},{bdy + bny * cw} L{bnx * hw},{bny * hw} L{-bnx * hw},{-bny * hw} L{bdx - bnx * cw},{bdy - bny * cw} Z"
+              fill="url(#beam-{i})"
+              filter="url(#centerGlow)"
+            />
+          {/if}
+
+          <!-- Glow ring -->
           <path
             d={H}
             fill="none"
@@ -333,51 +421,140 @@
             filter="url(#hexGlow)"
             class="hex-glow-ring"
           />
-        {/if}
 
-        <!-- Center hex has subtle radial fill -->
-        {#if isCenter}
-          <path d={H} fill="url(#centerGrad)" />
-          <!-- Inner hex outline -->
-          <path
-            d={HI}
-            fill="none"
-            stroke={item.isAsset ? DARK_ICON : "currentColor"}
-            stroke-width="0.7"
-            opacity="0.3"
-          />
-        {/if}
+          <!-- Icon -->
+          {#if item.isAsset}
+            {@const il = imgLayout(item.id as Asset)}
+            <image
+              href={item.icon}
+              x={il.x.toFixed(1)}
+              y={il.y.toFixed(1)}
+              width={il.w.toFixed(1)}
+              height={il.h.toFixed(1)}
+              class="hex-icon-img"
+            />
+          {:else}
+            <text
+              x="0"
+              y="0"
+              text-anchor="middle"
+              dominant-baseline="central"
+              class="hex-icon-text"
+              fill={iconColor}
+              opacity="0.85"
+            >{item.icon}</text>
+          {/if}
 
-        <!-- Icon -->
-        <text
-          x="0"
-          y={isCenter ? "2" : "1"}
-          text-anchor="middle"
-          dominant-baseline="central"
-          class="hex-icon"
-          class:hex-icon-lg={isCenter}
-          fill={iconColor}
-          opacity={isCenter ? 1 : 0.85}
-        >{item.icon}</text>
-
-        <!-- Label (outer hexes only, appears on press) -->
-        {#if isOuter}
-          <text
-            x="0"
-            y={R + 17}
-            text-anchor="middle"
-            class="hex-label"
-            fill="currentColor"
-            opacity={mode !== "idle" ? 0.65 : 0}
-          >{item.label}</text>
-        {/if}
+          <!-- Tooltip label on drag target -->
+          {#if isTarget}
+            <text
+              x={tooltipPos.x - pos.x}
+              y={tooltipPos.y - pos.y}
+              text-anchor="middle"
+              dominant-baseline="central"
+              class="hex-tooltip"
+              fill="currentColor"
+            >{item.label}</text>
+          {/if}
+        </g>
+        </g>
       </g>
     {/each}
+
+    <!-- Center hexagon — rendered last (on top) -->
+    {#if true}
+      {@const centerItem = items[0]}
+      {@const centerPos = ALL_POSITIONS[0]}
+    <g
+      transform="translate({centerPos.x.toFixed(2)},{centerPos.y.toFixed(2)})"
+      style="color: {centerItem.color}"
+    >
+      <!-- Chromatic aberration wobble — red channel -->
+      <path
+        d={H}
+        fill="rgba(255,60,60,0.22)"
+      >
+        <animateTransform attributeName="transform" type="translate" values="-3,-2;4,3;-5,-1;2,5;-4,-3;5,-2;-2,4;-3,-2" dur="0.35s" repeatCount="indefinite" />
+      </path>
+
+      <!-- Chromatic aberration wobble — blue channel -->
+      <path
+        d={H}
+        fill="rgba(40,120,255,0.22)"
+      >
+        <animateTransform attributeName="transform" type="translate" values="3,2;-4,-3;5,1;-2,-5;4,3;-5,2;2,-4;3,2" dur="0.38s" repeatCount="indefinite" />
+      </path>
+
+      <!-- Animated glow layer behind hex -->
+      <path
+        d={H}
+        fill="currentColor"
+        opacity="0"
+        filter="url(#centerGlow)"
+      >
+        <animate attributeName="opacity" values="0.15;0.55;0.15" dur="2.5s" repeatCount="indefinite" />
+      </path>
+
+      <g class="hex-group hex-center">
+      <!-- Hex background fill -->
+      <path
+        d={H}
+        fill={centerItem.color}
+        opacity="0.9"
+        class="hex-fill-solid"
+      />
+
+      <!-- Hex border -->
+      <path
+        d={H}
+        fill="none"
+        stroke="currentColor"
+        stroke-width="1.5"
+        opacity="1"
+        class="hex-border"
+      />
+
+      <!-- Radial gradient overlay -->
+      <path d={H} fill="url(#centerGrad)" />
+
+      <!-- Icon -->
+      {#if centerItem.isAsset}
+        {@const il = imgLayout(centerItem.id as Asset)}
+        <image
+          href={centerItem.icon}
+          x={il.x.toFixed(1)}
+          y={il.y.toFixed(1)}
+          width={il.w.toFixed(1)}
+          height={il.h.toFixed(1)}
+          class="hex-icon-img"
+        />
+      {:else}
+        <text
+          x="0"
+          y="0"
+          text-anchor="middle"
+          dominant-baseline="central"
+          class="hex-icon-text hex-icon-text-lg"
+          fill={DARK_ICON}
+        >{centerItem.icon}</text>
+      {/if}
+    </g>
+    </g>
+    {/if}
   </svg>
 
   <!-- Hint text at bottom (idle only) -->
   <div class="hint-text" class:visible={mode === "idle"}>
     hold to navigate
+  </div>
+
+  <!-- Wallet tag — bottom-left, visible on press -->
+  <div
+    class="wallet-tag"
+    class:visible={mode !== "idle"}
+    style="color: {currentAsset.color}"
+  >
+    +ALICE
   </div>
 </div>
 
@@ -416,11 +593,20 @@
   .amount-readout.visible {
     opacity: 1;
   }
-  .amount-label {
-    font-size: 11px;
-    font-weight: 500;
-    letter-spacing: 0.12em;
-    text-transform: uppercase;
+  .amount-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .amount-ticker {
+    width: 26px;
+    height: 26px;
+    background: currentColor;
+    mask-size: contain;
+    mask-repeat: no-repeat;
+    -webkit-mask-size: contain;
+    -webkit-mask-repeat: no-repeat;
+    filter: drop-shadow(0 0 12px currentColor);
   }
   .amount-value {
     font-size: 34px;
@@ -430,17 +616,36 @@
     font-family: "Inter", "SF Mono", "Fira Code", monospace;
   }
 
-  /* ── Hex groups ─────────────────────────────────── */
-  .hex-group {
-    transition: opacity 0.3s ease, transform 0.25s ease;
-    cursor: pointer;
-  }
-  .hex-hidden {
+  /* ── Float-out wrapper (outer hexagons) ─────────────── */
+  .hex-float-wrapper {
+    transform: scale(0);
+    transform-box: view-box;
     opacity: 0;
     pointer-events: none;
-    transition: opacity 0.2s ease, transform 0.2s ease;
   }
-  .hex-center {
+  .hex-float-wrapper.hex-floated {
+    transform: scale(1);
+    opacity: 1;
+    pointer-events: auto;
+    animation: floatBounce 0.28s ease-out forwards;
+  }
+
+  @keyframes floatBounce {
+    0%   { transform: scale(0); opacity: 0; }
+    60%  { transform: scale(1.04); opacity: 1; }
+    85%  { transform: scale(0.97); }
+    100% { transform: scale(1); opacity: 1; }
+  }
+
+  /* ── Hex groups ─────────────────────────────────── */
+  .hex-group {
+    transition: opacity 0.3s ease;
+    cursor: pointer;
+  }
+
+  /* Scale wrapper for hover push-out (animated via CSS vars) */
+  .hex-scale {
+    transform: translate(calc(var(--push-x, 0) * 1px), calc(var(--push-y, 0) * 1px)) scale(var(--scale, 1));
     transition: transform 0.28s cubic-bezier(0.34, 1.56, 0.64, 1);
   }
 
@@ -467,19 +672,18 @@
     transition: opacity 0.2s ease, stroke 0.3s ease, fill 0.3s ease;
   }
 
-  .hex-icon {
-    font-size: 18px;
+  .hex-icon-text {
+    font-size: 34px;
     transition: opacity 0.2s ease, fill 0.25s ease;
   }
-  .hex-icon-lg {
-    font-size: 28px;
+  .hex-icon-text-lg {
+    font-size: 48px;
   }
 
-  .hex-label {
-    font-size: 10px;
-    font-weight: 500;
-    letter-spacing: 0.08em;
-    transition: opacity 0.25s ease;
+  .hex-icon-img {
+    filter: brightness(0) saturate(0);
+    opacity: 0.8;
+    transition: opacity 0.2s ease;
   }
 
   /* ── Hint ───────────────────────────────────────── */
@@ -501,7 +705,36 @@
     opacity: 0.6;
   }
 
-  /* ── Center hex idle pulse ──────────────────────── */
+  /* ── Wallet tag (bottom-left corner) ───────────── */
+  .wallet-tag {
+    position: absolute;
+    bottom: 24px;
+    left: 16px;
+    font-size: 13px;
+    font-weight: 500;
+    letter-spacing: 0.06em;
+    font-family: "Inter", "SF Mono", monospace;
+    opacity: 0;
+    transition: opacity 0.35s ease;
+    filter: drop-shadow(0 0 6px currentColor);
+    pointer-events: none;
+  }
+  .wallet-tag.visible {
+    opacity: 0.85;
+  }
+
+  /* ── Tooltip on drag target ────────────────────── */
+  .hex-tooltip {
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    opacity: 0;
+    transition: opacity 0.15s ease;
+  }
+  .hex-scale.hex-target .hex-tooltip {
+    opacity: 0.9;
+    filter: url(#textGlow);
+  }
   @keyframes idlePulse {
     0%, 100% { opacity: 0.7; }
     50% { opacity: 1; }

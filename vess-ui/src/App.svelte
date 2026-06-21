@@ -1,140 +1,175 @@
 <script lang="ts">
+  import { fade, scale } from "svelte/transition";
+  import { onMount } from "svelte";
   import HexWallet from "./lib/components/HexWallet.svelte";
   import SendPanel from "./lib/components/SendPanel.svelte";
   import ReceivePanel from "./lib/components/ReceivePanel.svelte";
   import TagsPanel from "./lib/components/TagsPanel.svelte";
   import NodeStatus from "./lib/components/NodeStatus.svelte";
   import MintPanel from "./lib/components/MintPanel.svelte";
+  import { listSwapOffers, type SwapOffer } from "./lib/rpc/client";
 
-  type Tab = "wallet" | "send" | "receive" | "tags" | "mint" | "node" | "swap";
+  type Tab = "wallet" | "send" | "receive" | "tags" | "mint" | "node" | "bitcoin_receive" | "buy_vichor" | "buy_btc";
+  type Asset = "vess" | "bitcoin" | "vichor";
 
-  let activeTab: Tab = "wallet";
-  let sidebarOpen = false;
+  let popup: Tab | null = null;
+  let currentAsset: Asset = "vess";
+  let btcAddress = "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh";
+  let btcCopied = false;
+
+  let swapOffers: SwapOffer[] = [];
+  let swapLoading = false;
+
+  onMount(() => {});
 
   function onNavigate(tab: Tab) {
-    activeTab = tab;
-    sidebarOpen = false;
+    popup = tab;
+    if (tab === "buy_vichor") loadSwapOffers();
   }
 
-  const tabs = [
-    { id: "wallet" as Tab, label: "Wallet", icon: "◆", short: "Home" },
-    { id: "send" as Tab, label: "Send", icon: "📤", short: "Send" },
-    { id: "receive" as Tab, label: "Receive", icon: "📥", short: "Recv" },
-    { id: "tags" as Tab, label: "Tags", icon: "🏷️", short: "Tags" },
-    { id: "mint" as Tab, label: "Time-Lock Mint", icon: "🔒", short: "Mint" },
-    { id: "node" as Tab, label: "Node", icon: "🌐", short: "Node" },
-  ] as const;
+  async function loadSwapOffers() {
+    swapLoading = true;
+    try {
+      swapOffers = await listSwapOffers();
+    } catch {
+      swapOffers = [];
+    } finally {
+      swapLoading = false;
+    }
+  }
+
+  function closePopup() {
+    popup = null;
+  }
+
+  function copyBtc() {
+    navigator.clipboard.writeText(btcAddress);
+    btcCopied = true;
+    setTimeout(() => btcCopied = false, 2000);
+  }
+
+  function buyBtc() {
+    window.open("https://buy.moonpay.com?apiKey=YOUR_API_KEY&currencyCode=btc", "_blank");
+  }
 </script>
 
-<svelte:window on:resize={() => sidebarOpen = false} />
+<div class="h-dvh w-full overflow-hidden bg-[#1a1a1a]">
+  <!-- HexWallet always visible -->
+  <HexWallet bind:selectedAsset={currentAsset} onNavigate={(t) => onNavigate(t as Tab)} />
 
-<div class="flex flex-col md:flex-row h-dvh overflow-hidden bg-[#1a1a1a]">
-  <!-- Mobile header bar -->
-  <header class="md:hidden flex items-center justify-between px-4 py-3 bg-[#1c2224] border-b border-[#2a3033] shrink-0">
-    <button
-      on:click={() => sidebarOpen = !sidebarOpen}
-      class="p-2 -ml-2 rounded-lg hover:bg-[#252d30] transition-colors"
-      aria-label="Menu"
-    >
-      <svg class="w-6 h-6 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16" />
-      </svg>
-    </button>
-    <div class="flex items-center gap-2">
-      <span class="text-[#5fb5d2] text-xl">◆</span>
-      <span class="text-white font-bold">Vess</span>
-    </div>
-    <div class="w-10"></div> <!-- spacer for centering -->
-  </header>
-
-  <!-- Desktop sidebar + Mobile overlay sidebar -->
-  <aside
-    class="fixed inset-y-0 left-0 z-40 w-64 bg-[#1c2224] border-r border-[#2a3033] flex flex-col p-4 transition-transform duration-200 md:static md:translate-x-0"
-    class:-translate-x-full={!sidebarOpen}
-    class:translate-x-0={sidebarOpen}
-  >
-    <!-- Close button - mobile only -->
-    <button
-      on:click={() => sidebarOpen = false}
-      class="md:hidden self-end p-1 mb-2 rounded-lg hover:bg-[#252d30] transition-colors"
-      aria-label="Close menu"
-    >
-      <svg class="w-5 h-5 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
-      </svg>
-    </button>
-
-    <div class="text-xl font-bold mb-8 flex items-center gap-2">
-      <span class="text-[#5fb5d2] text-2xl">◆</span>
-      <span class="text-white">Vess</span>
-    </div>
-
-    <nav class="flex flex-col gap-1 flex-1">
-      {#each tabs as item}
-        <button
-          class="flex items-center gap-3 px-4 py-2.5 rounded-lg text-left transition-colors"
-          class:text-[#5fb5d2]={activeTab === item.id}
-          class:bg-[#252d30]={activeTab === item.id}
-          class:text-gray-400={activeTab !== item.id}
-          class:hover:bg-[#252d30]={activeTab !== item.id}
-          on:click={() => onNavigate(item.id)}
-        >
-          <span class="text-lg">{item.icon}</span>
-          <span class="font-medium">{item.label}</span>
-        </button>
-      {/each}
-    </nav>
-
-    <div class="text-xs text-gray-600 mt-4 border-t border-[#2a3033] pt-4 hidden md:block">
-      Vess Protocol &mdash; CLTV Time-Credit
-    </div>
-  </aside>
-
-  <!-- Mobile overlay backdrop -->
-  {#if sidebarOpen}
+  <!-- Popup overlay -->
+  {#if popup}
+    <!-- svelte-ignore a11y_click_events_have_key_events -->
+    <!-- svelte-ignore a11y_no_static_element_interactions -->
     <div
-      class="fixed inset-0 z-30 bg-black/50 md:hidden"
-      on:click={() => sidebarOpen = false}
-      on:keydown={(e) => e.key === 'Escape' && (sidebarOpen = false)}
-      role="button"
-      tabindex="0"
-    ></div>
-  {/if}
-
-  <!-- Main content -->
-  <main class="flex-1 overflow-hidden p-0 md:p-0 pb-20 md:pb-0">
-    {#if activeTab === "wallet"}
-      <HexWallet onNavigate={(t) => onNavigate(t as Tab)} />
-    {:else if activeTab === "send"}
-      <SendPanel />
-    {:else if activeTab === "receive"}
-      <ReceivePanel />
-    {:else if activeTab === "tags"}
-      <TagsPanel />
-    {:else if activeTab === "mint"}
-      <MintPanel />
-    {:else if activeTab === "node"}
-      <NodeStatus />
-    {:else if activeTab === "swap"}
-      <div class="flex items-center justify-center h-full text-gray-500 text-sm">
-        Swap coming soon
-      </div>
-    {/if}
-  </main>
-
-  <!-- Mobile bottom tab bar -->
-  <nav class="md:hidden fixed bottom-0 inset-x-0 z-40 bg-[#1c2224] border-t border-[#2a3033] flex justify-around items-center px-2 py-1.5 safe-area-bottom">
-    {#each tabs as item}
-      <button
-        class="flex flex-col items-center gap-0.5 py-1 px-2 rounded-lg min-w-0 flex-1 transition-colors"
-        class:text-[#5fb5d2]={activeTab === item.id}
-        class:text-gray-500={activeTab !== item.id}
-        on:click={() => onNavigate(item.id)}
+      class="fixed inset-0 z-50 flex items-center justify-center p-4"
+      on:click={closePopup}
+      role="dialog"
+      aria-modal="true"
+      tabindex="-1"
+    >
+      <!-- Backdrop -->
+      <div class="absolute inset-0 bg-black/60" transition:fade={{ duration: 200 }}></div>
+      <!-- Popup card — click on card stops propagation -->
+      <div
+        class="relative bg-gradient-to-b from-[#1e2629] to-[#1c2224] rounded-2xl p-6 w-full max-w-md max-h-[85vh] overflow-y-auto"
+        style="box-shadow: 0 0 60px rgba(0,0,0,0.5), 0 0 0 1px rgba(255,255,255,0.04), inset 0 1px 0 rgba(255,255,255,0.02)"
+        transition:scale={{ duration: 200, start: 0.92 }}
+        on:click={(e) => e.stopPropagation()}
+        on:keydown={(e) => e.stopPropagation()}
+        role="presentation"
       >
-        <span class="text-lg">{item.icon}</span>
-        <span class="text-[10px] font-medium leading-tight">{item.short}</span>
-      </button>
-    {/each}
-  </nav>
+        {#if popup === "send"}
+          <SendPanel asset={currentAsset} />
+        {:else if popup === "receive"}
+          <ReceivePanel asset={currentAsset} />
+        {:else if popup === "tags"}
+          <TagsPanel asset={currentAsset} />
+        {:else if popup === "mint"}
+          <MintPanel asset={currentAsset} />
+        {:else if popup === "node"}
+          <NodeStatus asset={currentAsset} />
+        {:else if popup === "bitcoin_receive"}
+          <div class="space-y-4">
+            <!-- QR Code -->
+            <div class="flex justify-center py-2">
+              <div class="w-52 h-52 bg-[#1a1a1a] rounded-xl flex items-center justify-center border-2 border-dashed border-[#323a3e]">
+                <span class="text-gray-600 text-xs text-center">QR Code<br />placeholder</span>
+              </div>
+            </div>
+
+            <!-- Bitcoin address (clickable) -->
+            <button
+              on:click={copyBtc}
+              class="w-full bg-[#f28e13]/10 rounded-lg px-4 py-3 text-center font-mono text-sm text-[#f28e13] hover:bg-[#f28e13]/20 transition-colors break-all"
+            >
+              {btcAddress}
+            </button>
+            {#if btcCopied}
+              <p class="text-xs text-green-400 text-center -mt-2">Copied!</p>
+            {/if}
+          </div>
+        {:else if popup === "buy_btc"}
+          <div class="space-y-4 text-center">
+            <h1 class="text-xl font-bold" style="color: #f28e13">Buy Bitcoin</h1>
+            <p class="text-sm text-gray-400">Purchase BTC via Moonpay onramp.</p>
+            <button
+              on:click={buyBtc}
+              class="w-full py-3 rounded-lg font-semibold bg-[#f28e13] hover:bg-[#d67d0f] text-black transition-colors"
+            >
+              BUY BTC
+            </button>
+          </div>
+        {:else if popup === "buy_vichor"}
+          <div class="space-y-4">
+            <h1 class="text-xl font-bold" style="color: #ccff00">Vichor Swap</h1>
+            <p class="text-sm text-gray-400">Peer-to-peer swap offers from the DHT.</p>
+
+            {#if swapLoading}
+              <div class="flex justify-center py-8">
+                <span class="text-gray-500 text-sm">Loading offers...</span>
+              </div>
+            {:else}
+              <!-- Buy Vichor (sellers offering Vichor for Vess) -->
+              <div>
+                <h2 class="text-sm font-medium text-gray-500 mb-2">Buy Vichor</h2>
+                {#each swapOffers.filter(o => !o.is_buy) as offer}
+                  <div class="bg-[#252d30]/40 rounded-lg p-3 flex items-center justify-between mb-2">
+                    <div>
+                      <div class="text-sm font-medium text-white">{offer.seller_tag}</div>
+                      <div class="text-xs text-gray-500">{offer.vichor_amount} Vichor for {offer.vess_price} Vess</div>
+                    </div>
+                    <button class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-[#ccff00]/90 hover:bg-[#ccff00] text-black transition-colors">Swap</button>
+                  </div>
+                {:else}
+                  <div class="text-sm text-gray-600 py-2">No offers to buy Vichor.</div>
+                {/each}
+                <button class="w-full mt-2 py-2 rounded-lg text-xs font-semibold border border-dashed border-[#ccff00]/30 text-[#ccff00]/70 hover:bg-[#ccff00]/10 transition-colors">+ Create Buy Offer</button>
+              </div>
+
+              <!-- Sell Vichor (buyers offering Vess for Vichor) -->
+              <hr class="border-[#2a3033]" />
+
+              <div>
+                <h2 class="text-sm font-medium text-gray-500 mb-2">Sell Vichor</h2>
+                {#each swapOffers.filter(o => o.is_buy) as offer}
+                  <div class="bg-[#252d30]/40 rounded-lg p-3 flex items-center justify-between mb-2">
+                    <div>
+                      <div class="text-sm font-medium text-white">{offer.seller_tag}</div>
+                      <div class="text-xs text-gray-500">{offer.vichor_amount} Vichor for {offer.vess_price} Vess</div>
+                    </div>
+                    <button class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-[#ccff00]/90 hover:bg-[#ccff00] text-black transition-colors">Swap</button>
+                  </div>
+                {:else}
+                  <div class="text-sm text-gray-600 py-2">No offers to sell Vichor.</div>
+                {/each}
+                <button class="w-full mt-2 py-2 rounded-lg text-xs font-semibold border border-dashed border-[#ccff00]/30 text-[#ccff00]/70 hover:bg-[#ccff00]/10 transition-colors">+ Create Sell Offer</button>
+              </div>
+            {/if}
+          </div>
+        {/if}
+      </div>
+    </div>
+  {/if}
 </div>
 

@@ -1,12 +1,18 @@
 <script lang="ts">
   import { mintTimelock } from "../rpc/client";
 
+  export let asset: "vess" | "bitcoin" | "vichor" = "vess";
+
   let amountSats: number | null = null;
   let durationYears = 1;
   let vichorBurned = 0;
   let minting = false;
   let result = "";
   let error = "";
+
+  $: assetColor = asset === "vess" ? "#5fb5d2" : asset === "vichor" ? "#ccff00" : "#f28e13";
+  $: inputClass = "w-full rounded-lg px-3 py-2 text-[#1a1a1a] placeholder-[#3d484c] focus:outline-none transition-colors";
+  $: inputStyle = `background: ${assetColor}18`;
 
   // Quadratic Vichor formula: (y-1)² × 10
   $: vichorRequired = durationYears <= 1 ? 0 : Math.pow(durationYears - 1, 2) * 10;
@@ -44,7 +50,8 @@
         type="number"
         bind:value={amountSats}
         min="1"
-        class="w-full bg-[#252d30] border border-[#323a3e] rounded-lg px-3 py-2 text-white focus:outline-none focus:border-[#5fb5d2]"
+        class={inputClass}
+        style={inputStyle}
       />
     </div>
 
@@ -79,7 +86,8 @@
             bind:value={vichorBurned}
             min="0"
             max={vichorRequired}
-            class="w-full bg-[#323a3e] border border-[#3d474b] rounded px-2 py-1 text-white text-sm focus:outline-none focus:border-[#5fb5d2]"
+            class={inputClass + " text-sm"}
+            style={inputStyle}
           />
           {#if vichorDeficit > 0}
             <p class="text-red-400 text-xs mt-1">Need {vichorDeficit} more Vichor</p>

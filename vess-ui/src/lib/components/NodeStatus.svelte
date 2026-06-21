@@ -2,10 +2,16 @@
   import { onMount } from "svelte";
   import { getNodeInfo, type NodeInfo } from "../rpc/client";
 
+  export let asset: "vess" | "bitcoin" | "vichor" = "vess";
+
   let info: NodeInfo | null = null;
   let loading = true;
   let error = "";
   let rpcUrl = "http://127.0.0.1:9821";
+
+  $: assetColor = asset === "vess" ? "#5fb5d2" : asset === "vichor" ? "#ccff00" : "#f28e13";
+  $: inputClass = "flex-1 rounded-lg px-3 py-2 text-[#1a1a1a] placeholder-[#3d484c] font-mono text-sm focus:outline-none transition-colors";
+  $: inputStyle = `background: ${assetColor}18`;
 
   onMount(async () => {
     try {
@@ -30,7 +36,8 @@
     <div class="flex gap-2">
       <input
         bind:value={rpcUrl}
-        class="flex-1 bg-[#252d30] border border-[#323a3e] rounded-lg px-3 py-2 text-white font-mono text-sm focus:outline-none focus:border-[#5fb5d2]"
+        class={inputClass}
+        style={inputStyle}
       />
       <button on:click={saveUrl} class="px-3 py-2 bg-[#252d30] hover:bg-[#323a3e] rounded-lg text-sm transition-colors">
         Save

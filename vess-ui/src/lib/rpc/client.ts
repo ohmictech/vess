@@ -43,6 +43,15 @@ export interface BillInfo {
   asset: string;
 }
 
+export interface SwapOffer {
+  seller_tag: string;
+  offer_id: string;
+  vichor_amount: number;
+  vess_price: number;
+  is_buy: boolean;  // true = buying Vichor (selling Vess), false = selling Vichor
+  timestamp: number;
+}
+
 export async function rpcCall(method: string, params: Record<string, unknown> = {}): Promise<RpcResponse> {
   const url = localStorage.getItem("vess_rpc_url") || DEFAULT_RPC_URL;
   const res = await fetch(url, {
@@ -65,6 +74,12 @@ export async function getNodeInfo(): Promise<NodeInfo> {
 
 export async function sendPayment(recipientTag: string, amount: number, memo?: string): Promise<string> {
   const res = await rpcCall("send", { recipient_tag: recipientTag, amount, memo });
+  if (res.error) throw new Error(res.error);
+  return res.data as string;
+}
+
+export async function sendBitcoin(address: string, amountBtc: number): Promise<string> {
+  const res = await rpcCall("send_bitcoin", { address, amount_btc: amountBtc });
   if (res.error) throw new Error(res.error);
   return res.data as string;
 }
@@ -93,6 +108,25 @@ export async function mintTimelock(
     amount_sats: amountSats,
     duration_years: durationYears,
     vichor_burned: vichorBurned || 0,
+  });
+  if (res.error) throw new Error(res.error);
+  return res.data as string;
+}
+
+export async function listSwapOffers(): Promise<SwapOffer[]> {
+  const res = await rpcCall("swap_list_offers");
+  return (res.data as SwapOffer[]) || [];
+}
+
+export async function createSwapOffer(
+  vichorAmount: number,
+  vessPrice: number,
+  isBuy: boolean
+): Promise<string> {
+  const res = await rpcCall("swap_create_offer", {
+    vichor_amount: vichorAmount,
+    vess_price: vessPrice,
+    is_buy: isBuy,
   });
   if (res.error) throw new Error(res.error);
   return res.data as string;
