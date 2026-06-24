@@ -24,7 +24,7 @@
   <div>
     <label class="block text-sm text-gray-400 mb-1">Your Tag</label>
     <div class="flex gap-2">
-      <div class="flex-1 rounded-lg px-3 py-2 font-mono text-sm truncate" style={accentStyle}>
+      <div class="flex-1 rounded-lg px-3 py-2 font-mono text-sm truncate tag-case" style={accentStyle}>
         +{tag || "ALICE"}
       </div>
       <button on:click={handleCopy} class="px-3 py-2 bg-[#252d30] hover:bg-[#323a3e] rounded-lg text-sm transition-colors shrink-0">
@@ -39,7 +39,9 @@
       type="number"
       bind:value={requestedAmount}
       min="1"
+      step="1"
       placeholder="0"
+      on:input={() => { if (requestedAmount !== null) requestedAmount = Math.floor(requestedAmount); }}
       class={inputClass}
       style={inputStyle}
     />

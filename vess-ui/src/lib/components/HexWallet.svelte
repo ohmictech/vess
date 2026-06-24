@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { getBalance, getBills, type BalanceData } from "../rpc/client";
+  import { getBalance, getVessTag, type BalanceData } from "../rpc/client";
 
   // ── Types ──────────────────────────────────────────────
   type Asset = "vess" | "bitcoin" | "vichor";
@@ -27,9 +27,14 @@
 
   // ── RPC data ──────────────────────────────────────────
   let balance: BalanceData | null = null;
+  let vesstag = "";
 
   onMount(async () => {
     try { balance = await getBalance(); } catch { /* node offline */ }
+    try { vesstag = await getVessTag(); } catch { /* not set yet */ }
+    window.addEventListener("vesstag-set", (e: Event) => {
+      vesstag = (e as CustomEvent).detail;
+    });
   });
 
   // ── State ─────────────────────────────────────────────
@@ -101,9 +106,9 @@
 
   // Per-asset image positioning (multipliers of R)
   const IMG_LAYOUT: Record<Asset, { ox: number; oy: number; w: number; h: number }> = {
-    vess:    { ox: -0.42, oy: -0.44, w: 0.84, h: 0.84 },
-    bitcoin: { ox: -0.43, oy: -0.46, w: 0.86, h: 0.86 },
-    vichor:  { ox: -0.32, oy: -0.42, w: 0.64, h: 0.64 },
+    vess:    { ox: -0.54, oy: -0.50, w: 1.08, h: 1.08 },
+    bitcoin: { ox: -0.68, oy: -0.70, w: 1.36, h: 1.36 },
+    vichor:  { ox: -0.39, oy: -0.34, w: 0.78, h: 0.78 },
   };
 
   function imgLayout(asset: Asset) {
@@ -113,6 +118,19 @@
       y: l.oy * R,
       w: l.w * R,
       h: l.h * R,
+    };
+  }
+
+  // Push a position with optional upward bias (for side tooltips)
+  function pushUpward(pos: { x: number; y: number }, amount: number, upBias: number = 0) {
+    const dx = pos.x - CENTER.x;
+    const dy = pos.y - CENTER.y - upBias;  // bias numerator upward
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    if (dist < 0.01) return { x: pos.x, y: pos.y - amount };
+    const factor = 1 + amount / dist;
+    return {
+      x: CENTER.x + dx * factor,
+      y: CENTER.y + (pos.y - CENTER.y) * factor - upBias * (factor - 1),
     };
   }
 
@@ -149,12 +167,35 @@
 
   // ── Amount text ───────────────────────────────────────
   $: currentAsset = ASSETS[selectedAsset];
+
+  // ── Haptic feedback on hex hover ──────────────────────
+  let prevTarget: number | null = null;
+  let centerPressed = false;
+  $: if (dragTarget !== null && dragTarget !== prevTarget) {
+    navigator.vibrate?.(6);
+    prevTarget = dragTarget;
+  }
+  $: if (dragTarget === null) prevTarget = null;
+
+  // ── Format with suffix ───────────────────────────────
+  function fmt(n: number): string {
+    if (n >= 1_000_000_000) return (n / 1_000_000_000).toFixed(n % 1_000_000_000 === 0 ? 0 : 1) + "b";
+    if (n >= 1_000_000) return (n / 1_000_000).toFixed(n % 1_000_000 === 0 ? 0 : 1) + "m";
+    if (n >= 1_000) return (n / 1_000).toFixed(n % 1_000 === 0 ? 0 : 1) + "k";
+    return String(n);
+  }
+
   $: displayAmount = (() => {
-    if (!balance) return "0";
+    if (!balance) {
+      if (selectedAsset === "vess") return fmt(8472);
+      if (selectedAsset === "bitcoin") return fmt(2500000);
+      if (selectedAsset === "vichor") return fmt(16384);
+      return "0";
+    }
     switch (selectedAsset) {
-      case "vess":    return String(balance.balance ?? 0);
-      case "bitcoin": return (balance.watch_only_balance ?? 0).toFixed(8);
-      case "vichor":  return String(balance.vichor_balance ?? 0);
+      case "vess":    return fmt(balance.balance ?? 0);
+      case "bitcoin": return fmt(balance.watch_only_balance ?? 0);
+      case "vichor":  return fmt(balance.vichor_balance ?? 0);
     }
   })();
 
@@ -187,6 +228,8 @@
     if (hit === 0) {
       mode = "pressed";
       dragTarget = null;
+      centerPressed = true;
+      setTimeout(() => centerPressed = false, 150);
     }
   }
 
@@ -255,6 +298,8 @@
     <div class="amount-row">
       <div
         class="amount-ticker"
+        class:amount-ticker-sm={selectedAsset === "vichor"}
+        class:amount-ticker-down={selectedAsset === "vess" || selectedAsset === "bitcoin"}
         style="mask-image: url({currentAsset.ticker}); -webkit-mask-image: url({currentAsset.ticker})"
       ></div>
       <span class="amount-value">{displayAmount}</span>
@@ -329,7 +374,10 @@
       {@const pushedPos = isTarget ? pushOut(pos, 8) : isAdjacent ? pushOut(pos, 4) : pos}
       {@const pushDx = pushedPos.x - pos.x}
       {@const pushDy = pushedPos.y - pos.y}
-      {@const tooltipPos = pushOut(pos, R + 24)}
+      {@const tooltipPos = !isTarget ? { x: 0, y: 0 } :
+        idx === 0 ? pushUpward(pos, R + 24, 170) :  // Send — tuck upward & inward
+        idx === 3 ? pushUpward(pos, R + 24, 170) :  // Settings — tuck upward & inward
+        pushOut(pos, R + 24)}
       {@const assetFill = item.isAsset ? item.color : "transparent"}
       {@const assetFillOpacity = item.isAsset ? 0.9 : 0}
       {@const iconColor = item.isAsset ? DARK_ICON : (isTarget ? DARK_ICON : item.color)}
@@ -440,6 +488,10 @@
               text-anchor="middle"
               dominant-baseline="central"
               class="hex-icon-text"
+              class:hex-icon-text-sm={item.id === "send"}
+              class:hex-icon-text-xs={item.id === "settings"}
+              class:hex-icon-text-sm2={item.id === "add"}
+              class:hex-icon-text-up={item.id === "mint"}
               fill={iconColor}
               opacity="0.85"
             >{item.icon}</text>
@@ -495,7 +547,7 @@
         <animate attributeName="opacity" values="0.15;0.55;0.15" dur="2.5s" repeatCount="indefinite" />
       </path>
 
-      <g class="hex-group hex-center">
+      <g class="hex-group hex-center" class:hex-press={centerPressed}>
       <!-- Hex background fill -->
       <path
         d={H}
@@ -550,11 +602,11 @@
 
   <!-- Wallet tag — bottom-left, visible on press -->
   <div
-    class="wallet-tag"
+    class="wallet-tag tag-case"
     class:visible={mode !== "idle"}
     style="color: {currentAsset.color}"
   >
-    +ALICE
+    {vesstag}
   </div>
 </div>
 
@@ -596,7 +648,7 @@
   .amount-row {
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: 4px;
   }
   .amount-ticker {
     width: 26px;
@@ -607,13 +659,23 @@
     -webkit-mask-size: contain;
     -webkit-mask-repeat: no-repeat;
     filter: drop-shadow(0 0 12px currentColor);
+    margin-right: -2px;
+    transform: translateX(3px);
+  }
+  .amount-ticker-sm {
+    width: 18px;
+    height: 18px;
+    transform: translateX(2px) translateY(3px);
+  }
+  .amount-ticker-down {
+    transform: translateX(3px) translateY(1px);
   }
   .amount-value {
-    font-size: 34px;
-    font-weight: 200;
-    letter-spacing: 0.03em;
+    font-size: 46px;
+    font-weight: 300;
+    letter-spacing: 0.08em;
     font-variant-numeric: tabular-nums;
-    font-family: "Inter", "SF Mono", "Fira Code", monospace;
+    font-family: "Orbitron", "Inter", "SF Mono", monospace;
   }
 
   /* ── Float-out wrapper (outer hexagons) ─────────────── */
@@ -673,11 +735,24 @@
   }
 
   .hex-icon-text {
-    font-size: 34px;
+    font-size: 48px;
     transition: opacity 0.2s ease, fill 0.25s ease;
   }
+  .hex-icon-text-sm {
+    font-size: 38px;
+    transform: translateX(2px);
+  }
+  .hex-icon-text-xs {
+    font-size: 34px;
+  }
+  .hex-icon-text-sm2 {
+    font-size: 42px;
+  }
+  .hex-icon-text-up {
+    transform: translateY(-3px);
+  }
   .hex-icon-text-lg {
-    font-size: 48px;
+    font-size: 54px;
   }
 
   .hex-icon-img {
@@ -741,5 +816,15 @@
   }
   .hex-root:has(.hex-center:not(.hex-hidden)) .hex-center .hex-border {
     animation: idlePulse 3s ease-in-out infinite;
+  }
+
+  /* ── Center hex press animation ─────────────────── */
+  @keyframes hexPress {
+    0%   { transform: scale(1); }
+    40%  { transform: scale(1.12); }
+    100% { transform: scale(1); }
+  }
+  .hex-press {
+    animation: hexPress 0.2s cubic-bezier(0.34, 1.56, 0.64, 1);
   }
 </style>

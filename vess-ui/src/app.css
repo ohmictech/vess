@@ -1,4 +1,5 @@
 @import "tailwindcss";
+@import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;600;700;800;900&display=swap');
 
 :root {
   --accent: #5fb5d2;
@@ -22,6 +23,7 @@ body {
   overscroll-behavior: none;
   user-select: none;
   -webkit-user-select: none;
+  text-transform: lowercase;
 }
 
 input, textarea {
@@ -43,6 +45,11 @@ html, body, #app {
   overflow: hidden;
   height: 100%;
   background: #1a1a1a;
+}
+
+/* Preserve case for vesstags */
+.tag-case {
+  text-transform: none;
 }
 
 /* Sci-fi scanline overlay (subtle) */

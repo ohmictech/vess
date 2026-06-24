@@ -7,7 +7,9 @@
   let info: NodeInfo | null = null;
   let loading = true;
   let error = "";
-  let rpcUrl = "http://127.0.0.1:9821";
+  let rpcUrl = localStorage.getItem("vess_rpc_url") || "http://127.0.0.1:9821";
+  let notificationsOn = localStorage.getItem("vess_notifications") !== "off";
+  let hapticsOn = localStorage.getItem("vess_haptics") !== "off";
 
   $: assetColor = asset === "vess" ? "#5fb5d2" : asset === "vichor" ? "#ccff00" : "#f28e13";
   $: inputClass = "flex-1 rounded-lg px-3 py-2 text-[#1a1a1a] placeholder-[#3d484c] font-mono text-sm focus:outline-none transition-colors";
@@ -26,44 +28,67 @@
   function saveUrl() {
     localStorage.setItem("vess_rpc_url", rpcUrl);
   }
+
+  function toggleNotifications() {
+    notificationsOn = !notificationsOn;
+    localStorage.setItem("vess_notifications", notificationsOn ? "on" : "off");
+  }
+
+  function toggleHaptics() {
+    hapticsOn = !hapticsOn;
+    localStorage.setItem("vess_haptics", hapticsOn ? "on" : "off");
+  }
 </script>
 
-<div class="w-full max-w-lg mx-auto">
-  <h1 class="text-2xl font-bold mb-6">Node Status</h1>
+<div class="space-y-4">
+  <h1 class="text-xl font-bold">Settings</h1>
 
-  <div class="bg-[#1c2224] rounded-xl border border-[#2a3033] p-6 mb-6">
-    <h2 class="text-sm font-medium text-gray-500 mb-4">RPC Connection</h2>
+  <!-- Toggles -->
+  <div class="space-y-2">
+    <button on:click={toggleNotifications} class="w-full flex items-center justify-between bg-[#252d30]/40 rounded-lg p-3 hover:bg-[#252d30]/60 transition-colors">
+      <span class="text-sm text-gray-300">Notifications</span>
+      <span class="text-xs font-medium px-2.5 py-1 rounded-full transition-colors {notificationsOn ? 'bg-[#10b981]/20 text-[#10b981]' : 'bg-[#374151] text-gray-500'}">
+        {notificationsOn ? "on" : "off"}
+      </span>
+    </button>
+
+    <button on:click={toggleHaptics} class="w-full flex items-center justify-between bg-[#252d30]/40 rounded-lg p-3 hover:bg-[#252d30]/60 transition-colors">
+      <span class="text-sm text-gray-300">Haptic Feedback</span>
+      <span class="text-xs font-medium px-2.5 py-1 rounded-full transition-colors {hapticsOn ? 'bg-[#10b981]/20 text-[#10b981]' : 'bg-[#374151] text-gray-500'}">
+        {hapticsOn ? "on" : "off"}
+      </span>
+    </button>
+  </div>
+
+  <!-- RPC Connection -->
+  <div>
+    <h2 class="text-sm font-medium text-gray-500 mb-2">RPC Connection</h2>
     <div class="flex gap-2">
-      <input
-        bind:value={rpcUrl}
-        class={inputClass}
-        style={inputStyle}
-      />
+      <input bind:value={rpcUrl} class={inputClass} style={inputStyle} />
       <button on:click={saveUrl} class="px-3 py-2 bg-[#252d30] hover:bg-[#323a3e] rounded-lg text-sm transition-colors">
         Save
       </button>
     </div>
   </div>
 
+  <!-- Network Info -->
   {#if loading}
-    <div class="bg-[#1c2224] rounded-xl border border-[#2a3033] p-6">
-      <div class="animate-pulse space-y-3">
-        <div class="h-4 bg-[#252d30] rounded w-3/4"></div>
-        <div class="h-4 bg-[#252d30] rounded w-1/2"></div>
-        <div class="h-4 bg-[#252d30] rounded w-2/3"></div>
-      </div>
+    <div class="animate-pulse space-y-3">
+      <div class="h-4 bg-[#252d30] rounded w-3/4"></div>
+      <div class="h-4 bg-[#252d30] rounded w-1/2"></div>
+      <div class="h-4 bg-[#252d30] rounded w-2/3"></div>
     </div>
   {:else if error}
-    <div class="bg-red-900/20 border border-red-800 rounded-xl p-6">
+    <div class="bg-red-900/20 border border-red-800 rounded-xl p-4">
       <p class="text-red-400 text-sm">Could not connect: {error}</p>
     </div>
   {:else if info}
-    <div class="bg-[#1c2224] rounded-xl border border-[#2a3033] p-6">
-      <h2 class="text-sm font-medium text-gray-500 mb-4">Network Info</h2>
-      <dl class="space-y-3">
+    <div>
+      <h2 class="text-sm font-medium text-gray-500 mb-2">Network</h2>
+      <dl class="space-y-2 text-sm">
         <div class="flex justify-between">
           <dt class="text-gray-400">Node ID</dt>
-          <dd class="text-gray-200 font-mono text-sm">{info.node_id?.slice(0, 16)}...</dd>
+          <dd class="text-gray-200 font-mono text-xs">{info.node_id?.slice(0, 12)}...</dd>
         </div>
         <div class="flex justify-between">
           <dt class="text-gray-400">Peers</dt>
@@ -76,14 +101,6 @@
         <div class="flex justify-between">
           <dt class="text-gray-400">Tags</dt>
           <dd class="text-gray-200">{info.tag_count}</dd>
-        </div>
-        <div class="flex justify-between">
-          <dt class="text-gray-400">Ownership Records</dt>
-          <dd class="text-gray-200">{info.ownership_count}</dd>
-        </div>
-        <div class="flex justify-between">
-          <dt class="text-gray-400">Protocol Hash</dt>
-          <dd class="text-gray-500 font-mono text-xs">{info.version_hash?.slice(0, 24)}...</dd>
         </div>
       </dl>
     </div>

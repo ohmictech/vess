@@ -7,7 +7,7 @@
   import TagsPanel from "./lib/components/TagsPanel.svelte";
   import NodeStatus from "./lib/components/NodeStatus.svelte";
   import MintPanel from "./lib/components/MintPanel.svelte";
-  import { listSwapOffers, type SwapOffer } from "./lib/rpc/client";
+  import { listSwapOffers, createSwapOffer, type SwapOffer } from "./lib/rpc/client";
 
   type Tab = "wallet" | "send" | "receive" | "tags" | "mint" | "node" | "bitcoin_receive" | "buy_vichor" | "buy_btc";
   type Asset = "vess" | "bitcoin" | "vichor";
@@ -19,12 +19,19 @@
 
   let swapOffers: SwapOffer[] = [];
   let swapLoading = false;
+  let showCreateOffer = false;
+  let createIsBuy = false;
+  let createVichorAmount: number | null = null;
+  let createVessPriceLog: number = 0;
+  $: createVessPrice = Math.round(Math.pow(10, (createVessPriceLog / 1000) * 9)) || 1;
+  let creatingOffer = false;
 
   onMount(() => {});
 
   function onNavigate(tab: Tab) {
+    navigator.vibrate?.(5);
     popup = tab;
-    if (tab === "buy_vichor") loadSwapOffers();
+    if (tab === "buy_vichor") { loadSwapOffers(); showCreateOffer = false; }
   }
 
   async function loadSwapOffers() {
@@ -39,10 +46,12 @@
   }
 
   function closePopup() {
+    navigator.vibrate?.(4);
     popup = null;
   }
 
   function copyBtc() {
+    navigator.vibrate?.(6);
     navigator.clipboard.writeText(btcAddress);
     btcCopied = true;
     setTimeout(() => btcCopied = false, 2000);
@@ -50,6 +59,27 @@
 
   function buyBtc() {
     window.open("https://buy.moonpay.com?apiKey=YOUR_API_KEY&currencyCode=btc", "_blank");
+  }
+
+  function openCreateOffer(isBuy: boolean) {
+    createIsBuy = isBuy;
+    createVichorAmount = null;
+    createVessPriceLog = 0;
+    showCreateOffer = true;
+  }
+
+  async function handleCreateOffer() {
+    if (!createVichorAmount || !createVessPrice) return;
+    creatingOffer = true;
+    try {
+      await createSwapOffer(createVichorAmount, createVichorAmount * createVessPrice, createIsBuy);
+      showCreateOffer = false;
+      loadSwapOffers();
+    } catch (e) {
+      console.error(e);
+    } finally {
+      creatingOffer = false;
+    }
   }
 </script>
 
@@ -125,45 +155,83 @@
             <h1 class="text-xl font-bold" style="color: #ccff00">Vichor Swap</h1>
             <p class="text-sm text-gray-400">Peer-to-peer swap offers from the DHT.</p>
 
+            {#if showCreateOffer}
+              <!-- Create offer form -->
+              <div class="bg-[#252d30]/40 rounded-lg p-4 space-y-3">
+                <h2 class="text-sm font-semibold text-white">{createIsBuy ? "Buy" : "Sell"} Vichor</h2>
+                <div>
+                  <label class="block text-xs text-gray-500 mb-1">Vichor Amount</label>
+                  <input type="number" bind:value={createVichorAmount} min="1" placeholder="0" class="w-full rounded-lg px-3 py-2 text-[#1a1a1a] placeholder-[#3d484c] focus:outline-none transition-colors" style="background: #ccff0018" />
+                </div>
+                <div>
+                  <label class="block text-xs text-gray-500 mb-1">Vichor Price: <span class="text-[#ccff00]">{createVessPrice.toLocaleString()}</span> Vess / Vichor</label>
+                  <input type="range" bind:value={createVessPriceLog} min="0" max="1000" step="1" class="w-full accent-[#ccff00]" />
+                  <div class="flex justify-between text-xs text-gray-600 mt-0.5">
+                    <span>1</span>
+                    <span>1B</span>
+                  </div>
+                </div>
+                {#if createVichorAmount && createVessPrice}
+                  <div class="text-xs text-[#ccff00]/80 bg-[#ccff00]/8 rounded px-2 py-1.5">
+                    Total: <span class="font-medium">{(createVichorAmount * createVessPrice).toLocaleString()}</span> Vess for {createVichorAmount.toLocaleString()} Vichor
+                  </div>
+                {/if}
+                <div class="flex gap-2">
+                  <button on:click={() => showCreateOffer = false} class="flex-1 py-2 rounded-lg text-xs font-medium bg-[#252d30] hover:bg-[#323a3e] text-gray-400 transition-colors">Cancel</button>
+                  <button on:click={handleCreateOffer} disabled={creatingOffer || !createVichorAmount || !createVessPrice} class="flex-1 py-2 rounded-lg text-xs font-semibold bg-[#ccff00]/90 hover:bg-[#ccff00] text-black transition-colors disabled:opacity-50">
+                    {creatingOffer ? "Creating..." : "Create Offer"}
+                  </button>
+                </div>
+              </div>
+            {/if}
+
             {#if swapLoading}
               <div class="flex justify-center py-8">
                 <span class="text-gray-500 text-sm">Loading offers...</span>
               </div>
             {:else}
-              <!-- Buy Vichor (sellers offering Vichor for Vess) -->
+              <!-- Buy Vichor -->
               <div>
                 <h2 class="text-sm font-medium text-gray-500 mb-2">Buy Vichor</h2>
                 {#each swapOffers.filter(o => !o.is_buy) as offer}
-                  <div class="bg-[#252d30]/40 rounded-lg p-3 flex items-center justify-between mb-2">
-                    <div>
-                      <div class="text-sm font-medium text-white">{offer.seller_tag}</div>
-                      <div class="text-xs text-gray-500">{offer.vichor_amount} Vichor for {offer.vess_price} Vess</div>
+                  {@const rate = (offer.vess_price / offer.vichor_amount).toFixed(4)}
+                  <div class="bg-[#252d30]/40 rounded-lg p-3 mb-2">
+                    <div class="flex items-center justify-between">
+                      <div>
+                        <div class="text-sm font-medium text-white">{offer.seller_tag}</div>
+                        <div class="text-xs text-gray-500">{offer.vichor_amount} Vichor for {offer.vess_price} Vess</div>
+                      </div>
+                      <button class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-[#ccff00]/90 hover:bg-[#ccff00] text-black transition-colors">Swap</button>
                     </div>
-                    <button class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-[#ccff00]/90 hover:bg-[#ccff00] text-black transition-colors">Swap</button>
+                    <div class="text-xs text-[#ccff00]/60 mt-1">Rate: {rate} Vess / Vichor</div>
                   </div>
                 {:else}
                   <div class="text-sm text-gray-600 py-2">No offers to buy Vichor.</div>
                 {/each}
-                <button class="w-full mt-2 py-2 rounded-lg text-xs font-semibold border border-dashed border-[#ccff00]/30 text-[#ccff00]/70 hover:bg-[#ccff00]/10 transition-colors">+ Create Buy Offer</button>
+                <button on:click={() => openCreateOffer(false)} class="w-full mt-2 py-2 rounded-lg text-xs font-semibold border border-dashed border-[#ccff00]/30 text-[#ccff00]/70 hover:bg-[#ccff00]/10 transition-colors">+ Create Buy Offer</button>
               </div>
 
-              <!-- Sell Vichor (buyers offering Vess for Vichor) -->
               <hr class="border-[#2a3033]" />
 
+              <!-- Sell Vichor -->
               <div>
                 <h2 class="text-sm font-medium text-gray-500 mb-2">Sell Vichor</h2>
                 {#each swapOffers.filter(o => o.is_buy) as offer}
-                  <div class="bg-[#252d30]/40 rounded-lg p-3 flex items-center justify-between mb-2">
-                    <div>
-                      <div class="text-sm font-medium text-white">{offer.seller_tag}</div>
-                      <div class="text-xs text-gray-500">{offer.vichor_amount} Vichor for {offer.vess_price} Vess</div>
+                  {@const rate = (offer.vess_price / offer.vichor_amount).toFixed(4)}
+                  <div class="bg-[#252d30]/40 rounded-lg p-3 mb-2">
+                    <div class="flex items-center justify-between">
+                      <div>
+                        <div class="text-sm font-medium text-white">{offer.seller_tag}</div>
+                        <div class="text-xs text-gray-500">{offer.vichor_amount} Vichor for {offer.vess_price} Vess</div>
+                      </div>
+                      <button class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-[#ccff00]/90 hover:bg-[#ccff00] text-black transition-colors">Swap</button>
                     </div>
-                    <button class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-[#ccff00]/90 hover:bg-[#ccff00] text-black transition-colors">Swap</button>
+                    <div class="text-xs text-[#ccff00]/60 mt-1">Rate: {rate} Vess / Vichor</div>
                   </div>
                 {:else}
                   <div class="text-sm text-gray-600 py-2">No offers to sell Vichor.</div>
                 {/each}
-                <button class="w-full mt-2 py-2 rounded-lg text-xs font-semibold border border-dashed border-[#ccff00]/30 text-[#ccff00]/70 hover:bg-[#ccff00]/10 transition-colors">+ Create Sell Offer</button>
+                <button on:click={() => openCreateOffer(true)} class="w-full mt-2 py-2 rounded-lg text-xs font-semibold border border-dashed border-[#ccff00]/30 text-[#ccff00]/70 hover:bg-[#ccff00]/10 transition-colors">+ Create Sell Offer</button>
               </div>
             {/if}
           </div>

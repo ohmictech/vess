@@ -118,6 +118,17 @@ export async function listSwapOffers(): Promise<SwapOffer[]> {
   return (res.data as SwapOffer[]) || [];
 }
 
+export async function getVessTag(): Promise<string> {
+  const res = await rpcCall("wallet_get_tag");
+  if (res.error) throw new Error(res.error);
+  return res.data as string;
+}
+
+export async function storeVessTag(tag: string): Promise<void> {
+  const res = await rpcCall("wallet_store_tag", { tag });
+  if (res.error) throw new Error(res.error);
+}
+
 export async function createSwapOffer(
   vichorAmount: number,
   vessPrice: number,

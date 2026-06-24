@@ -75,7 +75,7 @@
     result = "";
     try {
       const txid = await sendBitcoin(btcAddress, btcAmount);
-      result = `Sent ${btcAmount} BTC to ${btcAddress.slice(0, 12)}... (${txid.slice(0, 16)}...)`;
+      result = `Sent ${btcAmount} sats to ${btcAddress.slice(0, 12)}... (${txid.slice(0, 16)}...)`;
       btcAddress = "";
       btcAmount = null;
     } catch (e) {
@@ -101,22 +101,31 @@
     <!-- ── Bitcoin send ──────────────────────────── -->
     <div>
       <label class="block text-sm text-gray-400 mb-1">Bitcoin Address</label>
-      <input
-        bind:value={btcAddress}
-        placeholder="bc1q..."
-        class={inputClass + " font-mono text-sm"}
-        style={inputStyle}
-      />
+      <div class="flex gap-1.5">
+        <input
+          bind:value={btcAddress}
+          placeholder="bc1q..."
+          class={inputClass + " font-mono text-sm"}
+          style={inputStyle}
+        />
+        <button on:click={async () => { btcAddress = await navigator.clipboard.readText(); }} class="px-2.5 py-2 bg-[#252d30] hover:bg-[#323a3e] rounded-lg text-xs text-gray-400 transition-colors shrink-0" title="Paste">
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><rect x="8" y="2" width="8" height="4" rx="1"/><path d="M6 6h12a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2z"/><path d="M10 14l2 2 4-4"/></svg>
+        </button>
+        <button on:click={() => {}} class="px-2.5 py-2 bg-[#252d30] hover:bg-[#323a3e] rounded-lg text-xs text-gray-400 transition-colors shrink-0" title="Scan QR">
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><path d="M3 3h5v5H3V3z"/><path d="M16 3h5v5h-5V3z"/><path d="M3 16h5v5H3v-5z"/><path d="M16 16h5v5h-5v-5z"/><path d="M11 7v2"/><path d="M11 15v2"/><path d="M7 11h2"/><path d="M15 11h2"/></svg>
+        </button>
+      </div>
     </div>
 
     <div>
-      <label class="block text-sm text-gray-400 mb-1">Amount (BTC)</label>
+      <label class="block text-sm text-gray-400 mb-1">Amount (sats)</label>
       <input
         type="number"
         bind:value={btcAmount}
-        min="0.00000001"
-        step="0.00000001"
-        placeholder="0.00000000"
+        min="1"
+        step="1"
+        placeholder="0"
+        on:input={(e) => { if (btcAmount !== null) btcAmount = Math.floor(btcAmount); }}
         class={inputClass}
         style={inputStyle}
       />
@@ -129,7 +138,7 @@
       class:bg-[#5fb5d2]:hover:bg-[#4a9db8]:text-black={!sending}
       class:bg-[#323a3e]:text-gray-400={sending}
     >
-      {sending ? "Sending..." : "Send BTC"}
+      {sending ? "Sending..." : "Send sats"}
     </button>
 
   {:else}
@@ -158,7 +167,9 @@
         type="number"
         bind:value={amountVess}
         min="1"
+        step="1"
         placeholder="0"
+        on:input={() => { if (amountVess !== null) amountVess = Math.floor(amountVess); }}
         class={inputClass}
         style={inputStyle}
       />

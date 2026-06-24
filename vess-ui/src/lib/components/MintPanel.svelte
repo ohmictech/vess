@@ -15,7 +15,7 @@
   $: inputStyle = `background: ${assetColor}18`;
 
   // Quadratic Vichor formula: (y-1)² × 10
-  $: vichorRequired = durationYears <= 1 ? 0 : Math.pow(durationYears - 1, 2) * 10;
+  $: vichorRequired = durationYears <= 1 ? 0 : Math.round(Math.pow(durationYears - 1, 2) * 10);
   $: vichorDeficit = Math.max(0, vichorRequired - vichorBurned);
   $: canMint = amountSats !== null && amountSats > 0 && vichorDeficit === 0;
   $: vessAmount = amountSats !== null && amountSats !== 0
@@ -50,6 +50,8 @@
         type="number"
         bind:value={amountSats}
         min="1"
+        step="1"
+        on:input={() => { if (amountSats !== null) amountSats = Math.floor(amountSats); }}
         class={inputClass}
         style={inputStyle}
       />
@@ -86,6 +88,8 @@
             bind:value={vichorBurned}
             min="0"
             max={vichorRequired}
+            step="1"
+            on:input={() => { vichorBurned = Math.floor(vichorBurned); }}
             class={inputClass + " text-sm"}
             style={inputStyle}
           />

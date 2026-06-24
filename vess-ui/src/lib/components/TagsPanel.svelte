@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { registerTag, lookupTag } from "../rpc/client";
+  import { registerTag, lookupTag, storeVessTag } from "../rpc/client";
 
   export let asset: "vess" | "bitcoin" | "vichor" = "vess";
 
@@ -21,6 +21,8 @@
     result = "";
     try {
       await registerTag(tag);
+      await storeVessTag(tag);
+      window.dispatchEvent(new CustomEvent("vesstag-set", { detail: `+${tag}` }));
       result = `Tag +${tag} registered!`;
       tag = "";
     } catch (e) {
