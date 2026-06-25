@@ -395,7 +395,9 @@ fn expected_bitcoin_timelock_payload(burn: &vess_protocol::BitcoinTimeLockProof)
     vess_foundry::bitcoin_timelock_payload_commitment(
         &burn.first_owner_vk_hash,
         burn.locked_sats,
+        burn.lock_blocks,
         &burn.output_values,
+        None,
     )
 }
 
@@ -1714,12 +1716,17 @@ fn ownership_record_from_dht_seed(record: DhtSeedOwnershipRecord) -> OwnershipRe
         chain_tip: record.chain_tip,
         current_owner_vk_hash: record.current_owner_vk_hash,
         current_owner_vk: record.current_owner_vk,
-
+        denomination_value: record.denomination_value,
+        updated_at: record.updated_at,
+        proof_hash: record.proof_hash,
+        digest: record.digest,
+        nonce: record.nonce,
+        prev_claim_vk_hash: record.prev_claim_vk_hash,
         claim_hash: record.claim_hash,
         prev_transfer_chain_tip: record.prev_transfer_chain_tip,
         chain_depth: record.chain_depth,
         encrypted_bill: record.encrypted_bill,
-            accumulated_work: None,
+        accumulated_work: None,
     }
 }
 
@@ -2545,7 +2552,7 @@ fn ingest_dht_seed_response(
         }
     }
 
-    for manifest in response.manifests.into_iter().take(MAX_DHT_SEED_MANIFESTS) {
+    for manifest in response.manifests.iter().take(MAX_DHT_SEED_MANIFESTS) {
         if manifest.encrypted_manifest.len() > MAX_MANIFEST_SIZE {
             continue;
         }
@@ -2563,7 +2570,7 @@ fn ingest_dht_seed_response(
             }
         }
         s.manifest_store
-            .insert(manifest.dht_key, (manifest.encrypted_manifest, now));
+            .insert(manifest.dht_key, (manifest.encrypted_manifest.clone(), now));
         inserted_manifests += 1;
     }
 
@@ -2605,7 +2612,7 @@ fn ingest_dht_seed_response(
         }
     }
 
-    for seeded_manifest in response.manifests
+    for seeded_manifest in &response.manifests
     {
         if !s
             .registry
@@ -3053,6 +3060,8 @@ impl ArteryState {
         Self {
             registry: OwnershipRegistry::new(node_id_bytes),
             tag_dht: TagDht::new(node_id_bytes, k_neighbors),
+            swap_offers: BTreeMap::new(),
+            swap_offer_tx: None,
             node_id: node_id_bytes,
             routing_table: RoutingTable::new(node_id_bytes),
             gossip_config: GossipConfig::default(),
