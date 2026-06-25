@@ -8,12 +8,23 @@
   "permissions": [
     "core:default",
     "http:default",
+    "shell:allow-spawn",
+    "shell:allow-execute",
     {
       "identifier": "http:default",
       "allow": [
         { "url": "http://127.0.0.1:9821/**" },
         { "url": "http://localhost:9821/**" },
         { "url": "http://127.0.0.1:5173/**" }
+      ]
+    },
+    {
+      "identifier": "shell:allow-spawn",
+      "allow": [
+        {
+          "name": "vess-artery",
+          "sidecar": true
+        }
       ]
     }
   ]

@@ -10,7 +10,7 @@
   let result = "";
   let error = "";
 
-  $: assetColor = asset === "vess" ? "#5fb5d2" : asset === "vichor" ? "#ccff00" : "#f28e13";
+  $: assetColor = asset === "vess" ? "#88cddf" : asset === "vichor" ? "#ccff00" : "#f28e13";
   $: inputClass = "flex-1 rounded-lg px-3 py-2 text-[#1a1a1a] placeholder-[#3d484c] focus:outline-none transition-colors";
   $: inputStyle = `background: ${assetColor}18`;
 
@@ -50,18 +50,20 @@
   <div class="bg-[#1c2224] rounded-xl border border-[#2a3033] p-6 mb-6">
     <h2 class="text-lg font-semibold mb-4">Register Tag</h2>
     <div class="flex gap-2">
-      <span class="flex items-center text-gray-500">+</span>
-      <input
-        bind:value={tag}
-        placeholder="alice"
-        maxlength="20"
-        class={inputClass}
-        style={inputStyle}
-      />
+      <div class="relative flex-1">
+        <span class="absolute left-3 top-1/2 -translate-y-1/2 text-sm font-bold pointer-events-none" style="color: {assetColor}">+</span>
+        <input
+          bind:value={tag}
+          placeholder="alice"
+          maxlength="20"
+          class="flex-1 rounded-lg pl-7 pr-7 py-2 text-[#1a1a1a] placeholder-current placeholder-opacity-30 focus:outline-none transition-colors text-center"
+          style={inputStyle}
+        />
+      </div>
       <button
         on:click={handleRegister}
         disabled={registering || !tag}
-        class="px-4 py-2 bg-[#5fb5d2] hover:bg-[#4a9db8] text-black rounded-lg font-medium transition-colors disabled:opacity-50"
+        class="px-4 py-2 bg-[#88cddf] hover:bg-[#6bb8c9] text-black rounded-lg font-medium transition-colors disabled:opacity-50"
       >
         {registering ? "Mining PoW..." : "Register"}
       </button>

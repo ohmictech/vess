@@ -43,7 +43,7 @@
   let dragTarget: number | null = null;
 
   const ASSETS: Record<Asset, AssetInfo> = {
-    vess:   { label: "Vess",    color: "#5fb5d2", glow: "rgba(95,181,210,0.35)",   icon: "/vessicon.png",    ticker: "/vessicon.png" },
+    vess:   { label: "Vess",    color: "#88cddf", glow: "rgba(136,205,223,0.35)",   icon: "/vessicon.png",    ticker: "/vessicon.png" },
     bitcoin:{ label: "Bitcoin", color: "#f28e13", glow: "rgba(242,142,19,0.35)",   icon: "/bitcoinicon.png", ticker: "/saticon.png" },
     vichor: { label: "Vichor",  color: "#ccff00", glow: "rgba(204,255,0,0.35)",    icon: "/vichoricon.png",  ticker: "/vichoricon.png" },
   };
@@ -330,7 +330,7 @@
       </filter>
       <!-- Lighter glow for tooltip text -->
       <filter id="textGlow" x="-40%" y="-40%" width="180%" height="180%">
-        <feGaussianBlur in="SourceGraphic" stdDeviation="0.5" />
+        <feGaussianBlur in="SourceGraphic" stdDeviation="0.3" />
       </filter>
       <!-- Subtle noise texture for sci-fi feel -->
       <filter id="noise">

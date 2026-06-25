@@ -32,7 +32,7 @@
     <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 md:gap-4 mb-6 md:mb-8">
       <div class="bg-[#1c2224] rounded-xl p-4 md:p-5 border border-[#2a3033]">
         <div class="text-sm text-gray-500 mb-1">Vess Balance</div>
-        <div class="text-2xl md:text-3xl font-bold text-[#5fb5d2]">{balance?.balance ?? 0}</div>
+        <div class="text-2xl md:text-3xl font-bold text-[#88cddf]">{balance?.balance ?? 0}</div>
         <div class="text-xs text-gray-600 mt-1">sat-block credits</div>
       </div>
       <div class="bg-[#1c2224] rounded-xl p-4 md:p-5 border border-[#2a3033]">
@@ -70,7 +70,7 @@
                   <tr class="border-b border-[#2a3033]/50 hover:bg-[#252d30]/30">
                     <td class="py-2 pr-4 font-medium">{bill.denomination}</td>
                     <td class="py-2 pr-4">
-                      <span class="px-2 py-0.5 rounded text-xs {bill.asset === 'btc' ? 'bg-[#5fb5d2]/20 text-[#5fb5d2]' : 'bg-[#ccff00]/20 text-[#ccff00]'}">
+                      <span class="px-2 py-0.5 rounded text-xs {bill.asset === 'btc' ? 'bg-[#88cddf]/20 text-[#88cddf]' : 'bg-[#ccff00]/20 text-[#ccff00]'}">
                         {bill.asset}
                       </span>
                     </td>

@@ -1525,7 +1525,9 @@ fn message_dedup_key(msg: &PulseMessage) -> [u8; 32] {
             // All other message types are small; full serialization is fine.
             h.update(&msg.to_bytes().unwrap_or_default());
         }
+    }
     *h.finalize().as_bytes()
+}
 
 /// Check if a timestamp is within the acceptable window.
 fn timestamp_is_valid(ts: u64) -> bool {
@@ -2423,8 +2425,8 @@ impl DhtSeedCursor {
         if let Some(last) = response.consumed_records.last() {
             self.after_consumed_mint_id = Some(last.mint_id);
         }
-        }
-        }
+    }
+}
 
 fn dht_seed_response_is_empty(response: &DhtSeedResponse) -> bool {
     response.tags.is_empty()
@@ -2697,13 +2699,6 @@ fn ingest_dht_seed_response(
         }
     }
 
-        if !s
-            .registry
-        {
-            continue;
-        }
-        }
-
     for seeded_manifest in response
         .into_iter()
     {
@@ -2713,16 +2708,7 @@ fn ingest_dht_seed_response(
         {
             continue;
         }
-        }
-
-        .into_iter()
-    {
-        if !s
-            .registry
-        {
-            continue;
-        }
-        }
+    }
 
     drop(s);
 
@@ -2738,6 +2724,7 @@ fn ingest_dht_seed_response(
     }
 
     snapshot
+}
 
 fn spawn_local_lan_discovery(local_contact: MeshCarrierContact, state: Arc<Mutex<ArteryState>>) {
     let loopback_contact = match crate::local_discovery::loopback_contact(&local_contact) {
@@ -3589,6 +3576,7 @@ impl ArteryState {
             self.limbo_payment_ids.insert(id);
         }
     }
+}
 
 // ── Gossip drain helpers ────────────────────────────────────────────
 

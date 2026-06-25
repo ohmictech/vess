@@ -44,12 +44,14 @@ export interface BillInfo {
 }
 
 export interface SwapOffer {
-  seller_tag: string;
   offer_id: string;
-  vichor_amount: number;
-  vess_price: number;
-  is_buy: boolean;  // true = buying Vichor (selling Vess), false = selling Vichor
-  timestamp: number;
+  offer_asset: string;
+  offer_amount: number;
+  want_asset: string;
+  want_amount: number;
+  seller_tag: string;
+  hash_lock: string;
+  expires_at: number;
 }
 
 export async function rpcCall(method: string, params: Record<string, unknown> = {}): Promise<RpcResponse> {
@@ -78,8 +80,8 @@ export async function sendPayment(recipientTag: string, amount: number, memo?: s
   return res.data as string;
 }
 
-export async function sendBitcoin(address: string, amountBtc: number): Promise<string> {
-  const res = await rpcCall("send_bitcoin", { address, amount_btc: amountBtc });
+export async function sendBitcoin(address: string, amountBtc: number, memo?: string): Promise<string> {
+  const res = await rpcCall("send_bitcoin", { address, amount_btc: amountBtc, memo });
   if (res.error) throw new Error(res.error);
   return res.data as string;
 }
@@ -87,6 +89,17 @@ export async function sendBitcoin(address: string, amountBtc: number): Promise<s
 export async function lookupTag(tag: string): Promise<TagInfo> {
   const res = await rpcCall("tag_lookup", { tag });
   return res.data as TagInfo;
+}
+
+export async function getVessTag(): Promise<string> {
+  const res = await rpcCall("tag");
+  if (res.error) throw new Error(res.error);
+  return (res.data as any)?.tag || "";
+}
+
+export async function storeVessTag(tag: string): Promise<void> {
+  const res = await rpcCall("tag_register", { tag });
+  if (res.error) throw new Error(res.error);
 }
 
 export async function registerTag(tag: string): Promise<void> {
@@ -113,32 +126,66 @@ export async function mintTimelock(
   return res.data as string;
 }
 
-export async function listSwapOffers(): Promise<SwapOffer[]> {
-  const res = await rpcCall("swap_list_offers");
-  return (res.data as SwapOffer[]) || [];
-}
-
-export async function getVessTag(): Promise<string> {
-  const res = await rpcCall("wallet_get_tag");
-  if (res.error) throw new Error(res.error);
-  return res.data as string;
-}
-
-export async function storeVessTag(tag: string): Promise<void> {
-  const res = await rpcCall("wallet_store_tag", { tag });
-  if (res.error) throw new Error(res.error);
+export async function listSwapOffers(assetA: string = "vess", assetB: string = "vichor"): Promise<SwapOffer[]> {
+  const res = await rpcCall("swap_list", { asset_a: assetA, asset_b: assetB });
+  return (res.data as any)?.offers || [];
 }
 
 export async function createSwapOffer(
-  vichorAmount: number,
-  vessPrice: number,
-  isBuy: boolean
+  offerAsset: string,
+  offerAmount: number,
+  wantAsset: string,
+  wantAmount: number,
+  recipient: string,
+  expiresInSecs: number = 86400
 ): Promise<string> {
-  const res = await rpcCall("swap_create_offer", {
-    vichor_amount: vichorAmount,
-    vess_price: vessPrice,
-    is_buy: isBuy,
+  const res = await rpcCall("swap_propose", {
+    offer_asset: offerAsset,
+    offer_amount: offerAmount,
+    want_asset: wantAsset,
+    want_amount: wantAmount,
+    recipient,
+    expires_in_secs: expiresInSecs,
   });
   if (res.error) throw new Error(res.error);
-  return res.data as string;
+  return (res.data as any)?.hash_lock;
+}
+
+export async function exportSeedPhrase(): Promise<string[]> {
+  const res = await rpcCall("export_seed");
+  if (res.error) throw new Error(res.error);
+  const words = (res.data as any)?.words;
+  if (!Array.isArray(words)) throw new Error("Invalid seed response");
+  return words;
+}
+
+// ── Wallet onboarding ──────────────────────────────────
+
+export interface WalletStatus {
+  exists: boolean;
+  tag?: string;
+  node_id?: string;
+}
+
+export async function walletStatus(): Promise<WalletStatus> {
+  const res = await rpcCall("wallet_status");
+  return (res.data as WalletStatus) || { exists: false };
+}
+
+export async function checkTag(tag: string): Promise<{ available: boolean; reason?: string }> {
+  const res = await rpcCall("check_tag", { tag });
+  return (res.data as any) || { available: false, reason: "network error" };
+}
+
+export async function createWallet(tag: string): Promise<{ phrase: string[] }> {
+  const res = await rpcCall("create_wallet", { tag });
+  if (res.error) throw new Error(res.error);
+  const data = res.data as any;
+  if (!data?.phrase || !Array.isArray(data.phrase)) throw new Error("Invalid response");
+  return { phrase: data.phrase };
+}
+
+export async function recoverWallet(phrase: string[], tag: string): Promise<void> {
+  const res = await rpcCall("recover_wallet", { phrase, tag });
+  if (res.error) throw new Error(res.error);
 }

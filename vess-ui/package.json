@@ -9,7 +9,12 @@
     "preview": "vite preview",
     "tauri": "cargo tauri"
   },
-  "keywords": ["vess", "bitcoin", "post-quantum", "wallet"],
+  "keywords": [
+    "vess",
+    "bitcoin",
+    "post-quantum",
+    "wallet"
+  ],
   "author": "ohmictech",
   "license": "Apache-2.0",
   "devDependencies": {
@@ -22,6 +27,7 @@
   },
   "dependencies": {
     "@tauri-apps/api": "^2.11.1",
-    "@tauri-apps/plugin-http": "^2.5.9"
+    "@tauri-apps/plugin-http": "^2.5.9",
+    "qrcode": "^1.5.4"
   }
 }

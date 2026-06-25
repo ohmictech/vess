@@ -10,7 +10,7 @@
   let result = "";
   let error = "";
 
-  $: assetColor = asset === "vess" ? "#5fb5d2" : asset === "vichor" ? "#ccff00" : "#f28e13";
+  $: assetColor = asset === "vess" ? "#88cddf" : asset === "vichor" ? "#ccff00" : "#f28e13";
   $: inputClass = "w-full rounded-lg px-3 py-2 text-[#1a1a1a] placeholder-[#3d484c] focus:outline-none transition-colors";
   $: inputStyle = `background: ${assetColor}18`;
 
@@ -65,7 +65,7 @@
         min="0.1"
         max="10"
         step="0.1"
-        class="w-full accent-[#5fb5d2]"
+        class="w-full accent-[#88cddf]"
       />
       <div class="flex justify-between text-xs text-gray-600 mt-1">
         <span>0.1 yr</span>
@@ -76,7 +76,7 @@
     <div class="bg-[#252d30] rounded-lg p-4 space-y-2 text-sm">
       <div class="flex justify-between">
         <span class="text-gray-400">Vichor Required</span>
-        <span class:text-[#5fb5d2]={vichorRequired > 0} class:text-gray-500={vichorRequired === 0}>
+        <span class:text-[#88cddf]={vichorRequired > 0} class:text-gray-500={vichorRequired === 0}>
           {vichorRequired}
         </span>
       </div>
@@ -100,7 +100,7 @@
       {/if}
       <div class="flex justify-between pt-2 border-t border-[#323a3e]">
         <span class="text-gray-400">Vess to Mint</span>
-        <span class="text-[#5fb5d2] font-semibold">~{vessAmount}</span>
+        <span class="text-[#88cddf] font-semibold">~{vessAmount}</span>
       </div>
     </div>
 
@@ -108,7 +108,7 @@
       on:click={handleMint}
       disabled={minting || !canMint}
       class="w-full py-3 rounded-lg font-semibold transition-colors disabled:opacity-50"
-      class:bg-[#5fb5d2]:hover:bg-[#4a9db8]:text-black={!minting}
+      class:bg-[#88cddf]:hover:bg-[#6bb8c9]:text-black={!minting}
       class:bg-[#323a3e]:text-gray-400={minting}
     >
       {minting ? "Creating Time-Lock..." : "Create Time-Lock"}
