@@ -219,7 +219,7 @@
   <!-- ── Import: Enter 12 words ── -->
   {:else if step === "import"}
     <h1 class="text-xl font-bold" style="color: #88cddf">Recover Wallet</h1>
-    <p class="text-sm text-gray-400">Enter your 12-word recovery phrase.</p>
+    <p class="text-sm text-gray-400">enter your 12-word recovery phrase</p>
     <textarea
       bind:value={importPhrase}
       placeholder="word1 word2 word3 ... word12"

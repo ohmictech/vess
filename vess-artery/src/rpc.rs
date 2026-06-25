@@ -852,7 +852,9 @@ async fn handle_swap_propose(
     let dht_key = offer.dht_key();
     let mut s = lock_state(state);
     s.swap_offers.entry(dht_key).or_default().push(offer.clone());
-    let _ = s.swap_offer_tx.send(offer.clone());
+    if let Some(ref tx) = s.swap_offer_tx {
+        let _ = tx.send(offer.clone());
+    }
 
     RpcResponse::ok(RpcData::SwapPropose {
         hash_lock: crate::persistence::hex_key(&hash_lock),
@@ -934,7 +936,7 @@ fn handle_node_info(state: &Arc<Mutex<ArteryState>>, node: &MeshPulseNode) -> Rp
         bitcoin_pending_burns: s
             .wallet
             .as_ref()
-            .map(|wallet| wallet.bitcoin_wallet.pending_burn_count())
+            .map(|wallet| wallet.bitcoin_wallet.pending_timelock_count())
             .unwrap_or(0),
         bitcoin_connected_peers: {
             s.bitcoin_client.as_ref().map_or(0usize, |c: &vess_bitcoin::BitcoinLightClient| c.connected_peers())
@@ -1012,7 +1014,7 @@ fn handle_node_health(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
         .map(|ws| ws.billfold.watch_only_balance())
         .unwrap_or(0);
 
-    let total_supply = s.total_btc_supply.max(s.registry.total_supply());
+    let total_supply = s.registry.total_supply();
 
     // Report which discovery sources may have been active.
     let discovery_sources: Vec<String> = {
@@ -1049,7 +1051,7 @@ fn handle_node_health(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
         bitcoin_pending_burns: s
             .wallet
             .as_ref()
-            .map(|ws| ws.bitcoin_wallet.pending_burn_count())
+            .map(|ws| ws.bitcoin_wallet.pending_timelock_count())
             .unwrap_or(0),
         discovery_sources,
         total_supply,

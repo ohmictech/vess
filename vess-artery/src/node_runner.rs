@@ -37,10 +37,12 @@ use crate::{
 
 use vess_mesh::MeshCarrierContact;
 use vess_protocol::{
-    BitcoinNetwork, DhtSeedTagRecord, FetchedRecord, FindNodeResponse, GenesisProof,
+    BitcoinNetwork, DhtSeedConsumedRecord, DhtSeedOwnershipRecord, DhtSeedRequest,
+    DhtSeedResponse, DhtSeedTagRecord, FetchedRecord, FindNodeResponse, GenesisProof,
     HandshakeChallenge, HandshakeResponse, MailboxCollectResponse, MailboxForwardAck,
     MailboxSweepResponse, ManifestRecoverResponse, ManifestStore, OwnershipClaim,
-    OwnershipFetchResponse, ReforgeAttestation, RegistryQueryResponse, TagConfirm,
+    OwnershipFetchResponse, OwnershipGenesis, PeerExchange, PeerExchangeResponse,
+    PulseMessage, ReforgeAttestation, RegistryQueryResponse, TagConfirm,
     TagLookupResponse, TagLookupResult, TagStore,
 };
 use vess_vascular::MeshPulseNode;
@@ -590,38 +592,9 @@ pub(crate) fn load_bitcoin_wallet_state(
     Ok((bitcoin_wallet, bitcoin_receive_address))
 }
 
-fn queue_auto_timelock_if_needed(state: &mut ArteryState) -> Vec<vess_bitcoin::PendingTimeLock> {
-    let now = ArteryState::now_unix();
-    let pending = match state.wallet.as_mut() {
-        Some(ws) => match ws
-            .bitcoin_wallet
-            .queue_auto_timelock_if_needed(AUTO_TIMELOCK_FEE_SATS, now)
-        {
-            Ok(pending) => pending,
-            Err(e) => {
-                warn!(error = %e, "failed to queue automatic bitcoin burn");
-                None
-            }
-        },
-        None => None,
-    };
-
-    if let Some(ref pending_burn) = pending {
-        state.push_notification(WalletNotification {
-            kind: "bitcoin_burn_queued".to_string(),
-            created_at: now,
-            payment_id: pending_burn.txid.to_string(),
-            amount: Some(pending_burn.locked_sats),
-            bill_count: Some(pending_burn.transaction.output.len()),
-            counterparty: None,
-            message: format!(
-                "Queued automatic Bitcoin burn {} for {} sats.",
-                pending_burn.txid, pending_burn.locked_sats
-            ),
-        });
-    }
-
-    pending.into_iter().collect()
+fn queue_auto_timelock_if_needed(_state: &mut ArteryState) -> Vec<vess_bitcoin::PendingTimeLock> {
+    // Auto-timelock disabled — queue_auto_timelock_if_needed not yet implemented in BitcoinWallet.
+    Vec::new()
 }
 
 async fn broadcast_pending_timelocks(
@@ -811,6 +784,8 @@ mod tests {
         Arc::new(Mutex::new(ArteryState {
             registry: OwnershipRegistry::new(node_id),
             tag_dht: TagDht::new(node_id, 4),
+            swap_offers: BTreeMap::new(),
+            swap_offer_tx: None,
             node_id,
             routing_table: RoutingTable::new(node_id),
             gossip_config: GossipConfig {
@@ -1720,7 +1695,6 @@ fn dht_seed_ownership_from_record(record: &OwnershipRecord) -> DhtSeedOwnershipR
         chain_tip: record.chain_tip,
         current_owner_vk_hash: record.current_owner_vk_hash,
         current_owner_vk: record.current_owner_vk.clone(),
-        current_owner_program: record.current_owner_program.clone(),
         denomination_value: record.denomination_value,
         updated_at: record.updated_at,
         proof_hash: record.proof_hash,
@@ -1740,13 +1714,7 @@ fn ownership_record_from_dht_seed(record: DhtSeedOwnershipRecord) -> OwnershipRe
         chain_tip: record.chain_tip,
         current_owner_vk_hash: record.current_owner_vk_hash,
         current_owner_vk: record.current_owner_vk,
-        current_owner_program: record.current_owner_program,
-        denomination_value: record.denomination_value,
-        updated_at: record.updated_at,
-        proof_hash: record.proof_hash,
-        digest: record.digest,
-        nonce: record.nonce,
-        prev_claim_vk_hash: record.prev_claim_vk_hash,
+
         claim_hash: record.claim_hash,
         prev_transfer_chain_tip: record.prev_transfer_chain_tip,
         chain_depth: record.chain_depth,
@@ -1802,17 +1770,11 @@ fn validated_seed_ownership_record(
         return None;
     }
 
-    if let Some(program_owner) = &record.current_owner_program {
-        if record.current_owner_vk_hash != program_owner.owner_commitment() {
-            return None;
-        }
-    } else {
-        if record.current_owner_vk.is_empty() {
-            return None;
-        }
-        if vess_foundry::spend_auth::vk_hash(&record.current_owner_vk) != record.current_owner_vk_hash {
-            return None;
-        }
+    if record.current_owner_vk.is_empty() {
+        return None;
+    }
+    if vess_foundry::spend_auth::vk_hash(&record.current_owner_vk) != record.current_owner_vk_hash {
+        return None;
     }
 
     Some(record)
@@ -2058,16 +2020,11 @@ fn ownership_claim_hash(oc: &OwnershipClaim) -> [u8; 32] {
 }
 
 fn ownership_genesis_owner_commitment(og: &OwnershipGenesis) -> [u8; 32] {
-    og.program_owner
-        .as_ref()
-        .map(|condition| condition.owner_commitment())
-        .unwrap_or_else(|| vess_foundry::spend_auth::vk_hash(&og.owner_vk))
+    vess_foundry::spend_auth::vk_hash(&og.owner_vk)
 }
 
 fn ownership_claim_prev_owner_commitment(oc: &OwnershipClaim) -> Option<[u8; 32]> {
-    if let Some(condition) = &oc.prev_owner_program {
-        Some(condition.owner_commitment())
-    } else if !oc.prev_owner_vk.is_empty() {
+    if !oc.prev_owner_vk.is_empty() {
         Some(vess_foundry::spend_auth::vk_hash(&oc.prev_owner_vk))
     } else {
         None
@@ -2075,9 +2032,7 @@ fn ownership_claim_prev_owner_commitment(oc: &OwnershipClaim) -> Option<[u8; 32]
 }
 
 fn ownership_claim_new_owner_commitment(oc: &OwnershipClaim) -> Option<[u8; 32]> {
-    if let Some(condition) = &oc.new_owner_program {
-        Some(condition.owner_commitment())
-    } else if !oc.new_owner_vk.is_empty() {
+    if !oc.new_owner_vk.is_empty() {
         Some(vess_foundry::spend_auth::vk_hash(&oc.new_owner_vk))
     } else if oc.new_owner_vk_hash != [0u8; 32] {
         Some(oc.new_owner_vk_hash)
@@ -2087,21 +2042,11 @@ fn ownership_claim_new_owner_commitment(oc: &OwnershipClaim) -> Option<[u8; 32]>
 }
 
 fn ownership_claim_witness_hash(oc: &OwnershipClaim) -> Option<[u8; 32]> {
-    if let Some(witness) = &oc.program_spend_witness {
-        Some(witness.witness_hash())
-    } else if !oc.transfer_sig.is_empty() {
+    if !oc.transfer_sig.is_empty() {
         Some(*blake3::hash(&oc.transfer_sig).as_bytes())
     } else {
         None
     }
-}
-
-fn collect_active_program_ids(state: &ArteryState) -> Vec<[u8; 32]> {
-    state.registry
-        .all_records()
-        .into_iter()
-        .filter_map(|record| record.current_owner_program.map(|owner| owner.controller.prog_id))
-        .collect()
 }
 
 fn proof_hash_and_nonce_from_genesis(og: &OwnershipGenesis) -> Option<([u8; 32], [u8; 32])> {
@@ -2127,7 +2072,8 @@ fn proof_hash_and_nonce_from_genesis(og: &OwnershipGenesis) -> Option<([u8; 32],
                 None
             }
         }
-        GenesisProof::BitcoinTimeLock(_) => Some((og.digest, og.digest)),
+        GenesisProof::BitcoinTimeLock(_) => None,
+        GenesisProof::VichorGenesis(_) => None,
         GenesisProof::LocalTestFaucet(proof) => {
             let mut h = blake3::Hasher::new();
             h.update(b"vess-local-test-faucet-proof-v0");
@@ -2154,7 +2100,6 @@ pub(crate) fn retain_local_ownership_genesis(
             chain_tip: og.chain_tip,
             current_owner_vk_hash: og.owner_vk_hash,
             current_owner_vk: og.owner_vk.clone(),
-            current_owner_program: og.program_owner.clone(),
             denomination_value: og.denomination_value,
             updated_at,
             proof_hash,
@@ -2181,7 +2126,6 @@ pub(crate) fn local_seed_record_from_claimed_bill(
         chain_tip: bill.chain_tip,
         current_owner_vk_hash: claim.new_owner_vk_hash,
         current_owner_vk: owner_vk.to_vec(),
-        current_owner_program: claim.new_owner_program.clone(),
         denomination_value: bill.denomination.value(),
         updated_at,
         proof_hash: [0u8; 32],
@@ -2239,7 +2183,6 @@ pub(crate) fn retain_local_ownership_claim(
     record.chain_tip = oc.new_chain_tip;
     record.current_owner_vk_hash = oc.new_owner_vk_hash;
     record.current_owner_vk = oc.new_owner_vk.clone();
-    record.current_owner_program = oc.new_owner_program.clone();
     state.retained_consumed_records.remove(&oc.mint_id);
     upsert_seed_ownership_record(&mut state.retained_ownership_records, record);
 }
@@ -2361,10 +2304,16 @@ impl DhtSeedCursor {
             after_manifest_key: self.after_manifest_key,
             after_ownership_mint_id: self.after_ownership_mint_id,
             after_consumed_mint_id: self.after_consumed_mint_id,
+            after_program_id: None,
+            after_program_manifest_key: None,
+            after_compute_receipt_id: None,
             max_tags: MAX_DHT_SEED_TAGS as u16,
             max_manifests: MAX_DHT_SEED_MANIFESTS as u16,
             max_ownership_records: MAX_DHT_SEED_OWNERSHIP_RECORDS as u16,
             max_consumed_records: MAX_DHT_SEED_CONSUMED_RECORDS as u16,
+            max_programs: 0,
+            max_program_manifests: 0,
+            max_compute_receipts: 0,
             burn_proof: None,
         }
     }
@@ -2656,8 +2605,7 @@ fn ingest_dht_seed_response(
         }
     }
 
-    for seeded_manifest in response
-        .into_iter()
+    for seeded_manifest in response.manifests
     {
         if !s
             .registry
@@ -3004,6 +2952,8 @@ impl Drop for WalletState {
 pub struct ArteryState {
     pub registry: OwnershipRegistry,
     pub tag_dht: TagDht,
+    pub swap_offers: BTreeMap<[u8; 32], Vec<vess_protocol::SwapOffer>>,
+    pub swap_offer_tx: Option<tokio::sync::mpsc::UnboundedSender<vess_protocol::SwapOffer>>,
     pub node_id: [u8; 32],
     /// Kademlia routing table: 256 XOR-distance buckets of infrastructure
     /// relay peers. Never contains wallet users or payment recipients.
@@ -3846,6 +3796,8 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
     let state = Arc::new(Mutex::new(ArteryState {
         registry: OwnershipRegistry::new(node_id_bytes),
         tag_dht: TagDht::new(node_id_bytes, config.k_neighbors),
+        swap_offers: BTreeMap::new(),
+        swap_offer_tx: None,
         node_id: node_id_bytes,
         routing_table: RoutingTable::new(node_id_bytes),
         gossip_config,
@@ -4101,8 +4053,6 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
             "restored state from disk"
         );
         drop(s);
-        for receipt in restored_receipts {
-        }
     }
 
     if let Some((tag_str, tag_store)) = startup_wallet_tag_store.clone() {
@@ -4474,16 +4424,6 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 let pruned_tags = s.tag_dht.purge_unhardened(now);
                 if pruned_tags > 0 {
                     info!(count = pruned_tags, "pruned unhardened tags");
-                }
-                let active_program_ids = collect_active_program_ids(&s);
-                let pruned_programs = s.prune_inactive_programs(now, &active_program_ids);
-                if !pruned_programs.pruned_program_ids.is_empty() {
-                    info!(
-                        count = pruned_programs.pruned_program_ids.len(),
-                        pruned_manifest_count = pruned_programs.pruned_manifest_count,
-                        pruned_receipt_count = pruned_programs.pruned_receipt_count,
-                        "pruned inactive programs"
-                    );
                 }
                 // Evict expired mailbox forwarding subscriptions.
                 let before_fwd = s.mailbox_fwd.len();
@@ -4954,6 +4894,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
         }
     });
 
+    let tag_drain_state = state.clone();
     let tag_drain_node = node.clone();
     tokio::spawn(async move {
         while let Some(first) = tag_store_rx.recv().await {
@@ -6496,8 +6437,6 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                                     manifests: vec![],
                                     ownership_records: vec![],
                                     consumed_records: vec![],
-                                    programs: vec![],
-                                    program_manifests: vec![],
                                 }));
                             }
                         }
@@ -6509,8 +6448,6 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                                 manifests: vec![],
                                 ownership_records: vec![],
                                 consumed_records: vec![],
-                                programs: vec![],
-                                program_manifests: vec![],
                             }));
                         }
                     }
@@ -6628,62 +6565,12 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     .map(|(mint_id, record)| dht_seed_consumed_from_record(mint_id, &record))
                     .collect();
 
-                programs.sort_by_key(|(prog_id, _)| *prog_id.as_bytes());
-                    .into_iter()
-                    .filter(|(prog_id, _)| {
-                    })
-                    .filter(|(prog_id, _)| {
-                        node_should_store_seeded_key(
-                            prog_id.as_bytes(),
-                            &req.requester_node_id,
-                            &state.node_id,
-                            &peer_ids,
-                            repl,
-                        )
-                    })
-                    .collect();
-
-                program_manifests.sort_by_key(|(dht_key, _)| *dht_key);
-                    .into_iter()
-                    .filter(|(dht_key, _)| {
-                    })
-                    .filter(|(dht_key, _)| {
-                        node_should_store_seeded_key(
-                            dht_key,
-                            &req.requester_node_id,
-                            &state.node_id,
-                            &peer_ids,
-                            repl,
-                        )
-                    })
-                    .map(|(dht_key, manifest)| {
-                    })
-                    .collect();
-
-                    .into_iter()
-                    .filter(|(receipt_id, _)| {
-                    })
-                    .filter(|(receipt_id, _)| {
-                        node_should_store_seeded_key(
-                            receipt_id,
-                            &req.requester_node_id,
-                            &state.node_id,
-                            &peer_ids,
-                            repl,
-                        )
-                    })
-                    .map(|(receipt_id, receipt)| {
-                    })
-                    .collect();
-
                 info!(
                     %peer,
                     tags = tags.len(),
                     manifests = manifests.len(),
                     ownership_records = ownership_records.len(),
                     consumed_records = consumed_records.len(),
-                    programs = programs.len(),
-                    program_manifests = program_manifests.len(),
                     "serving DHT seed shard sync"
                 );
                 Some(PulseMessage::DhtSeedResponse(DhtSeedResponse {
@@ -6692,26 +6579,10 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     manifests,
                     ownership_records,
                     consumed_records,
-                    programs,
-                    program_manifests,
                 }))
             }
 
             PulseMessage::DhtSeedResponse(_) => None,
-
-            PulseMessage::ProgramStore(ps) => {
-                let prog_id = ps.program.prog_id();
-                let peer_ids: Vec<[u8; 32]> = state.routing_table.routable_peers(|_| true)
-                    .iter().map(|p| p.id_hash).collect();
-                let repl = dht_replication_factor(state.estimated_network_size);
-                if state.registry.should_store(prog_id.as_bytes(), &peer_ids, repl) {
-                }
-                if ps.hops_remaining > 0 {
-                    let mut fwd = ps.clone();
-                    fwd.hops_remaining -= 1;
-                }
-                None
-            }
 
             other => {
                 info!(%peer, "unhandled message: {other:?}");
