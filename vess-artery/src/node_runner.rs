@@ -37,11 +37,11 @@ use crate::{
 
 use vess_mesh::MeshCarrierContact;
 use vess_protocol::{
-    DhtSeedTagRecord, FetchedRecord, FindNodeResponse, GenesisProof, HandshakeChallenge,
-    HandshakeResponse, MailboxCollectResponse, MailboxForwardAck, MailboxSweepResponse,
-    ManifestRecoverResponse, ManifestStore, OwnershipClaim, OwnershipFetchResponse,
-    ReforgeAttestation, RegistryQueryResponse, TagConfirm, TagLookupResponse,
-    TagLookupResult, TagStore,
+    BitcoinNetwork, DhtSeedTagRecord, FetchedRecord, FindNodeResponse, GenesisProof,
+    HandshakeChallenge, HandshakeResponse, MailboxCollectResponse, MailboxForwardAck,
+    MailboxSweepResponse, ManifestRecoverResponse, ManifestStore, OwnershipClaim,
+    OwnershipFetchResponse, ReforgeAttestation, RegistryQueryResponse, TagConfirm,
+    TagLookupResponse, TagLookupResult, TagStore,
 };
 use vess_vascular::MeshPulseNode;
 
@@ -1599,44 +1599,6 @@ fn ensure_owner_only_file_permissions(path: &Path) -> Result<()> {
     Ok(())
 }
 
-    let receipts_dir = state_dir.join("receipts");
-    if let Err(error) = std::fs::create_dir_all(&receipts_dir) {
-        warn!(error = %error, path = %receipts_dir.display(), "failed to create receipts directory");
-        return;
-    }
-
-    let receipt_path = receipts_dir.join(format!("{}.txt", hex_key(&receipt.receipt_id)));
-    let parent_receipts = if receipt.parent_receipt_ids.is_empty() {
-        "none".to_string()
-    } else {
-        receipt
-            .parent_receipt_ids
-            .iter()
-            .map(hex_key)
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    let json = match serde_json::to_string_pretty(receipt) {
-        Ok(json) => json,
-        Err(error) => {
-            warn!(error = %error, receipt_id = %hex_key(&receipt.receipt_id), "failed to serialize compute receipt text mirror");
-            return;
-        }
-    };
-    let contents = format!(
-        "Receipt ID: {}\nProgram ID: {}\nJob ID: {}\nCreated At: {}\nParent Receipts:\n{}\n\nJSON:\n{}\n",
-        hex_key(&receipt.receipt_id),
-        hex_key(receipt.prog_id.as_bytes()),
-        hex_key(&receipt.job_id),
-        receipt.created_at,
-        parent_receipts,
-        json,
-    );
-
-    if let Err(error) = std::fs::write(&receipt_path, contents) {
-        warn!(error = %error, path = %receipt_path.display(), "failed to write compute receipt text file");
-    }
-
 fn peer_hash_from_contact_bytes(contact_bytes: &[u8]) -> Option<[u8; 32]> {
     if contact_bytes.len() > MAX_SERIALIZED_MESH_CONTACT_BYTES {
         return None;
@@ -1988,11 +1950,6 @@ fn apply_quorum_seed_snapshots(state: &Arc<Mutex<ArteryState>>, snapshots: Vec<S
     }
 }
 
-
-    dht_key: [u8; 32],
-
-    receipt_id: [u8; 32],
-
 fn dht_seed_consumed_from_record(
     mint_id: [u8; 32],
     record: &ConsumedRecord,
@@ -2139,13 +2096,13 @@ fn ownership_claim_witness_hash(oc: &OwnershipClaim) -> Option<[u8; 32]> {
     }
 }
 
-    state
-        .registry
+fn collect_active_program_ids(state: &ArteryState) -> Vec<[u8; 32]> {
+    state.registry
         .all_records()
         .into_iter()
         .filter_map(|record| record.current_owner_program.map(|owner| owner.controller.prog_id))
         .collect()
-
+}
 
 fn proof_hash_and_nonce_from_genesis(og: &OwnershipGenesis) -> Option<([u8; 32], [u8; 32])> {
     match &og.genesis_proof {
@@ -3433,19 +3390,6 @@ impl ArteryState {
             .map(|(k, (v, _))| (hex_key(k), v.clone()))
             .collect();
 
-            .all_programs()
-            .into_iter()
-            .map(|(prog_id, program)| (hex_key(prog_id.as_bytes()), program))
-            .collect();
-            .all_manifests()
-            .into_iter()
-            .map(|(dht_key, manifest)| (hex_key(&dht_key), manifest))
-            .collect();
-            .all_receipts()
-            .into_iter()
-            .map(|(receipt_id, receipt)| (hex_key(&receipt_id), receipt))
-            .collect();
-
         ArterySnapshot {
             tags,
             bills: BTreeMap::new(), // legacy — kept for deserialization compat
@@ -4531,8 +4475,8 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 if pruned_tags > 0 {
                     info!(count = pruned_tags, "pruned unhardened tags");
                 }
-                let pruned_programs = s
-                    .prune_inactive_programs(now, &active_program_ids);
+                let active_program_ids = collect_active_program_ids(&s);
+                let pruned_programs = s.prune_inactive_programs(now, &active_program_ids);
                 if !pruned_programs.pruned_program_ids.is_empty() {
                     info!(
                         count = pruned_programs.pruned_program_ids.len(),
@@ -4937,11 +4881,6 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     }
                     Ok(_) => warn!("unexpected response from bootstrap peer"),
                     Err(e) => warn!("bootstrap peer {peer_str} unreachable: {e}"),
-                }
-
-                if let Some(snapshot) =
-                {
-                    seed_snapshots.push(snapshot);
                 }
             }
 
@@ -6468,6 +6407,8 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                             );
 
                             // ── Program receipt: if bills landed in a program ──
+                        }
+                        Ok(None) => {}
                         Err(e) => {
                             warn!(error = %e, "auto-receive trial-decrypt error");
                         }
@@ -6758,6 +6699,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
 
             PulseMessage::DhtSeedResponse(_) => None,
 
+            PulseMessage::ProgramStore(ps) => {
                 let prog_id = ps.program.prog_id();
                 let peer_ids: Vec<[u8; 32]> = state.routing_table.routable_peers(|_| true)
                     .iter().map(|p| p.id_hash).collect();

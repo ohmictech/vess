@@ -731,7 +731,7 @@ async fn handle_request(
         RpcRequest::PendingPayments => handle_pending_payments(state),
         RpcRequest::PaymentHistory { max } => handle_payment_history(state, max),
         RpcRequest::SwapPropose { offer_asset, offer_amount, want_asset, want_amount, recipient, expires_in_secs } => {
-            handle_swap_propose(state, node, &offer_asset, offer_amount, &want_asset, want_amount, &recipient, expires_in_secs).await
+            handle_swap_propose(state, node, &offer_asset, offer_amount, &want_asset, want_amount, &recipient, expires_in_secs.as_ref()).await
         }
         RpcRequest::SwapList { asset_a, asset_b } => handle_swap_list(state, node, &asset_a, &asset_b).await,
     }
@@ -875,7 +875,7 @@ async fn handle_swap_list(
         .as_secs();
     let offers: Vec<vess_protocol::SwapOffer> = s.swap_offers
         .get(&dht_key)
-        .map(|v| v.iter().filter(|o| o.expires_at > now).cloned().collect())
+        .map(|v: &Vec<vess_protocol::SwapOffer>| v.iter().filter(|o| o.expires_at > now).cloned().collect())
         .unwrap_or_default();
     RpcResponse::ok(RpcData::SwapList { offers })
 }
@@ -936,11 +936,9 @@ fn handle_node_info(state: &Arc<Mutex<ArteryState>>, node: &MeshPulseNode) -> Rp
             .as_ref()
             .map(|wallet| wallet.bitcoin_wallet.pending_burn_count())
             .unwrap_or(0),
-        bitcoin_connected_peers: s
-            .bitcoin_client
-            .as_ref()
-            .map(|client| client.connected_peers())
-            .unwrap_or(0),
+        bitcoin_connected_peers: {
+            s.bitcoin_client.as_ref().map_or(0usize, |c: &vess_bitcoin::BitcoinLightClient| c.connected_peers())
+        },
         profile: if s.is_testnet { "testnet" } else { "production" }.to_string(),
         profile_description: if s.is_testnet { "testnet (signet, faucet on)" } else { "production (mainnet)" }.to_string(),
         unsafe_mode: s.unsafe_mode,
@@ -1045,11 +1043,9 @@ fn handle_node_health(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
         wallet_state: wallet_state.to_string(),
         wallet_balance,
         wallet_watch_only,
-        bitcoin_peers: s
-            .bitcoin_client
-            .as_ref()
-            .map(|client| client.connected_peers())
-            .unwrap_or(0),
+        bitcoin_peers: {
+            s.bitcoin_client.as_ref().map_or(0usize, |c: &vess_bitcoin::BitcoinLightClient| c.connected_peers())
+        },
         bitcoin_pending_burns: s
             .wallet
             .as_ref()
@@ -1651,7 +1647,7 @@ async fn handle_send(
 
     // ── Prepare payment inside a block so the mutex guard is dropped
     // before the async direct-delivery attempt.
-    let (msg, payment_id, sent_mints, recipient_scan_ek) = {
+    let (msg, payment_id, sent_mints, recipient_scan_ek): (PulseMessage, [u8; 32], Vec<[u8; 32]>, Vec<u8>) = {
         let mut s = lock_state(&state);
 
     // ── Require wallet ──────────────────────────────────────────────
@@ -2483,7 +2479,7 @@ async fn handle_wallet_unlock(
         if let Some(path) = wallet_path_override {
             std::path::PathBuf::from(path)
         } else if let Some(p) = &s.wallet_path {
-            p.clone()
+            std::path::PathBuf::clone(p)
         } else {
             return RpcResponse::err("no wallet path provided");
         }

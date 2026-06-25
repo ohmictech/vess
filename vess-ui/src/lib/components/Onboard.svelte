@@ -126,18 +126,18 @@
   <!-- ── Choose: Create or Import ── -->
   {:else if step === "choose"}
     <h1 class="text-2xl font-bold flex items-center justify-center gap-2" style="color: #88cddf">
-      Welcome to <img src="/vessicon.png" alt="Vess" class="w-8 h-8 inline-block" />
+      welcome to <img src="/vessicon.png" alt="Vess" class="w-8 h-8 inline-block" />
     </h1>
     <div class="flex flex-col gap-3 w-full">
       <button on:click={() => step = "new-tag"}
         class="w-full py-4 rounded-xl font-semibold text-lg transition-all hover:scale-[1.02] active:scale-[0.98]"
         style="background: #88cddf; color: #1a1a1a;">
-        Create New Wallet
+        new wallet
       </button>
       <button on:click={() => step = "import"}
         class="w-full py-4 rounded-xl font-semibold text-lg transition-all hover:scale-[1.02] active:scale-[0.98]"
         style="background: #88cddf18; color: #88cddf; border: 2px solid #88cddf40;">
-        Import from Seed
+        import from seed
       </button>
     </div>
 
@@ -164,7 +164,7 @@
       <button on:click={createNew} disabled={loading || !tagAvailable}
         class="w-full py-3 rounded-xl font-semibold transition-all disabled:opacity-40"
         style="background: #88cddf; color: #1a1a1a;">
-        {loading ? "creating..." : "Create Wallet"}
+        {loading ? "creating..." : "create wallet"}
       </button>
       <button on:click={() => step = "choose"}
         class="text-xs text-gray-500 hover:text-gray-300 transition-colors">← back</button>
@@ -185,13 +185,13 @@
     <button on:click={() => { confirmWords = Array(12).fill(""); step = "new-confirm"; }}
       class="w-full py-3 rounded-xl font-semibold transition-all"
       style="background: #f28e13; color: #1a1a1a;">
-      I've Written Them Down
+      i've written them down
     </button>
 
   <!-- ── New: Confirm seed phrase ── -->
   {:else if step === "new-confirm"}
     <h1 class="text-xl font-bold" style="color: #f28e13">Confirm Your Phrase</h1>
-    <p class="text-xs text-gray-400">Enter each word in order to verify you saved them.</p>
+    <p class="text-xs text-gray-400">enter each word to verify</p>
     <div class="grid grid-cols-3 gap-2 w-full">
       {#each seedWords as _, i}
         <div class="flex flex-col gap-0.5">
