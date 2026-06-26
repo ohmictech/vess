@@ -1,6 +1,6 @@
 <script lang="ts">
   import { fade, scale } from "svelte/transition";
-  import { onMount } from "svelte";
+  import { onMount, onDestroy } from "svelte";
   import HexWallet from "./lib/components/HexWallet.svelte";
   import SendPanel from "./lib/components/SendPanel.svelte";
   import ReceivePanel from "./lib/components/ReceivePanel.svelte";
@@ -8,7 +8,7 @@
   import NodeStatus from "./lib/components/NodeStatus.svelte";
   import MintPanel from "./lib/components/MintPanel.svelte";
   import Onboard from "./lib/components/Onboard.svelte";
-  import { listSwapOffers, createSwapOffer, getBalance, type SwapOffer } from "./lib/rpc/client";
+  import { listSwapOffers, createSwapOffer, getBalance, getNodeInfo, type SwapOffer } from "./lib/rpc/client";
   import { biometricGate } from "./lib/auth";
   import QRCode from "qrcode";
 
@@ -24,6 +24,19 @@
   let btcAddress = "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh";
   let btcCopied = false;
   let btcQr = "";
+
+  // ── peer count ──
+  let peerCount = 0;
+  let networkSize = 0;
+  let peerPollTimer: ReturnType<typeof setInterval> | null = null;
+
+  async function refreshPeerCount() {
+    try {
+      const info = await getNodeInfo();
+      peerCount = info.peer_count;
+      networkSize = info.estimated_network_size;
+    } catch { /* node offline */ }
+  }
 
   // ── swap state ──
   let swapOffers: SwapOffer[] = [];
@@ -53,6 +66,13 @@
     QRCode.toDataURL(btcAddress, { width: 256, margin: 1 }).then(url => btcQr = url);
     // Check if onboarding was already completed
     if (localStorage.getItem("vess_onboarded") === "1") onboarded = true;
+    // Start peer count polling
+    refreshPeerCount();
+    peerPollTimer = setInterval(refreshPeerCount, 15_000);
+  });
+
+  onDestroy(() => {
+    if (peerPollTimer) clearInterval(peerPollTimer);
   });
 
   function onOnboardReady() {
@@ -339,5 +359,17 @@
     </div>
   {/if}
 {/if}
+
+  <!-- ── peer count (always visible, bottom-right) ── -->
+  <div
+    class="fixed bottom-3 right-3 z-40 flex items-center gap-1.5 text-xs text-gray-500 select-none pointer-events-none"
+    style="text-shadow: 0 1px 4px rgba(0,0,0,0.6)"
+  >
+    <span class="inline-block w-1.5 h-1.5 rounded-full" style="background: {peerCount > 0 ? '#88cddf' : '#555'}"></span>
+    {peerCount > 0 ? `${peerCount} peer${peerCount === 1 ? '' : 's'}` : 'offline'}
+    {#if networkSize > 0}
+      <span class="text-gray-600">· est {networkSize}</span>
+    {/if}
+  </div>
 </div>
 

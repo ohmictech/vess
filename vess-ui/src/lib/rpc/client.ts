@@ -3,6 +3,34 @@
 
 const DEFAULT_RPC_URL = "http://127.0.0.1:9821";
 
+let _rpcUrl: string | null = null;
+
+async function getRpcUrl(): Promise<string> {
+  if (_rpcUrl) return _rpcUrl;
+
+  // Check localStorage first (survives refreshes, port persistence).
+  const stored = localStorage.getItem("vess_rpc_url");
+  if (stored) {
+    _rpcUrl = stored;
+    return stored;
+  }
+
+  // In Tauri, ask the backend for the actual port.
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    const port: number = await invoke("get_rpc_port");
+    const url = `http://127.0.0.1:${port}`;
+    localStorage.setItem("vess_rpc_url", url);
+    _rpcUrl = url;
+    return url;
+  } catch {
+    // Not in Tauri (dev mode in browser) — try default.
+    localStorage.setItem("vess_rpc_url", DEFAULT_RPC_URL);
+    _rpcUrl = DEFAULT_RPC_URL;
+    return DEFAULT_RPC_URL;
+  }
+}
+
 export interface RpcRequest {
   method: string;
   params: Record<string, unknown>;
@@ -55,11 +83,11 @@ export interface SwapOffer {
 }
 
 export async function rpcCall(method: string, params: Record<string, unknown> = {}): Promise<RpcResponse> {
-  const url = localStorage.getItem("vess_rpc_url") || DEFAULT_RPC_URL;
+  const url = await getRpcUrl();
   const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ method, params }),
+    body: JSON.stringify({ method, ...params }),
   });
   return res.json();
 }
@@ -186,6 +214,6 @@ export async function createWallet(tag: string): Promise<{ phrase: string[] }> {
 }
 
 export async function recoverWallet(phrase: string[], tag: string): Promise<void> {
-  const res = await rpcCall("recover_wallet", { phrase, tag });
+  const res = await rpcCall("recover_wallet", { phrase: phrase.join(" "), tag });
   if (res.error) throw new Error(res.error);
 }
