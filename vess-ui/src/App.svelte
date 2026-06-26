@@ -367,7 +367,7 @@
   >
     <span class="inline-block w-1.5 h-1.5 rounded-full" style="background: {peerCount > 0 ? '#88cddf' : '#555'}"></span>
     {peerCount > 0 ? `${peerCount} peer${peerCount === 1 ? '' : 's'}` : 'offline'}
-    {#if networkSize > 0}
+    {#if networkSize > 0 && networkSize !== peerCount}
       <span class="text-gray-600">· est {networkSize}</span>
     {/if}
   </div>

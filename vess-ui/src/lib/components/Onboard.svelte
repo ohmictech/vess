@@ -35,10 +35,10 @@
 
   // Validate tag format
   function validateTag(t: string): string {
-    const clean = t.replace(/^\+/, "").toUpperCase();
+    const clean = t.replace(/^\+/, "").toLowerCase();
     if (clean.length < 2) return "too short";
     if (clean.length > 20) return "too long";
-    if (!/^[A-Z][A-Z0-9]*$/.test(clean)) return "must start with letter, then letters/numbers";
+    if (!/^[a-zA-Z][a-zA-Z0-9]*$/.test(clean)) return "must start with letter, then letters/numbers";
     return "";
   }
 
@@ -49,7 +49,7 @@
     if (v) { error = v; return; }
     loading = true;
     try {
-      const res = await checkTag(vesstag.replace(/^\+/, "").toUpperCase());
+      const res = await checkTag(vesstag.replace(/^\+/, "").toLowerCase());
       tagAvailable = res.available;
       if (!res.available) error = res.reason || "tag already taken";
     } catch {
@@ -65,7 +65,7 @@
     if (!tagAvailable) return;
     loading = true;
     try {
-      const res = await createWallet(vesstag.replace(/^\+/, "").toUpperCase());
+      const res = await createWallet(vesstag.replace(/^\+/, "").toLowerCase());
       seedWords = res.phrase;
       step = "new-seed";
     } catch (e) {
@@ -106,7 +106,7 @@
     }
     loading = true;
     try {
-      await recoverWallet(words, vesstag.replace(/^\+/, "").toUpperCase());
+      await recoverWallet(words, vesstag.replace(/^\+/, "").toLowerCase());
       step = "done";
       dispatch("ready");
     } catch (e) {

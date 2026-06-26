@@ -71,7 +71,7 @@ pub fn run() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_rpc_port])
+        .invoke_handler(tauri::generate_handler![get_rpc_port, rpc_proxy])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
@@ -79,4 +79,28 @@ pub fn run() {
 #[tauri::command]
 fn get_rpc_port(state: tauri::State<NodeProcess>) -> u16 {
     state.rpc_port
+}
+
+#[tauri::command]
+async fn rpc_proxy(state: tauri::State<'_, NodeProcess>, method: String, params: serde_json::Value) -> Result<serde_json::Value, String> {
+    let port = state.rpc_port;
+    let url = format!("http://127.0.0.1:{port}");
+    let body = serde_json::json!({ "method": method });
+    // Merge params into top-level if provided.
+    let body = if let serde_json::Value::Object(map) = params {
+        let mut m: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&serde_json::to_string(&body).unwrap()).unwrap();
+        m.extend(map);
+        serde_json::Value::Object(m)
+    } else {
+        body
+    };
+    let client = reqwest::Client::new();
+    let resp = client.post(&url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("RPC connection failed: {e}"))?;
+    let json: serde_json::Value = resp.json().await
+        .map_err(|e| format!("RPC parse failed: {e}"))?;
+    Ok(json)
 }
