@@ -529,19 +529,23 @@ fn validate_bitcoin_timelock_genesis(
         return Err("century lock output_index exceeds CENTURY_LOCK_BLOCKS");
     }
 
-    // 7. For century locks: verify the claimed block hash is in the local
-    // Bitcoin header chain. This prevents submitting bills with fake block
-    // hashes — the node must have seen the actual block header.
+    // 7. For century locks: verify the claimed block hash matches the
+    // actual block at the expected height in the local Bitcoin header chain.
     if matches!(&og.genesis_proof, GenesisProof::CenturyLock(_)) {
+        let expected_height = burn.block_height + og.output_index as u64;
         if let Some(client) = bitcoin_client {
-            if !client.has_block_header(&og.digest) {
-                return Err("century lock block hash not in local Bitcoin header chain");
+            match client.block_hash_at_height(expected_height) {
+                Some(actual_hash) if actual_hash == og.digest => {
+                    // Block hash matches — this bill claims a real block at the right height.
+                }
+                Some(actual_hash) => {
+                    return Err("century lock block hash does not match header chain at expected height");
+                }
+                None => {
+                    return Err("century lock expected block height not yet in header chain");
+                }
             }
         }
-        // If no Bitcoin client is available, the block hash cannot be
-        // independently verified. Nodes without a client should either
-        // trust the SPV proof (which includes a confirmed block) or
-        // defer to nodes that do have a client.
     }
 
     // Return the bundle commitment as proof of successful validation.

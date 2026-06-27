@@ -11,7 +11,7 @@ The BTC returns after the lock expires. No burn, no bridge, no custodian. The ec
 
 The protocol's intention and novelty is to fundamentally change what "access to credit" means. Rather than having to be in debt to someone else to acquire liquidity against your assets, Vess allows you to directly issue tokenized claims on future work against your own Bitcoin, trustlessly.
 
-Once BTC is locked, the corresponding minted Vess is moved around like cryptographically self-contained bearer bonds that can be split and combined cryptographically. As such, there is no global consensus mechanism, "blocks", or state.
+Once BTC is locked, the corresponding minted Vess is moved around as cryptographically self-contained bearer bonds that can be split and combined. As such, there is no global consensus mechanism, "blocks", or state, just a deterministic ownership registry hash table.
 
 Vess is built on maximum decentralization, piggybacking the BTC network with a builtin light client + self-audited transaction and block commitments. No node RPC required.
 
@@ -54,7 +54,7 @@ is the only exchange it needs, retaining the same keys, same wallet, same networ
 
 ## Tags
 
-Human-readable identities for payments (e.g. `+ALICE`). Once registered, the tag→address mapping is permanent.
+Human-readable identities for payments (e.g. `+ALICE`). Once registered and paid to, the tag→address mapping is permanent.
 
 - Lowercase alphanumeric only, 3–20 chars
 - Argon2id PoW (2 GiB) to claim
@@ -62,13 +62,13 @@ Human-readable identities for payments (e.g. `+ALICE`). Once registered, the tag
 ## Architecture
 
 Nodes form a peer-to-peer mesh with post-quantum handshakes (ML-KEM-768 + Falcon).
-Ownership state is replicated deterministically across the DHT. 
+Ownership state is replicated deterministically. 
 
 - **No consensus** — deterministic registry rules
 - **No fees** — no gas, no mempool, no fee auction
 - **No burn** — BTC returns after CLTV expiry
 - **No bridge** — native Bitcoin script
-- **No CEX** — swap DHT is the exchange
+- **No UTXOs or accounts** - payment amounts and recipients are obfuscated
 
 ## Cryptography
 
@@ -96,7 +96,6 @@ All Vess-native operations are post-quantum.
 | Single asset | Vess (time-credit) + Vichor (stock) |
 
 Vess is **not** a sidechain, rollup, federated mint, or multisig bridge.
-It is Bitcoin-native time-credit with self-contained liquidity.
 
 ## License
 

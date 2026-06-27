@@ -279,6 +279,11 @@ impl HeaderChain {
         self.records.len().saturating_sub(1)
     }
 
+    /// Return the block hash at a given height, if the chain extends that far.
+    fn block_hash_at_height(&self, height: u64) -> Option<BlockHash> {
+        self.records.get(height as usize).map(|r| r.hash)
+    }
+
     fn best_hash(&self) -> BlockHash {
         self.records
             .last()
@@ -832,6 +837,15 @@ impl BitcoinLightClient {
         let hash = BlockHash::from_slice(block_hash)
             .unwrap_or(BlockHash::all_zeros());
         self.header_chain.lock().unwrap().index.contains_key(&hash)
+    }
+
+    /// Return the block hash at a given height in the validated header chain.
+    /// Returns `None` if the chain doesn't extend to that height yet.
+    /// Used by century lock validation to verify that a claimed block hash
+    /// matches the actual block at the expected height.
+    pub fn block_hash_at_height(&self, height: u64) -> Option<[u8; 32]> {
+        let hash = self.header_chain.lock().unwrap().block_hash_at_height(height);
+        hash.map(|h| *h.as_ref())
     }
 
     pub fn active_peers(&self) -> Vec<SocketAddr> {
