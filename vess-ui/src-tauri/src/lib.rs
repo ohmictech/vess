@@ -3,10 +3,12 @@ use tauri_plugin_shell::ShellExt;
 use tauri_plugin_shell::process::CommandChild;
 use tauri_plugin_shell::process::CommandEvent;
 use std::sync::Mutex;
+use std::sync::Arc;
 
 struct NodeProcess {
     child: Mutex<Option<CommandChild>>,
     rpc_port: u16,
+    ready: Arc<Mutex<bool>>,
 }
 
 /// Find a free port in range 9821–9851.
@@ -41,7 +43,7 @@ pub fn run() {
             })?;
 
             log::info!("spawning Vess node on port {port}");
-            app.manage(NodeProcess { child: Mutex::new(None), rpc_port: port });
+            app.manage(NodeProcess { child: Mutex::new(None), rpc_port: port, ready: Arc::new(Mutex::new(false)) });
 
             let shell = app.shell();
             let (mut rx, child) = shell
@@ -67,6 +69,35 @@ pub fn run() {
                         _ => {}
                     }
                 }
+            });
+
+            // Spawn readiness check in background — do NOT block setup().
+            let ready_flag = app.state::<NodeProcess>().ready.clone();
+            tauri::async_runtime::spawn(async move {
+                let rpc_url = format!("http://127.0.0.1:{port}");
+                log::info!("waiting for node RPC at {rpc_url}...");
+                let client = reqwest::Client::new();
+                for attempt in 0..60 {
+                    match client.post(&rpc_url)
+                        .json(&serde_json::json!({"method": "node_info"}))
+                        .send()
+                        .await
+                    {
+                        Ok(r) if r.status().as_u16() == 200 => {
+                            log::info!("node RPC ready after {}s", attempt);
+                            *ready_flag.lock().unwrap() = true;
+                            return;
+                        }
+                        _ => {
+                            if attempt == 0 {
+                                log::info!("node still starting...");
+                            }
+                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        }
+                    }
+                }
+                log::warn!("node RPC did not become ready within 60s");
+                *ready_flag.lock().unwrap() = true; // let UI load anyway
             });
 
             Ok(())
