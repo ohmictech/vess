@@ -164,7 +164,9 @@ impl Denomination {
     /// Check whether a u64 is a valid 1-2-5 denomination.
     ///
     /// A value is valid iff after stripping all trailing zeros the
-    /// remaining digit is 1, 2, or 5.
+    /// remaining digit is 1, 2, or 5. Any denomination in the 1-2-5
+    /// series is accepted — higher denominations require proportionally
+    /// more work to mint, which is self-limiting.
     pub fn is_valid(v: u64) -> bool {
         if v == 0 {
             return false;
@@ -476,6 +478,24 @@ pub fn bitcoin_timelock_mint_id(txid: &[u8; 32], output_index: u32) -> [u8; 32] 
     h.update(txid);
     h.update(&output_index.to_le_bytes());
     *h.finalize().as_bytes()
+}
+
+/// Compute the per-block Vess amount for a timelock or century lock.
+///
+/// `per_block = ceil(locked_sats / BLOCKS_PER_YEAR)`
+///
+/// This is the denomination of each bill produced by the faucet.
+pub fn bitcoin_timelock_per_block_vess(locked_sats: u64, lock_blocks: u64) -> u64 {
+    const BLOCKS_PER_YEAR: u64 = 52_560;
+    const CENTURY_LOCK_THRESHOLD: u64 = 5_256_000;
+    if lock_blocks >= CENTURY_LOCK_THRESHOLD {
+        // Century lock: per-block drip, rounded up
+        ((locked_sats as u128 + BLOCKS_PER_YEAR as u128 - 1)
+            / BLOCKS_PER_YEAR as u128) as u64
+    } else {
+        // Standard timelock: full amount at once
+        locked_sats
+    }
 }
 
 // ── Vichor genesis ──────────────────────────────────────────────────

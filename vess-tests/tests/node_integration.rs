@@ -87,9 +87,6 @@ async fn spawn_node(
         is_testnet: false,
         test: false,
         bootstrap_dns: vec![],
-        eth_rpc_url: None,
-        eth_burn_contract: None,
-        eth_chain_id: None,
     };
 
     tokio::spawn(async move { run_node(config).await });

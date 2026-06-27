@@ -132,6 +132,12 @@ pub struct WalletFile {
     #[serde(default)]
     pub encrypted_bitcoin_wallet_state: Option<EncryptedBlob>,
 
+    /// Active century lock IDs owned by this wallet.
+    /// Persisted so recovery from seed phrase restores the faucet.
+    /// The full CenturyLockState is recovered from the DHT manifest or node snapshot.
+    #[serde(default)]
+    pub century_lock_ids: Vec<[u8; 32]>,
+
     /// Password-encrypted copy of the encryption key for fast daily unlock.
     /// Set via `vess init --password` or `vess set-password`.
     #[serde(default)]
@@ -165,6 +171,7 @@ struct WalletPrivateMetadata {
     billfold: BillFold,
     next_dht_index: u64,
     tag_registration: Option<StoredTagRegistration>,
+    century_lock_ids: Vec<[u8; 32]>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -249,6 +256,7 @@ impl WalletFile {
             encrypted_bitcoin_wallet_state: None,
             password_cache: None,
             integrity_hash: None,
+            century_lock_ids: Vec::new(),
         };
         wallet.refresh_encrypted_private_metadata(enc_key)?;
         Ok(wallet)
@@ -266,6 +274,7 @@ impl WalletFile {
             billfold: self.billfold.clone(),
             next_dht_index: self.next_dht_index,
             tag_registration: self.tag_registration.clone(),
+            century_lock_ids: self.century_lock_ids.clone(),
         }
     }
 
@@ -287,6 +296,7 @@ impl WalletFile {
         self.billfold = metadata.billfold;
         self.next_dht_index = metadata.next_dht_index;
         self.tag_registration = metadata.tag_registration;
+        self.century_lock_ids = metadata.century_lock_ids;
         Ok(())
     }
 
@@ -986,6 +996,7 @@ mod tests {
             mint_id: [0x33; 32],
             chain_tip: [0x44; 32],
             chain_depth: 0,
+            asset: vess_foundry::Asset::Btc,
         };
         billfold.deposit_with_credentials(
             bill.clone(),

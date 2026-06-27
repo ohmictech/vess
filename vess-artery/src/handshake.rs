@@ -155,12 +155,13 @@ impl PeerRegistry {
 
     /// Generate a random nonce, record it, and transition peer to Challenged.
     ///
-    /// Returns the nonce to embed in a [`HandshakeChallenge`] message.
-    pub fn issue_challenge(&mut self, peer_id: [u8; 32]) -> [u8; 32] {
-        // Never overwrite Banished entries — return a zero nonce sentinel.
+    /// Returns `Some(nonce)` to embed in a [`HandshakeChallenge`] message,
+    /// or `None` if the peer is Banished and should not be challenged.
+    pub fn issue_challenge(&mut self, peer_id: [u8; 32]) -> Option<[u8; 32]> {
+        // Never overwrite Banished entries — return None as sentinel.
         if let Some(existing) = self.peers.get(&peer_id) {
             if existing.state == PeerState::Banished {
-                return [0u8; 32];
+                return None;
             }
             // If already Challenged and the challenge hasn't expired, return
             // the existing nonce.  This prevents concurrent tasks (handshake
@@ -171,7 +172,7 @@ impl PeerRegistry {
                     (existing.challenge_nonce, existing.challenged_at)
                 {
                     if at.elapsed() < self.challenge_timeout {
-                        return nonce;
+                        return Some(nonce);
                     }
                 }
             }
@@ -196,7 +197,7 @@ impl PeerRegistry {
                 has_proven_burn: false,
             },
         );
-        nonce
+        Some(nonce)
     }
 
     /// Verify the HMAC in a [`HandshakeResponse`] against the stored nonce.
@@ -664,7 +665,7 @@ mod tests {
 
         assert_eq!(reg.state(&peer), PeerState::Unknown);
 
-        let nonce = reg.issue_challenge(peer);
+        let nonce = reg.issue_challenge(peer).expect("non-banished peer should get a nonce");
         assert_eq!(reg.state(&peer), PeerState::Challenged);
 
         let hmac = compute_handshake_hmac(&version, &nonce);
@@ -678,7 +679,7 @@ mod tests {
         let mut reg = PeerRegistry::new(Duration::from_secs(30));
         let peer = [0x02; 32];
 
-        let _nonce = reg.issue_challenge(peer);
+        let _nonce = reg.issue_challenge(peer).expect("non-banished peer should get a nonce");
         let bad_hmac = [0xFF; 32];
         assert!(!reg.verify_response(&peer, &bad_hmac, &[version]));
         // Still Challenged (caller is responsible for banishing).
@@ -692,6 +693,30 @@ mod tests {
 
         reg.mark_banished(peer);
         assert_eq!(reg.state(&peer), PeerState::Banished);
+
+        // Banished peers must NOT receive a valid nonce — issue_challenge
+        // returns None, preventing a bypass where [0u8;32] was a valid nonce.
+        assert!(reg.issue_challenge(peer).is_none());
+    }
+
+    #[test]
+    fn banished_peer_never_gets_valid_challenge() {
+        let mut reg = PeerRegistry::new(Duration::from_secs(30));
+        let peer = [0x05; 32];
+
+        // Fresh peer gets a nonce.
+        let nonce = reg.issue_challenge(peer).expect("fresh peer should get nonce");
+        assert_ne!(nonce, [0u8; 32]); // nonce should be random, not zero
+
+        // Banish it.
+        reg.mark_banished(peer);
+        assert_eq!(reg.state(&peer), PeerState::Banished);
+
+        // Should NEVER issue a challenge to a banished peer.
+        assert!(reg.issue_challenge(peer).is_none());
+
+        // Verify the state remains Banished (not overwritten to Challenged).
+        assert_eq!(reg.state(&peer), PeerState::Banished);
     }
 
     #[test]
@@ -699,7 +724,7 @@ mod tests {
         let mut reg = PeerRegistry::new(Duration::from_millis(0));
         let peer = [0x04; 32];
 
-        let _nonce = reg.issue_challenge(peer);
+        let _nonce = reg.issue_challenge(peer).expect("non-banished peer should get a nonce");
         assert_eq!(reg.state(&peer), PeerState::Challenged);
 
         // With a 0ms timeout, the challenge is immediately stale.

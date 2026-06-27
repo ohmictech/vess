@@ -38,6 +38,7 @@ fn fresh_bill(denom: Denomination) -> VessBill {
         mint_id: rand::random(),
         chain_tip: rand::random(),
         chain_depth: 0,
+        asset: vess_foundry::Asset::Btc,
     }
 }
 
@@ -101,7 +102,7 @@ fn full_payment_lifecycle() {
             prev_transfer_chain_tip: None,
             current_owner_vk_hash: *blake3::hash(&vk).as_bytes(),
             current_owner_vk: vk.clone(),
-            current_owner_program: None,
+
             denomination_value: bill.denomination.value(),
             updated_at: now_unix(),
             proof_hash: [0u8; 32],
@@ -136,7 +137,6 @@ fn ownership_registry_double_registration() {
         prev_transfer_chain_tip: None,
         current_owner_vk_hash: *blake3::hash(&vk).as_bytes(),
         current_owner_vk: vk.clone(),
-        current_owner_program: None,
         denomination_value: 10,
         updated_at: now_unix(),
         proof_hash: [0u8; 32],
@@ -153,7 +153,6 @@ fn ownership_registry_double_registration() {
         prev_transfer_chain_tip: None,
         current_owner_vk_hash: *blake3::hash(&vk).as_bytes(),
         current_owner_vk: vk.clone(),
-        current_owner_program: None,
         denomination_value: 20,
         updated_at: now_unix(),
         proof_hash: [0u8; 32],
@@ -186,7 +185,6 @@ fn ownership_registry_consume_and_merkle() {
         prev_transfer_chain_tip: None,
         current_owner_vk_hash: *blake3::hash(&vk).as_bytes(),
         current_owner_vk: vk.clone(),
-        current_owner_program: None,
         denomination_value: 10,
         updated_at: now_unix(),
         proof_hash: [0u8; 32],
@@ -339,7 +337,8 @@ fn protocol_message_serialization() {
         bill_count: 0,
         mailbox_key: None,
         direct_receipt_tag_hash: None,
-        program_receipt: None,
+        hash_lock: None,
+
     })];
 
     for msg in &messages {
@@ -536,7 +535,7 @@ fn ownership_registry_persistence_roundtrip() {
             prev_transfer_chain_tip: None,
             current_owner_vk_hash: *blake3::hash(&vk).as_bytes(),
             current_owner_vk: vk.clone(),
-            current_owner_program: None,
+
             denomination_value: 10,
             updated_at: now_unix(),
             proof_hash: [0u8; 32],
@@ -579,7 +578,7 @@ fn ownership_registry_total_supply() {
             prev_transfer_chain_tip: None,
             current_owner_vk_hash: *blake3::hash(&vk).as_bytes(),
             current_owner_vk: vk.clone(),
-            current_owner_program: None,
+
             denomination_value: val,
             updated_at: now_unix(),
             proof_hash: [0u8; 32],
@@ -734,7 +733,6 @@ fn artery_snapshot_save_load() {
         prev_transfer_chain_tip: None,
         current_owner_vk_hash: *blake3::hash(&vk).as_bytes(),
         current_owner_vk: vk.clone(),
-        current_owner_program: None,
         denomination_value: 10,
         updated_at: now_unix(),
         proof_hash: [0u8; 32],
@@ -751,7 +749,6 @@ fn artery_snapshot_save_load() {
         prev_transfer_chain_tip: None,
         current_owner_vk_hash: *blake3::hash(&vk).as_bytes(),
         current_owner_vk: vk.clone(),
-        current_owner_program: None,
         denomination_value: 20,
         updated_at: now_unix(),
         proof_hash: [0u8; 32],
@@ -775,9 +772,6 @@ fn artery_snapshot_save_load() {
         ownership_records: vec![record1, record2],
         consumed_records: std::collections::BTreeMap::new(),
         manifests: std::collections::BTreeMap::new(),
-        compute_programs: std::collections::BTreeMap::new(),
-        compute_program_manifests: std::collections::BTreeMap::new(),
-        compute_receipts: std::collections::BTreeMap::new(),
         retained_ownership_records: vec![],
         retained_consumed_records: std::collections::BTreeMap::new(),
         peer_endpoints: std::collections::BTreeMap::new(),
@@ -874,8 +868,9 @@ fn tag_hardening_and_pruning() {
     assert!(dht.is_hardened("alice"));
     assert!(!dht.is_hardened("bob"));
 
-    // Purge at now = 1000 + 30 days + 1 → bob should be pruned.
-    let now = 1000 + vess_tag::TAG_PRUNE_SECS + 1;
+    // Purge at now = 1000 + 100 years + 1 → bob should be pruned.
+    let ttl: u64 = 365 * 24 * 60 * 60 * 100; // 100 years (internal TagDht TTL)
+    let now = 1000 + ttl + 1;
     let pruned = dht.purge_unhardened(now);
     assert_eq!(pruned, 1);
     assert!(dht.lookup("alice").is_some());
@@ -935,7 +930,7 @@ fn full_send_receive_attest_finalize() {
             prev_transfer_chain_tip: None,
             current_owner_vk_hash: *blake3::hash(&vk).as_bytes(),
             current_owner_vk: vk.clone(),
-            current_owner_program: None,
+
             denomination_value: bill.denomination.value(),
             updated_at: now_unix(),
             proof_hash: [0u8; 32],
@@ -960,7 +955,7 @@ fn full_send_receive_attest_finalize() {
             prev_transfer_chain_tip: None,
             current_owner_vk_hash: *blake3::hash(&vk).as_bytes(),
             current_owner_vk: vk.clone(),
-            current_owner_program: None,
+
             denomination_value: bill.denomination.value(),
             updated_at: now_unix(),
             proof_hash: [0u8; 32],

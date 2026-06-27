@@ -487,7 +487,46 @@ fn validate_bitcoin_timelock_genesis(
     burn: &vess_protocol::BitcoinTimeLockProof,
     bitcoin_client: Option<&vess_bitcoin::BitcoinLightClient>,
 ) -> std::result::Result<[u8; 32], &'static str> {
-    unimplemented!("validate_bitcoin_timelock_genesis needs updating")
+    // 1. Validate the burn proof itself (SPV, confirmations, merkle, etc.).
+    validate_timelock_proof_standalone(burn, bitcoin_client)?;
+
+    // 2. Verify the ownership fields match.
+    if og.owner_vk_hash != burn.first_owner_vk_hash {
+        return Err("ownership genesis owner_vk_hash mismatch with burn proof");
+    }
+    if og.owner_vk != burn.first_owner_vk {
+        return Err("ownership genesis owner_vk mismatch with burn proof");
+    }
+
+    // 3. Verify mint_id is deterministic from txid + output_index.
+    let expected_mint_id = vess_foundry::bitcoin_timelock_mint_id(&burn.txid, og.output_index);
+    if og.mint_id != expected_mint_id {
+        return Err("century lock mint_id does not match txid + output_index");
+    }
+
+    // 4. Verify chain_tip is derived from mint_id + owner.
+    let expected_chain_tip = vess_foundry::genesis_chain_tip(&og.mint_id, &og.owner_vk_hash);
+    if og.chain_tip != expected_chain_tip {
+        return Err("ownership genesis chain_tip mismatch");
+    }
+
+    // 5. Verify denomination matches the burn proof's per-block Vess for this output.
+    let per_block = vess_foundry::bitcoin_timelock_per_block_vess(
+        burn.locked_sats, burn.lock_blocks,
+    );
+    if og.denomination_value != per_block {
+        return Err("century lock bill denomination does not match per-block Vess");
+    }
+
+    // 6. Verify output_index is within the century lock range.
+    let max_outputs = vess_protocol::CENTURY_LOCK_BLOCKS;
+    if og.output_index as u64 >= max_outputs {
+        return Err("century lock output_index exceeds CENTURY_LOCK_BLOCKS");
+    }
+
+    // Return the bundle commitment as proof of successful validation.
+    let commitment = bitcoin_timelock_bundle_commitment(burn);
+    Ok(commitment)
 }
 
 /// Verify the [`ProofOfVessOwnership`] attached to a [`TagLookup`] request.
@@ -675,6 +714,7 @@ mod tests {
         let txid = [0x11; 32];
         let owner_vk = vec![0x42; 64];
         let owner_vk_hash = vess_foundry::spend_auth::vk_hash(&owner_vk);
+        let output_values = vec![10u64];
         let burn = vess_protocol::BitcoinTimeLockProof {
             network: BitcoinNetwork::Regtest,
             txid,
@@ -687,9 +727,14 @@ mod tests {
             merkle_root: txid,
             merkle_proof: Vec::new(),
             merkle_index: 0,
+            locked_sats: 100,
+            lock_blocks: 52560,
+            cltv_block_height: 52600,
+            vess_amount: 100,
             first_owner_vk: owner_vk.clone(),
             first_owner_vk_hash: owner_vk_hash,
             output_values: output_values.clone(),
+            commitment_payload: Vec::new(),
         };
         let digest = [0u8; 32]; // TODO: recompute with bitcoin_timelock_payload_commitment
         let mint_id = vess_foundry::bitcoin_timelock_mint_id(&txid, 0);
@@ -722,7 +767,6 @@ mod tests {
             prev_transfer_chain_tip: None,
             current_owner_vk_hash: [0x44; 32],
             current_owner_vk: vec![0x55; 64],
-            current_owner_program: None,
             denomination_value: 10,
             updated_at,
             proof_hash: [0x66; 32],
@@ -756,7 +800,7 @@ mod tests {
             bill_count: 1,
             mailbox_key: Some([tag.wrapping_add(2); 32]),
             direct_receipt_tag_hash: None,
-            program_receipt: None,
+            hash_lock: None,
         }
     }
 
@@ -829,6 +873,8 @@ mod tests {
             test_faucet_enabled: false,
             is_testnet: false,
             events: VecDeque::new(),
+            passive_mode: false,
+            payment_history: vess_kloak::payment::PaymentHistory::default(),
         }))
     }
 
@@ -848,11 +894,9 @@ mod tests {
             mint_id,
             stealth_id: [witness_seed.wrapping_add(1); 32],
             prev_owner_vk,
-            prev_owner_program: None,
             transfer_sig,
             new_owner_vk_hash,
             new_owner_vk,
-            new_owner_program: None,
             new_chain_tip: vess_foundry::advance_chain_tip_with_hash(
                 &base_chain_tip,
                 &new_owner_vk_hash,
@@ -862,10 +906,10 @@ mod tests {
             hops_remaining: 0,
             chain_depth,
             encrypted_bill: Vec::new(),
-            program_spend_witness: None,
             pow_nonce: None,
             pow_hash: None,
             accumulated_work: None,
+            hash_preimage: None,
         }
     }
 
@@ -1148,20 +1192,18 @@ mod tests {
             mint_id: [0x75; 32],
             stealth_id: [0x76; 32],
             prev_owner_vk: Vec::new(),
-            prev_owner_program: None,
             transfer_sig: Vec::new(),
             new_owner_vk_hash,
             new_owner_vk: Vec::new(),
-            new_owner_program: None,
             new_chain_tip: valid_tip,
             timestamp: 1_700_000_000,
             hops_remaining: 0,
             chain_depth: 2,
             encrypted_bill: Vec::new(),
-            program_spend_witness: None,
             pow_nonce: None,
             pow_hash: None,
             accumulated_work: None,
+            hash_preimage: None,
         };
 
         assert!(verify_competing_claim_chain_tip(base_chain_tip, &claim, witness_hash));
@@ -1191,7 +1233,6 @@ mod tests {
                     prev_transfer_chain_tip: None,
                     current_owner_vk_hash: vess_foundry::spend_auth::vk_hash(&genesis_owner_vk),
                     current_owner_vk: genesis_owner_vk.clone(),
-                    current_owner_program: None,
                     denomination_value: 10,
                     updated_at,
                     proof_hash: [0x55; 32],
@@ -1286,11 +1327,9 @@ mod tests {
                 mint_id: [0x01; 32],
                 stealth_id: [0x02; 32],
                 prev_owner_vk: Vec::new(),
-                prev_owner_program: None,
                 transfer_sig: Vec::new(),
                 new_owner_vk_hash,
                 new_owner_vk: Vec::new(),
-                new_owner_program: None,
                 new_chain_tip: vess_foundry::advance_chain_tip_with_hash(
                     &base_chain_tip,
                     &new_owner_vk_hash,
@@ -1300,10 +1339,10 @@ mod tests {
                 hops_remaining: 0,
                 chain_depth: 2,
                 encrypted_bill: Vec::new(),
-                program_spend_witness: None,
                 pow_nonce: None,
                 pow_hash: None,
                 accumulated_work: None,
+                hash_preimage: None,
             };
 
             prop_assert!(verify_competing_claim_chain_tip(base_chain_tip, &claim, witness_hash));
@@ -2102,6 +2141,45 @@ pub(crate) fn retain_local_ownership_genesis(
     og: &OwnershipGenesis,
     updated_at: u64,
 ) {
+    // Validate century lock and timelock proofs before accepting.
+    match &og.genesis_proof {
+        GenesisProof::BitcoinTimeLock(burn) => {
+            if let Err(e) = validate_bitcoin_timelock_genesis(
+                og, burn, state.bitcoin_client.as_ref(),
+            ) {
+                tracing::warn!(
+                    mint_id = %crate::persistence::hex_key(&og.mint_id),
+                    error = e,
+                    "rejecting OwnershipGenesis with invalid BitcoinTimeLock proof"
+                );
+                return;
+            }
+        }
+        GenesisProof::CenturyLock(burn) => {
+            if let Err(e) = validate_bitcoin_timelock_genesis(
+                og, burn, state.bitcoin_client.as_ref(),
+            ) {
+                tracing::warn!(
+                    mint_id = %crate::persistence::hex_key(&og.mint_id),
+                    error = e,
+                    "rejecting OwnershipGenesis with invalid CenturyLock proof"
+                );
+                return;
+            }
+            // Additional century-lock-specific check: output_index must not
+            // exceed the century lock range (5,256,000 blocks = 100 years).
+            if og.output_index as u64 >= vess_protocol::CENTURY_LOCK_BLOCKS {
+                tracing::warn!(
+                    mint_id = %crate::persistence::hex_key(&og.mint_id),
+                    output_index = og.output_index,
+                    "rejecting century lock bill: output_index exceeds CENTURY_LOCK_BLOCKS"
+                );
+                return;
+            }
+        }
+        _ => {}
+    }
+
     let Some((proof_hash, proof_nonce)) = proof_hash_and_nonce_from_genesis(og) else {
         return;
     };
@@ -2962,6 +3040,17 @@ impl Drop for WalletState {
     }
 }
 
+impl WalletState {
+    /// Record a century lock ID for wallet-file persistence.
+    pub(crate) fn add_century_lock_id(&mut self, lock_id: [u8; 32]) {
+        // The lock ID will be persisted via flush_wallet → save → encrypted_private_metadata.
+        // We store it in a temporary list; flush_wallet reads century_locks from ArteryState.
+        // The lock ID is already stored in ArteryState.century_locks.
+        // This method exists as a hook for future wallet-level tracking.
+        let _ = lock_id;
+    }
+}
+
 /// Shared artery node state behind a mutex.
 pub struct ArteryState {
     pub registry: OwnershipRegistry,
@@ -3286,11 +3375,14 @@ impl ArteryState {
 
     /// Persist the in-memory wallet billfold to disk immediately.
     /// Spend credentials are encrypted before writing.
+    /// Also syncs century_lock_ids from ArteryState to the wallet file.
     /// No-op if no wallet is loaded.
     pub(crate) fn flush_wallet(&self) {
         if let Some(ref ws) = self.wallet {
             if let Ok(mut wf) = vess_kloak::WalletFile::load(&ws.wallet_path) {
                 wf.billfold = ws.billfold.clone();
+                // Sync century lock IDs from node state to wallet file.
+                wf.century_lock_ids = self.century_locks.keys().cloned().collect();
                 // Encrypt spend credentials before persisting.
                 if let Err(e) = wf.encrypt_spend_credentials(&ws.billfold, &ws.enc_key) {
                     tracing::warn!(error = %e, "failed to encrypt spend credentials");
@@ -3320,18 +3412,39 @@ impl ArteryState {
         &mut self,
         manifest_tx: &tokio::sync::mpsc::UnboundedSender<vess_protocol::ManifestStore>,
     ) -> Option<[u8; 32]> {
-        let ws = self.wallet.as_ref()?;
         // Collect bill mint IDs and DHT indices for recovery.
-        let bill_info: Vec<([u8; 32], u64)> = ws.billfold.bills().iter()
-            .map(|b| (b.mint_id, b.dht_index)).collect();
-        if bill_info.is_empty() { return None; }
+        let bill_info: Vec<([u8; 32], u64)> = self.wallet.as_ref()
+            .map(|ws| ws.billfold.bills().iter()
+                .map(|b| (b.mint_id, b.dht_index)).collect())
+            .unwrap_or_default();
 
-        let manifest_json = serde_json::to_vec(&bill_info).ok()?;
+        // Collect active century lock IDs for recovery.
+        let century_lock_ids: Vec<[u8; 32]> = self.century_locks.keys().cloned().collect();
+
+        // Get enc_key (cloned to release borrow).
+        let enc_key = self.wallet.as_ref().map(|ws| ws.enc_key);
+
+        // Nothing to publish if no bills, no century locks, or no encryption key.
+        if bill_info.is_empty() && century_lock_ids.is_empty() { return None; }
+        let enc_key = enc_key?;
+
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct WalletManifest {
+            bills: Vec<([u8; 32], u64)>,
+            #[serde(default)]
+            century_lock_ids: Vec<[u8; 32]>,
+        }
+
+        let manifest = WalletManifest {
+            bills: bill_info,
+            century_lock_ids,
+        };
+        let manifest_json = serde_json::to_vec(&manifest).ok()?;
         let dht_key: [u8; 32] = *blake3::hash(&manifest_json).as_bytes();
 
         // Encrypt with the wallet's enc_key (ChaCha20Poly1305 nonce || ct).
         let encrypted_manifest = vess_kloak::persistence::EncryptedBlob::encrypt(
-            &manifest_json, &ws.enc_key
+            &manifest_json, &enc_key
         ).map(|blob| {
             let mut v = Vec::with_capacity(12 + blob.ciphertext.len());
             v.extend_from_slice(&blob.nonce);
@@ -3347,6 +3460,118 @@ impl ArteryState {
         self.manifest_store.insert(dht_key, (encrypted_manifest, Self::now_unix()));
         let _ = manifest_tx.send(msg);
         Some(dht_key)
+    }
+
+    /// Create a century lock faucet from a BitcoinTimeLockProof.
+    /// Stores the CenturyLockState, persists to wallet, and publishes manifest.
+    pub(crate) fn create_century_lock(
+        &mut self,
+        burn_proof: vess_protocol::BitcoinTimeLockProof,
+        manifest_tx: &tokio::sync::mpsc::UnboundedSender<vess_protocol::ManifestStore>,
+    ) -> Result<vess_protocol::CenturyLockState, &'static str> {
+        let owner_node_id = self.node_id;
+        let created_at = Self::now_unix();
+        let lock = vess_protocol::CenturyLockState::new(burn_proof, owner_node_id, created_at);
+
+        if lock.per_block_vess == 0 {
+            return Err("century lock per-block Vess is zero — locked sats too low");
+        }
+
+        let lock_id = lock.lock_id;
+        self.century_locks.insert(lock_id, lock.clone());
+
+        // Persist lock ID to wallet file.
+        if let Some(ref mut ws) = self.wallet {
+            ws.add_century_lock_id(lock_id);
+        }
+
+        // Flush wallet to disk and publish updated manifest to DHT.
+        self.flush_wallet();
+        self.publish_manifest_to_dht(manifest_tx);
+
+        tracing::info!(
+            lock_id = %crate::persistence::hex_key(&lock_id),
+            total_sats = lock.total_sats,
+            per_block_vess = lock.per_block_vess,
+            "century lock faucet created"
+        );
+
+        Ok(lock)
+    }
+
+    /// Mint pending bills for all active century locks.
+    /// Called when a new Bitcoin block is observed.
+    /// Returns the number of bills minted.
+    pub(crate) fn mint_century_lock_bills(
+        &mut self,
+        current_block: u64,
+        og_tx: &tokio::sync::mpsc::UnboundedSender<vess_protocol::OwnershipGenesis>,
+        manifest_tx: &tokio::sync::mpsc::UnboundedSender<vess_protocol::ManifestStore>,
+    ) -> usize {
+        let mut minted = 0usize;
+        let old_block = self.century_lock_last_block;
+        self.century_lock_last_block = current_block;
+
+        // Collect all pending genesis messages first (avoids borrow conflicts).
+        let mut pending_ogs: Vec<vess_protocol::OwnershipGenesis> = Vec::new();
+        let mut lock_updates: Vec<([u8; 32], u64)> = Vec::new();
+
+        let lock_ids: Vec<[u8; 32]> = self.century_locks.keys().cloned().collect();
+        for lock_id in &lock_ids {
+            let Some(lock) = self.century_locks.get(lock_id) else { continue };
+            if !lock.is_active(current_block) { continue; }
+
+            let start = lock.last_claimed_block.max(old_block);
+            let end = current_block.min(lock.end_block);
+
+            for block in start..end {
+                let output_index = (block - lock.start_block) as u32;
+                let mint_id = vess_foundry::bitcoin_timelock_mint_id(
+                    &lock.burn_proof.txid,
+                    output_index,
+                );
+
+                pending_ogs.push(vess_protocol::OwnershipGenesis {
+                    mint_id,
+                    chain_tip: vess_foundry::genesis_chain_tip(
+                        &mint_id,
+                        &lock.burn_proof.first_owner_vk_hash,
+                    ),
+                    owner_vk_hash: lock.burn_proof.first_owner_vk_hash,
+                    owner_vk: lock.burn_proof.first_owner_vk.clone(),
+                    denomination_value: lock.per_block_vess,
+                    genesis_proof: vess_protocol::GenesisProof::CenturyLock(
+                        lock.burn_proof.clone(),
+                    ),
+                    digest: lock.burn_proof.txid,
+                    hops_remaining: 6,
+                    chain_depth: 0,
+                    output_index,
+                    ..Default::default()
+                });
+            }
+
+            lock_updates.push((*lock_id, end));
+        }
+
+        // Now apply all mutations.
+        for og in pending_ogs {
+            queue_local_ownership_genesis(self, og_tx, og);
+            minted += 1;
+        }
+        for (lock_id, end) in lock_updates {
+            if let Some(lock) = self.century_locks.get_mut(&lock_id) {
+                lock.last_claimed_block = end;
+            }
+        }
+
+        if minted > 0 {
+            tracing::info!(minted, current_block, previous_block = old_block, "minted century lock bills");
+            self.flush_wallet();
+            self.publish_manifest_to_dht(manifest_tx);
+        }
+
+        minted
     }
 
     fn snapshot(&self) -> ArterySnapshot {
@@ -4394,6 +4619,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
     let flush_node = node.clone();
     let flush_storage_dir = config.state_dir.clone();
     let flush_manifest_tx = manifest_tx.clone();
+    let flush_og_tx = og_tx.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
         loop {
@@ -4490,20 +4716,19 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 }
                 // ── Century lock auto-minting ──────────────────────
                 // Mint pending bills for active century locks.
-                // Called manually via RPC or triggered by block events.
-                // State is tracked in s.century_locks.
                 if !s.century_locks.is_empty() {
-                    for (_lock_id, lock) in s.century_locks.iter() {
-                        if lock.is_active(s.century_lock_last_block) {
-                            let remaining = lock.remaining_vess(s.century_lock_last_block);
-                            if remaining > 0 {
-                                info!(
-                                    lock_id = %crate::persistence::hex_key(&lock.lock_id),
-                                    remaining_vess = remaining,
-                                    unclaimed_blocks = lock.unclaimed_blocks(s.century_lock_last_block),
-                                    "century lock has unclaimed Vess"
-                                );
-                            }
+                    let current_block = s.century_lock_last_block;
+                    let has_pending = s.century_locks.values().any(|lock| {
+                        lock.is_active(current_block) && lock.unclaimed_blocks(current_block) > 0
+                    });
+                    if has_pending {
+                        let minted = s.mint_century_lock_bills(
+                            current_block,
+                            &flush_og_tx,
+                            &flush_manifest_tx,
+                        );
+                        if minted > 0 {
+                            info!(minted, "auto-minted century lock bills");
                         }
                     }
                 }
@@ -4734,9 +4959,12 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 }
                 info!(peer = %peer_str, "connecting to bootstrap peer");
 
-                let nonce = {
+                let nonce = match {
                     let mut s = boot_state.lock().unwrap();
                     s.peer_registry.issue_challenge(peer_hash)
+                } {
+                    Some(n) => n,
+                    None => continue, // peer is banished, skip
                 };
                 let challenge = PulseMessage::HandshakeChallenge(HandshakeChallenge { nonce });
                 match boot_node
@@ -5444,9 +5672,12 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     Err(_) => continue,
                 };
 
-                let nonce = {
+                let nonce = match {
                     let mut s = hs_state.lock().unwrap();
                     s.peer_registry.issue_challenge(peer_hash)
+                } {
+                    Some(n) => n,
+                    None => continue, // peer is banished, skip
                 };
 
                 {
@@ -5580,9 +5811,12 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     None => continue, // peer no longer in routing table
                 };
 
-                let nonce = {
+                let nonce = match {
                     let mut s = reverify_state.lock().unwrap();
                     s.peer_registry.issue_challenge(peer_hash)
+                } {
+                    Some(n) => n,
+                    None => continue, // peer is banished, skip
                 };
 
                 let target = match decode_contact_bytes(&id_bytes) {

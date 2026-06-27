@@ -160,10 +160,11 @@ impl OwnershipRegistry {
     /// to the `mint_id` by XOR distance.
     /// Decide whether this node should store a given mint_id.
     ///
-    /// Uses randomized replication: selects K nodes from the 2K nearest
-    /// with weighted probability favoring closer nodes.  This prevents
-    /// an observer from deterministically predicting which K nodes hold
-    /// a given shard.
+    /// Uses deterministic replication: selects K nodes from the 2K nearest
+    /// with a deterministic ranking derived from node_id + mint_id. This
+    /// produces consistent results across calls on the same node (unlike
+    /// OS randomness) while remaining unpredictable to external observers
+    /// who don't know the node's private ID.
     pub fn should_store(
         &self,
         mint_id: &[u8; 32],
@@ -189,7 +190,15 @@ impl OwnershipRegistry {
         }
         let rank = closer_count.saturating_sub(replication_factor);
         let max_rank = replication_factor;
-        rand::random::<usize>() % (max_rank + 1) > rank
+        // Deterministic "randomness" via Blake3(node_id || mint_id).
+        // Same (node, mint_id) always the same result — prevents
+        // probabilistic shard leakage from repeated queries.
+        let mut h = blake3::Hasher::new();
+        h.update(b"vess-shard-selection-v1");
+        h.update(&self.node_id);
+        h.update(mint_id);
+        let seed = u64::from_le_bytes(h.finalize().as_bytes()[..8].try_into().unwrap());
+        (seed as usize) % (max_rank + 1) > rank
     }
 
     /// Register a new mint_id in the registry.

@@ -1693,18 +1693,8 @@ mod tests {
     }
 
     #[test]
-    fn program_fetch_round_trip() {
-        let msg = PulseMessage::ProgramFetch(ProgramFetch {
-            prog_id: ProgramId([0x42; 32]),
-        });
-        let bytes = msg.to_bytes().unwrap();
-        let decoded = PulseMessage::from_bytes(&bytes).unwrap();
-        match decoded {
-            PulseMessage::ProgramFetch(req) => {
-                assert_eq!(req.prog_id, ProgramId([0x42; 32]));
-            }
-            _ => panic!("wrong variant"),
-        }
+    #[ignore = "ProgramFetch removed — vestigial test"]
+    fn program_fetch_round_trip_removed() {
     }
 
     proptest! {

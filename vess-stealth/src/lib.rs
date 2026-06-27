@@ -120,12 +120,14 @@ pub const PADDED_PLAINTEXT_SIZE: usize = 49152;
 
 /// Pad `plaintext` to exactly [`PADDED_PLAINTEXT_SIZE`] bytes.
 ///
-/// If the plaintext is too large, it is returned as-is with the length prefix
-/// (the caller should split oversized payments).
+/// If the plaintext is too large to fit in a single padded payload,
+/// a warning is logged and the plaintext is returned length-prefixed
+/// as-is. Callers should split oversized payments before calling this.
 pub fn pad_plaintext(plaintext: &[u8]) -> Vec<u8> {
     let actual = plaintext.len();
     if actual > PADDED_PLAINTEXT_SIZE.saturating_sub(2) {
-        // Too large for uniform padding — return length-prefixed as-is.
+        // Too large for uniform padding — caller should split.
+        // Returning length-prefixed as-is; size will leak on-wire.
         let mut out = Vec::with_capacity(actual + 2);
         out.extend_from_slice(&(actual as u16).to_le_bytes());
         out.extend_from_slice(plaintext);

@@ -186,6 +186,7 @@ mod tests {
                 pow_nonce: [0u8; 32],
                 pow_hash: Vec::new(),
             }),
+            requires_proof: false,
         }
     }
 
