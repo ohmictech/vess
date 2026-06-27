@@ -70,15 +70,7 @@ pub(crate) fn limbo_ack_key(payment_id: &[u8; 32]) -> [u8; 32] {
 const MAX_WALLET_NOTIFICATIONS: usize = 256;
 
 /// Check for conflicting ownership claims across adjacent DHT shards.
-///
-/// When accepting a claim for `mint_id`, checks that we have a full
-/// K-peer shard of verified peers. If the shard is complete, the DHT
-/// replication ensures any conflicting claim would have been gossiped
-/// to us. If the shard is incomplete, the claim is still accepted but
-/// a warning is logged.
-///
-/// Returns `true` if the claim can be accepted (no conflict detected).
-#[allow(dead_code)] // wired into claim handler during integration
+/// Called before accepting an OwnershipClaim into the local registry.
 pub(crate) fn check_cross_shard_consistency(
     state: &crate::node_runner::ArteryState,
     mint_id: &[u8; 32],
@@ -119,7 +111,6 @@ pub(crate) fn check_cross_shard_consistency(
 /// Callers should spawn this as a background task and also call
 /// `peer_registry.issue_challenge()` + send `HandshakeChallenge`
 /// messages to each evicted peer to trigger immediate re-handshake.
-#[allow(dead_code)] // wired into periodic task during integration
 pub(crate) fn reverify_stale_peers(state: &std::sync::Arc<std::sync::Mutex<ArteryState>>) -> Vec<[u8; 32]> {
     let mut s = lock_state(state);
     let due = s.peer_registry.peers_due_for_reverification(
@@ -149,8 +140,7 @@ pub(crate) fn reverify_stale_peers(state: &std::sync::Arc<std::sync::Mutex<Arter
 /// offense. A Sybil cannot fabricate evidence against an honest node because
 /// the evidence requires the victim's signature or a verifiable protocol
 /// violation.
-#[allow(dead_code)] // called from message dispatcher banishment handler
-fn verify_banishment_proof(bp: &vess_protocol::BanishmentProof) -> bool {
+pub(crate) fn verify_banishment_proof(bp: &vess_protocol::BanishmentProof) -> bool {
     use vess_protocol::BanishmentOffense;
 
     // Verify reporter's signature over the proof contents
@@ -474,12 +464,103 @@ fn protocol_bitcoin_network(network: vess_bitcoin::BitcoinNetwork) -> BitcoinNet
 }
 
 fn confirmed_timelock_outputs(
-    _pending: &vess_bitcoin::PendingTimeLock,
-    _confirmation: &vess_bitcoin::TimeLockConfirmationProof,
-    _network: vess_bitcoin::BitcoinNetwork,
-    _hops_remaining: u8,
+    pending: &vess_bitcoin::PendingTimeLock,
+    confirmation: &vess_bitcoin::TimeLockConfirmationProof,
+    network: vess_bitcoin::BitcoinNetwork,
+    hops_remaining: u8,
 ) -> Result<(Vec<OwnershipGenesis>, Vec<vess_foundry::VessBill>)> {
-    unimplemented!("confirmed_timelock_outputs needs updating for new BitcoinTimeLockProof fields")
+    use bitcoin::hashes::Hash;
+
+    let txid: [u8; 32] = *pending.txid.as_ref();
+    let block_hash: [u8; 32] = *confirmation.block_hash.as_ref();
+    let merkle_root: [u8; 32] = *confirmation.merkle_root.as_ref();
+
+    // Split the Vess amount into canonical 1-2-5 output denominations.
+    let output_values = vess_foundry::bitcoin_timelock_output_values(pending.vess_amount);
+    if output_values.is_empty() {
+        return Err(anyhow::anyhow!("no output values for vess_amount={}", pending.vess_amount));
+    }
+
+    let owner_vk_hash = pending.first_owner_vk_hash;
+    let mut genesis_records = Vec::with_capacity(output_values.len());
+    let mut bills = Vec::with_capacity(output_values.len());
+
+    for (i, &denom_value) in output_values.iter().enumerate() {
+        // Build the full BitcoinTimeLockProof with SPV data from the confirmation.
+        let burn_proof = vess_protocol::BitcoinTimeLockProof {
+            network: match network {
+                vess_bitcoin::BitcoinNetwork::Mainnet => vess_protocol::BitcoinNetwork::Mainnet,
+                vess_bitcoin::BitcoinNetwork::Testnet => vess_protocol::BitcoinNetwork::Testnet,
+                vess_bitcoin::BitcoinNetwork::Signet => vess_protocol::BitcoinNetwork::Signet,
+                vess_bitcoin::BitcoinNetwork::Regtest => vess_protocol::BitcoinNetwork::Regtest,
+            },
+            txid,
+            block_hash,
+            block_height: confirmation.block_height,
+            confirmations: confirmation.confirmations,
+            required_confirmations: confirmation.required_confirmations,
+            corroborating_peer_count: confirmation.corroborating_peer_count,
+            chain_work: confirmation.chain_work,
+            merkle_root,
+            merkle_proof: confirmation.merkle_proof.clone(),
+            merkle_index: confirmation.merkle_index,
+            locked_sats: pending.locked_sats,
+            lock_blocks: pending.lock_blocks,
+            cltv_block_height: pending.cltv_block_height,
+            vess_amount: pending.vess_amount,
+            first_owner_vk: pending.first_owner_vk.clone(),
+            first_owner_vk_hash: owner_vk_hash,
+            output_values: output_values.clone(),
+            commitment_payload: vess_foundry::bitcoin_timelock_payload_commitment(
+                &owner_vk_hash,
+                pending.locked_sats,
+                pending.lock_blocks,
+                &output_values,
+                None::<&[u8; 32]>,
+            ).to_vec(),
+        };
+
+        let mint_id = vess_foundry::bitcoin_timelock_mint_id(&txid, i as u32);
+        let chain_tip = vess_foundry::genesis_chain_tip(&mint_id, &owner_vk_hash);
+
+        let denom = vess_foundry::Denomination::from_value(denom_value)
+            .ok_or_else(|| anyhow::anyhow!("invalid denomination value {denom_value}"))?;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let bill = vess_foundry::VessBill {
+            denomination: denom,
+            digest: block_hash,
+            created_at: now,
+            stealth_id: mint_id, // self-stealth: minted bills bound to minter
+            dht_index: 0,
+            mint_id,
+            chain_tip,
+            chain_depth: 0,
+            asset: vess_foundry::Asset::Btc,
+        };
+
+        genesis_records.push(OwnershipGenesis {
+            mint_id,
+            chain_tip,
+            owner_vk_hash,
+            owner_vk: pending.first_owner_vk.clone(),
+            denomination_value: denom_value,
+            genesis_proof: vess_protocol::GenesisProof::BitcoinTimeLock(burn_proof),
+            digest: block_hash,
+            hops_remaining,
+            chain_depth: 0,
+            output_index: i as u32,
+            ..Default::default()
+        });
+
+        bills.push(bill);
+    }
+
+    Ok((genesis_records, bills))
 }
 
 fn validate_bitcoin_timelock_genesis(
@@ -2281,6 +2362,15 @@ pub(crate) fn retain_local_ownership_claim(
     fallback: Option<OwnershipRecord>,
     updated_at: u64,
 ) {
+    // Cross-shard consistency check: reject claims for already-consumed bills.
+    if !check_cross_shard_consistency(state, &oc.mint_id) {
+        tracing::warn!(
+            mint_id = %crate::persistence::hex_key(&oc.mint_id),
+            "rejecting claim: bill already consumed"
+        );
+        return;
+    }
+
     let record = state
         .retained_ownership_records
         .remove(&oc.mint_id)
@@ -2420,16 +2510,10 @@ impl DhtSeedCursor {
             after_manifest_key: self.after_manifest_key,
             after_ownership_mint_id: self.after_ownership_mint_id,
             after_consumed_mint_id: self.after_consumed_mint_id,
-            after_program_id: None,
-            after_program_manifest_key: None,
-            after_compute_receipt_id: None,
             max_tags: MAX_DHT_SEED_TAGS as u16,
             max_manifests: MAX_DHT_SEED_MANIFESTS as u16,
             max_ownership_records: MAX_DHT_SEED_OWNERSHIP_RECORDS as u16,
             max_consumed_records: MAX_DHT_SEED_CONSUMED_RECORDS as u16,
-            max_programs: 0,
-            max_program_manifests: 0,
-            max_compute_receipts: 0,
             burn_proof: None,
         }
     }
@@ -3049,13 +3133,6 @@ pub struct WalletState {
     /// Mailbox shard key derived from our spend encapsulation key.
     /// Used for targeted [`MailboxSweep`] and automatic forwarding subscription.
     pub mailbox_key: [u8; 32],
-    /// Spend seed for DHT manifest encryption and wallet recovery.
-    /// `None` for older wallets that haven't been migrated yet.
-    /// Cached spend seed derived from the wallet raw seed.
-    /// Used by the node to sign spend operations without re-deriving.
-    /// Set during wallet load/create; consumed by payment signing paths.
-    #[allow(dead_code)]
-    pub spend_seed: Option<[u8; 32]>,
 }
 
 impl Drop for WalletState {
@@ -3993,7 +4070,6 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 wallet_path: wallet_path.clone(),
                 enc_key,
                 mailbox_key,
-                spend_seed: None,
             }),
             startup_wallet_tag_store,
         )
@@ -4655,6 +4731,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
     let flush_storage_dir = config.state_dir.clone();
     let flush_manifest_tx = manifest_tx.clone();
     let flush_og_tx = og_tx.clone();
+    let flush_ra_tx = ra_tx.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
         loop {
@@ -4711,7 +4788,24 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     .as_secs();
                 let pruned_tags = s.tag_dht.purge_unhardened(now);
                 if pruned_tags > 0 {
-                    info!(count = pruned_tags, "pruned unhardened tags");
+                    info!(count = pruned_tags, "pruned unhandened tags");
+                }
+                // ── Periodic peer reverification ─────────────────
+                // Re-challenge peers whose verification has expired.
+                let due = reverify_stale_peers(&flush_state);
+                if !due.is_empty() {
+                    info!(count = due.len(), "re-verifying stale peers");
+                    for peer_id in &due {
+                        let mut s = flush_state.lock().unwrap();
+                        if let Some(nonce) = s.peer_registry.issue_challenge(*peer_id) {
+                            drop(s);
+                            // Send HandshakeChallenge to the peer.
+                            // For now, we can't route to specific peers without
+                            // their contact info in the routing table.
+                            // The peer will be re-challenged on next contact.
+                            let _ = nonce;
+                        }
+                    }
                 }
                 // Evict expired mailbox forwarding subscriptions.
                 let before_fwd = s.mailbox_fwd.len();
@@ -4768,6 +4862,26 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                         if minted > 0 {
                             info!(minted, "auto-minted century lock bills");
                         }
+                    }
+                }
+                // ── Opportunistic bill consolidation ──────────────
+                // Consolidate small bills into larger denominations when idle.
+                if let Some(ref ws) = s.wallet {
+                    let cred_map = ws.billfold.export_credentials().clone();
+                    if !cred_map.is_empty() {
+                        // Build a minimal QueueSenders from available channels.
+                        let senders = crate::rpc::QueueSenders {
+                            manifest_tx: flush_manifest_tx.clone(),
+                            tag_store_tx: tokio::sync::mpsc::unbounded_channel().0,
+                            tag_confirm_tx: tokio::sync::mpsc::unbounded_channel().0,
+                            og_tx: flush_og_tx.clone(),
+                            oc_tx: tokio::sync::mpsc::unbounded_channel().0,
+                            ra_tx: flush_ra_tx.clone(),
+                            pay_tx: tokio::sync::mpsc::unbounded_channel().0,
+                        };
+                        crate::rpc::fire_opportunistic_consolidations(
+                            &mut s, &cred_map, &[], &senders,
+                        );
                     }
                 }
                 let n = s.estimated_network_size;
@@ -6129,6 +6243,19 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     }
                 }
                 return None;
+            }
+            PulseMessage::BanishmentProof(bp) => {
+                info!(%peer, "banishment proof received");
+                if verify_banishment_proof(&bp) {
+                    state.peer_registry.mark_banished(bp.peer_id);
+                    ban_ref.banish(bp.peer_id);
+                    info!(
+                        target = %crate::persistence::hex_key(&bp.peer_id),
+                        "peer banished via network-wide banishment proof"
+                    );
+                } else {
+                    warn!(%peer, "invalid banishment proof — rejecting");
+                }
             }
             _ => {}
         }

@@ -1494,8 +1494,7 @@ async fn handle_tag_lookup(
 /// finds groups whose combined value equals a valid denomination, and reforges
 /// up to 2 groups (highest combined value first). Each consolidation is
 /// completely independent of the payment — failures are silently skipped.
-#[allow(dead_code)]
-fn fire_opportunistic_consolidations(
+pub(crate) fn fire_opportunistic_consolidations(
     s: &mut ArteryState,
     cred_map: &HashMap<[u8; 32], SpendCredential>,
     excluded: &[[u8; 32]],
@@ -2675,7 +2674,6 @@ async fn handle_wallet_unlock(
     let (balance, bill_count, watch_only_balance) = {
         let mut s = lock_state(&state);
         s.wallet_path = Some(wallet_path.clone());
-        let spend_seed = vess_kloak::recovery::spend_seed_from_raw_seed(&raw_seed);
         s.wallet = Some(WalletState {
             stealth_secret,
             stealth_address: address,
@@ -2684,7 +2682,6 @@ async fn handle_wallet_unlock(
             bitcoin_receive_address,
             wallet_path: wallet_path.clone(),
             enc_key,
-            spend_seed: Some(spend_seed),
             mailbox_key,
         });
 

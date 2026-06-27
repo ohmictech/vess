@@ -745,15 +745,6 @@ pub struct DhtSeedRequest {
     /// Exclusive cursor for paginating consumed tombstones by mint_id.
     #[serde(default)]
     pub after_consumed_mint_id: Option<[u8; 32]>,
-    /// Exclusive cursor for paginating immutable compute programs by `prog_id`.
-    #[serde(default)]
-    pub after_program_id: Option<[u8; 32]>,
-    /// Exclusive cursor for paginating program manifests by alias DHT key.
-    #[serde(default)]
-    pub after_program_manifest_key: Option<[u8; 32]>,
-    /// Exclusive cursor for paginating compute receipts by receipt ID.
-    #[serde(default)]
-    pub after_compute_receipt_id: Option<[u8; 32]>,
     /// Maximum tag records to return.
     pub max_tags: u16,
     /// Maximum encrypted manifest records to return.
@@ -764,15 +755,6 @@ pub struct DhtSeedRequest {
     /// Maximum consumed-record tombstones to return.
     #[serde(default)]
     pub max_consumed_records: u16,
-    /// Maximum immutable compute programs to return.
-    #[serde(default)]
-    pub max_programs: u16,
-    /// Maximum mutable program manifests to return.
-    #[serde(default)]
-    pub max_program_manifests: u16,
-    /// Maximum compute receipts to return.
-    #[serde(default)]
-    pub max_compute_receipts: u16,
     /// Proof that the requester owns a Vess bill (prevents Sybil-based
     /// DHT shard collection during bootstrap). Absent in testnet mode.
     #[serde(default)]
@@ -1656,16 +1638,10 @@ mod tests {
             after_manifest_key: Some([0x33; 32]),
             after_ownership_mint_id: Some([0x44; 32]),
             after_consumed_mint_id: Some([0x55; 32]),
-            after_program_id: Some([0x66; 32]),
-            after_program_manifest_key: Some([0x77; 32]),
-            after_compute_receipt_id: Some([0x88; 32]),
             max_tags: 10,
             max_manifests: 11,
             max_ownership_records: 12,
             max_consumed_records: 13,
-            max_programs: 14,
-            max_program_manifests: 15,
-            max_compute_receipts: 16,
             burn_proof: None,
         });
         let bytes = msg.to_bytes().unwrap();
@@ -1677,24 +1653,13 @@ mod tests {
                 assert_eq!(req.after_manifest_key, Some([0x33; 32]));
                 assert_eq!(req.after_ownership_mint_id, Some([0x44; 32]));
                 assert_eq!(req.after_consumed_mint_id, Some([0x55; 32]));
-                assert_eq!(req.after_program_id, Some([0x66; 32]));
-                assert_eq!(req.after_program_manifest_key, Some([0x77; 32]));
-                assert_eq!(req.after_compute_receipt_id, Some([0x88; 32]));
                 assert_eq!(req.max_tags, 10);
                 assert_eq!(req.max_manifests, 11);
                 assert_eq!(req.max_ownership_records, 12);
                 assert_eq!(req.max_consumed_records, 13);
-                assert_eq!(req.max_programs, 14);
-                assert_eq!(req.max_program_manifests, 15);
-                assert_eq!(req.max_compute_receipts, 16);
             }
             _ => panic!("wrong variant"),
         }
-    }
-
-    #[test]
-    #[ignore = "ProgramFetch removed — vestigial test"]
-    fn program_fetch_round_trip_removed() {
     }
 
     proptest! {
