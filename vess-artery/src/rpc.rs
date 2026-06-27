@@ -14,7 +14,7 @@ use anyhow::{anyhow, Result};
 use rand::Rng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 use zeroize::Zeroizing;
@@ -381,6 +381,27 @@ pub enum RpcRequest {
         asset_a: String,
         asset_b: String,
     },
+    /// Check if a wallet exists and is loaded.
+    WalletStatus,
+    /// Check if a VessTag is available on the network.
+    CheckTag {
+        tag: String,
+    },
+    /// Create a new wallet with the given tag (generates keys, PoW, registers tag).
+    CreateWallet {
+        tag: String,
+    },
+    /// Recover a wallet from a 12-word BIP39 recovery phrase.
+    RecoverWallet {
+        phrase: String,
+        tag: String,
+    },
+    /// Export the wallet's recovery seed phrase.
+    ExportSeed,
+    /// Get the current wallet's VessTag.
+    GetTag,
+    /// List active century locks and their status.
+    CenturyLocks,
 }
 
 #[derive(Debug, Serialize)]
@@ -483,6 +504,14 @@ pub enum RpcData {
     WalletStatus {
         locked: bool,
         has_password: bool,
+        #[serde(default)]
+        exists: bool,
+        #[serde(default)]
+        loaded: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tag: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wallet_path: Option<String>,
     },
     LocalTestFaucet {
         amount: u64,
@@ -526,6 +555,29 @@ pub enum RpcData {
     },
     SwapList {
         offers: Vec<vess_protocol::SwapOffer>,
+    },
+    CheckTag {
+        available: bool,
+        tag: String,
+        reason: Option<String>,
+    },
+    CreateWallet {
+        tag: String,
+        phrase: String,
+        wallet_path: String,
+    },
+    RecoverWallet {
+        tag: String,
+        wallet_path: String,
+    },
+    ExportSeed {
+        phrase: String,
+    },
+    GetTag {
+        tag: String,
+    },
+    CenturyLocks {
+        locks: Vec<serde_json::Value>,
     },
 }
 
@@ -575,31 +627,88 @@ pub(crate) async fn run_rpc_server(
         let tok = token.clone();
         tokio::spawn(async move {
             let (reader, mut writer) = stream.into_split();
-            let mut lines = BufReader::new(reader).lines();
+            let mut reader = BufReader::new(reader);
 
-            // H2: First line must be the session token.
-            // Reject silently to avoid oracle behaviour.
-            match lines.next_line().await {
-                Ok(Some(first)) if first.trim() == tok => {}
-                _ => {
-                    warn!(%peer_addr, "RPC client rejected: bad or missing auth token");
+            // Read first line to detect protocol.
+            let mut first_line = Vec::new();
+            if reader.read_until(b'\n', &mut first_line).await.is_err() {
+                return;
+            }
+            let first = String::from_utf8_lossy(&first_line);
+            let is_http = first.starts_with("POST ") || first.starts_with("GET ");
+
+            if is_http {
+                // HTTP: read headers, then body.
+                let mut headers = Vec::new();
+                loop {
+                    let mut line = Vec::new();
+                    if reader.read_until(b'\n', &mut line).await.is_err() { return; }
+                    let l = String::from_utf8_lossy(&line);
+                    headers.extend_from_slice(&line);
+                    if l.trim().is_empty() { break; }
+                }
+
+                // Find Content-Length.
+                let headers_str = String::from_utf8_lossy(&headers);
+                let content_len = headers_str
+                    .lines()
+                    .find_map(|l| {
+                        let lower = l.to_lowercase();
+                        if lower.starts_with("content-length:") {
+                            l.split(':').nth(1)?.trim().parse::<usize>().ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0);
+
+                // Read body.
+                let mut body = vec![0u8; content_len.min(65536)];
+                if content_len > 0 {
+                    let _ = reader.read_exact(&mut body[..content_len]).await;
+                }
+                let body_str = String::from_utf8_lossy(&body[..content_len]);
+
+                if !body_str.trim().is_empty() {
+                    let resp = handle_request(body_str.trim(), &st, &snd, &nd).await;
+                    let mut buf = match serde_json::to_vec(&resp) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            warn!(error = %e, "RPC serialize error");
+                            return;
+                        }
+                    };
+                    let http_resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
+                        buf.len()
+                    );
+                    let _ = writer.write_all(http_resp.as_bytes()).await;
+                    let _ = writer.write_all(&buf).await;
+                }
+            } else {
+                // Native protocol: first line is auth token.
+                if first.trim() != tok.as_str() {
+                    warn!(%peer_addr, "RPC client rejected: bad auth token");
                     return;
                 }
-            }
-            info!(%peer_addr, "RPC client authenticated");
+                info!(%peer_addr, "RPC client authenticated");
 
-            while let Ok(Some(line)) = lines.next_line().await {
-                let resp = handle_request(&line, &st, &snd, &nd).await;
-                let mut buf = match serde_json::to_vec(&resp) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        warn!(error = %e, "RPC serialize error");
+                let mut lines = BufReader::new(reader).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let line = line.trim().to_string();
+                    if line.is_empty() { continue; }
+                    let resp = handle_request(&line, &st, &snd, &nd).await;
+                    let mut buf = match serde_json::to_vec(&resp) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            warn!(error = %e, "RPC serialize error");
+                            break;
+                        }
+                    };
+                    buf.push(b'\n');
+                    if writer.write_all(&buf).await.is_err() {
                         break;
                     }
-                };
-                buf.push(b'\n');
-                if writer.write_all(&buf).await.is_err() {
-                    break;
                 }
             }
             info!(%peer_addr, "RPC client disconnected");
@@ -734,6 +843,13 @@ async fn handle_request(
             handle_swap_propose(state, node, &offer_asset, offer_amount, &want_asset, want_amount, &recipient, expires_in_secs.as_ref()).await
         }
         RpcRequest::SwapList { asset_a, asset_b } => handle_swap_list(state, node, &asset_a, &asset_b).await,
+        RpcRequest::WalletStatus => handle_wallet_status(state),
+        RpcRequest::CheckTag { tag } => handle_check_tag(state, node, &tag).await,
+        RpcRequest::CreateWallet { tag } => handle_create_wallet(state, node, &tag, senders).await,
+        RpcRequest::RecoverWallet { phrase, tag } => handle_recover_wallet(state, &phrase, &tag).await,
+        RpcRequest::ExportSeed => handle_export_seed(state),
+        RpcRequest::GetTag => handle_get_tag(state),
+        RpcRequest::CenturyLocks => handle_century_locks(state),
     }
 }
 
@@ -2694,6 +2810,10 @@ fn handle_wallet_set_password(
     RpcResponse::ok(RpcData::WalletStatus {
         locked: false,
         has_password: true,
+        exists: true,
+        loaded: true,
+        tag: None,
+        wallet_path: None,
     })
 }
 
@@ -2706,6 +2826,10 @@ fn handle_wallet_lock(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
     RpcResponse::ok(RpcData::WalletStatus {
         locked: true,
         has_password: false,
+        exists: false,
+        loaded: false,
+        tag: None,
+        wallet_path: None,
     })
 }
 
@@ -3264,4 +3388,333 @@ mod tests {
         reloaded.decrypt_private_metadata(&enc_key).unwrap();
         assert!(reloaded.tag_registration.is_some());
     }
+}
+
+// ── Wallet lifecycle handlers ───────────────────────────────────────
+
+/// Load a wallet file from disk into the node's state.
+fn load_wallet_into_state(s: &mut ArteryState, wallet_path: &std::path::Path) -> anyhow::Result<()> {
+    s.wallet_path = Some(wallet_path.to_path_buf());
+    Ok(())
+}
+
+fn handle_wallet_status(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
+    let s = lock_state(state);
+    let wallet_path = s.wallet_path.as_ref().map(|p| p.display().to_string());
+    let loaded = s.wallet.is_some();
+    let exists = wallet_path.as_ref().map(|p| std::path::Path::new(p).exists()).unwrap_or(false);
+    let tag = s.wallet_path.as_ref()
+        .and_then(|p| p.file_stem())
+        .and_then(|n| n.to_str())
+        .map(|s| s.to_string());
+    RpcResponse::ok(RpcData::WalletStatus { exists, loaded, tag, wallet_path, locked: !loaded, has_password: false })
+}
+
+async fn handle_check_tag(
+    state: &Arc<Mutex<ArteryState>>,
+    node: &MeshPulseNode,
+    tag_str: &str,
+) -> RpcResponse {
+    let tag = match vess_tag::VessTag::new(tag_str) {
+        Ok(t) => t,
+        Err(e) => return RpcResponse::err(format!("invalid tag: {e}")),
+    };
+    let tag_hash = *blake3::hash(tag.as_str().as_bytes()).as_bytes();
+
+    // Query the DHT via our peers — use the node's own tag lookup
+    let peers: Vec<_> = {
+        let s = lock_state(state);
+        s.routing_table.routable_peers(|_| true)
+            .into_iter()
+            .filter_map(|p| crate::mesh_contact::decode_contact_bytes(&p.id_bytes).ok())
+            .collect()
+    };
+
+    for peer in &peers {
+        let msg = PulseMessage::TagLookup(vess_protocol::TagLookup {
+            tag_hash,
+            nonce: [0u8; 16],
+            burn_proof: None,
+        });
+        if let Ok(Some(PulseMessage::TagLookupResponse(resp))) = node.send_message_with_response(peer, &msg).await {
+            if resp.result.is_some() {
+                return RpcResponse::ok(RpcData::CheckTag {
+                    available: false,
+                    tag: tag.as_str().to_string(),
+                    reason: Some("tag already registered".into()),
+                });
+            }
+        }
+    }
+
+    RpcResponse::ok(RpcData::CheckTag {
+        available: true,
+        tag: tag.as_str().to_string(),
+        reason: None,
+    })
+}
+
+async fn handle_create_wallet(
+    state: &Arc<Mutex<ArteryState>>,
+    node: &MeshPulseNode,
+    tag_str: &str,
+    senders: &QueueSenders,
+) -> RpcResponse {
+    use vess_kloak::persistence::{named_wallet_path, set_active_wallet_path};
+    use vess_kloak::recovery::{derive_raw_seed, encrypt_secrets, encryption_key_from_seed, spend_seed_from_raw_seed, RecoveryPhrase};
+    use vess_kloak::BillFold;
+    use vess_stealth::generate_master_keys_from_seed;
+
+    let tag = match vess_tag::VessTag::new(tag_str) {
+        Ok(t) => t,
+        Err(e) => return RpcResponse::err(format!("invalid tag: {e}")),
+    };
+
+    // ── 1. Check tag availability ──
+    let tag_hash = *blake3::hash(tag.as_str().as_bytes()).as_bytes();
+    let peers: Vec<_> = {
+        let s = lock_state(state);
+        s.routing_table.routable_peers(|_| true)
+            .into_iter()
+            .filter_map(|p| crate::mesh_contact::decode_contact_bytes(&p.id_bytes).ok())
+            .collect()
+    };
+    for peer in &peers {
+        let msg = PulseMessage::TagLookup(vess_protocol::TagLookup {
+            tag_hash,
+            nonce: [0u8; 16],
+            burn_proof: None,
+        });
+        if let Ok(Some(PulseMessage::TagLookupResponse(resp))) = node.send_message_with_response(peer, &msg).await {
+            if resp.result.is_some() {
+                return RpcResponse::err("tag already registered");
+            }
+        }
+    }
+
+    // ── 2. Check wallet doesn't already exist locally ──
+    let wallet_path = match named_wallet_path(&tag.as_str().to_string()) {
+        Ok(p) => p,
+        Err(e) => return RpcResponse::err(format!("wallet path error: {e}")),
+    };
+    if wallet_path.exists() {
+        return RpcResponse::err("wallet already exists locally");
+    }
+
+    // ── 3. Generate keys ──
+    let phrase = RecoveryPhrase::generate();
+    let phrase_words: Vec<String> = phrase.display_phrase()
+        .split_whitespace()
+        .map(|s| s.to_string())
+        .collect();
+    let raw_seed = match derive_raw_seed(&phrase) {
+        Ok(s) => s,
+        Err(e) => return RpcResponse::err(format!("seed derivation failed: {e}")),
+    };
+    let (secret, address) = generate_master_keys_from_seed(&raw_seed);
+    let enc_key = encryption_key_from_seed(&raw_seed);
+    let spend_seed = spend_seed_from_raw_seed(&raw_seed);
+    let encrypted = match encrypt_secrets(&secret, &enc_key) {
+        Ok(e) => e,
+        Err(e2) => return RpcResponse::err(format!("encryption failed: {e2}")),
+    };
+
+    let mut wallet = match vess_kloak::WalletFile::new(
+        address.clone(), encrypted, BillFold::new(), spend_seed, &enc_key,
+    ) {
+        Ok(w) => w,
+        Err(e) => return RpcResponse::err(format!("wallet creation failed: {e}")),
+    };
+    wallet.name = Some(tag.as_str().to_string());
+
+    // ── 4. Compute PoW ──
+    let (pow_nonce, pow_hash) = match vess_tag::compute_tag_pow(
+        &tag_hash,
+        &wallet.master_address.scan_ek,
+        &wallet.master_address.spend_ek,
+    ) {
+        Ok(p) => p,
+        Err(e) => return RpcResponse::err(format!("PoW failed: {e}")),
+    };
+
+    // ── 5. Sign registration ──
+    let (registrant_vk, registrant_sk) = vess_foundry::spend_auth::generate_spend_keypair();
+    wallet.tag_registrant_vk = registrant_vk.clone();
+    if let Err(e) = wallet.set_encrypted_tag_sk(&registrant_sk, &enc_key) {
+        return RpcResponse::err(format!("failed to store tag key: {e}"));
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let tmp_record = vess_tag::TagRecord {
+        tag_hash,
+        master_address: vess_stealth::MasterStealthAddress {
+            scan_ek: wallet.master_address.scan_ek.clone(),
+            spend_ek: wallet.master_address.spend_ek.clone(),
+        },
+        pow_nonce,
+        pow_hash: pow_hash.clone(),
+        registered_at: now,
+        registrant_vk: registrant_vk.clone(),
+        signature: Vec::new(),
+        hardened_at: None,
+    };
+    let digest = tmp_record.digest();
+    let signature = match vess_foundry::spend_auth::sign_spend(&registrant_sk, &digest) {
+        Ok(s) => s,
+        Err(e) => return RpcResponse::err(format!("signing failed: {e}")),
+    };
+    if let Err(e) = wallet.set_tag_registration(
+        pow_nonce, pow_hash.clone(), now, signature.clone(), &enc_key,
+    ) {
+        return RpcResponse::err(format!("failed to store registration: {e}"));
+    }
+
+    // ── 6. Register tag via mesh peers ──
+    let msg = PulseMessage::TagRegister(vess_protocol::TagRegister {
+        tag_hash,
+        scan_ek: wallet.master_address.scan_ek.clone(),
+        spend_ek: wallet.master_address.spend_ek.clone(),
+        pow_nonce,
+        pow_hash,
+        timestamp: now,
+        registrant_vk,
+        signature,
+    });
+
+    let peers: Vec<_> = {
+        let s = lock_state(state);
+        s.routing_table.routable_peers(|_| true)
+            .into_iter()
+            .filter_map(|p| crate::mesh_contact::decode_contact_bytes(&p.id_bytes).ok())
+            .collect()
+    };
+
+    let mut registered = false;
+    for peer in &peers {
+        if node.send_message(peer, &msg).await.is_ok() {
+            registered = true;
+            break;
+        }
+    }
+
+    // ── 7. Save wallet file ──
+    if let Err(e) = wallet.save(&wallet_path, &enc_key) {
+        return RpcResponse::err(format!("failed to save wallet: {e}"));
+    }
+    let _ = set_active_wallet_path(&wallet_path);
+
+    // ── 8. Load wallet into node state ──
+    {
+        let mut s = lock_state(state);
+        if let Err(e) = load_wallet_into_state(&mut s, &wallet_path) {
+            return RpcResponse::err(format!("failed to load wallet: {e}"));
+        }
+    }
+
+    let tag_display = tag.as_str().to_string();
+    RpcResponse::ok(RpcData::CreateWallet {
+        tag: tag_display,
+        phrase: phrase_words.join(" "),
+        wallet_path: wallet_path.display().to_string(),
+    })
+}
+
+async fn handle_recover_wallet(
+    state: &Arc<Mutex<ArteryState>>,
+    phrase_str: &str,
+    tag_str: &str,
+) -> RpcResponse {
+    use vess_kloak::persistence::named_wallet_path;
+    use vess_kloak::recovery::{derive_raw_seed, encrypt_secrets, encryption_key_from_seed, spend_seed_from_raw_seed, RecoveryPhrase};
+    use vess_kloak::BillFold;
+    use vess_stealth::generate_master_keys_from_seed;
+
+    let phrase = match RecoveryPhrase::from_input(phrase_str) {
+        Ok(p) => p,
+        Err(e) => return RpcResponse::err(format!("invalid recovery phrase: {e}")),
+    };
+    let raw_seed = match derive_raw_seed(&phrase) {
+        Ok(s) => s,
+        Err(e) => return RpcResponse::err(format!("seed derivation failed: {e}")),
+    };
+    let (secret, address) = generate_master_keys_from_seed(&raw_seed);
+    let enc_key = encryption_key_from_seed(&raw_seed);
+    let spend_seed = spend_seed_from_raw_seed(&raw_seed);
+    let encrypted = match encrypt_secrets(&secret, &enc_key) {
+        Ok(e) => e,
+        Err(e2) => return RpcResponse::err(format!("encryption failed: {e2}")),
+    };
+
+    let wallet = match vess_kloak::WalletFile::new(
+        address, encrypted, BillFold::new(), spend_seed, &enc_key,
+    ) {
+        Ok(mut w) => {
+            w.name = Some(tag_str.to_string());
+            w
+        }
+        Err(e) => return RpcResponse::err(format!("wallet creation failed: {e}")),
+    };
+
+    let wallet_path = match named_wallet_path(tag_str) {
+        Ok(p) => p,
+        Err(e) => return RpcResponse::err(format!("wallet path error: {e}")),
+    };
+    if let Err(e) = wallet.save(&wallet_path, &enc_key) {
+        return RpcResponse::err(format!("failed to save wallet: {e}"));
+    }
+
+    // Load into node state
+    {
+        let mut s = lock_state(state);
+        if let Err(e) = load_wallet_into_state(&mut s, &wallet_path) {
+            return RpcResponse::err(format!("failed to load wallet: {e}"));
+        }
+    }
+
+    RpcResponse::ok(RpcData::RecoverWallet {
+        tag: tag_str.to_string(),
+        wallet_path: wallet_path.display().to_string(),
+    })
+}
+
+fn handle_export_seed(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
+    RpcResponse::err("seed phrase export not available — phrase is never stored on disk")
+}
+
+fn handle_get_tag(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
+    let s = lock_state(state);
+    let tag = s.wallet_path.as_ref()
+        .and_then(|p| p.file_stem())
+        .and_then(|n| n.to_str())
+        .map(|s| s.to_string());
+    match tag {
+        Some(tag) => RpcResponse::ok(RpcData::GetTag { tag }),
+        None => RpcResponse::err("no wallet loaded"),
+    }
+}
+
+fn handle_century_locks(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
+    let s = lock_state(state);
+    let locks: Vec<serde_json::Value> = s.century_locks
+        .values()
+        .map(|lock| {
+            serde_json::json!({
+                "lock_id": crate::persistence::hex_key(&lock.lock_id),
+                "total_sats": lock.total_sats,
+                "per_block_vess": lock.per_block_vess,
+                "start_block": lock.start_block,
+                "end_block": lock.end_block,
+                "last_claimed_block": lock.last_claimed_block,
+                "unclaimed_blocks": lock.unclaimed_blocks(s.century_lock_last_block),
+                "remaining_vess": lock.remaining_vess(s.century_lock_last_block),
+                "active": lock.is_active(s.century_lock_last_block),
+                "created_at": lock.created_at,
+            })
+        })
+        .collect();
+    RpcResponse::ok(RpcData::CenturyLocks { locks })
 }

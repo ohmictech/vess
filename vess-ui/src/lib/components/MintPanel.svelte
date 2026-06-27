@@ -6,6 +6,7 @@
   let amountSats: number | null = null;
   let durationYears = 1;
   let vichorBurned = 0;
+  let centuryLock = false;
   let minting = false;
   let result = "";
   let error = "";
@@ -14,12 +15,32 @@
   $: inputClass = "w-full rounded-lg px-3 py-2 text-[#1a1a1a] placeholder-[#3d484c] focus:outline-none transition-colors";
   $: inputStyle = `background: ${assetColor}18`;
 
-  // Quadratic Vichor formula: (y-1)² × 10
-  $: vichorRequired = durationYears <= 1 ? 0 : Math.round(Math.pow(durationYears - 1, 2) * 10);
+  // Century lock forces 100-year duration, no Vichor required.
+  $: effectiveYears = centuryLock ? 100 : durationYears;
+  $: vichorRequired = centuryLock ? 0 : Math.ceil((amountSats || 0) * durationYears / 100_000);
   $: vichorDeficit = Math.max(0, vichorRequired - vichorBurned);
   $: canMint = amountSats !== null && amountSats > 0 && vichorDeficit === 0;
   $: vessAmount = amountSats !== null && amountSats !== 0
-    ? Math.floor(amountSats * durationYears * 52560 / 52560)
+    ? Math.floor(amountSats * effectiveYears * 52560 / 52560)
+    : 0;
+
+  // Per-block Vess amount for century lock display.
+  // Rounds to the nearest valid 1-2-5 denomination (same as Denomination::nearest in Rust).
+  function nearestDenomination(value: number): number {
+    if (value <= 0) return 1;
+    let power = 1;
+    while (power <= value / 10) power *= 10;
+    const candidates = [1 * power, 2 * power, 5 * power, 10 * power];
+    let best = candidates[0];
+    let bestDiff = Infinity;
+    for (const c of candidates) {
+      const diff = Math.abs(c - value);
+      if (diff < bestDiff) { bestDiff = diff; best = c; }
+    }
+    return best;
+  }
+  $: perBlockVess = centuryLock && amountSats
+    ? nearestDenomination(Math.ceil(amountSats / 52560))
     : 0;
 
   async function handleMint() {
@@ -58,7 +79,7 @@
     </div>
 
     <div>
-      <label class="block text-sm text-gray-400 mb-1">Duration: {durationYears} year{durationYears === 1 ? '' : 's'}</label>
+      <label class="block text-sm text-gray-400 mb-1">Duration: {effectiveYears} year{effectiveYears === 1 ? '' : 's'}</label>
       <input
         type="range"
         bind:value={durationYears}
@@ -66,21 +87,38 @@
         max="10"
         step="0.1"
         class="w-full accent-[#88cddf]"
+        disabled={centuryLock}
+        class:opacity-30={centuryLock}
       />
       <div class="flex justify-between text-xs text-gray-600 mt-1">
         <span>0.1 yr</span>
         <span>10 yr</span>
       </div>
+
+      <!-- ── century lock toggle ── -->
+      <label class="flex items-start gap-3 mt-3 p-3 rounded-lg cursor-pointer transition-colors hover:bg-[#252d30]/50"
+        style="background: {centuryLock ? '#3d1515' : '#252d30'}; border: 1px solid {centuryLock ? '#cc3333' : '#323a3e'}">
+        <input type="checkbox" bind:checked={centuryLock} class="mt-0.5 accent-[#cc3333]" />
+        <div>
+          <span class="text-sm font-medium" style="color: {centuryLock ? '#ff6666' : '#999'}">Century Lock</span>
+          <p class="text-xs text-gray-500 mt-0.5">Lock your bitcoin for 100 years and receive a steady Vess faucet — one bill per Bitcoin block.</p>
+          {#if centuryLock && perBlockVess > 0}
+            <p class="text-xs mt-1" style="color: '#ff6666'">{perBlockVess} Vess / block · no Vichor required</p>
+          {/if}
+        </div>
+      </label>
     </div>
 
     <div class="bg-[#252d30] rounded-lg p-4 space-y-2 text-sm">
-      <div class="flex justify-between">
-        <span class="text-gray-400">Vichor Required</span>
-        <span class:text-[#88cddf]={vichorRequired > 0} class:text-gray-500={vichorRequired === 0}>
-          {vichorRequired}
-        </span>
-      </div>
-      {#if vichorRequired > 0}
+      {#if !centuryLock}
+        <div class="flex justify-between">
+          <span class="text-gray-400">Vichor Required</span>
+          <span class:text-[#88cddf]={vichorRequired > 0} class:text-gray-500={vichorRequired === 0}>
+            {vichorRequired}
+          </span>
+        </div>
+      {/if}
+      {#if !centuryLock && vichorRequired > 0}
         <div>
           <label class="block text-gray-400 mb-1">Vichor Burned</label>
           <input

@@ -3,18 +3,18 @@
 
 # Vess
 
-**Bitcoin time-credit protocol — post-quantum, feeless, fair-launch.**
+**Bitcoin opportunity-cost credit protocol. Post-quantum, feeless, stateless.**
 
 Vess turns locked Bitcoin into spendable time-credits. Lock BTC via
-`OP_CHECKLOCKTIMEVERIFY` and receive Vess — 1 sat locked for 1 year = 1 Vess.
+`OP_CHECKLOCKTIMEVERIFY` and receive Vess. 1 sat locked for 1 year = 1 Vess.
 The BTC returns after the lock expires. No burn, no bridge, no custodian.
 
 ## How It Works
 
 1. **Lock BTC** — Your wallet builds a CLTV time-lock transaction. BTC sits at your own address, locked for 0.1–10 years.
 2. **Mint Vess** — When the lock confirms, ownership records are gossiped to the DHT. `Vess = locked_sats × lock_blocks / 52,560`.
-3. **Spend** — Vess bills are bearer instruments sent via tags (e.g. `+ALICE`), QR, NFC, BLE, or any transport.
-4. **Claim** — The recipient broadcasts an `OwnershipClaim` to the DHT to finalize receipt.
+3. **Spend** — Vess bills are bearer instruments sent via tags (e.g. `+ALICE`)
+4. **Claim** — The recipient wallet automatically broadcasts an `OwnershipClaim` to the DHT to finalize receipt.
 
 ## Vess & Vichor
 
@@ -29,7 +29,7 @@ Vess and Vichor are two independent assets with distinct purposes.
 
 ### Vichor Gate
 
-Locks ≤1 year are free. Beyond that, Vichor must be burned:
+Locks ≤1 year are freely accessible. Beyond that, Vichor must be burned, ensuring speculators are contributing to the network longevity:
 
 ```
 Duration    Vichor Required

@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 license-file = "../LICENSE"
 
+[[bin]]
+name = "vess-artery"
+path = "src/main.rs"
+
 [features]
 test-pow = ["vess-tag/test-pow"]
 test-mint = ["vess-foundry/test-mint"]
@@ -29,6 +33,7 @@ rand = "0.8"
 anyhow = "1"
 bitcoin = "0.32"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 zeroize = { version = "1", features = ["zeroize_derive"] }

@@ -782,6 +782,8 @@ fn artery_snapshot_save_load() {
         retained_consumed_records: std::collections::BTreeMap::new(),
         peer_endpoints: std::collections::BTreeMap::new(),
         limbo_payment_ids: vec![],
+        century_locks: vec![],
+        century_lock_last_block: 0,
     };
 
     storage.save(&snapshot).unwrap();

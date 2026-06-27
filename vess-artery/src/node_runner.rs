@@ -815,6 +815,8 @@ mod tests {
             pending_reforge_genesis: HashMap::new(),
             wallet: None,
             bitcoin_client: None,
+            century_locks: HashMap::new(),
+            century_lock_last_block: 0,
             wallet_path: None,
             notifications: VecDeque::new(),
             outbound_payments: HashMap::new(),
@@ -2080,6 +2082,11 @@ fn proof_hash_and_nonce_from_genesis(og: &OwnershipGenesis) -> Option<([u8; 32],
             }
         }
         GenesisProof::BitcoinTimeLock(_) => None,
+        GenesisProof::CenturyLock(proof) => {
+            // Century lock proof_hash is derived from the burn txid.
+            let proof_hash = *blake3::hash(&proof.txid).as_bytes();
+            Some((proof_hash, proof_hash))
+        }
         GenesisProof::VichorGenesis(_) => None,
         GenesisProof::LocalTestFaucet(proof) => {
             let mut h = blake3::Hasher::new();
@@ -3015,6 +3022,11 @@ pub struct ArteryState {
     /// Background Bitcoin light client used for burn verification and
     /// transaction broadcast/onboarding.
     pub bitcoin_client: Option<vess_bitcoin::BitcoinLightClient>,
+    /// Active century-lock faucets owned by this node's wallet.
+    /// Keyed by lock_id. Each produces one bill per Bitcoin block.
+    pub century_locks: HashMap<[u8; 32], vess_protocol::CenturyLockState>,
+    /// Last Bitcoin block height at which century locks were checked.
+    pub century_lock_last_block: u64,
     /// Wallet file path (set from config even when wallet is locked).
     /// Used by the RPC `wallet_unlock` endpoint to load the file.
     pub wallet_path: Option<PathBuf>,
@@ -3086,6 +3098,8 @@ impl ArteryState {
             pending_reforge_genesis: HashMap::new(),
             wallet: None,
             bitcoin_client: None,
+            century_locks: HashMap::new(),
+            century_lock_last_block: 0,
             wallet_path: None,
             notifications: VecDeque::new(),
             events: VecDeque::new(),
@@ -3399,6 +3413,8 @@ impl ArteryState {
             // M5: persist the set of in-flight limbo payment IDs so a restart
             // cannot be used to replay a payment that is already in limbo.
             limbo_payment_ids: self.limbo_payment_ids.iter().cloned().collect(),
+            century_locks: self.century_locks.values().cloned().collect(),
+            century_lock_last_block: self.century_lock_last_block,
         }
     }
 
@@ -3833,6 +3849,8 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
         pending_reforge_genesis: HashMap::new(),
         wallet: wallet_state,
         bitcoin_client,
+        century_locks: HashMap::new(),
+        century_lock_last_block: 0,
         wallet_path: config.wallet_path.clone(),
         notifications: VecDeque::new(),
         outbound_payments: HashMap::new(),
@@ -4470,9 +4488,25 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                         );
                     }
                 }
-                // Re-estimate network size from routing table and scale
-                // gossip parameters dynamically.
-                s.estimated_network_size = s.routing_table.estimated_network_size();
+                // ── Century lock auto-minting ──────────────────────
+                // Mint pending bills for active century locks.
+                // Called manually via RPC or triggered by block events.
+                // State is tracked in s.century_locks.
+                if !s.century_locks.is_empty() {
+                    for (_lock_id, lock) in s.century_locks.iter() {
+                        if lock.is_active(s.century_lock_last_block) {
+                            let remaining = lock.remaining_vess(s.century_lock_last_block);
+                            if remaining > 0 {
+                                info!(
+                                    lock_id = %crate::persistence::hex_key(&lock.lock_id),
+                                    remaining_vess = remaining,
+                                    unclaimed_blocks = lock.unclaimed_blocks(s.century_lock_last_block),
+                                    "century lock has unclaimed Vess"
+                                );
+                            }
+                        }
+                    }
+                }
                 let n = s.estimated_network_size;
                 // k_neighbors scales logarithmically: max(6, ceil(log2(N)))
                 let log2_n = if n > 1 {

@@ -85,6 +85,12 @@ pub struct ArterySnapshot {
     /// put into limbo but whose limbo record was never cleaned up after a restart.
     #[serde(default)]
     pub limbo_payment_ids: Vec<[u8; 32]>,
+    /// Active century-lock faucets owned by this node's wallet.
+    #[serde(default)]
+    pub century_locks: Vec<vess_protocol::CenturyLockState>,
+    /// Last Bitcoin block height at which century locks were checked.
+    #[serde(default)]
+    pub century_lock_last_block: u64,
 }
 
 impl ArterySnapshot {
@@ -106,6 +112,8 @@ impl ArterySnapshot {
             retained_ownership_records: Vec::new(),
             retained_consumed_records: BTreeMap::new(),
             limbo_payment_ids: Vec::new(),
+            century_locks: Vec::new(),
+            century_lock_last_block: 0,
         }
     }
 }

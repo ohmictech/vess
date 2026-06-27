@@ -2066,6 +2066,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "vess-bitcoin",
  "vess-foundry",
  "vess-kloak",

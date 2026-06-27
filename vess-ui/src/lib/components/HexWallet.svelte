@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { getBalance, getVessTag, type BalanceData } from "../rpc/client";
+  import { getBalance, getVessTag, getCenturyLocks, type BalanceData, type CenturyLockInfo } from "../rpc/client";
 
   // ── Types ──────────────────────────────────────────────
   type Asset = "vess" | "bitcoin" | "vichor";
@@ -28,10 +28,27 @@
   // ── RPC data ──────────────────────────────────────────
   let balance: BalanceData | null = null;
   let vesstag = "";
+  let centuryLocks: CenturyLockInfo[] = [];
+  let totalCenturyVess = 0;
+  let totalCenturyPerBlock = 0;
 
   onMount(async () => {
     try { balance = await getBalance(); } catch { /* node offline */ }
     try { vesstag = await getVessTag(); } catch { /* not set yet */ }
+    try {
+      centuryLocks = await getCenturyLocks();
+      totalCenturyVess = centuryLocks.reduce((s, l) => s + l.remaining_vess, 0);
+      totalCenturyPerBlock = centuryLocks.filter(l => l.active).reduce((s, l) => s + l.per_block_vess, 0);
+    } catch { /* RPC not available */ }
+    // Poll every 30s
+    setInterval(async () => {
+      try { balance = await getBalance(); } catch {}
+      try {
+        centuryLocks = await getCenturyLocks();
+        totalCenturyVess = centuryLocks.reduce((s, l) => s + l.remaining_vess, 0);
+        totalCenturyPerBlock = centuryLocks.filter(l => l.active).reduce((s, l) => s + l.per_block_vess, 0);
+      } catch {}
+    }, 30_000);
     window.addEventListener("vesstag-set", (e: Event) => {
       vesstag = (e as CustomEvent).detail;
     });
@@ -304,6 +321,21 @@
       ></div>
       <span class="amount-value">{displayAmount}</span>
     </div>
+
+    <!-- ── Century lock / timelock info ── -->
+    {#if selectedAsset === "vess" && totalCenturyVess > 0}
+      <div class="amount-sub">
+        <span class="inline-block rounded-full px-2 py-0.5 text-xs font-medium" style="background: {currentAsset.color}18; color: {currentAsset.color}">
+          {totalCenturyPerBlock} Vess/block · {centuryLocks.length} faucet{centuryLocks.length === 1 ? '' : 's'}
+        </span>
+      </div>
+    {:else if selectedAsset === "bitcoin" && balance && (balance.watch_only_balance ?? 0) > 0}
+      <div class="amount-sub">
+        <span class="inline-block rounded-full px-2 py-0.5 text-xs font-medium" style="background: {currentAsset.color}18; color: {currentAsset.color}">
+          {fmt(balance.watch_only_balance ?? 0)} locked · {centuryLocks.filter(l => l.active).length} century
+        </span>
+      </div>
+    {/if}
   </div>
 
   <!-- SVG hexagonal grid -->
@@ -676,6 +708,10 @@
     letter-spacing: 0.08em;
     font-variant-numeric: tabular-nums;
     font-family: "Orbitron", "Inter", "SF Mono", monospace;
+  }
+  .amount-sub {
+    margin-top: 2px;
+    text-align: center;
   }
 
   /* ── Float-out wrapper (outer hexagons) ─────────────── */

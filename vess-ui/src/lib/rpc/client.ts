@@ -238,3 +238,21 @@ export async function recoverWallet(phrase: string[], tag: string): Promise<void
   const res = await rpcCall("recover_wallet", { phrase: phrase.join(" "), tag });
   if (res.error) throw new Error(res.error);
 }
+
+export async function getCenturyLocks(): Promise<CenturyLockInfo[]> {
+  const res = await rpcCall("century_locks");
+  return (res as any)?.locks || [];
+}
+
+export interface CenturyLockInfo {
+  lock_id: string;
+  total_sats: number;
+  per_block_vess: number;
+  start_block: number;
+  end_block: number;
+  last_claimed_block: number;
+  unclaimed_blocks: number;
+  remaining_vess: number;
+  active: boolean;
+  created_at: number;
+}

@@ -240,6 +240,10 @@ pub enum GenesisProof {
     /// Bitcoin time-lock proof: CLTV-locked BTC creates sat-block Vess credits.
     BitcoinTimeLock(BitcoinTimeLockProof),
 
+    /// Century lock: BTC burned for 100 years creates a perpetual Vess faucet.
+    /// One Vess bill per Bitcoin block, amount = total_sats / 52_560 (rounded).
+    CenturyLock(BitcoinTimeLockProof),
+
     /// One-time Vichor genesis: 1B supply held by dev, sold on swap DHT.
     VichorGenesis(VichorGenesisProof),
 
@@ -1392,6 +1396,87 @@ pub struct FetchedRecord {
 pub struct OwnershipFetchResponse {
     /// Fetched records (parallel to the request's `mint_ids`).
     pub records: Vec<FetchedRecord>,
+}
+
+// ── Century Lock ─────────────────────────────────────────────────────
+
+/// The number of Bitcoin blocks in 100 years (144 × 365.25 × 100).
+pub const CENTURY_LOCK_BLOCKS: u64 = 5_256_000;
+
+/// Standard Bitcoin blocks per year (144 × 365.25).
+
+/// State for an active century-lock faucet.
+///
+/// When BTC is burned for 100 years, it creates a perpetual Vess faucet
+/// that mints one bill per Bitcoin block. Each bill is valued at
+/// `total_sats / BLOCKS_PER_YEAR` (rounded down).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CenturyLockState {
+    /// Unique identifier: `Blake3("vess-century-lock-v0" || burn_txid)`.
+    pub lock_id: [u8; 32],
+    /// The Bitcoin burn proof that created this lock.
+    pub burn_proof: BitcoinTimeLockProof,
+    /// Total satoshis burned (from burn_proof.locked_sats).
+    pub total_sats: u64,
+    /// Vess amount per Bitcoin block: `total_sats / BLOCKS_PER_YEAR`.
+    pub per_block_vess: u64,
+    /// Bitcoin block height when the lock starts (burn confirmation height).
+    pub start_block: u64,
+    /// Bitcoin block height when the lock expires (start + CENTURY_LOCK_BLOCKS).
+    pub end_block: u64,
+    /// Last Bitcoin block height for which a bill was minted.
+    /// Increments by 1 each time a bill is successfully claimed.
+    pub last_claimed_block: u64,
+    /// The node ID of the wallet that owns this century lock.
+    pub owner_node_id: [u8; 32],
+    /// Unix timestamp when this lock was created.
+    pub created_at: u64,
+}
+
+impl CenturyLockState {
+    /// Create a new century lock state from a burn proof.
+    pub fn new(burn_proof: BitcoinTimeLockProof, owner_node_id: [u8; 32], created_at: u64) -> Self {
+        let total_sats = burn_proof.locked_sats;
+        let per_block_vess = (total_sats + BLOCKS_PER_YEAR - 1) / BLOCKS_PER_YEAR;
+        let start_block = burn_proof.block_height;
+        let end_block = start_block.saturating_add(CENTURY_LOCK_BLOCKS);
+        let lock_id = {
+            let mut h = blake3::Hasher::new();
+            h.update(b"vess-century-lock-v0");
+            h.update(&burn_proof.txid);
+            *h.finalize().as_bytes()
+        };
+        Self {
+            lock_id,
+            burn_proof,
+            total_sats,
+            per_block_vess,
+            start_block,
+            end_block,
+            last_claimed_block: start_block.saturating_sub(1), // nothing claimed yet
+            owner_node_id,
+            created_at,
+        }
+    }
+
+    /// How many blocks remain unclaimed.
+    pub fn unclaimed_blocks(&self, current_block: u64) -> u64 {
+        if current_block <= self.last_claimed_block {
+            return 0;
+        }
+        let max_claimable = self.end_block.min(current_block);
+        max_claimable.saturating_sub(self.last_claimed_block)
+    }
+
+    /// Remaining Vess that can be minted from this lock.
+    pub fn remaining_vess(&self, current_block: u64) -> u64 {
+        self.unclaimed_blocks(current_block) * self.per_block_vess
+    }
+
+    /// Whether this lock is still active.
+    pub fn is_active(&self, current_block: u64) -> bool {
+        current_block < self.end_block && self.last_claimed_block < self.end_block
+    }
 }
 
 // ── Direct Peer-to-Peer Payment ──────────────────────────────────────

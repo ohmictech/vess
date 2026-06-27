@@ -451,7 +451,9 @@ impl BitcoinWallet {
         }
 
         // Vichor gate: free ≤1 year, then quadratic (y-1)²×10 in 0.1 increments.
-        let vichor_required = vess_foundry::vichor_required_for_years(duration_years);
+        let spendable = self.spendable_tracked_balance();
+        let locked_sats = ((spendable as f64) * (percentage / 100.0)) as u64;
+        let vichor_required = vess_foundry::vichor_required_for_years(locked_sats, duration_years);
         if vichor_burned < vichor_required {
             return Err(anyhow!(
                 "duration {duration_years} years requires {vichor_required} Vichor burned, got {vichor_burned}"

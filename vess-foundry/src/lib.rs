@@ -237,6 +237,32 @@ impl Denomination {
         values.sort_unstable_by(|a, b| b.cmp(a));
         values.into_iter().map(Denomination).collect()
     }
+
+    /// Round a raw u64 amount to the nearest valid 1-2-5 denomination.
+    /// Ties round up. Returns `D1` for 0.
+    pub fn nearest(value: u64) -> Self {
+        if value == 0 {
+            return Self::D1;
+        }
+        // Find the power-of-10 magnitude.
+        let mut power: u64 = 1;
+        while power <= value / 10 {
+            power *= 10;
+        }
+        // Candidates at this power level: 1×, 2×, 5× power
+        let candidates = [1 * power, 2 * power, 5 * power, 10 * power];
+        let mut best = candidates[0];
+        let mut best_diff = u64::MAX;
+        for &c in &candidates {
+            if c == 0 { continue; }
+            let diff = if c >= value { c - value } else { value - c };
+            if diff < best_diff {
+                best_diff = diff;
+                best = c;
+            }
+        }
+        Self(best)
+    }
 }
 
 impl std::fmt::Display for Denomination {
@@ -510,13 +536,9 @@ pub fn vichor_genesis_mint_id(nonce: &[u8; 32]) -> [u8; 32] {
 /// marginal cost grows linearly with duration. This creates natural
 /// market tiers where speculators must buy Vichor from the market,
 /// funding protocol development.
-pub fn vichor_required_for_years(years: f64) -> u64 {
-    if years <= 1.0 {
-        0
-    } else {
-        let excess = years - 1.0;
-        (excess * excess * 10.0) as u64
-    }
+pub fn vichor_required_for_years(locked_sats: u64, years: f64) -> u64 {
+    // 1 Vichor per 100,000 sat-years (linear in both amount and time).
+    (locked_sats as f64 * years / 100_000.0).ceil() as u64
 }
 
 /// Provably unspendable verification key hash. Any Vichor bill transferred
