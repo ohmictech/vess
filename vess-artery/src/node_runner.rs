@@ -498,10 +498,15 @@ fn validate_bitcoin_timelock_genesis(
         return Err("ownership genesis owner_vk mismatch with burn proof");
     }
 
-    // 3. Verify mint_id is deterministic from txid + output_index.
-    let expected_mint_id = vess_foundry::bitcoin_timelock_mint_id(&burn.txid, og.output_index);
+    // 3. Verify mint_id: standard timelocks use txid+output_index;
+    // century locks additionally require the block hash (in og.digest).
+    let expected_mint_id = if matches!(&og.genesis_proof, GenesisProof::CenturyLock(_)) {
+        vess_foundry::century_lock_mint_id(&burn.txid, og.output_index, &og.digest)
+    } else {
+        vess_foundry::bitcoin_timelock_mint_id(&burn.txid, og.output_index)
+    };
     if og.mint_id != expected_mint_id {
-        return Err("century lock mint_id does not match txid + output_index");
+        return Err("mint_id does not match txid + output_index");
     }
 
     // 4. Verify chain_tip is derived from mint_id + owner.
@@ -522,6 +527,21 @@ fn validate_bitcoin_timelock_genesis(
     let max_outputs = vess_protocol::CENTURY_LOCK_BLOCKS;
     if og.output_index as u64 >= max_outputs {
         return Err("century lock output_index exceeds CENTURY_LOCK_BLOCKS");
+    }
+
+    // 7. For century locks: verify the claimed block hash is in the local
+    // Bitcoin header chain. This prevents submitting bills with fake block
+    // hashes — the node must have seen the actual block header.
+    if matches!(&og.genesis_proof, GenesisProof::CenturyLock(_)) {
+        if let Some(client) = bitcoin_client {
+            if !client.has_block_header(&og.digest) {
+                return Err("century lock block hash not in local Bitcoin header chain");
+            }
+        }
+        // If no Bitcoin client is available, the block hash cannot be
+        // independently verified. Nodes without a client should either
+        // trust the SPV proof (which includes a confirmed block) or
+        // defer to nodes that do have a client.
     }
 
     // Return the bundle commitment as proof of successful validation.
@@ -736,7 +756,7 @@ mod tests {
             output_values: output_values.clone(),
             commitment_payload: Vec::new(),
         };
-        let digest = [0u8; 32]; // TODO: recompute with bitcoin_timelock_payload_commitment
+        let digest = burn.block_hash; // timelock mints are txid-anchored
         let mint_id = vess_foundry::bitcoin_timelock_mint_id(&txid, 0);
         let og = OwnershipGenesis {
             mint_id,
@@ -3501,10 +3521,14 @@ impl ArteryState {
 
     /// Mint pending bills for all active century locks.
     /// Called when a new Bitcoin block is observed.
+    ///
+    /// `block_hashes` maps block height → block hash for blocks in the
+    /// current chain. Each bill's mint_id is bound to its block hash.
     /// Returns the number of bills minted.
     pub(crate) fn mint_century_lock_bills(
         &mut self,
         current_block: u64,
+        block_hashes: &std::collections::BTreeMap<u64, [u8; 32]>,
         og_tx: &tokio::sync::mpsc::UnboundedSender<vess_protocol::OwnershipGenesis>,
         manifest_tx: &tokio::sync::mpsc::UnboundedSender<vess_protocol::ManifestStore>,
     ) -> usize {
@@ -3526,9 +3550,16 @@ impl ArteryState {
 
             for block in start..end {
                 let output_index = (block - lock.start_block) as u32;
-                let mint_id = vess_foundry::bitcoin_timelock_mint_id(
+                // Get the block hash for this height, or use the burn proof's
+                // block_hash for the genesis block (output_index=0).
+                let block_hash = block_hashes.get(&block)
+                    .copied()
+                    .unwrap_or(lock.burn_proof.block_hash);
+
+                let mint_id = vess_foundry::century_lock_mint_id(
                     &lock.burn_proof.txid,
                     output_index,
+                    &block_hash,
                 );
 
                 pending_ogs.push(vess_protocol::OwnershipGenesis {
@@ -3543,7 +3574,7 @@ impl ArteryState {
                     genesis_proof: vess_protocol::GenesisProof::CenturyLock(
                         lock.burn_proof.clone(),
                     ),
-                    digest: lock.burn_proof.txid,
+                    digest: block_hash, // the Bitcoin block hash this bill claims
                     hops_remaining: 6,
                     chain_depth: 0,
                     output_index,
@@ -4722,8 +4753,11 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                         lock.is_active(current_block) && lock.unclaimed_blocks(current_block) > 0
                     });
                     if has_pending {
+                        // TODO: populate block_hashes from Bitcoin light client.
+                        let block_hashes = std::collections::BTreeMap::new();
                         let minted = s.mint_century_lock_bills(
                             current_block,
+                            &block_hashes,
                             &flush_og_tx,
                             &flush_manifest_tx,
                         );

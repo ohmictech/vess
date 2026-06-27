@@ -7,12 +7,20 @@
 
 Vess turns locked Bitcoin into spendable time-credits. Lock BTC via
 `OP_CHECKLOCKTIMEVERIFY` and receive Vess. 1 satoshi locked for 1 year = 1 Vess.
-The BTC returns after the lock expires. No burn, no bridge, no custodian. The economic value behind a unit of Vess represents the opportunity cost of locking your Bitcoin.
+The BTC returns after the lock expires. No burn, no bridge, no custodian. The economic value behind a unit of Vess represents the opportunity-time cost of locking your Bitcoin.
+
+The protocol's intention and novelty is to fundamentally change what "access to credit" means. Rather than having to be in debt to someone else to acquire liquidity against your assets, Vess allows you to directly issue tokenized claims on future work against your own Bitcoin, trustlessly.
+
+Once BTC is locked, the corresponding minted Vess is moved around like cryptographically self-contained bearer bonds that can be split and combined cryptographically. As such, there is no global consensus mechanism, "blocks", or state.
+
+Vess is built on maximum decentralization, piggybacking the BTC network with a builtin light client + self-audited transaction and block commitments. No node RPC required.
+
+Every Vess wallet is its own node.
 
 ## How It Works
 
 1. **Lock BTC** — Your wallet builds a CLTV time-lock transaction. BTC sits at your own address, locked for 0.1–10 years.
-2. **Mint Vess** — When the lock confirms, ownership records are gossiped to the DHT. `Vess = locked_sats × lock_blocks / 52,560`.
+2. **Mint Vess** — When the lock confirms, ownership records are gossiped to the DHT.
 3. **Spend** — Vess bills are bearer instruments sent via tags (e.g. `+ALICE`)
 4. **Claim** — The recipient wallet automatically broadcasts an `OwnershipClaim` to the DHT to finalize receipt.
 
@@ -29,20 +37,20 @@ Vess and Vichor are two independent assets with distinct purposes.
 
 ### Vichor Gate
 
-Locks ≤1 year are freely accessible. Beyond that, Vichor must be burned proportionally, ensuring speculators are contributing to the network longevity:
+Locks ≤1 year are freely accessible. Beyond that, Vichor must be burned proportionally, ensuring speculators are contributing to the network longevity and strength:
 
 Vichor is burned by transferring it to a provably unspendable address
 (`VICHOR_BURN_VK_HASH`). The burn proof is committed in the Bitcoin
 time-lock transaction's `OP_RETURN`, binding it to a specific mint.
 
-Speculators who want high-leverage long-term locks must buy Vichor from
+Speculators who want high leverage, long-term locks must buy Vichor from
 the market, funding protocol development while making the remaining
 Vichor supply scarcer.
 
 ### Self-Contained Liquidity
 
 Vichor never needs a CEX or DEX. The Swap DHT (`vess-swap-v0|btc|vichor`)
-is the only exchange it needs, retaining the same keys, same wallet, same network.
+is the only exchange it needs, retaining the same keys, same wallet, same network. Bitcoin, Vichor, and Vess can all be exchanged feelessly and P2P. No price oracles required.
 
 ## Tags
 

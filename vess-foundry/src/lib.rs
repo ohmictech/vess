@@ -466,17 +466,36 @@ pub fn vichor_burn_digest(
     *h.finalize().as_bytes()
 }
 
-/// Derive the deterministic mint_id for a bitcoin time-lock bundle output.
+/// Derive the deterministic mint_id for a standard bitcoin time-lock bill.
 ///
 /// `mint_id = Blake3("vess-timelock-mint-id-v1" || txid || output_index_le)`
 ///
-/// The Bitcoin txid anchors the shared time-lock event, while `output_index`
-/// distinguishes sibling Vess bills derived from the same lock.
+/// Every Vess bill traces to a Bitcoin transaction. The txid anchors the
+/// time-lock event and `output_index` distinguishes sibling bills from the
+/// same lock.
 pub fn bitcoin_timelock_mint_id(txid: &[u8; 32], output_index: u32) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(b"vess-timelock-mint-id-v1");
     h.update(txid);
     h.update(&output_index.to_le_bytes());
+    *h.finalize().as_bytes()
+}
+
+/// Derive the deterministic mint_id for a century lock faucet bill.
+///
+/// `mint_id = Blake3("vess-century-mint-id-v1" || txid || output_index_le || block_hash)`
+///
+/// Like a standard timelock bill, every century-lock bill traces to the
+/// century lock's Bitcoin genesis transaction via `txid`. Additionally,
+/// the `block_hash` binds the bill to the specific Bitcoin block being
+/// claimed — preventing reorg ambiguity since the faucet produces one
+/// bill per block over 100 years.
+pub fn century_lock_mint_id(txid: &[u8; 32], output_index: u32, block_hash: &[u8; 32]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"vess-century-mint-id-v1");
+    h.update(txid);
+    h.update(&output_index.to_le_bytes());
+    h.update(block_hash);
     *h.finalize().as_bytes()
 }
 
