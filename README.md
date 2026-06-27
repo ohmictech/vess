@@ -3,11 +3,11 @@
 
 # Vess
 
-**Bitcoin opportunity-cost credit protocol. Post-quantum, feeless, stateless.**
+**Bitcoin time-value credit protocol. Post-quantum. Feeless. Stateless.**
 
 Vess turns locked Bitcoin into spendable time-credits. Lock BTC via
-`OP_CHECKLOCKTIMEVERIFY` and receive Vess. 1 sat locked for 1 year = 1 Vess.
-The BTC returns after the lock expires. No burn, no bridge, no custodian.
+`OP_CHECKLOCKTIMEVERIFY` and receive Vess. 1 satoshi locked for 1 year = 1 Vess.
+The BTC returns after the lock expires. No burn, no bridge, no custodian. The economic value behind a unit of Vess represents the opportunity cost of locking your Bitcoin.
 
 ## How It Works
 
@@ -29,19 +29,7 @@ Vess and Vichor are two independent assets with distinct purposes.
 
 ### Vichor Gate
 
-Locks ≤1 year are freely accessible. Beyond that, Vichor must be burned, ensuring speculators are contributing to the network longevity:
-
-```
-Duration    Vichor Required
-────────    ───────────────
-≤1.0 year   0 (free)
- 1.1 years  1
- 2.0 years  10
- 3.0 years  40
- 5.0 years  160
- 7.0 years  360
-10.0 years  810
-```
+Locks ≤1 year are freely accessible. Beyond that, Vichor must be burned proportionally, ensuring speculators are contributing to the network longevity:
 
 Vichor is burned by transferring it to a provably unspendable address
 (`VICHOR_BURN_VK_HASH`). The burn proof is committed in the Bitcoin
@@ -54,31 +42,19 @@ Vichor supply scarcer.
 ### Self-Contained Liquidity
 
 Vichor never needs a CEX or DEX. The Swap DHT (`vess-swap-v0|btc|vichor`)
-is the only exchange it needs — same keys, same wallet, same network.
+is the only exchange it needs, retaining the same keys, same wallet, same network.
 
 ## Tags
 
-Human-readable identities (e.g. `+ALICE`). Uppercase display eliminates
-`I`/`l`/`1` confusion. Immutable — once registered, the tag→address mapping
-is permanent.
+Human-readable identities for payments (e.g. `+ALICE`). Once registered, the tag→address mapping is permanent.
 
 - Lowercase alphanumeric only, 3–20 chars
 - Argon2id PoW (2 GiB) to claim
-- No expiry, no pruning, no lockout
-
-## Quick Start
-
-```bash
-git clone https://github.com/ohmictech/vess.git
-cd vess
-cargo build --release --package vess-cli
-```
 
 ## Architecture
 
 Nodes form a peer-to-peer mesh with post-quantum handshakes (ML-KEM-768 + Falcon).
-Ownership state is replicated deterministically across the DHT. Payments try
-direct delivery first, falling back to gossip relay.
+Ownership state is replicated deterministically across the DHT. 
 
 - **No consensus** — deterministic registry rules
 - **No fees** — no gas, no mempool, no fee auction
