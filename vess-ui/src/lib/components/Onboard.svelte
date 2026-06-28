@@ -13,23 +13,40 @@
   let loading = false;
   let error = "";
   let tagAvailable = false;
+  let statusMessage = "Starting node...";
 
-  // Detect existing wallet
+  // Wait for node, then check if wallet exists.
   async function detect() {
     loading = true;
-    try {
-      const status = await walletStatus();
-      if (status.exists) {
-        dispatch("ready");
-        return;
-      }
-      step = "choose";
-    } catch {
-      // node offline — still allow onboarding
-      step = "choose";
-    } finally {
-      loading = false;
+
+    // Phase 1: wait for node TCP port to be open.
+    for (let attempt = 1; attempt <= 30; attempt++) {
+      statusMessage = `Starting node${" .".repeat(attempt % 4)}`;
+      try {
+        const { invoke } = await import("@tauri-apps/api/core");
+        if (await invoke("is_node_ready")) break;
+      } catch { /* invoke not available yet */ }
+      await new Promise(r => setTimeout(r, 2000));
     }
+
+    // Phase 2: check if a wallet already exists.
+    for (let attempt = 1; attempt <= 10; attempt++) {
+      statusMessage = `Checking wallet${" .".repeat(attempt % 4)}`;
+      try {
+        const status = await walletStatus();
+        if (status.exists) {
+          dispatch("ready");
+          return;
+        }
+        step = "choose";
+        loading = false;
+        return;
+      } catch (e) {
+        if (attempt < 10) await new Promise(r => setTimeout(r, 1000));
+      }
+    }
+    step = "choose";
+    loading = false;
   }
   detect();
 
@@ -121,7 +138,7 @@
   <!-- ── Detect (loading) ── -->
   {#if step === "detect"}
     <svg class="w-10 h-10 animate-spin text-[#88cddf]" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" stroke-opacity="0.2"/><path d="M12 2a10 10 0 0 1 10 10" stroke-linecap="round"/></svg>
-    <p class="text-sm text-gray-400">checking wallet...</p>
+    <p class="text-sm text-gray-400">{statusMessage}</p>
 
   <!-- ── Choose: Create or Import ── -->
   {:else if step === "choose"}

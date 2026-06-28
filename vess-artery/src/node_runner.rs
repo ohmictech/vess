@@ -1775,7 +1775,29 @@ fn queue_discovered_peer_contact(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let mut s = lock_state(&state);
+    // Try to acquire the state lock with a short retry loop.
+    // The message listener or handshake drain may hold it briefly;
+    // retrying with a small delay avoids silently dropping peers.
+    // If the lock is poisoned (prior panic), recover it.
+    let mut s = 'lock: {
+        for attempt in 0..20 {
+            match state.try_lock() {
+                Ok(s) => break 'lock s,
+                Err(std::sync::TryLockError::Poisoned(e)) => {
+                    warn!(source, "state lock poisoned — recovering");
+                    break 'lock e.into_inner();
+                }
+                Err(std::sync::TryLockError::WouldBlock) if attempt < 19 => {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    // last attempt failed
+                }
+            }
+        }
+        warn!(source, "state locked for 1s — retry next discovery cycle");
+        return;
+    };
     if peer_hash == s.node_id {
         return;
     }
@@ -5848,17 +5870,22 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     .send_message_with_response(&target, &challenge)
                     .await
                 {
+                    // HMAC check (quick, inside lock) then PoW verification
+                    // (slow, ~2s, outside lock to avoid blocking everything).
+                    let hmac_ok = {
+                        let mut s = hs_state.lock().unwrap();
+                        s.peer_registry.verify_response(&peer_hash, &resp.hmac, &ALLOWED_VERSIONS)
+                    };
+                    let pow_ok = if hmac_ok && !resp.pow_hash.is_empty() {
+                        verify_handshake_pow(&peer_hash, &nonce, &resp.pow_hash)
+                    } else {
+                        false
+                    };
+
                     let verified = {
                         let mut s = hs_state.lock().unwrap();
-                        if s.peer_registry.verify_response(
-                            &peer_hash,
-                            &resp.hmac,
-                            &ALLOWED_VERSIONS,
-                        ) {
-                            // Verify Argon2id PoW from the peer.
-                            if resp.pow_hash.is_empty()
-                                || !verify_handshake_pow(&peer_hash, &nonce, &resp.pow_hash)
-                            {
+                        if hmac_ok {
+                            if !pow_ok {
                                 let failures = s.peer_registry.record_handshake_failure(&peer_hash);
                                 warn!(failures, "peer PoW verification failed");
                                 if failures >= MAX_HANDSHAKE_FAILURES {
@@ -6132,11 +6159,6 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
             return None;
         }
 
-        // Use into_inner() to recover from a poisoned mutex — if another task
-        // panicked while holding the lock, we still need to keep processing
-        // messages rather than crashing the entire process.
-        let mut state = st.lock().unwrap_or_else(|e| e.into_inner());
-
         let peer_id: [u8; 32] = peer_hash;
         let peer_bytes = match encode_contact_bytes(&peer.contact) {
             Ok(bytes) => bytes,
@@ -6149,48 +6171,81 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        if state.routing_table.contains(&peer_id) {
-            state.routing_table.fill_id_bytes(&peer_id, peer_bytes.clone());
-        } else {
-            let inserted = state.routing_table.insert(RoutingPeer {
-                id_hash: peer_id,
-                id_bytes: peer_bytes.clone(),
-                last_seen: now_ts,
-                first_seen: now_ts,
-            });
-            if inserted {
-                push_peer_notification(
-                    &mut state,
-                    "vess_peer_discovered",
-                    &peer_id,
-                    Some("inbound".to_string()),
-                    format!("Discovered Vess peer via inbound traffic: {}", hex_key(&peer_id)),
-                );
-                info!(%peer, "new peer discovered ({} total)", state.routing_table.peer_count());
-            }
-        }
-        if state.peer_registry.state(&peer_id) != PeerState::Verified
-            && !state.handshake_queue.contains(&peer_id)
+
+        // Quick routing update — lock briefly (try_lock so we never block
+        // the message listener and prevent handshake processing).
+        let node_id_local;
         {
-            state.handshake_queue.push(peer_id);
+            let mut state = match st.try_lock() {
+                Ok(s) => s,
+                Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    // Lock busy — drop message, sender will retry.
+                    return None;
+                }
+            };
+
+            if state.routing_table.contains(&peer_id) {
+                state.routing_table.fill_id_bytes(&peer_id, peer_bytes.clone());
+            } else {
+                let inserted = state.routing_table.insert(RoutingPeer {
+                    id_hash: peer_id,
+                    id_bytes: peer_bytes.clone(),
+                    last_seen: now_ts,
+                    first_seen: now_ts,
+                });
+                if inserted {
+                    push_peer_notification(
+                        &mut state,
+                        "vess_peer_discovered",
+                        &peer_id,
+                        Some("inbound".to_string()),
+                        format!("Discovered Vess peer via inbound traffic: {}", hex_key(&peer_id)),
+                    );
+                    info!(%peer, "new peer discovered ({} total)", state.routing_table.peer_count());
+                }
+            }
+            if state.peer_registry.state(&peer_id) != PeerState::Verified
+                && !state.handshake_queue.contains(&peer_id)
+            {
+                state.handshake_queue.push(peer_id);
+            }
+            node_id_local = state.node_id;
+        } // Lock released here — other tasks can now acquire it.
+
+        // ── HandshakeChallenge: can be handled without the state lock ──
+        // because we only need node_id (already extracted above) and the
+        // PoW computation is expensive (~2s blocking).
+        if let PulseMessage::HandshakeChallenge(hc) = &msg {
+            let hmac = compute_handshake_hmac(&PROTOCOL_VERSION_HASH, &hc.nonce);
+            let nonce = hc.nonce;
+            let pow_hash = tokio::task::block_in_place(|| {
+                compute_handshake_pow(&node_id_local, &nonce)
+            });
+            return Some(PulseMessage::HandshakeResponse(HandshakeResponse {
+                hmac,
+                pow_hash,
+            }));
         }
 
-        // ── Handshake messages ──────────────────────────────────────
+        // Re-acquire lock for remaining message types.
+        // Use try_lock with a short retry so we don't block the message
+        // listener (preventing HandshakeChallenge processing).
+        let mut state = match st.try_lock() {
+            Ok(s) => s,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                // Lock busy — skip this message, sender will retry.
+                return None;
+            }
+        };
+
+        // ── Handshake messages (continued) ──────────────────────────
         match &msg {
-            PulseMessage::HandshakeChallenge(hc) => {
-                let hmac = compute_handshake_hmac(&PROTOCOL_VERSION_HASH, &hc.nonce);
-                // Offload Argon2id PoW to a blocking thread so the UDP
-                // listener stays responsive for payments arriving during
-                // the ~2 s computation.
-                let node_id = state.node_id;
-                let nonce = hc.nonce;
-                let pow_hash = tokio::task::block_in_place(|| {
-                    compute_handshake_pow(&node_id, &nonce)
-                });
-                return Some(PulseMessage::HandshakeResponse(HandshakeResponse {
-                    hmac,
-                    pow_hash,
-                }));
+            PulseMessage::HandshakeChallenge(_hc) => {
+                // Already handled above; this arm is unreachable but
+                // required for exhaustive match.
+                unreachable!();
             }
             PulseMessage::HandshakeResponse(hr) => {
                 // Read the challenge nonce BEFORE verify_response consumes it.

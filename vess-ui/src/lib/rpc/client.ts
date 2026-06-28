@@ -8,40 +8,27 @@ let _rpcUrl: string | null = null;
 async function getRpcUrl(): Promise<string> {
   if (_rpcUrl) return _rpcUrl;
 
-  // Check localStorage first.
-  const stored = localStorage.getItem("vess_rpc_url");
-  if (stored) {
-    // Verify it still works.
-    try {
-      const res = await fetch(stored, { method: "POST", headers: { "Content-Type": "application/json" }, body: '{"method":"node_info"}' });
-      if (res.ok) { _rpcUrl = stored; return stored; }
-    } catch { /* dead */ }
-  }
-
-  // Try Tauri command first (fastest in bundled app).
+  // In Tauri: trust the backend port directly (no HTTP validation needed).
   try {
     const { invoke } = await import("@tauri-apps/api/core");
     const port: number = await invoke("get_rpc_port");
     const url = `http://127.0.0.1:${port}`;
-    localStorage.setItem("vess_rpc_url", url);
     _rpcUrl = url;
     return url;
   } catch { /* not in Tauri */ }
 
-  // Fallback: scan ports 9821–9851 for a running node.
+  // Fallback for browser dev mode: scan ports 9821–9851.
   for (let port = 9821; port <= 9851; port++) {
     try {
       const url = `http://127.0.0.1:${port}`;
-      const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: '{"method":"node_info"}' });
-      if (res.ok) {
-        localStorage.setItem("vess_rpc_url", url);
-        _rpcUrl = url;
-        return url;
-      }
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 2000);
+      const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: '{"method":"node_info"}', signal: ctrl.signal });
+      clearTimeout(t);
+      if (res.ok) { _rpcUrl = url; return url; }
     } catch { /* try next */ }
   }
 
-  // Nothing found — default (will show offline until node starts).
   return DEFAULT_RPC_URL;
 }
 
@@ -97,20 +84,9 @@ export interface SwapOffer {
 }
 
 export async function rpcCall(method: string, params: Record<string, unknown> = {}): Promise<RpcResponse> {
-  // Try Tauri proxy first (bypasses HTTP scope issues).
-  try {
-    const { invoke } = await import("@tauri-apps/api/core");
-    return await invoke<RpcResponse>("rpc_proxy", { method, params: params || {} });
-  } catch {
-    // Fallback: direct HTTP fetch.
-    const url = await getRpcUrl();
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ method, ...params }),
-    });
-    return res.json();
-  }
+  // Use Tauri proxy (raw TCP with proper auth token).
+  const { invoke } = await import("@tauri-apps/api/core");
+  return await invoke<RpcResponse>("rpc_proxy", { method, params: params || {} });
 }
 
 export async function getBalance(): Promise<BalanceData> {
@@ -141,7 +117,7 @@ export async function lookupTag(tag: string): Promise<TagInfo> {
 }
 
 export async function getVessTag(): Promise<string> {
-  const res = await rpcCall("tag");
+  const res = await rpcCall("get_tag");
   if (res.error) throw new Error(res.error);
   return (res as any)?.tag || "";
 }

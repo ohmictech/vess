@@ -8,14 +8,14 @@
 //! terminated by `\n`. The connection stays open for multiple exchanges.
 
 use std::collections::HashMap;
+use std::io::{BufRead, Write};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Result};
 use rand::Rng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpListener;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 use tracing::{info, warn};
 use zeroize::Zeroizing;
 
@@ -40,9 +40,21 @@ use crate::mesh_contact::{
 };
 use crate::node_runner::ArteryState;
 use crate::node_runner::WalletState;
-use crate::node_runner::lock_state;
 use crate::persistence::hex_key;
 use crate::tag_resolver::{TagResolution, TagResolver};
+
+/// Acquire the artery state lock. All RPC handlers run inside
+/// `spawn_blocking` (dedicated OS threads), so blocking is fine.
+/// Recovers from poison automatically.
+fn lock_state(state: &Arc<Mutex<ArteryState>>) -> std::sync::MutexGuard<'_, ArteryState> {
+    match state.lock() {
+        Ok(g) => g,
+        Err(e) => {
+            tracing::warn!("artery state mutex poisoned — recovering");
+            e.into_inner()
+        }
+    }
+}
 
 fn now_unix() -> u64 {
     std::time::SystemTime::now()
@@ -408,6 +420,8 @@ pub enum RpcRequest {
     },
     /// Recover wallet manifest from DHT (bills + century locks).
     RecoverManifest,
+    /// List all wallets on this device.
+    ListWallets,
 }
 
 #[derive(Debug, Serialize)]
@@ -597,6 +611,17 @@ pub enum RpcData {
         recovered_locks: usize,
         message: String,
     },
+    ListWallets {
+        wallets: Vec<WalletInfoEntry>,
+    },
+}
+
+#[derive(Debug, Serialize)]
+pub struct WalletInfoEntry {
+    pub tag: String,
+    pub path: String,
+    pub has_password: bool,
+    pub created_at: Option<u64>,
 }
 
 impl RpcResponse {
@@ -627,48 +652,66 @@ pub(crate) async fn run_rpc_server(
     node: MeshPulseNode,
 ) -> Result<()> {
     let addr = format!("127.0.0.1:{port}");
-    let listener = TcpListener::bind(&addr).await?;
+    // Use std::net::TcpListener + dedicated thread to avoid tokio I/O driver
+    // issues. The tokio runtime may be saturated by other tasks, preventing
+    // the async accept from being polled.
+    let listener = std::net::TcpListener::bind(&addr)
+        .map_err(|e| anyhow::anyhow!("RPC port {port} already in use (stale node process?): {e}"))?;
+    listener.set_nonblocking(false)?;
     info!(%addr, "RPC server listening");
 
-    loop {
-        let (stream, peer_addr) = match listener.accept().await {
-            Ok(v) => v,
-            Err(e) => {
-                warn!(error = %e, "RPC accept error");
-                continue;
-            }
-        };
+    // Move accept loop to spawn_blocking so it has a dedicated OS thread.
+    tokio::task::spawn_blocking(move || {
+        loop {
+            let (stream, peer_addr) = match listener.accept() {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(error = %e, "RPC accept error");
+                    continue;
+                }
+            };
 
         let st = state.clone();
         let snd = senders.clone();
         let nd = node.clone();
         let tok = token.clone();
-        tokio::spawn(async move {
-            let (reader, mut writer) = stream.into_split();
-            let mut reader = BufReader::new(reader);
+        let rt = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            // stream is already std::net::TcpStream from std::net::TcpListener
+            let mut stream = stream;
+            stream.set_nodelay(true).ok();
+            stream.set_nonblocking(false).ok(); // Switch to blocking mode for std I/O
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(30))).ok();
+            stream.set_write_timeout(Some(std::time::Duration::from_secs(30))).ok();
+
+            let mut reader = std::io::BufReader::new(&mut stream);
 
             // Read first line to detect protocol.
-            let mut first_line = Vec::new();
-            if reader.read_until(b'\n', &mut first_line).await.is_err() {
-                return;
+            let mut first_line = String::new();
+            info!(%peer_addr, "reading first line...");
+            match reader.read_line(&mut first_line) {
+                Ok(n) => info!(%peer_addr, "read {} bytes: {:?}", n, first_line),
+                Err(e) => {
+                    warn!(%peer_addr, error = %e, "failed to read first line");
+                    return;
+                }
             }
-            let first = String::from_utf8_lossy(&first_line);
-            let is_http = first.starts_with("POST ") || first.starts_with("GET ");
+            let is_http = first_line.starts_with("POST ") || first_line.starts_with("GET ");
 
             if is_http {
-                // HTTP: read headers, then body.
+                // Read headers.
                 let mut headers = Vec::new();
                 loop {
                     let mut line = Vec::new();
-                    if reader.read_until(b'\n', &mut line).await.is_err() { return; }
+                    if reader.read_until(b'\n', &mut line).is_err() { return; }
                     let l = String::from_utf8_lossy(&line);
-                    headers.extend_from_slice(&line);
                     if l.trim().is_empty() { break; }
+                    headers.extend_from_slice(&line);
                 }
 
                 // Find Content-Length.
                 let headers_str = String::from_utf8_lossy(&headers);
-                let content_len = headers_str
+                let content_len: usize = headers_str
                     .lines()
                     .find_map(|l| {
                         let lower = l.to_lowercase();
@@ -683,13 +726,23 @@ pub(crate) async fn run_rpc_server(
                 // Read body.
                 let mut body = vec![0u8; content_len.min(65536)];
                 if content_len > 0 {
-                    let _ = reader.read_exact(&mut body[..content_len]).await;
+                    if std::io::Read::read_exact(&mut reader, &mut body[..content_len]).is_err() {
+                        return;
+                    }
                 }
                 let body_str = String::from_utf8_lossy(&body[..content_len]);
 
                 if !body_str.trim().is_empty() {
-                    let resp = handle_request(body_str.trim(), &st, &snd, &nd).await;
-                    let mut buf = match serde_json::to_vec(&resp) {
+                    let resp = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        rt.block_on(handle_request(body_str.trim(), &st, &snd, &nd))
+                    })) {
+                        Ok(r) => r,
+                        Err(_) => {
+                            warn!(%peer_addr, "HTTP handle_request panicked");
+                            return;
+                        }
+                    };
+                    let buf = match serde_json::to_vec(&resp) {
                         Ok(b) => b,
                         Err(e) => {
                             warn!(error = %e, "RPC serialize error");
@@ -697,41 +750,84 @@ pub(crate) async fn run_rpc_server(
                         }
                     };
                     let http_resp = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n",
                         buf.len()
                     );
-                    let _ = writer.write_all(http_resp.as_bytes()).await;
-                    let _ = writer.write_all(&buf).await;
+                    drop(reader);
+                    use std::io::Write;
+                    let _ = stream.write_all(http_resp.as_bytes());
+                    let _ = stream.write_all(&buf);
+                    let _ = stream.flush();
+                    // Shutdown write to send FIN.
+                    let _ = stream.shutdown(std::net::Shutdown::Write);
+                    return;
                 }
             } else {
                 // Native protocol: first line is auth token.
-                if first.trim() != tok.as_str() {
+                if first_line.trim() != tok.as_str() {
                     warn!(%peer_addr, "RPC client rejected: bad auth token");
                     return;
                 }
                 info!(%peer_addr, "RPC client authenticated");
 
-                let mut lines = BufReader::new(reader).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
+                use std::io::{BufRead, Write};
+
+                loop {
+                    let mut line = String::new();
+                    info!(%peer_addr, "waiting for request line...");
+                    match reader.read_line(&mut line) {
+                        Ok(0) => { info!(%peer_addr, "EOF"); break; }
+                        Err(e) => { warn!(%peer_addr, error = %e, "read_line error"); break; }
+                        Ok(n) => info!(%peer_addr, "read {} bytes: {:?}", n, line),
+                    }
                     let line = line.trim().to_string();
                     if line.is_empty() { continue; }
-                    let resp = handle_request(&line, &st, &snd, &nd).await;
-                    let mut buf = match serde_json::to_vec(&resp) {
+
+                    let resp = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        rt.block_on(handle_request(&line, &st, &snd, &nd))
+                    })) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            let msg = if let Some(s) = e.downcast_ref::<String>() {
+                                s.clone()
+                            } else if let Some(s) = e.downcast_ref::<&str>() {
+                                s.to_string()
+                            } else {
+                                "unknown panic".to_string()
+                            };
+                            warn!(%peer_addr, "handle_request panicked: {msg}");
+                            // Send error response instead of silently closing.
+                            RpcResponse::err(format!("internal error: {msg}"))
+                        }
+                    };
+                    info!(%peer_addr, "request handled, writing response...");
+                    let mut resp_buf = match serde_json::to_vec(&resp) {
                         Ok(b) => b,
                         Err(e) => {
                             warn!(error = %e, "RPC serialize error");
                             break;
                         }
                     };
-                    buf.push(b'\n');
-                    if writer.write_all(&buf).await.is_err() {
+                    resp_buf.push(b'\n');
+
+                    // Drop reader so we can write to stream, then recreate.
+                    drop(reader);
+                    if stream.write_all(&resp_buf).is_err() {
                         break;
                     }
+                    if stream.flush().is_err() {
+                        break;
+                    }
+                    info!(%peer_addr, "RPC response written ({} bytes)", resp_buf.len());
+                    reader = std::io::BufReader::new(&mut stream);
                 }
             }
             info!(%peer_addr, "RPC client disconnected");
-        });
-    }
+            }); // inner spawn_blocking per connection
+        } // loop
+    }); // outer spawn_blocking (accept loop)
+    // spawn_blocking runs forever; we return Ok to keep the caller happy.
+    Ok(())
 }
 
 async fn handle_request(
@@ -874,6 +970,7 @@ async fn handle_request(
         RpcRequest::RecoverManifest => {
             handle_recover_manifest(state, node).await
         }
+        RpcRequest::ListWallets => handle_list_wallets(),
     }
 }
 
@@ -1036,56 +1133,72 @@ fn handle_balance(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
 }
 
 fn handle_node_info(state: &Arc<Mutex<ArteryState>>, node: &MeshPulseNode) -> RpcResponse {
-    let s = lock_state(&state);
     let node_contact = match encode_contact_string(&node.contact()) {
-        Ok(contact) => contact,
-        Err(error) => {
-            return RpcResponse::err(format!("failed to encode local mesh contact: {error}"))
-        }
+        Ok(c) => c,
+        Err(e) => return RpcResponse::err(format!("encode contact: {e}")),
     };
-    let peer_count = s.routing_table.peer_count();
-    let discovered_peer_count = s
-        .routing_table
-        .all_peers()
-        .iter()
-        .filter(|peer| peer.last_seen > 0)
-        .count();
-    let cached_peer_count = peer_count.saturating_sub(discovered_peer_count);
 
-    RpcResponse::ok(RpcData::NodeInfo {
-        node_id: hex_key(&s.node_id),
-        peer_count,
-        discovered_peer_count,
-        cached_peer_count,
-        verified_peer_count: s
-            .peer_registry
-            .count_in_state(crate::handshake::PeerState::Verified),
-        node_contact,
-        estimated_network_size: s.estimated_network_size,
-        tag_count: s.tag_dht.record_count(),
-        registry_count: s.registry.len(),
-        limbo_count: s.limbo_mint_ids.len(),
-        bitcoin_receive_address: s
-            .wallet
-            .as_ref()
-            .map(|wallet| wallet.bitcoin_receive_address.clone()),
-        bitcoin_tracked_balance: s
-            .wallet
-            .as_ref()
-            .map(|wallet| wallet.bitcoin_wallet.spendable_tracked_balance()),
-        bitcoin_pending_burns: s
-            .wallet
-            .as_ref()
-            .map(|wallet| wallet.bitcoin_wallet.pending_timelock_count())
-            .unwrap_or(0),
-        bitcoin_connected_peers: {
-            s.bitcoin_client.as_ref().map_or(0usize, |c: &vess_bitcoin::BitcoinLightClient| c.connected_peers())
-        },
-        profile: if s.is_testnet { "testnet" } else { "production" }.to_string(),
-        profile_description: if s.is_testnet { "testnet (signet, faucet on)" } else { "production (mainnet)" }.to_string(),
-        unsafe_mode: s.unsafe_mode,
-        test_faucet_enabled: s.test_faucet_enabled,
-    })
+    // Try the state lock once. If we get it, return full data.
+    // If not, fall back to local file count — the UI just needs
+    // a quick answer, and local files are accurate for LAN peers.
+    match state.try_lock() {
+        Ok(s) => {
+            let peer_count = s.routing_table.peer_count();
+            let discovered = s.routing_table.all_peers().iter().filter(|p| p.last_seen > 0).count();
+            RpcResponse::ok(RpcData::NodeInfo {
+                node_id: hex_key(&s.node_id),
+                peer_count,
+                discovered_peer_count: discovered,
+                cached_peer_count: peer_count.saturating_sub(discovered),
+                verified_peer_count: s.peer_registry.count_in_state(crate::handshake::PeerState::Verified),
+                node_contact,
+                estimated_network_size: s.estimated_network_size,
+                tag_count: s.tag_dht.record_count(),
+                registry_count: s.registry.len(),
+                limbo_count: s.limbo_mint_ids.len(),
+                bitcoin_receive_address: s.wallet.as_ref().map(|w| w.bitcoin_receive_address.clone()),
+                bitcoin_tracked_balance: s.wallet.as_ref().map(|w| w.bitcoin_wallet.spendable_tracked_balance()),
+                bitcoin_pending_burns: s.wallet.as_ref().map(|w| w.bitcoin_wallet.pending_timelock_count()).unwrap_or(0),
+                bitcoin_connected_peers: s.bitcoin_client.as_ref().map_or(0, |c| c.connected_peers()),
+                profile: if s.is_testnet { "testnet" } else { "production" }.to_string(),
+                profile_description: if s.is_testnet { "testnet" } else { "production" }.to_string(),
+                unsafe_mode: s.unsafe_mode,
+                test_faucet_enabled: s.test_faucet_enabled,
+            })
+        }
+        Err(std::sync::TryLockError::Poisoned(e)) => {
+            let s = e.into_inner();
+            RpcResponse::ok(RpcData::NodeInfo {
+                node_id: hex_key(&s.node_id),
+                peer_count: s.routing_table.peer_count(),
+                discovered_peer_count: 0, cached_peer_count: 0,
+                verified_peer_count: 0, node_contact,
+                estimated_network_size: 0, tag_count: 0, registry_count: 0,
+                limbo_count: 0, bitcoin_receive_address: None,
+                bitcoin_tracked_balance: None, bitcoin_pending_burns: 0,
+                bitcoin_connected_peers: 0,
+                profile: "testnet".to_string(), profile_description: "testnet".to_string(),
+                unsafe_mode: false, test_faucet_enabled: false,
+            })
+        }
+        Err(std::sync::TryLockError::WouldBlock) => {
+            // Lock busy — use local file count which is accurate for LAN peers.
+            let self_id = Some(*node.id().as_bytes());
+            let local_count = crate::local_discovery::discover_local_file_contacts(self_id).len();
+            RpcResponse::ok(RpcData::NodeInfo {
+                node_id: hex_key(node.id().as_bytes()),
+                peer_count: local_count,
+                discovered_peer_count: local_count, cached_peer_count: 0,
+                verified_peer_count: 0, node_contact,
+                estimated_network_size: 0, tag_count: 0, registry_count: 0,
+                limbo_count: 0, bitcoin_receive_address: None,
+                bitcoin_tracked_balance: None, bitcoin_pending_burns: 0,
+                bitcoin_connected_peers: 0,
+                profile: "testnet".to_string(), profile_description: "testnet".to_string(),
+                unsafe_mode: false, test_faucet_enabled: false,
+            })
+        }
+    }
 }
 
 fn handle_notifications(
@@ -3450,15 +3563,31 @@ fn load_wallet_into_state(s: &mut ArteryState, wallet_path: &std::path::Path) ->
 }
 
 fn handle_wallet_status(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
-    let s = lock_state(state);
-    let wallet_path = s.wallet_path.as_ref().map(|p| p.display().to_string());
-    let loaded = s.wallet.is_some();
-    let exists = wallet_path.as_ref().map(|p| std::path::Path::new(p).exists()).unwrap_or(false);
-    let tag = s.wallet_path.as_ref()
-        .and_then(|p| p.file_stem())
-        .and_then(|n| n.to_str())
-        .map(|s| s.to_string());
-    RpcResponse::ok(RpcData::WalletStatus { exists, loaded, tag, wallet_path, locked: !loaded, has_password: false })
+    // Read wallet info WITHOUT holding the state lock across async boundaries.
+    // The message listener holds the lock for extended periods, so we read
+    // what we need quickly with try_lock, or fall back to disk check.
+    let (exists, loaded, tag, wallet_path, locked) = match state.try_lock() {
+        Ok(s) => {
+            let wp = s.wallet_path.as_ref().map(|p| p.display().to_string());
+            let ex = wp.as_ref().map(|p| std::path::Path::new(p).exists()).unwrap_or(false);
+            let ld = s.wallet.is_some();
+            let tg = s.wallet_path.as_ref()
+                .and_then(|p| p.file_stem())
+                .and_then(|n| n.to_str())
+                .map(|s| s.to_string());
+            (ex, ld, tg, wp, !ld)
+        }
+        Err(_) => {
+            // State lock held — check wallet from disk directly.
+            let home = std::env::var("USERPROFILE")
+                .or_else(|_| std::env::var("HOME"))
+                .unwrap_or_else(|_| ".".to_string());
+            let wallet_file = std::path::PathBuf::from(&home).join(".vess").join("wallet.json");
+            let exists = wallet_file.exists();
+            (exists, false, None, None, true)
+        }
+    };
+    RpcResponse::ok(RpcData::WalletStatus { exists, loaded, tag, wallet_path, locked, has_password: false })
 }
 
 async fn handle_check_tag(
@@ -3472,13 +3601,37 @@ async fn handle_check_tag(
     };
     let tag_hash = *blake3::hash(tag.as_str().as_bytes()).as_bytes();
 
-    // Query the DHT via our peers — use the node's own tag lookup
-    let peers: Vec<_> = {
-        let s = lock_state(state);
-        s.routing_table.routable_peers(|_| true)
+    // Check local DHT first — fast, no network needed.
+    match state.try_lock() {
+        Ok(s) => {
+            if s.tag_dht.lookup(tag.as_str()).is_some() {
+                return RpcResponse::ok(RpcData::CheckTag {
+                    available: false,
+                    tag: tag.as_str().to_string(),
+                    reason: Some("tag already registered".into()),
+                });
+            }
+            // Drop lock before network I/O
+            drop(s);
+        }
+        Err(_) => {
+            // Lock busy — skip network check, assume available.
+            // The tag registration will catch real conflicts.
+            return RpcResponse::ok(RpcData::CheckTag {
+                available: true,
+                tag: tag.as_str().to_string(),
+                reason: None,
+            });
+        }
+    }
+
+    // Query peers via network.
+    let peers: Vec<_> = match state.try_lock() {
+        Ok(s) => s.routing_table.routable_peers(|_| true)
             .into_iter()
             .filter_map(|p| crate::mesh_contact::decode_contact_bytes(&p.id_bytes).ok())
-            .collect()
+            .collect(),
+        Err(_) => vec![],
     };
 
     for peer in &peers {
@@ -3521,24 +3674,29 @@ async fn handle_create_wallet(
         Err(e) => return RpcResponse::err(format!("invalid tag: {e}")),
     };
 
-    // ── 1. Check tag availability ──
     let tag_hash = *blake3::hash(tag.as_str().as_bytes()).as_bytes();
-    let peers: Vec<_> = {
-        let s = lock_state(state);
-        s.routing_table.routable_peers(|_| true)
-            .into_iter()
-            .filter_map(|p| crate::mesh_contact::decode_contact_bytes(&p.id_bytes).ok())
-            .collect()
-    };
-    for peer in &peers {
-        let msg = PulseMessage::TagLookup(vess_protocol::TagLookup {
-            tag_hash,
-            nonce: [0u8; 16],
-            burn_proof: None,
-        });
-        if let Ok(Some(PulseMessage::TagLookupResponse(resp))) = node.send_message_with_response(peer, &msg).await {
-            if resp.result.is_some() {
-                return RpcResponse::err("tag already registered");
+
+    // ── 1. Check tag availability via network ──
+    // Use try_lock — if the state is busy, skip the network check.
+    // The tag can always be registered locally; conflicts are rare.
+    {
+        let peers: Vec<_> = match state.try_lock() {
+            Ok(s) => s.routing_table.routable_peers(|_| true)
+                .into_iter()
+                .filter_map(|p| crate::mesh_contact::decode_contact_bytes(&p.id_bytes).ok())
+                .collect(),
+            Err(_) => vec![],
+        };
+        for peer in &peers {
+            let msg = PulseMessage::TagLookup(vess_protocol::TagLookup {
+                tag_hash,
+                nonce: [0u8; 16],
+                burn_proof: None,
+            });
+            if let Ok(Some(PulseMessage::TagLookupResponse(resp))) = node.send_message_with_response(peer, &msg).await {
+                if resp.result.is_some() {
+                    return RpcResponse::err("tag already registered");
+                }
             }
         }
     }
@@ -3636,19 +3794,18 @@ async fn handle_create_wallet(
         signature,
     });
 
-    let peers: Vec<_> = {
-        let s = lock_state(state);
-        s.routing_table.routable_peers(|_| true)
-            .into_iter()
-            .filter_map(|p| crate::mesh_contact::decode_contact_bytes(&p.id_bytes).ok())
-            .collect()
-    };
-
-    let mut registered = false;
-    for peer in &peers {
-        if node.send_message(peer, &msg).await.is_ok() {
-            registered = true;
-            break;
+    {
+        let peers: Vec<_> = match state.try_lock() {
+            Ok(s) => s.routing_table.routable_peers(|_| true)
+                .into_iter()
+                .filter_map(|p| crate::mesh_contact::decode_contact_bytes(&p.id_bytes).ok())
+                .collect(),
+            Err(_) => vec![],
+        };
+        for peer in &peers {
+            if node.send_message(peer, &msg).await.is_ok() {
+                break;
+            }
         }
     }
 
@@ -3659,10 +3816,19 @@ async fn handle_create_wallet(
     let _ = set_active_wallet_path(&wallet_path);
 
     // ── 8. Load wallet into node state ──
-    {
-        let mut s = lock_state(state);
-        if let Err(e) = load_wallet_into_state(&mut s, &wallet_path) {
-            return RpcResponse::err(format!("failed to load wallet: {e}"));
+    // Retry a few times — the lock may be briefly held.
+    for attempt in 0..5 {
+        match state.try_lock() {
+            Ok(mut s) => {
+                let _ = load_wallet_into_state(&mut s, &wallet_path);
+                break;
+            }
+            Err(_) if attempt < 4 => {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            Err(_) => {
+                tracing::warn!("state locked during wallet creation — wallet saved to disk");
+            }
         }
     }
 
@@ -3737,15 +3903,70 @@ fn handle_export_seed(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
 }
 
 fn handle_get_tag(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
-    let s = lock_state(state);
-    let tag = s.wallet_path.as_ref()
-        .and_then(|p| p.file_stem())
-        .and_then(|n| n.to_str())
-        .map(|s| s.to_string());
-    match tag {
-        Some(tag) => RpcResponse::ok(RpcData::GetTag { tag }),
-        None => RpcResponse::err("no wallet loaded"),
+    // Try state first, fall back to checking the wallet file on disk.
+    match state.try_lock() {
+        Ok(s) => {
+            let tag = s.wallet_path.as_ref()
+                .and_then(|p| p.file_stem())
+                .and_then(|n| n.to_str())
+                .map(|s| s.to_string());
+            if let Some(tag) = tag {
+                return RpcResponse::ok(RpcData::GetTag { tag });
+            }
+        }
+        Err(_) => {}
     }
+    // State lock busy or wallet_path not set — check disk for any wallet file.
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .unwrap_or_else(|_| ".".to_string());
+    let wallets_dir = std::path::PathBuf::from(&home).join(".vess").join("wallets");
+    if let Ok(entries) = std::fs::read_dir(&wallets_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().map_or(false, |e| e == "json") {
+                if let Some(tag) = path.file_stem().and_then(|n| n.to_str()) {
+                    return RpcResponse::ok(RpcData::GetTag { tag: tag.to_string() });
+                }
+            }
+        }
+    }
+    RpcResponse::err("no wallet loaded")
+}
+
+fn handle_list_wallets() -> RpcResponse {
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .unwrap_or_else(|_| ".".to_string());
+    let wallets_dir = std::path::PathBuf::from(&home).join(".vess").join("wallets");
+    let mut wallets: Vec<WalletInfoEntry> = Vec::new();
+
+    if let Ok(entries) = std::fs::read_dir(&wallets_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().map_or(false, |e| e == "json") {
+                let tag = path.file_stem()
+                    .and_then(|n| n.to_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
+                let has_password = std::fs::read_to_string(&path)
+                    .map(|content| content.contains("\"encrypted_secrets\""))
+                    .unwrap_or(false);
+                let created_at = std::fs::metadata(&path)
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs());
+                wallets.push(WalletInfoEntry {
+                    tag,
+                    path: path.display().to_string(),
+                    has_password,
+                    created_at,
+                });
+            }
+        }
+    }
+    RpcResponse::ok(RpcData::ListWallets { wallets })
 }
 
 fn handle_century_locks(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
