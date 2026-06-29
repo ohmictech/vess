@@ -1,10 +1,10 @@
 <script lang="ts">
   import { createEventDispatcher } from "svelte";
-  import { walletStatus, checkTag, createWallet, recoverWallet } from "../rpc/client";
+  import { walletStatus, checkTag, createWallet, recoverWallet, setWalletPassword } from "../rpc/client";
 
   const dispatch = createEventDispatcher();
 
-  type Step = "detect" | "choose" | "new-tag" | "new-seed" | "new-confirm" | "import" | "import-tag" | "done";
+  type Step = "detect" | "choose" | "new-tag" | "new-seed" | "new-confirm" | "new-password" | "import" | "import-tag" | "done";
 
   let step: Step = "detect";
   let vesstag = "";
@@ -108,8 +108,27 @@
       error = "words don't match — try again";
       return;
     }
-    step = "done";
-    dispatch("ready");
+    step = "new-password";
+  }
+
+  // Step: new-password — set wallet encryption password
+  let walletPassword = "";
+  let walletPasswordConfirm = "";
+
+  async function setPassword() {
+    error = "";
+    if (walletPassword.length < 4) { error = "password must be at least 4 characters"; return; }
+    if (walletPassword !== walletPasswordConfirm) { error = "passwords don't match"; return; }
+    loading = true;
+    try {
+      await setWalletPassword("", walletPassword);
+      step = "done";
+      dispatch("ready");
+    } catch (e) {
+      error = String(e);
+    } finally {
+      loading = false;
+    }
   }
 
   // Step: import — recover from phrase
@@ -175,6 +194,8 @@
       </div>
       {#if tagAvailable}
         <p class="text-xs text-green-400">✓ tag available</p>
+        <p class="text-xs text-amber-400/80">Tags must be hardened by receiving a payment within 30 days of registration, otherwise they expire.</p>
+        <p class="text-xs text-green-400">✓ tag available</p>
       {:else if vesstag.length >= 2}
         <p class="text-xs text-red-400">{error || "checking..."}</p>
       {/if}
@@ -232,6 +253,37 @@
     </button>
     <button on:click={() => step = "new-seed"}
       class="text-xs text-gray-500 hover:text-gray-300 transition-colors">← view phrase again</button>
+
+  <!-- ── New: Set wallet password ── -->
+  {:else if step === "new-password"}
+    <h1 class="text-xl font-bold" style="color: #88cddf">Set Wallet Password</h1>
+    <p class="text-sm text-gray-400">Encrypt your wallet with a password. You'll need this to unlock it in the future.</p>
+    <div class="w-full space-y-3">
+      <input
+        type="password"
+        bind:value={walletPassword}
+        placeholder="Enter password (min 4 characters)"
+        class="w-full rounded-xl px-4 py-3 text-sm bg-[#88cddf]12 text-gray-200 placeholder-[#88cddf]/30 focus:outline-none"
+        style="background: #88cddf18"
+      />
+      <input
+        type="password"
+        bind:value={walletPasswordConfirm}
+        placeholder="Confirm password"
+        class="w-full rounded-xl px-4 py-3 text-sm bg-[#88cddf]12 text-gray-200 placeholder-[#88cddf]/30 focus:outline-none"
+        style="background: #88cddf18"
+        on:keydown={(e) => e.key === "Enter" && setPassword()}
+      />
+    </div>
+    {#if error}
+      <p class="text-xs text-red-400">{error}</p>
+    {/if}
+    <button on:click={setPassword}
+      class="w-full py-3 rounded-xl font-semibold transition-all disabled:opacity-40"
+      style="background: #88cddf; color: #1a1a1a;"
+      disabled={loading}>
+      {loading ? "Encrypting..." : "Set Password & Finish"}
+    </button>
 
   <!-- ── Import: Enter 12 words ── -->
   {:else if step === "import"}

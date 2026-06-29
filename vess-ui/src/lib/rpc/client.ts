@@ -122,6 +122,18 @@ export async function getVessTag(): Promise<string> {
   return (res as any)?.tag || "";
 }
 
+export interface CheckMyTagResult {
+  tag: string | null;
+  valid: boolean;
+  hardened: boolean;
+  message: string;
+}
+
+export async function checkMyTag(): Promise<CheckMyTagResult> {
+  const res = await rpcCall("check_my_tag");
+  return (res as any) || { tag: null, valid: false, hardened: false, message: "error" };
+}
+
 export async function storeVessTag(tag: string): Promise<void> {
   const res = await rpcCall("tag_register", { tag });
   if (res.error) throw new Error(res.error);
@@ -129,6 +141,28 @@ export async function storeVessTag(tag: string): Promise<void> {
 
 export async function registerTag(tag: string): Promise<void> {
   const res = await rpcCall("tag_register", { tag });
+  if (res.error) throw new Error(res.error);
+}
+
+export interface WalletInfo {
+  tag: string;
+  path: string;
+  has_password: boolean;
+  created_at: number | null;
+}
+
+export async function listWallets(): Promise<WalletInfo[]> {
+  const res = await rpcCall("list_wallets");
+  return ((res as any)?.wallets as WalletInfo[]) || [];
+}
+
+export async function unlockWallet(walletPath: string, password: string): Promise<void> {
+  const res = await rpcCall("wallet_unlock", { wallet_path: walletPath, password });
+  if (res.error) throw new Error(res.error);
+}
+
+export async function setWalletPassword(currentPassword: string, newPassword: string): Promise<void> {
+  const res = await rpcCall("wallet_set_password", { current_password: currentPassword, new_password: newPassword });
   if (res.error) throw new Error(res.error);
 }
 

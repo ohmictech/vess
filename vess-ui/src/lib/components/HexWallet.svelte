@@ -1,11 +1,11 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { getBalance, getVessTag, getCenturyLocks, type BalanceData, type CenturyLockInfo } from "../rpc/client";
+  import { getBalance, getVessTag, checkMyTag, getCenturyLocks, type BalanceData, type CenturyLockInfo, type CheckMyTagResult } from "../rpc/client";
 
   // ── Types ──────────────────────────────────────────────
   type Asset = "vess" | "bitcoin" | "vichor";
   type Mode = "idle" | "pressed" | "dragging";
-  type ActionId = "send" | "add" | "mint" | "settings";
+  type ActionId = "send" | "add" | "mint" | "settings" | "cards";
 
   interface AssetInfo {
     label: string;
@@ -23,11 +23,14 @@
     icon: string;
     isAsset: boolean;
     isCenter: boolean;
+    isSmall?: boolean;
   }
 
   // ── RPC data ──────────────────────────────────────────
   let balance: BalanceData | null = null;
   let vesstag = "";
+  let tagCheck: CheckMyTagResult | null = null;
+  let showTagWarning = false;
   let centuryLocks: CenturyLockInfo[] = [];
   let totalCenturyVess = 0;
   let totalCenturyPerBlock = 0;
@@ -35,24 +38,25 @@
   onMount(async () => {
     try { balance = await getBalance(); } catch { /* node offline */ }
     try { vesstag = await getVessTag(); } catch { /* not set yet */ }
-    try {
-      centuryLocks = await getCenturyLocks();
-      totalCenturyVess = centuryLocks.reduce((s, l) => s + l.remaining_vess, 0);
-      totalCenturyPerBlock = centuryLocks.filter(l => l.active).reduce((s, l) => s + l.per_block_vess, 0);
-    } catch { /* RPC not available */ }
+    try { centuryLocks = await getCenturyLocks(); totalCenturyVess = centuryLocks.reduce((s, l) => s + l.remaining_vess, 0); totalCenturyPerBlock = centuryLocks.filter(l => l.active).reduce((s, l) => s + l.per_block_vess, 0); } catch {}
+    // Check tag validity on mount
+    try { tagCheck = await checkMyTag(); showTagWarning = !tagCheck.valid; } catch {}
+
     // Poll every 30s
     setInterval(async () => {
       try { balance = await getBalance(); } catch {}
-      try {
-        centuryLocks = await getCenturyLocks();
-        totalCenturyVess = centuryLocks.reduce((s, l) => s + l.remaining_vess, 0);
-        totalCenturyPerBlock = centuryLocks.filter(l => l.active).reduce((s, l) => s + l.per_block_vess, 0);
-      } catch {}
+      try { centuryLocks = await getCenturyLocks(); totalCenturyVess = centuryLocks.reduce((s, l) => s + l.remaining_vess, 0); totalCenturyPerBlock = centuryLocks.filter(l => l.active).reduce((s, l) => s + l.per_block_vess, 0); } catch {}
+      // Re-check tag validity periodically
+      try { tagCheck = await checkMyTag(); showTagWarning = !tagCheck.valid; } catch {}
     }, 30_000);
     window.addEventListener("vesstag-set", (e: Event) => {
       vesstag = (e as CustomEvent).detail;
+      showTagWarning = false;
+      tagCheck = null;
     });
   });
+
+  function dismissWarning() { showTagWarning = false; }
 
   // ── State ─────────────────────────────────────────────
   export let selectedAsset: Asset = "vess";
@@ -69,6 +73,7 @@
     send:     "#3b82f6",
     add:      "#10b981",
     mint:     "#eab308",
+    cards:    "#ec4899",
     settings: "#6b7280",
   };
 
@@ -84,6 +89,8 @@
     { q: 1, r: -1 },  // 2: top-right — Add
     { q: 0, r: -1 },  // 3: top-left — Swap
     { q:-1, r: 0  },  // 4: left — Settings
+    // cards — smaller hex nested between mint and settings
+    { q:-0.5, r: -0.5 },
     { q:-1, r: 1  },  // 5: bottom-left — Asset A
     { q: 0, r: 1  },  // 6: bottom-right — Asset B
   ];
@@ -154,6 +161,7 @@
   const DARK_ICON = "#1c2224";           // panel navy for icons on asset hexes & action drag targets
 
   const H = hexPath(R);                 // outer hex path
+  const HS = hexPath(R * 0.62);          // small hex path (cards)
 
   // ── Derived: outer assets ─────────────────────────────
   $: otherAssets = (["vess", "bitcoin", "vichor"] as Asset[]).filter(a => a !== selectedAsset);
@@ -170,11 +178,12 @@
       case 2: return { id: "add",   label: "Receive", color: ACTION_COLORS.add,   glow: "rgba(16,185,129,0.3)",  icon: "↓", isAsset: false, isCenter: false };
       case 3: return { id: "mint",  label: "Mint",    color: ACTION_COLORS.mint,  glow: "rgba(234,179,8,0.3)",   icon: "+", isAsset: false, isCenter: false };
       case 4: return { id: "settings", label: "Settings", color: ACTION_COLORS.settings, glow: "rgba(107,114,128,0.3)", icon: "⚙", isAsset: false, isCenter: false };
-      case 5: {
+      case 5: return { id: "cards", label: "Cards", color: ACTION_COLORS.cards, glow: "rgba(236,72,153,0.3)", icon: "🎁", isAsset: false, isCenter: false, isSmall: true };
+      case 6: {
         const a = ASSETS[otherAssets[0]];
         return { id: otherAssets[0], label: a.label, color: a.color, glow: a.glow, icon: a.icon, isAsset: true, isCenter: false };
       }
-      case 6: {
+      case 7: {
         const a = ASSETS[otherAssets[1]];
         return { id: otherAssets[1], label: a.label, color: a.color, glow: a.glow, icon: a.icon, isAsset: true, isCenter: false };
       }
@@ -233,7 +242,8 @@
       const dx = pt.x - ALL_POSITIONS[i].x;
       const dy = pt.y - ALL_POSITIONS[i].y;
       const d = Math.sqrt(dx * dx + dy * dy);
-      if (d < R * 1.15 && d < bestDist) { best = i; bestDist = d; }
+      const hitR = i === 5 ? R * 0.80 : R * 1.15; // cards = smaller hit zone
+      if (d < hitR && d < bestDist) { best = i; bestDist = d; }
     }
     return best >= 0 ? best : null;
   }
@@ -295,6 +305,7 @@
           else onNavigate("mint");
           break;
         case "settings": onNavigate("node"); break;
+        case "cards":    onNavigate("cards"); break;
       }
     }
   }
@@ -304,6 +315,19 @@
   on:pointerup={() => { mode = "idle"; dragTarget = null; }}
   on:pointercancel={() => { mode = "idle"; dragTarget = null; }}
 />
+
+<!-- Tag validity warning -->
+{#if showTagWarning && tagCheck}
+  <div class="tag-warning">
+    <span class="tag-warning-text">
+      {tagCheck.tag ? `+${tagCheck.tag}: ${tagCheck.message}` : tagCheck.message}
+    </span>
+    <button class="tag-warning-btn" on:click={() => onNavigate("tags")}>
+      {tagCheck.tag ? "re-register" : "create tag"}
+    </button>
+    <button class="tag-warning-close" on:click={dismissWarning}>×</button>
+  </div>
+{/if}
 
 <div class="hex-root">
   <!-- Amount readout — 25% from top, visible only when active -->
@@ -401,7 +425,7 @@
       {@const isTarget = mode === "dragging" && dragTarget === i}
       {@const targetOuterIdx = dragTarget !== null ? dragTarget - 1 : -1}
       {@const isAdjacent = dragTarget !== null && !isTarget && (
-        idx === (targetOuterIdx - 1 + 6) % 6 || idx === (targetOuterIdx + 1) % 6
+        idx === (targetOuterIdx - 1 + 7) % 7 || idx === (targetOuterIdx + 1) % 7
       )}
       {@const pushedPos = isTarget ? pushOut(pos, 8) : isAdjacent ? pushOut(pos, 4) : pos}
       {@const pushDx = pushedPos.x - pos.x}
@@ -432,7 +456,7 @@
           >
           <!-- Hex background fill (solid for assets, subtle for actions) -->
           <path
-            d={H}
+            d={item.isSmall ? HS : H}
             fill={assetFill}
             opacity={assetFillOpacity}
             class="hex-fill-solid"
@@ -440,7 +464,7 @@
 
           <!-- Hex border -->
           <path
-            d={H}
+            d={item.isSmall ? HS : H}
             fill="none"
             stroke="currentColor"
             stroke-width={item.isAsset ? 1.5 : 1.2}
@@ -451,7 +475,7 @@
           <!-- Action hex: subtle fill normally, solid fill on drag target -->
           {#if !item.isAsset}
             <path
-              d={H}
+              d={item.isSmall ? HS : H}
               fill="currentColor"
               opacity={isTarget ? 0.88 : 0.05}
               class="hex-fill"
@@ -461,7 +485,7 @@
           <!-- Asset hex: shimmer sweep on drag target -->
           {#if item.isAsset && isTarget}
             <path
-              d={H}
+              d={item.isSmall ? HS : H}
               fill="url(#shimmer)"
               opacity="1"
               class="hex-shimmer"
@@ -475,8 +499,8 @@
             {@const bdist = Math.sqrt(bdx * bdx + bdy * bdy)}
             {@const bnx = -bdy / bdist}
             {@const bny = bdx / bdist}
-            {@const cw = R * 0.55}
-            {@const hw = R * 0.2}
+            {@const cw = item.isSmall ? R * 0.35 : R * 0.55}
+            {@const hw = item.isSmall ? R * 0.13 : R * 0.2}
             <defs>
               <linearGradient id="beam-{i}" x1="{bdx}" y1="{bdy}" x2="0" y2="0" gradientUnits="userSpaceOnUse">
                 <stop offset="0%" stop-color={ASSETS[selectedAsset].color} stop-opacity="0.5" />
@@ -493,7 +517,7 @@
 
           <!-- Glow ring -->
           <path
-            d={H}
+            d={item.isSmall ? HS : H}
             fill="none"
             stroke="currentColor"
             stroke-width="2.5"
@@ -643,6 +667,45 @@
 </div>
 
 <style>
+  .tag-warning {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 60;
+    background: rgba(180, 80, 30, 0.92);
+    backdrop-filter: blur(8px);
+    border-bottom: 1px solid rgba(200, 100, 40, 0.4);
+    padding: 10px 16px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .tag-warning-text {
+    flex: 1;
+    font-size: 13px;
+    color: #ffcc88;
+  }
+  .tag-warning-btn {
+    background: #ffcc88;
+    color: #1a1a1a;
+    border: none;
+    border-radius: 6px;
+    padding: 5px 12px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .tag-warning-close {
+    background: none;
+    border: none;
+    color: #ffcc88;
+    font-size: 18px;
+    cursor: pointer;
+    padding: 0 4px;
+    line-height: 1;
+  }
   .hex-root {
     position: relative;
     width: 100%;

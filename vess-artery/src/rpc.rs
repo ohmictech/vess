@@ -412,6 +412,8 @@ pub enum RpcRequest {
     ExportSeed,
     /// Get the current wallet's VessTag.
     GetTag,
+    /// Check if the current wallet's tag is still valid in the DHT.
+    CheckMyTag,
     /// List active century locks and their status.
     CenturyLocks,
     /// Create a century lock faucet from a BitcoinTimeLockProof.
@@ -595,6 +597,12 @@ pub enum RpcData {
     },
     GetTag {
         tag: String,
+    },
+    CheckMyTag {
+        tag: Option<String>,
+        valid: bool,
+        hardened: bool,
+        message: String,
     },
     CenturyLocks {
         locks: Vec<serde_json::Value>,
@@ -963,6 +971,7 @@ async fn handle_request(
         RpcRequest::RecoverWallet { phrase, tag } => handle_recover_wallet(state, &phrase, &tag).await,
         RpcRequest::ExportSeed => handle_export_seed(state),
         RpcRequest::GetTag => handle_get_tag(state),
+        RpcRequest::CheckMyTag => handle_check_my_tag(state, node).await,
         RpcRequest::CenturyLocks => handle_century_locks(state),
         RpcRequest::CenturyLockCreate { burn_proof_json } => {
             handle_century_lock_create(state, &burn_proof_json, &senders.manifest_tx).await
@@ -2943,11 +2952,28 @@ fn handle_wallet_set_password(
     current_password: &str,
     new_password: &str,
 ) -> RpcResponse {
+    // Find wallet path — try state first, then disk scan.
     let wallet_path = {
         let s = lock_state(&state);
-        match &s.wallet {
-            Some(ws) => ws.wallet_path.clone(),
-            None => return RpcResponse::err("wallet not loaded — unlock first"),
+        if let Some(ws) = &s.wallet {
+            ws.wallet_path.clone()
+        } else if let Some(p) = &s.wallet_path {
+            p.clone()
+        } else {
+            // Scan disk for any wallet.
+            let home = std::env::var("USERPROFILE")
+                .or_else(|_| std::env::var("HOME"))
+                .unwrap_or_else(|_| ".".to_string());
+            let wallets_dir = std::path::PathBuf::from(&home).join(".vess").join("wallets");
+            let found = std::fs::read_dir(&wallets_dir).ok().and_then(|entries| {
+                entries.flatten()
+                    .map(|e| e.path())
+                    .find(|p| p.extension().map_or(false, |e| e == "json"))
+            });
+            match found {
+                Some(p) => p,
+                None => return RpcResponse::err("no wallet found on disk — create one first"),
+            }
         }
     };
 
@@ -3782,7 +3808,36 @@ async fn handle_create_wallet(
         return RpcResponse::err(format!("failed to store registration: {e}"));
     }
 
-    // ── 6. Register tag via mesh peers ──
+    // ── 6. Re-check tag availability (post-PoW) then register ──
+    // The PoW computation took several seconds — another node may have
+    // registered the same tag in that window. Query peers one more time
+    // before broadcasting our registration.
+    {
+        let peers: Vec<_> = match state.try_lock() {
+            Ok(s) => s.routing_table.routable_peers(|_| true)
+                .into_iter()
+                .filter_map(|p| crate::mesh_contact::decode_contact_bytes(&p.id_bytes).ok())
+                .collect(),
+            Err(_) => vec![],
+        };
+        for peer in &peers {
+            let lookup = PulseMessage::TagLookup(vess_protocol::TagLookup {
+                tag_hash,
+                nonce: rand::random(),
+                burn_proof: None,
+            });
+            if let Ok(Some(PulseMessage::TagLookupResponse(resp))) = node.send_message_with_response(peer, &lookup).await {
+                if resp.result.is_some() {
+                    // Another node registered this tag during our PoW window.
+                    // Clean up the wallet file we just wrote.
+                    let _ = std::fs::remove_file(&wallet_path);
+                    return RpcResponse::err("tag was just registered by another node — please try a different tag");
+                }
+            }
+        }
+    }
+
+    // ── 6b. Broadcast tag registration ──
     let msg = PulseMessage::TagRegister(vess_protocol::TagRegister {
         tag_hash,
         scan_ek: wallet.master_address.scan_ek.clone(),
@@ -3932,6 +3987,80 @@ fn handle_get_tag(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
         }
     }
     RpcResponse::err("no wallet loaded")
+}
+
+async fn handle_check_my_tag(
+    state: &Arc<Mutex<ArteryState>>,
+    node: &MeshPulseNode,
+) -> RpcResponse {
+    // Get the wallet's tag from state or disk.
+    let tag_str = {
+        let s = match state.try_lock() {
+            Ok(s) => s,
+            Err(_) => return RpcResponse::ok(RpcData::CheckMyTag {
+                tag: None, valid: false, hardened: false,
+                message: "state busy — retrying".into(),
+            }),
+        };
+        s.wallet_path.as_ref()
+            .and_then(|p| p.file_stem())
+            .and_then(|n| n.to_str())
+            .map(|s| s.to_string())
+    };
+
+    let Some(tag_str) = tag_str else {
+        return RpcResponse::ok(RpcData::CheckMyTag {
+            tag: None, valid: false, hardened: false,
+            message: "no wallet loaded".into(),
+        });
+    };
+
+    // Query peers to see if the tag is in the DHT.
+    let tag_hash = *blake3::hash(tag_str.as_bytes()).as_bytes();
+    let peers: Vec<_> = match state.try_lock() {
+        Ok(s) => s.routing_table.routable_peers(|_| true)
+            .into_iter()
+            .filter_map(|p| crate::mesh_contact::decode_contact_bytes(&p.id_bytes).ok())
+            .collect(),
+        Err(_) => vec![],
+    };
+
+    let mut found = false;
+    let mut hardened = false;
+    for peer in &peers {
+        let msg = PulseMessage::TagLookup(vess_protocol::TagLookup {
+            tag_hash,
+            nonce: rand::random(),
+            burn_proof: None,
+        });
+        if let Ok(Some(PulseMessage::TagLookupResponse(resp))) = node.send_message_with_response(peer, &msg).await {
+            if let Some(result) = &resp.result {
+                found = true;
+                hardened = result.registered_at > 0;
+                break;
+            }
+        }
+    }
+
+    if found {
+        RpcResponse::ok(RpcData::CheckMyTag {
+            tag: Some(tag_str),
+            valid: true,
+            hardened,
+            message: if hardened {
+                "tag is active and hardened".into()
+            } else {
+                "tag is registered but not yet hardened — receive a payment to harden it".into()
+            },
+        })
+    } else {
+        RpcResponse::ok(RpcData::CheckMyTag {
+            tag: Some(tag_str),
+            valid: false,
+            hardened: false,
+            message: "tag not found on network — it may have expired or not been registered".into(),
+        })
+    }
 }
 
 fn handle_list_wallets() -> RpcResponse {

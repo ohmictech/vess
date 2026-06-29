@@ -7,18 +7,21 @@
   import TagsPanel from "./lib/components/TagsPanel.svelte";
   import NodeStatus from "./lib/components/NodeStatus.svelte";
   import MintPanel from "./lib/components/MintPanel.svelte";
+  import GiftCardPanel from "./lib/components/GiftCardPanel.svelte";
   import Onboard from "./lib/components/Onboard.svelte";
+  import WalletSelect from "./lib/components/WalletSelect.svelte";
   import { listSwapOffers, createSwapOffer, getBalance, getNodeInfo, type SwapOffer } from "./lib/rpc/client";
   import { biometricGate } from "./lib/auth";
   import QRCode from "qrcode";
 
-  type Tab = "wallet" | "send" | "receive" | "tags" | "mint" | "node" | "bitcoin_receive" | "buy_vichor" | "buy_btc";
+  type Tab = "wallet" | "send" | "receive" | "tags" | "mint" | "node" | "cards" | "bitcoin_receive" | "buy_vichor" | "buy_btc";
   type Asset = "vess" | "bitcoin" | "vichor";
 
   const ASSETS: Asset[] = ["vess", "bitcoin", "vichor"];
   const ASSET_COLOR: Record<string, string> = { vess: "#88cddf", bitcoin: "#f28e13", vichor: "#ccff00" };
 
   let onboarded = false;
+  let walletUnlocked = false;
   let popup: Tab | null = null;
   let currentAsset: Asset = "vess";
   let btcAddress = "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh";
@@ -77,6 +80,7 @@
 
   function onOnboardReady() {
     onboarded = true;
+    walletUnlocked = true;
     localStorage.setItem("vess_onboarded", "1");
   }
 
@@ -172,6 +176,8 @@
 <div class="h-dvh w-full overflow-hidden bg-[#1a1a1a]">
   {#if !onboarded}
     <Onboard on:ready={onOnboardReady} />
+  {:else if !walletUnlocked}
+    <WalletSelect on:unlock={() => (walletUnlocked = true)} />
   {:else}
   <!-- HexWallet always visible -->
   <HexWallet bind:selectedAsset={currentAsset} onNavigate={(t) => onNavigate(t as Tab)} />
@@ -208,6 +214,8 @@
           <MintPanel asset={currentAsset} />
         {:else if popup === "node"}
           <NodeStatus asset={currentAsset} />
+        {:else if popup === "cards"}
+          <GiftCardPanel />
         {:else if popup === "bitcoin_receive"}
           <div class="space-y-3 flex flex-col items-center">
             <!-- QR Code — click to copy -->
