@@ -177,7 +177,13 @@
   {#if !onboarded}
     <Onboard on:ready={onOnboardReady} />
   {:else if !walletUnlocked}
-    <WalletSelect on:unlock={() => (walletUnlocked = true)} />
+    <WalletSelect
+      on:unlock={() => (walletUnlocked = true)}
+      on:noWallets={() => {
+        onboarded = false;
+        localStorage.removeItem("vess_onboarded");
+      }}
+    />
   {:else}
   <!-- HexWallet always visible -->
   <HexWallet bind:selectedAsset={currentAsset} onNavigate={(t) => onNavigate(t as Tab)} />

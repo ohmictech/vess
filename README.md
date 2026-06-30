@@ -54,7 +54,7 @@ is the only exchange it needs, retaining the same keys, same wallet, same networ
 
 ## Tags
 
-Human-readable identities for payments (e.g. `+ALICE`). Once registered and paid to, the tag→address mapping is permanent.
+Human-readable identities for payments (e.g. `+ALICE`). Once registered and paid to, the tag→address mapping is permanent. Unconfirmed tags last 30 days. Receiving Vess to a tag hardens it.
 
 - Lowercase alphanumeric only, 3–20 chars
 - Argon2id PoW (2 GiB) to claim

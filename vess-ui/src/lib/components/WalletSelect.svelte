@@ -2,7 +2,7 @@
   import { createEventDispatcher } from "svelte";
   import { listWallets, unlockWallet, type WalletInfo } from "../rpc/client";
 
-  const dispatch = createEventDispatcher<{ unlock: string }>();
+  const dispatch = createEventDispatcher<{ unlock: string; noWallets: true }>();
 
   let wallets: WalletInfo[] = [];
   let loading = true;
@@ -13,14 +13,17 @@
   async function loadWallets() {
     try {
       wallets = await listWallets();
+      if (wallets.length === 0) {
+        dispatch("noWallets", true);
+        return;
+      }
       if (wallets.length === 1) {
-        // Single wallet — auto-select if no password, otherwise prompt
         if (!wallets[0].has_password) {
           await unlock(wallets[0]);
           return;
         }
         selectedPath = wallets[0].path;
-      } else if (wallets.length > 1) {
+      } else {
         selectedPath = wallets[0].path;
       }
     } catch (e) {

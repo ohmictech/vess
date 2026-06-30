@@ -46,37 +46,17 @@ pub static ALLOWED_VERSIONS: std::sync::LazyLock<Vec<[u8; 32]>> = std::sync::Laz
 
 // ── Handshake PoW parameters ────────────────────────────────────────
 
-/// Argon2id memory cost for handshake PoW: 256 MiB (in KiB).
-/// Enough to be costly for Sybil fleets but tolerable for honest nodes.
-pub const HANDSHAKE_POW_M_COST: u32 = 256 * 1024; // 256 MiB
+/// Argon2id memory cost for handshake PoW: 1 GiB (in KiB).
+/// Fixed cost — does not scale with network size. High enough that
+/// Sybil fleets pay a meaningful RAM cost per fake node, but tolerable
+/// for honest users running a single node.
+pub const HANDSHAKE_POW_M_COST: u32 = 1024 * 1024; // 1 GiB
 /// Argon2id time cost (iterations) for handshake PoW.
 pub const HANDSHAKE_POW_T_COST: u32 = 2;
 /// Argon2id parallelism for handshake PoW.
 pub const HANDSHAKE_POW_P_COST: u32 = 1;
 /// Argon2id output length for handshake PoW.
 pub const HANDSHAKE_POW_OUTPUT_LEN: usize = 32;
-
-/// Minimum memory cost for adaptive PoW (64 MiB).
-const ADAPTIVE_POW_MIN_M_COST: u32 = 64 * 1024;
-/// Maximum memory cost for adaptive PoW (4 GiB).
-const ADAPTIVE_POW_MAX_M_COST: u32 = 4 * 1024 * 1024;
-/// Network size above which PoW difficulty scales.
-const ADAPTIVE_POW_THRESHOLD: usize = 100;
-
-/// Compute adaptive handshake PoW parameters based on estimated network size.
-///
-/// For small networks (≤100 nodes), uses base difficulty (256 MiB).
-/// For larger networks, scales linearly: network_size / 100 × 256 MiB,
-/// capped at 4 GiB. This makes Sybil attacks progressively more expensive
-/// as the network grows.
-pub fn adaptive_handshake_pow_m_cost(estimated_network_size: usize) -> u32 {
-    if estimated_network_size <= ADAPTIVE_POW_THRESHOLD {
-        return HANDSHAKE_POW_M_COST;
-    }
-    let scale = estimated_network_size as u64 * 1024 / 100;
-    let scaled = (HANDSHAKE_POW_M_COST as u64 * scale / 1024) as u32;
-    scaled.clamp(ADAPTIVE_POW_MIN_M_COST, ADAPTIVE_POW_MAX_M_COST)
-}
 
 #[cfg(test)]
 /// Reduced parameters for unit tests (fast: 1 KiB × 1 iteration).
@@ -424,24 +404,6 @@ pub fn compute_handshake_pow(node_id: &[u8], nonce: &[u8; 32]) -> Vec<u8> {
         nonce,
         HANDSHAKE_POW_T_COST,
         HANDSHAKE_POW_M_COST,
-        HANDSHAKE_POW_P_COST,
-    )
-}
-
-/// Compute handshake PoW with adaptive memory cost based on network size.
-///
-/// On small networks (≤100 nodes), identical to [`compute_handshake_pow`].
-/// On large networks, memory cost scales up to make Sybil attacks expensive.
-pub fn compute_handshake_pow_adaptive(
-    node_id: &[u8],
-    nonce: &[u8; 32],
-    estimated_network_size: usize,
-) -> Vec<u8> {
-    compute_handshake_pow_with_params(
-        node_id,
-        nonce,
-        HANDSHAKE_POW_T_COST,
-        adaptive_handshake_pow_m_cost(estimated_network_size),
         HANDSHAKE_POW_P_COST,
     )
 }
