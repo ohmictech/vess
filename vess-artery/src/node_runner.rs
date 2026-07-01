@@ -528,7 +528,6 @@ mod tests {
             payment_latency: PaymentLatencyTracker::new(1000),
             pending_reforge_genesis: HashMap::new(),
             wallet: None,
-            bitcoin_client: None,
             century_locks: HashMap::new(),
             century_lock_last_block: 0,
             wallet_path: None,
@@ -541,7 +540,6 @@ mod tests {
             mailbox_fwd_limiter: crate::gossip::PeerRateLimiter::new(5, 60),
             unsafe_mode: false,
             test_faucet_enabled: false,
-            is_testnet: false,
             events: VecDeque::new(),
             passive_mode: false,
             own_scan_dk: None,
@@ -1779,7 +1777,6 @@ fn proof_hash_and_nonce_from_genesis(og: &OwnershipGenesis) -> Option<([u8; 32],
                 None
             }
         }
-        GenesisProof::BitcoinTimeLock(_) => None,
         GenesisProof::CenturyLock(proof) => {
             // Century lock proof_hash is derived from the burn txid.
             let proof_hash = *blake3::hash(&proof.txid).as_bytes();
@@ -1802,18 +1799,6 @@ pub(crate) fn retain_local_ownership_genesis(
 ) {
     // Validate century lock and timelock proofs before accepting.
     match &og.genesis_proof {
-        GenesisProof::BitcoinTimeLock(burn) => {
-            if let Err(e) = validate_bitcoin_timelock_genesis(
-                og, burn, state.bitcoin_client.as_ref(),
-            ) {
-                tracing::warn!(
-                    mint_id = %crate::persistence::hex_key(&og.mint_id),
-                    error = e,
-                    "rejecting OwnershipGenesis with invalid BitcoinTimeLock proof"
-                );
-                return;
-            }
-        }
         GenesisProof::CenturyLock(burn) => {
             if let Err(e) = validate_bitcoin_timelock_genesis(
                 og, burn, state.bitcoin_client.as_ref(),
@@ -2663,42 +2648,6 @@ fn routing_table_has_capacity(state: &Arc<Mutex<ArteryState>>) -> bool {
     state.routing_table.has_capacity()
 }
 
-}
-
-fn spawn_bitcoin_peer_notifications(
-    client: (),
-    state: Arc<Mutex<ArteryState>>,
-) {
-    tokio::spawn(async move {
-        let mut announced = HashSet::new();
-        loop {
-            let current: HashSet<_> = client.active_peers().into_iter().collect();
-            let newly_connected: Vec<_> = current.difference(&announced).copied().collect();
-            if !newly_connected.is_empty() {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                let mut s = lock_state(&state);
-                for peer in newly_connected {
-                    s.push_notification(WalletNotification {
-                        kind: "bitcoin_peer_connected".to_string(),
-                        created_at: now,
-                        payment_id: peer.to_string(),
-                        amount: None,
-                        bill_count: None,
-                        counterparty: Some(peer.to_string()),
-                        message: format!("Bitcoin peer connected: {peer}"),
-                    });
-                }
-            }
-            announced.retain(|peer| current.contains(peer));
-            announced.extend(current);
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        }
-    });
-}
-
 /// Configuration for running an artery node.
 pub struct NodeConfig {
     /// Number of gossip neighbors (K).
@@ -2728,23 +2677,14 @@ pub struct NodeConfig {
     /// phrase via environment variables.  Can also be provided via the
     /// `VESS_WALLET_PASSWORD` env var.
     pub wallet_password: Option<String>,
-    /// Optional override for the embedded Bitcoin light client configuration.
     /// Useful for deterministic integration tests with local mock peers.
-    pub 
     /// Optional bind address override. Default: 0.0.0.0:0 (OS-assigned port on all interfaces).
     pub bind_addr: Option<std::net::SocketAddr>,
     /// Whether to enable LAN/local-file peer discovery.
     pub enable_local_discovery: bool,
-    /// Allow advertising a non-public mesh contact into Bitcoin-side Vess seed discovery.
     /// Intended for local integration tests that run all nodes on loopback.
-    pub allow_private_bitcoin_seed_contact: bool,
-    /// When true, discard persisted peer cache / reputation / ban state on startup.
-    /// Useful for ephemeral interactive CLI nodes that reuse slot directories.
     pub reset_transient_peer_state: bool,
-    /// When true, run in testnet mode: Bitcoin signet, faucet enabled,
     /// unsafe ops allowed, testnet DHT namespace, seed peers.
-    /// When false, production mode: Bitcoin mainnet, all safety enforced.
-    pub is_testnet: bool,
     /// Deprecated alias for is_testnet + faucet. Kept for backward compat.
     pub test: bool,
 }
@@ -2760,12 +2700,9 @@ impl Default for NodeConfig {
             wallet_path: None,
             rpc_port: None,
             wallet_password: None,
-            bitcoin_config: None,
             bind_addr: None,
             enable_local_discovery: true,
-            allow_private_bitcoin_seed_contact: false,
             reset_transient_peer_state: false,
-            is_testnet: false,
             test: false,
             bootstrap_dns: Vec::new(),
         }
@@ -2831,8 +2768,6 @@ pub struct WalletState {
     pub stealth_secret: StealthSecretKey,
     pub stealth_address: MasterStealthAddress,
     pub billfold: vess_kloak::BillFold,
-    pub bitcoin_wallet: (),
-    pub bitcoin_receive_address: String,
     pub wallet_path: PathBuf,
     /// Encryption key for spend credentials and tag keys on disk.
     pub enc_key: [u8; 32],
@@ -2923,14 +2858,7 @@ pub struct ArteryState {
         HashMap<[u8; 32], Vec<(vess_protocol::OwnershipGenesis, u64)>>,
     /// Embedded wallet — trial-decrypts incoming payments automatically.
     pub wallet: Option<WalletState>,
-    /// Background Bitcoin light client used for burn verification and
     /// transaction broadcast/onboarding.
-    pub 
-    /// Active century-lock faucets owned by this node's wallet.
-    /// Keyed by lock_id. Each produces one bill per Bitcoin block.
-    pub 
-    /// Last Bitcoin block height at which century locks were checked.
-    pub 
     /// Wallet file path (set from config even when wallet is locked).
     /// Used by the RPC `wallet_unlock` endpoint to load the file.
     pub wallet_path: Option<PathBuf>,
@@ -3001,7 +2929,6 @@ impl ArteryState {
             payment_latency: PaymentLatencyTracker::new(1000),
             pending_reforge_genesis: HashMap::new(),
             wallet: None,
-            bitcoin_client: None,
             century_locks: HashMap::new(),
             century_lock_last_block: 0,
             wallet_path: None,
@@ -3206,18 +3133,6 @@ impl ArteryState {
                 if let Err(e) = wf.encrypt_spend_credentials(&ws.billfold, &ws.enc_key) {
                     tracing::warn!(error = %e, "failed to encrypt spend credentials");
                 }
-                match ws.bitcoin_wallet.export_state_bytes() {
-                    Ok(state_bytes) => {
-                        if let Err(e) =
-                            wf.set_encrypted_bitcoin_wallet_state(&state_bytes, &ws.enc_key)
-                        {
-                            tracing::warn!(error = %e, "failed to encrypt bitcoin wallet state");
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "failed to serialize bitcoin wallet state");
-                    }
-                }
                 if let Err(e) = wf.save(&ws.wallet_path, &ws.enc_key) {
                     tracing::warn!(error = %e, "failed to flush wallet to disk");
                 }
@@ -3279,10 +3194,6 @@ impl ArteryState {
         self.manifest_store.insert(dht_key, (encrypted_manifest, Self::now_unix()));
         let _ = manifest_tx.send(msg);
         Some(dht_key)
-    }
-
-    /// Create a century lock faucet from a BitcoinTimeLockProof.
-        minted
     }
 
     fn snapshot(&self) -> ArterySnapshot {
@@ -3651,21 +3562,11 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
             tracing::warn!(error = %e, "failed to decrypt spend credentials — wallet may be from older version");
         }
 
-        let (bitcoin_wallet, bitcoin_receive_address) =
-            load_bitcoin_wallet_state(&wallet, &raw_seed, &enc_key)?;
-
-        info!(
-            path = %wallet_path.display(),
-            bitcoin_receive_address = %bitcoin_receive_address,
-            "wallet loaded — auto-receive enabled"
-        );
         (
             Some(WalletState {
                 stealth_secret,
                 stealth_address: address,
                 billfold,
-                bitcoin_wallet,
-                bitcoin_receive_address,
                 wallet_path: wallet_path.clone(),
                 enc_key,
                 mailbox_key,
@@ -3675,33 +3576,6 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
     } else {
         (None, None)
     };
-
-    info!("Starting Bitcoin peer discovery before Vess mesh bootstrap...");
-    let mut btc_config = config.bitcoin_config.clone().unwrap_or_default();
-    // If no explicit Bitcoin network was configured, use testnet signet or mainnet.
-    if config.bitcoin_config.is_none() {
-        btc_config.network = if config.is_testnet {
-            ()::Signet
-        } else {
-            ()::Mainnet
-        };
-    }
-    let bitcoin_client = match ()::spawn(btc_config)
-    .await
-    {
-        Ok(client) => {
-            info!(
-                peers = client.connected_peers(),
-                "bitcoin light client started"
-            );
-            Some(client)
-        }
-        Err(e) => {
-            warn!("bitcoin light client failed to start: {e}");
-            None
-        }
-    };
-    let bitcoin_seed_client = bitcoin_client.clone();
 
     let mesh_seed = load_or_create_mesh_seed(&config.state_dir)?;
     let bind_addr = config.bind_addr.unwrap_or_else(|| {
@@ -3727,29 +3601,6 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
         let (secret, addr) = vess_mesh::generate_mesh_keys_from_seed(&mesh_seed, 0);
         (Some(secret.network_scan_dk), Some(addr.network_scan_ek))
     };
-    if let Some(client) = &bitcoin_seed_client {
-        let local_contact = node.contact();
-        let allow_private = config.allow_private_bitcoin_seed_contact;
-        match vess_mesh::validate_public_mesh_contact(&local_contact) {
-            Ok(()) => {
-                let local_contact = encode_contact_string(&local_contact)?;
-                let (seed_auth_sk, seed_auth_vk) = ()(&mesh_seed);
-                client.set_local_vess_seed_node(node_id_str.clone(), local_contact, seed_auth_sk, seed_auth_vk);
-            }
-            Err(error) => {
-                if allow_private {
-                    let loopback_contact = crate::local_discovery::loopback_contact(&local_contact)
-                        .unwrap_or_else(|_| local_contact.clone());
-                    let local_contact = encode_contact_string(&loopback_contact)?;
-                    let (seed_auth_sk, seed_auth_vk) = ()(&mesh_seed);
-                    client.set_local_vess_seed_node(node_id_str.clone(), local_contact, seed_auth_sk, seed_auth_vk);
-                    warn!(%error, "local mesh contact is not public-routable; advertising it anyway for test-only Bitcoin seed discovery");
-                } else {
-                    warn!(%error, "local mesh contact is not public-routable; skipping Bitcoin seed advertisement");
-                }
-            }
-        }
-    }
 
     let gossip_config = GossipConfig {
         k_neighbors: config.k_neighbors,
@@ -3788,7 +3639,6 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
         payment_latency: PaymentLatencyTracker::new(1000),
         pending_reforge_genesis: HashMap::new(),
         wallet: wallet_state,
-        bitcoin_client,
         century_locks: HashMap::new(),
         century_lock_last_block: 0,
         wallet_path: config.wallet_path.clone(),
@@ -3802,9 +3652,8 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
         mailbox_fwd: HashMap::new(),
         // MailboxForwardRegister: 5 registrations per 60-second window per peer.
         mailbox_fwd_limiter: crate::gossip::PeerRateLimiter::new(5, 60),
-        unsafe_mode: config.is_testnet || config.test,
-        test_faucet_enabled: config.is_testnet || config.test,
-        is_testnet: config.is_testnet,
+        unsafe_mode: config.test,
+        test_faucet_enabled: config.test,
         events: VecDeque::new(),
         limbo_payment_times: HashMap::new(),
         passive_mode: false,
@@ -3817,178 +3666,6 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
             vess_kloak::payment::PaymentHistory::load(&history_path)
         },
     }));
-
-    if let Some(client) = {
-        let s = lock_state(&state);
-        s.bitcoin_client.clone()
-    } {
-        spawn_bitcoin_peer_notifications(client.clone(), state.clone());
-        let state_for_bitcoin = state.clone();
-        let retry_state = state.clone();
-        let retry_client = client.clone();
-        tokio::spawn(async move {
-            let mut interval =
-                tokio::time::interval(std::time::Duration::from_secs(0));
-            loop {
-                interval.tick().await;
-                let pending_timelocks = {
-                    let mut s = retry_state.lock().unwrap();
-                    let mut pending_timelocks = queue_auto_timelock_if_needed(&mut s);
-                    if let Some(ws) = s.wallet.as_ref() {
-                        pending_timelocks.extend(ws.bitcoin_wallet.pending_timelocks_ready_for_broadcast(
-                            ArteryState::now_unix(),
-                            0,
-                        ));
-                    }
-                    if !pending_timelocks.is_empty() {
-                        s.flush_wallet();
-                    }
-                    pending_timelocks
-                };
-
-                if !pending_timelocks.is_empty() {
-                    broadcast_pending_timelocks(
-                        retry_state.clone(),
-                        retry_client.clone(),
-                        pending_timelocks,
-                    )
-                    .await;
-                }
-            }
-        });
-
-        let subscriber_client = client.clone();
-        tokio::spawn(async move {
-            let mut rx = subscriber_client.subscribe_transactions();
-            loop {
-                match rx.recv().await {
-                    Ok(observed) => {
-                        let pending_timelocks = {
-                            let mut s = state_for_bitcoin.lock().unwrap();
-                            let mut active_receive_address = None;
-                            let mut rotated_receive_address = None;
-                            let mut update = None;
-                            if let Some(ws) = s.wallet.as_mut() {
-                                active_receive_address = Some(ws.bitcoin_receive_address.clone());
-                                let current_receive_address = ws.bitcoin_receive_address.clone();
-                                let wallet_update =
-                                    ws.bitcoin_wallet.record_transaction(&observed.transaction);
-                                let used_current_receive_address =
-                                    wallet_update.discovered_utxos.iter().any(|utxo| {
-                                        utxo.address.to_string() == current_receive_address
-                                    });
-                                if used_current_receive_address {
-                                    match ws.bitcoin_wallet.issue_receive_address() {
-                                        Ok(next_receive_address) => {
-                                            ws.bitcoin_receive_address =
-                                                next_receive_address.address.to_string();
-                                            rotated_receive_address =
-                                                Some(ws.bitcoin_receive_address.clone());
-                                        }
-                                        Err(e) => {
-                                            warn!(error = %e, "failed to rotate bitcoin receive address after first tracked use");
-                                        }
-                                    }
-                                }
-                                update = Some(wallet_update);
-                            }
-
-                            if let Some(ref update) = update {
-                                if !update.discovered_utxos.is_empty() {
-                                    let received_sats: u64 = update
-                                        .discovered_utxos
-                                        .iter()
-                                        .map(|utxo| utxo.value_sats)
-                                        .sum();
-                                    s.push_notification(WalletNotification {
-                                        kind: "bitcoin_received".to_string(),
-                                        created_at: ArteryState::now_unix(),
-                                        payment_id: observed.txid.to_string(),
-                                        amount: Some(received_sats),
-                                        bill_count: Some(update.discovered_utxos.len()),
-                                        counterparty: Some(observed.peer.to_string()),
-                                        message: format!(
-                                            "Tracked {} sat(s) to {} Bitcoin output(s) in {} for receive address {}.",
-                                            received_sats,
-                                            update.discovered_utxos.len(),
-                                            observed.txid,
-                                            active_receive_address.unwrap_or_else(|| "<unknown>".to_string())
-                                        ),
-                                    });
-                                    if let Some(ref next_receive_address) = rotated_receive_address
-                                    {
-                                        s.push_notification(WalletNotification {
-                                            kind: "bitcoin_receive_address_rotated".to_string(),
-                                            created_at: ArteryState::now_unix(),
-                                            payment_id: observed.txid.to_string(),
-                                            amount: None,
-                                            bill_count: None,
-                                            counterparty: None,
-                                            message: format!(
-                                                "Rotated Bitcoin receive address after {}. New receive address: {}.",
-                                                observed.txid, next_receive_address
-                                            ),
-                                        });
-                                    }
-                                }
-                                for pending_txid in &update.seen_pending_timelocks {
-                                    s.push_notification(WalletNotification {
-                                        kind: "bitcoin_burn_seen".to_string(),
-                                        created_at: ArteryState::now_unix(),
-                                        payment_id: pending_txid.to_string(),
-                                        amount: None,
-                                        bill_count: None,
-                                        counterparty: Some(observed.peer.to_string()),
-                                        message: format!(
-                                            "Observed pending Bitcoin burn {} from peer {}.",
-                                            pending_txid, observed.peer
-                                        ),
-                                    });
-                                }
-                                for pending_txid in &update.conflicted_pending_timelocks {
-                                    s.push_notification(WalletNotification {
-                                        kind: "bitcoin_burn_conflicted".to_string(),
-                                        created_at: ArteryState::now_unix(),
-                                        payment_id: pending_txid.to_string(),
-                                        amount: None,
-                                        bill_count: None,
-                                        counterparty: Some(observed.peer.to_string()),
-                                        message: format!(
-                                            "Pending Bitcoin burn {} conflicted with observed transaction {}.",
-                                            pending_txid, observed.txid
-                                        ),
-                                    });
-                                }
-                            }
-
-                            let pending_timelocks = queue_auto_timelock_if_needed(&mut s);
-                            if let Some(ref update) = update {
-                                if update.has_state_change() || !pending_timelocks.is_empty() {
-                                    s.flush_wallet();
-                                }
-                            } else if !pending_timelocks.is_empty() {
-                                s.flush_wallet();
-                            }
-                            pending_timelocks
-                        };
-
-                        if !pending_timelocks.is_empty() {
-                            broadcast_pending_timelocks(
-                                state_for_bitcoin.clone(),
-                                subscriber_client.clone(),
-                                pending_timelocks,
-                            )
-                            .await;
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                        warn!(skipped, "bitcoin transaction subscriber lagged behind");
-                    }
-                }
-            }
-        });
-    }
 
     // ── Gossip drain channels ───────────────────────────────────────
     // Unbounded mpsc channels decouple queue producers (handler) from
@@ -4120,9 +3797,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
     // ── Hash clock: advance tick every ~6s, gossip to peers ─────────
     spawn_clock_tick_task(state.clone());
     spawn_clock_gossip_task(node.clone(), state.clone());
-    if let Some(client) = bitcoin_seed_client.clone() {
-        spawn_bitcoin_vess_discovery(client, state.clone());
-    }
+
     if config.wallet_path.is_some() {
         let s = lock_state(&state);
         let bal = s.wallet.as_ref().map(|w| w.billfold.balance()).unwrap_or(0);
@@ -4172,7 +3847,6 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
 
     if let Some(confirm_client) = {
         let s = lock_state(&state);
-        s.bitcoin_client.clone()
     } {
         let confirm_state = state.clone();
         let confirm_og_tx = og_tx.clone();
@@ -4187,7 +3861,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     let pending_timelocks = s
                         .wallet
                         .as_ref()
-                        .map(|ws| ws.bitcoin_wallet.pending_timelocks())
+                        .map(|w| w.pending_timelocks())
                         .unwrap_or_default();
                     (pending_timelocks, s.gossip_config.max_hops)
                 };
@@ -4200,20 +3874,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                         Ok(Some(confirmation)) => confirmation,
                         Ok(None) => continue,
                         Err(e) => {
-                            warn!(txid = %pending.txid, error = %e, "failed to confirm automatic bitcoin burn");
-                            continue;
-                        }
-                    };
-
-                    let (genesis_records, bills) = match confirmed_timelock_outputs(
-                        &pending,
-                        &confirmation,
-                        ()::Mainnet,
-                        hops_remaining,
-                    ) {
-                        Ok(outputs) => outputs,
-                        Err(e) => {
-                            warn!(txid = %pending.txid, error = %e, "failed to assemble bitcoin burn ownership genesis records");
+                            warn!(txid = %pending.txid, error = %e, "failed to confirm automatic burn");
                             continue;
                         }
                     };
@@ -4230,7 +3891,6 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                         let mut s = confirm_state.lock().unwrap();
                         let removed = if let Some(ws) = s.wallet.as_mut() {
                             if ws
-                                .bitcoin_wallet
                                 .remove_pending_timelock(&pending.txid)
                                 .is_none()
                             {
@@ -4250,34 +3910,6 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                         } else {
                             false
                         };
-
-                        if removed {
-                            s.push_notification(WalletNotification {
-                                kind: "bitcoin_burn_confirmed".to_string(),
-                                created_at: ArteryState::now_unix(),
-                                payment_id: pending.txid.to_string(),
-                                amount: Some(minted_total),
-                                bill_count: Some(bill_count),
-                                counterparty: Some(confirmation.block_hash.to_string()),
-                                message: format!(
-                                    "Confirmed Bitcoin burn {} in block {} and minted {} Vess bill(s) for {} sats.",
-                                    pending.txid,
-                                    confirmation.block_hash,
-                                    bill_count,
-                                    minted_total
-                                ),
-                            });
-                            s.flush_wallet();
-                            info!(
-                                txid = %pending.txid,
-                                block_hash = %confirmation.block_hash,
-                                minted_total,
-                                bill_count,
-                                "confirmed automatic bitcoin burn and generated ownership genesis"
-                            );
-                        }
-
-                        removed
                     };
 
                     if should_gossip {
@@ -4462,7 +4094,6 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                         lock.is_active(current_block) && lock.unclaimed_blocks(current_block) > 0
                     });
                     if has_pending {
-                        // TODO: populate block_hashes from Bitcoin light client.
                         let block_hashes = std::collections::BTreeMap::new();
                         let minted = s.mint_century_lock_bills(
                             current_block,
@@ -4615,11 +4246,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
             }
         }
     }
-    // Append testnet seed peers when running in testnet mode.
-    if config.is_testnet {
-        // Placeholder — add seed node contacts here once deployed.
-        // for seed in TESTNET_SEED_PEERS { all_bootstrap.push(seed.to_string()); }
-    }
+    // Append testnet seed peers when running in testnet mode
     {
         let s = lock_state(&state);
         all_bootstrap.extend(
@@ -4644,26 +4271,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
         }
         all_bootstrap.extend(local_peers.iter().filter_map(bootstrap_string_from_contact));
     }
-    if let Some(client) = &bitcoin_seed_client {
-        let discovered = client
-            .discover_vess_nodes()
-            .await;
-        if !discovered.is_empty() {
-            info!(
-                count = discovered.len(),
-                "discovered Vess bootstrap nodes via Bitcoin peers"
-            );
-            for node in discovered {
-                all_bootstrap.push(node.contact.clone());
-                match parse_contact_string(&node.contact) {
-                    Ok(contact) => queue_discovered_peer_contact(&state, contact, "bitcoin"),
-                    Err(error) => {
-                        warn!(node_id = %node.node_id, "Bitcoin-discovered Vess contact rejected: {error}")
-                    }
-                }
-            }
-        }
-    }
+   
     all_bootstrap.sort_unstable();
     all_bootstrap.dedup();
 
