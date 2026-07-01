@@ -13,7 +13,6 @@ test-pow = ["vess-tag/test-pow"]
 test-mint = ["vess-foundry/test-mint"]
 
 [dependencies]
-vess-bitcoin = { path = "../vess-bitcoin" }
 vess-mesh = { path = "../vess-mesh" }
 vess-stealth = { path = "../vess-stealth" }
 vess-foundry = { path = "../vess-foundry" }
@@ -32,7 +31,6 @@ dirs-next = "2"
 socket2 = "0.5"
 rand = "0.8"
 anyhow = "1"
-bitcoin = "0.32"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1", features = ["full"] }

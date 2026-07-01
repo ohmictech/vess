@@ -31,6 +31,7 @@
 
 pub mod merkle;
 pub mod mint;
+pub mod mine;
 pub mod proof;
 pub mod reforge;
 pub mod seal;
@@ -46,26 +47,27 @@ use serde::{Deserialize, Serialize};
 /// The denomination value always represents the smallest unit of the asset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Asset {
-    /// Bitcoin time-locked credit (1 denomination unit = 1 Vess).
-    Btc,
-    /// Vichor — fixed-supply (1B) network stock. Held initially by dev,
-    /// sold on the swap DHT, burned to turbo BTC time-lock mints.
+    /// Vharyx — raw mined commodity (Argon2id CPU burn).
+    Vharyx,
+    /// Vess — time-locked vharyx, spendable currency.
+    Vess,
+    /// Vichor — fixed-supply (1B) network stock.
     Vichor,
 }
 
 impl Asset {
-    /// Short identifier for serialization: "btc", "vichor"
     pub fn name(&self) -> String {
         match self {
-            Asset::Btc => "btc".to_string(),
+            Asset::Vharyx => "vharyx".to_string(),
+            Asset::Vess => "vess".to_string(),
             Asset::Vichor => "vichor".to_string(),
         }
     }
 
-    /// Parse from a short identifier string.
     pub fn parse(s: &str) -> Option<Self> {
         match s {
-            "btc" | "BTC" => Some(Asset::Btc),
+            "vharyx" | "VHARYX" | "Vharyx" => Some(Asset::Vharyx),
+            "vess" | "VESS" | "Vess" => Some(Asset::Vess),
             "vichor" | "VICHOR" | "Vichor" => Some(Asset::Vichor),
             _ => None,
         }
@@ -88,14 +90,15 @@ impl<'de> Deserialize<'de> for Asset {
 impl std::fmt::Display for Asset {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Asset::Btc => write!(f, "BTC"),
+            Asset::Vharyx => write!(f, "VHARYX"),
+            Asset::Vess => write!(f, "VESS"),
             Asset::Vichor => write!(f, "VICHOR"),
         }
     }
 }
 
 impl Default for Asset {
-    fn default() -> Self { Asset::Btc }
+    fn default() -> Self { Asset::Vharyx }
 }
 
 /// Bill denomination following the 1-2-5 series: any `d × 10^k` where
@@ -312,8 +315,8 @@ pub struct VessBill {
     /// compute `chain_depth + 1` when building their OwnershipClaim.
     #[serde(default)]
     pub chain_depth: u64,
-    /// Origin asset: BTC, ETH, or an ERC-20 token address.
-    /// Bills of different assets cannot be combined. Defaults to BTC
+    /// Origin asset: vharyx, vess, or vichor.
+    /// Bills of different assets cannot be combined.  Defaults to vharyx.
     /// for backward compatibility with pre-multi-asset wallets.
     #[serde(default)]
     pub asset: Asset,
@@ -485,36 +488,43 @@ pub fn bitcoin_timelock_mint_id(txid: &[u8; 32], output_index: u32) -> [u8; 32] 
 ///
 /// `mint_id = Blake3("vess-century-mint-id-v1" || txid || output_index_le || block_hash)`
 ///
-/// Like a standard timelock bill, every century-lock bill traces to the
-/// century lock's Bitcoin genesis transaction via `txid`. Additionally,
-/// the `block_hash` binds the bill to the specific Bitcoin block being
-/// claimed — preventing reorg ambiguity since the faucet produces one
-/// bill per block over 100 years.
-pub fn century_lock_mint_id(txid: &[u8; 32], output_index: u32, block_hash: &[u8; 32]) -> [u8; 32] {
+/// Derive the mint_id for a vharyx bill from a miner's node ID and bill nonce.
+///
+/// `mint_id = Blake3("vess-vharyx-mint-v1" || miner_node_id || bill_nonce_be)`
+pub fn vharyx_mint_id(miner_node_id: &[u8; 32], bill_nonce: u64) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
-    h.update(b"vess-century-mint-id-v1");
-    h.update(txid);
-    h.update(&output_index.to_le_bytes());
-    h.update(block_hash);
+    h.update(b"vess-vharyx-mint-v1");
+    h.update(miner_node_id);
+    h.update(&bill_nonce.to_be_bytes());
     *h.finalize().as_bytes()
 }
 
-/// Compute the per-block Vess amount for a timelock or century lock.
+/// Derive the mint_id for a century-lock Vess bill from a lock_id and tick.
+pub fn century_lock_mint_id(lock_id: &[u8; 32], tick: u64) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"vess-century-mint-id-v2");
+    h.update(lock_id);
+    h.update(&tick.to_be_bytes());
+    *h.finalize().as_bytes()
+}
+
+/// Compute the per-tick Vess amount for a century lock.
 ///
-/// `per_block = ceil(locked_sats / BLOCKS_PER_YEAR)`
+/// `per_tick = ceil(total_locked / TICKS_PER_YEAR)`
+pub fn century_lock_per_tick_vess(total_locked: u64) -> u64 {
+    const TICKS_PER_YEAR: u64 = 365 * 24 * 60 * 60 / 6;
+    ((total_locked as u128 + TICKS_PER_YEAR as u128 - 1) / TICKS_PER_YEAR as u128) as u64
+}
+
+/// Compute the Vess amount from locked vharyx and lock duration.
 ///
-/// This is the denomination of each bill produced by the faucet.
-pub fn bitcoin_timelock_per_block_vess(locked_sats: u64, lock_blocks: u64) -> u64 {
-    const BLOCKS_PER_YEAR: u64 = 52_560;
-    const CENTURY_LOCK_THRESHOLD: u64 = 5_256_000;
-    if lock_blocks >= CENTURY_LOCK_THRESHOLD {
-        // Century lock: per-block drip, rounded up
-        ((locked_sats as u128 + BLOCKS_PER_YEAR as u128 - 1)
-            / BLOCKS_PER_YEAR as u128) as u64
-    } else {
-        // Standard timelock: full amount at once
-        locked_sats
-    }
+/// `vess = locked_vharyx × lock_years` (1:1 per year, free for 1 year)
+/// Extended locks (1.1–10 years) require vichor burn.
+pub fn compute_vess_from_lock(locked_vharyx: u64, lock_years_tenths: u64) -> u64 {
+    // 1 year = 10 tenths.  Free tier: ≤10 tenths gives 1×.
+    // Extended: proportional to years.
+    let years = lock_years_tenths as f64 / 10.0;
+    (locked_vharyx as f64 * years) as u64
 }
 
 // ── Vichor genesis ──────────────────────────────────────────────────
@@ -655,7 +665,7 @@ mod tests {
         assert_eq!(compute_vess_amount(100, MAX_LOCK_BLOCKS), 1_000);
         // 100 sats × 5,256 blocks = 10 Vess (0.1×)
         assert_eq!(compute_vess_amount(100, MIN_LOCK_BLOCKS), 10);
-        // 1 BTC × 52,560 blocks = 100,000,000 Vess
+        // 1 Vharyx × 52,560 ticks = 100,000,000 Vess
         assert_eq!(compute_vess_amount(100_000_000, BLOCKS_PER_YEAR), 100_000_000);
         // 1 sat × 1 block = 0 Vess (rounds down, need at least 526 blocks for 1 Vess per 100 sats)
         assert_eq!(compute_vess_amount(1, 1), 0);

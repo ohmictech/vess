@@ -1,0 +1,15 @@
+[package]
+name = "vess-mine"
+version = "0.1.0"
+edition = "2021"
+license-file = "../LICENSE"
+
+[dependencies]
+argon2 = "0.5"
+blake3 = "1"
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+anyhow = "1"
+tracing = "0.1"
+vess-protocol = { path = "../vess-protocol" }
+vess-foundry = { path = "../vess-foundry" }

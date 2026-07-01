@@ -17,113 +17,8 @@
 
 use serde::{Deserialize, Serialize};
 use blake3;
-
-/// Bitcoin network identifier used by time-lock-backed bill genesis proofs.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub enum BitcoinNetwork {
-    Mainnet,
-    Testnet,
-    Signet,
-    Regtest,
-}
-
-/// Proof that a Bitcoin transaction is time-locked via OP_CHECKLOCKTIMEVERIFY.
-///
-/// Instead of burning BTC with OP_RETURN, the owner locks BTC to their own
-/// address for a future block height. This creates **sat-block time credits**:
-///
-/// ```text
-/// vess = locked_sats × lock_blocks / BLOCKS_PER_YEAR
-/// ```
-///
+/// Vess protocol version hash — Blake3 Merkle root of all workspace source.
 /// Lock 100 sats for 52,560 blocks (≈1 year) → 100 Vess.
-/// Lock 100 sats for 525,600 blocks (≈10 years) → 1,000 Vess.
-/// Lock 100 sats for 5,256 blocks (≈0.1 years) → 10 Vess.
-///
-/// The BTC is not destroyed — it returns to the owner after the CLTV
-/// block height expires. The time-lock proof is verified via SPV.
-///
-/// # Limits
-///
-/// - Minimum lock: 5,256 blocks (≈0.1 years)
-/// - Maximum lock: 525,600 blocks (≈10 years)
-///
-/// This proof is the trust anchor for Vess bill genesis. Every node MUST
-/// verify it before accepting the associated bills into the DHT.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BitcoinTimeLockProof {
-    /// Bitcoin network the lock was observed on.
-    pub network: BitcoinNetwork,
-    /// Transaction ID of the time-lock transaction.
-    pub txid: [u8; 32],
-    /// Block hash containing the time-lock transaction.
-    pub block_hash: [u8; 32],
-    /// Height of the containing block in the validated header chain.
-    #[serde(default)]
-    pub block_height: u64,
-    /// Confirmations observed by the validating Bitcoin light client.
-    #[serde(default)]
-    pub confirmations: u32,
-    /// Minimum confirmations required by the validating Bitcoin light client.
-    #[serde(default)]
-    pub required_confirmations: u32,
-    /// Number of distinct Bitcoin peers that corroborated the tx/block data.
-    #[serde(default)]
-    pub corroborating_peer_count: u32,
-    /// Cumulative validated chainwork at the containing block, big-endian.
-    #[serde(default)]
-    pub chain_work: [u8; 32],
-    /// Merkle root committed by the containing block header.
-    pub merkle_root: [u8; 32],
-    /// Merkle branch proving `txid` inclusion in the block.
-    pub merkle_proof: Vec<[u8; 32]>,
-    /// Leaf index of `txid` in the block's merkle tree.
-    pub merkle_index: u32,
-    /// Amount of satoshis locked (not burned — returned after timelock).
-    pub locked_sats: u64,
-    /// Duration of the timelock in Bitcoin blocks.
-    /// `lock_blocks = cltv_block_height − confirmation_block_height`
-    pub lock_blocks: u64,
-    /// The CLTV block height encoded in the transaction output.
-    pub cltv_block_height: u64,
-    /// The Vess amount this lock produces.
-    /// `vess = locked_sats × lock_blocks / BLOCKS_PER_YEAR`
-    pub vess_amount: u64,
-    /// Full ML-DSA-65 verification key of the first Vess owner (the locker).
-    pub first_owner_vk: Vec<u8>,
-    /// Blake3 hash of the first owner's ML-DSA-65 verification key.
-    pub first_owner_vk_hash: [u8; 32],
-    /// Canonical 1-2-5 bill values for this Vess amount.
-    pub output_values: Vec<u64>,
-    /// Commitment payload in the CLTV output (e.g. OP_RETURN or
-    /// the output script itself, committing to the owner and terms).
-    pub commitment_payload: Vec<u8>,
-}
-
-/// Bitcoin blocks per year (365.25 days × 144 blocks/day ≈ 52,560).
-pub const BLOCKS_PER_YEAR: u64 = 52_560;
-
-/// Minimum timelock duration in blocks (~0.1 years).
-pub const MIN_LOCK_BLOCKS: u64 = 5_256;
-
-/// Maximum timelock duration in blocks (~10 years).
-pub const MAX_LOCK_BLOCKS: u64 = 525_600;
-
-/// Compute the Vess amount from locked sats and lock duration in blocks.
-///
-/// ```text
-/// vess = locked_sats × lock_blocks / BLOCKS_PER_YEAR
-/// ```
-///
-/// # Examples
-///
-/// - 100 sats × 52,560 blocks / 52,560 = 100 Vess
-/// - 100 sats × 525,600 blocks / 52,560 = 1,000 Vess
-/// - 100 sats × 5,256 blocks / 52,560 = 10 Vess
-pub fn compute_vess_amount(locked_sats: u64, lock_blocks: u64) -> u64 {
-    (locked_sats as u128 * lock_blocks as u128 / BLOCKS_PER_YEAR as u128) as u64
-}
-
 /// Development-only proof for local faucet bills.
 ///
 /// Nodes only accept this proof when local test faucet mode is explicitly
@@ -229,20 +124,11 @@ pub struct VichorBurnProof {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum GenesisProof {
     /// Existing Vess-native genesis proof bytes.
-    ///
-    /// These bytes are further parsed by validators as one of:
-    /// - single STARK proof
-    /// - aggregate proof
-    /// - sampled aggregate proof
-    /// - reforge proof
     Vess(Vec<u8>),
 
-    /// Bitcoin time-lock proof: CLTV-locked BTC creates sat-block Vess credits.
-    BitcoinTimeLock(BitcoinTimeLockProof),
-
-    /// Century lock: BTC burned for 100 years creates a perpetual Vess faucet.
-    /// One Vess bill per Bitcoin block, amount = total_sats / 52_560 (rounded).
-    CenturyLock(BitcoinTimeLockProof),
+    /// Vharyx mining proof: Argon2id CPU burn creates a vharyx bill.
+    /// The proof contains a Merkle tree of argon2id state roots.
+    VharyxMined(VharyxMinedProof),
 
     /// One-time Vichor genesis: 1B supply held by dev, sold on swap DHT.
     VichorGenesis(VichorGenesisProof),
@@ -250,6 +136,27 @@ pub enum GenesisProof {
     /// Local testing faucet proof. Accepted only when explicitly enabled by
     /// the node operator.
     LocalTestFaucet(LocalTestFaucetProof),
+}
+
+/// Proof that a miner performed Argon2id CPU work to create vharyx bills.
+///
+/// The miner runs `argon2id(m_cost=256MiB, t=3, p=1)` for each bill nonce,
+/// accumulates proofs in a batch, then submits them as a Merkle tree.
+/// Verifiers spot-check random leaves to confirm the work was done.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VharyxMinedProof {
+    /// Mesh node ID of the miner (binds proof to this identity).
+    pub miner_node_id: [u8; 32],
+    /// First bill nonce in this batch (inclusive).
+    pub bill_nonce_start: u64,
+    /// Last bill nonce in this batch (inclusive).
+    pub bill_nonce_end: u64,
+    /// Merkle root over all (bill_nonce, argon2_state_root) pairs.
+    pub merkle_root: [u8; 32],
+    /// Total Argon2id iterations across the batch (for denomination).
+    pub total_compute_ticks: u64,
+    /// ML-DSA-65 signature by miner_node_id over the batch.
+    pub signature: Vec<u8>,
 }
 
 /// Top-level pulse message envelope.
@@ -653,18 +560,12 @@ pub struct TagLookup {
 }
 
 /// Cryptographic proof that a tag lookup requester is a real Vess user
-/// who owns at least one bill (from a Bitcoin burn or a prior transfer).
-/// Nodes verify this before serving a [`TagLookup`], making mass
-/// enumeration economically infeasible.
+/// who owns at least one bill.  Nodes verify this before serving a
+/// [`TagLookup`], making mass enumeration economically infeasible.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProofOfVessOwnership {
-    /// Bitcoin time-lock proof (if this bill came from a time-lock).
-    /// At least one of `timelock` or `mint_id` must be present.
-    #[serde(default)]
-    pub timelock: Option<BitcoinTimeLockProof>,
-    /// Mint ID of a Vess bill the requester owns (for non-burn bills).
-    #[serde(default)]
-    pub mint_id: Option<[u8; 32]>,
+    /// Mint ID of a Vess bill the requester owns.
+    pub mint_id: [u8; 32],
     /// ML-DSA-65 public key of the bill owner.
     pub owner_vk: Vec<u8>,
     /// ML-DSA-65 signature over
@@ -1521,33 +1422,31 @@ pub struct OwnershipFetchResponse {
 
 // ── Century Lock ─────────────────────────────────────────────────────
 
-/// The number of Bitcoin blocks in 100 years (144 × 365.25 × 100).
-pub const CENTURY_LOCK_BLOCKS: u64 = 5_256_000;
+/// Approximate number of ticks in one year (at 6s/tick).
+pub const TICKS_PER_YEAR: u64 = 365 * 24 * 60 * 60 / 6;
 
-/// Standard Bitcoin blocks per year (144 × 365.25).
+/// Approximate number of ticks in 100 years (at 6s/tick).
+pub const CENTURY_LOCK_TICKS: u64 = 100 * TICKS_PER_YEAR;
 
 /// State for an active century-lock faucet.
 ///
-/// When BTC is burned for 100 years, it creates a perpetual Vess faucet
-/// that mints one bill per Bitcoin block. Each bill is valued at
-/// `total_sats / BLOCKS_PER_YEAR` (rounded down).
+/// When vharyx is locked for 100 years, it creates a perpetual Vess faucet
+/// that mints one bill per network tick. Each bill is valued at
+/// `total_locked / TICKS_PER_YEAR` (rounded up).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CenturyLockState {
-    /// Unique identifier: `Blake3("vess-century-lock-v0" || burn_txid)`.
+    /// Unique identifier: `Blake3("vess-century-lock-v1" || lock_nonce)`.
     pub lock_id: [u8; 32],
-    /// The Bitcoin burn proof that created this lock.
-    pub burn_proof: BitcoinTimeLockProof,
-    /// Total satoshis burned (from burn_proof.locked_sats).
-    pub total_sats: u64,
-    /// Vess amount per Bitcoin block: `total_sats / BLOCKS_PER_YEAR`.
-    pub per_block_vess: u64,
-    /// Bitcoin block height when the lock starts (burn confirmation height).
-    pub start_block: u64,
-    /// Bitcoin block height when the lock expires (start + CENTURY_LOCK_BLOCKS).
-    pub end_block: u64,
-    /// Last Bitcoin block height for which a bill was minted.
-    /// Increments by 1 each time a bill is successfully claimed.
-    pub last_claimed_block: u64,
+    /// Total vharyx units locked.
+    pub total_locked: u64,
+    /// Vess amount per network tick: `ceil(total_locked / TICKS_PER_YEAR)`.
+    pub per_tick_vess: u64,
+    /// Network tick when the lock starts.
+    pub start_tick: u64,
+    /// Network tick when the lock expires (start + CENTURY_LOCK_TICKS).
+    pub end_tick: u64,
+    /// Last network tick for which a bill was minted.
+    pub last_claimed_tick: u64,
     /// The node ID of the wallet that owns this century lock.
     pub owner_node_id: [u8; 32],
     /// Unix timestamp when this lock was created.
@@ -1555,48 +1454,49 @@ pub struct CenturyLockState {
 }
 
 impl CenturyLockState {
-    /// Create a new century lock state from a burn proof.
-    pub fn new(burn_proof: BitcoinTimeLockProof, owner_node_id: [u8; 32], created_at: u64) -> Self {
-        let total_sats = burn_proof.locked_sats;
-        let per_block_vess = (total_sats + BLOCKS_PER_YEAR - 1) / BLOCKS_PER_YEAR;
-        let start_block = burn_proof.block_height;
-        let end_block = start_block.saturating_add(CENTURY_LOCK_BLOCKS);
+    /// Create a new century lock state from a vharyx mint_id and tick.
+    pub fn new(
+        vharyx_mint_id: &[u8; 32],
+        total_locked: u64,
+        start_tick: u64,
+        owner_node_id: [u8; 32],
+        created_at: u64,
+    ) -> Self {
+        let per_tick_vess = (total_locked + TICKS_PER_YEAR - 1) / TICKS_PER_YEAR;
+        let end_tick = start_tick.saturating_add(CENTURY_LOCK_TICKS);
         let lock_id = {
             let mut h = blake3::Hasher::new();
-            h.update(b"vess-century-lock-v0");
-            h.update(&burn_proof.txid);
+            h.update(b"vess-century-lock-v1");
+            h.update(vharyx_mint_id);
             *h.finalize().as_bytes()
         };
         Self {
             lock_id,
-            burn_proof,
-            total_sats,
-            per_block_vess,
-            start_block,
-            end_block,
-            last_claimed_block: start_block.saturating_sub(1), // nothing claimed yet
+            total_locked,
+            per_tick_vess,
+            start_tick,
+            end_tick,
+            last_claimed_tick: start_tick.saturating_sub(1),
             owner_node_id,
             created_at,
         }
     }
 
-    /// How many blocks remain unclaimed.
-    pub fn unclaimed_blocks(&self, current_block: u64) -> u64 {
-        if current_block <= self.last_claimed_block {
-            return 0;
-        }
-        let max_claimable = self.end_block.min(current_block);
-        max_claimable.saturating_sub(self.last_claimed_block)
+    /// How many ticks remain unclaimed.
+    pub fn unclaimed_ticks(&self, current_tick: u64) -> u64 {
+        if current_tick <= self.last_claimed_tick { return 0; }
+        let max_claimable = self.end_tick.min(current_tick);
+        max_claimable.saturating_sub(self.last_claimed_tick)
     }
 
     /// Remaining Vess that can be minted from this lock.
-    pub fn remaining_vess(&self, current_block: u64) -> u64 {
-        self.unclaimed_blocks(current_block) * self.per_block_vess
+    pub fn remaining_vess(&self, current_tick: u64) -> u64 {
+        self.unclaimed_ticks(current_tick) * self.per_tick_vess
     }
 
     /// Whether this lock is still active.
-    pub fn is_active(&self, current_block: u64) -> bool {
-        current_block < self.end_block && self.last_claimed_block < self.end_block
+    pub fn is_active(&self, current_tick: u64) -> bool {
+        current_tick < self.end_tick && self.last_claimed_tick < self.end_tick
     }
 }
 

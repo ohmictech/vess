@@ -19,3 +19,4 @@ rand = "0.8"
 anyhow = "1"
 tracing = "0.1"
 postcard = { version = "1", features = ["alloc"] }
+argon2 = "0.5"

@@ -2051,7 +2051,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "argon2",
- "bitcoin",
  "blake3",
  "cuckoofilter",
  "dirs-next",
@@ -2067,7 +2066,6 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "vess-bitcoin",
  "vess-clock",
  "vess-foundry",
  "vess-kloak",
@@ -2114,6 +2112,7 @@ name = "vess-foundry"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "argon2",
  "blake3",
  "chacha20poly1305",
  "hex",
