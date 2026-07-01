@@ -7,14 +7,13 @@
   import TagsPanel from "./lib/components/TagsPanel.svelte";
   import NodeStatus from "./lib/components/NodeStatus.svelte";
   import MintPanel from "./lib/components/MintPanel.svelte";
-  import GiftCardPanel from "./lib/components/GiftCardPanel.svelte";
   import Onboard from "./lib/components/Onboard.svelte";
   import WalletSelect from "./lib/components/WalletSelect.svelte";
   import { listSwapOffers, createSwapOffer, getBalance, getNodeInfo, type SwapOffer } from "./lib/rpc/client";
   import { biometricGate } from "./lib/auth";
   import QRCode from "qrcode";
 
-  type Tab = "wallet" | "send" | "receive" | "tags" | "mint" | "node" | "cards" | "bitcoin_receive" | "buy_vichor" | "buy_btc";
+  type Tab = "wallet" | "send" | "receive" | "tags" | "mint" | "node" | "bitcoin_receive" | "buy_vichor" | "buy_btc";
   type Asset = "vess" | "bitcoin" | "vichor";
 
   const ASSETS: Asset[] = ["vess", "bitcoin", "vichor"];
@@ -38,7 +37,10 @@
       const info = await getNodeInfo();
       peerCount = info.peer_count;
       networkSize = info.estimated_network_size;
-    } catch { /* node offline */ }
+    } catch {
+      peerCount = 0;
+      networkSize = 0;
+    }
   }
 
   // ── swap state ──
@@ -140,7 +142,7 @@
   }
 
   function buyBtc() {
-    window.open("https://buy.moonpay.com?apiKey=YOUR_API_KEY&currencyCode=btc", "_blank");
+    window.open("https://www.moonpay.com/buy/btc", "_blank");
   }
 
   function syncPriceFromInput(e: Event) {
@@ -220,8 +222,6 @@
           <MintPanel asset={currentAsset} />
         {:else if popup === "node"}
           <NodeStatus asset={currentAsset} />
-        {:else if popup === "cards"}
-          <GiftCardPanel />
         {:else if popup === "bitcoin_receive"}
           <div class="space-y-3 flex flex-col items-center">
             <!-- QR Code — click to copy -->

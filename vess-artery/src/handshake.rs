@@ -99,6 +99,9 @@ pub struct PeerEntry {
     /// proving they are a real Vess user (not a Sybil). Required for
     /// TagLookup queries.
     pub has_proven_burn: bool,
+    /// Relay encapsulation key (ML-KEM-768 scan_ek) shared during handshake.
+    /// Present for nodes willing to relay onion payments.
+    pub relay_ek: Option<Vec<u8>>,
 }
 
 // ── Peer registry ───────────────────────────────────────────────────
@@ -175,6 +178,7 @@ impl PeerRegistry {
                 handshake_failures: failures,
                 last_handshake_at: Some(Instant::now()),
                 has_proven_burn: false,
+                relay_ek: None,
             },
         );
         Some(nonce)
@@ -213,6 +217,7 @@ impl PeerRegistry {
                     handshake_failures: 0,
                     last_handshake_at: Some(Instant::now()),
                     has_proven_burn: false,
+                    relay_ek: None,
                 },
             );
             true
@@ -233,8 +238,21 @@ impl PeerRegistry {
                 handshake_failures: 0,
                 last_handshake_at: Some(Instant::now()),
                 has_proven_burn: false,
+                relay_ek: None,
             },
         );
+    }
+
+    /// Store a peer's relay encapsulation key (for onion routing).
+    pub fn set_relay_ek(&mut self, peer_id: &[u8; 32], ek: Vec<u8>) {
+        if let Some(entry) = self.peers.get_mut(peer_id) {
+            entry.relay_ek = Some(ek);
+        }
+    }
+
+    /// Get a peer's relay encapsulation key, if they shared one.
+    pub fn relay_ek(&self, peer_id: &[u8; 32]) -> Option<&[u8]> {
+        self.peers.get(peer_id).and_then(|e| e.relay_ek.as_deref())
     }
 
     /// Retrieve the challenge nonce for a peer (if one is stored).
@@ -256,6 +274,7 @@ impl PeerRegistry {
                 handshake_failures: failures,
                 last_handshake_at: Some(Instant::now()),
                 has_proven_burn: false,
+                relay_ek: None,
             },
         );
     }
@@ -360,6 +379,7 @@ impl PeerRegistry {
                         handshake_failures: 0,
                         last_handshake_at: entry.last_handshake_at,
                         has_proven_burn: false,
+                        relay_ek: None,
                     },
                 );
             }

@@ -5,7 +5,7 @@
   // ── Types ──────────────────────────────────────────────
   type Asset = "vess" | "bitcoin" | "vichor";
   type Mode = "idle" | "pressed" | "dragging";
-  type ActionId = "send" | "add" | "mint" | "settings" | "cards";
+  type ActionId = "send" | "add" | "mint" | "settings";
 
   interface AssetInfo {
     label: string;
@@ -23,7 +23,6 @@
     icon: string;
     isAsset: boolean;
     isCenter: boolean;
-    isSmall?: boolean;
   }
 
   // ── RPC data ──────────────────────────────────────────
@@ -73,7 +72,6 @@
     send:     "#3b82f6",
     add:      "#10b981",
     mint:     "#eab308",
-    cards:    "#ec4899",
     settings: "#6b7280",
   };
 
@@ -89,8 +87,6 @@
     { q: 1, r: -1 },  // 2: top-right — Add
     { q: 0, r: -1 },  // 3: top-left — Swap
     { q:-1, r: 0  },  // 4: left — Settings
-    // cards — smaller hex nested between mint and settings
-    { q:-0.5, r: -0.5 },
     { q:-1, r: 1  },  // 5: bottom-left — Asset A
     { q: 0, r: 1  },  // 6: bottom-right — Asset B
   ];
@@ -161,7 +157,6 @@
   const DARK_ICON = "#1c2224";           // panel navy for icons on asset hexes & action drag targets
 
   const H = hexPath(R);                 // outer hex path
-  const HS = hexPath(R * 0.62);          // small hex path (cards)
 
   // ── Derived: outer assets ─────────────────────────────
   $: otherAssets = (["vess", "bitcoin", "vichor"] as Asset[]).filter(a => a !== selectedAsset);
@@ -178,12 +173,11 @@
       case 2: return { id: "add",   label: "Receive", color: ACTION_COLORS.add,   glow: "rgba(16,185,129,0.3)",  icon: "↓", isAsset: false, isCenter: false };
       case 3: return { id: "mint",  label: "Mint",    color: ACTION_COLORS.mint,  glow: "rgba(234,179,8,0.3)",   icon: "+", isAsset: false, isCenter: false };
       case 4: return { id: "settings", label: "Settings", color: ACTION_COLORS.settings, glow: "rgba(107,114,128,0.3)", icon: "⚙", isAsset: false, isCenter: false };
-      case 5: return { id: "cards", label: "Cards", color: ACTION_COLORS.cards, glow: "rgba(236,72,153,0.3)", icon: "🎁", isAsset: false, isCenter: false, isSmall: true };
-      case 6: {
+      case 5: {
         const a = ASSETS[otherAssets[0]];
         return { id: otherAssets[0], label: a.label, color: a.color, glow: a.glow, icon: a.icon, isAsset: true, isCenter: false };
       }
-      case 7: {
+      case 6: {
         const a = ASSETS[otherAssets[1]];
         return { id: otherAssets[1], label: a.label, color: a.color, glow: a.glow, icon: a.icon, isAsset: true, isCenter: false };
       }
@@ -242,8 +236,7 @@
       const dx = pt.x - ALL_POSITIONS[i].x;
       const dy = pt.y - ALL_POSITIONS[i].y;
       const d = Math.sqrt(dx * dx + dy * dy);
-      const hitR = i === 5 ? R * 0.80 : R * 1.15; // cards = smaller hit zone
-      if (d < hitR && d < bestDist) { best = i; bestDist = d; }
+      if (d < R * 1.15 && d < bestDist) { best = i; bestDist = d; }
     }
     return best >= 0 ? best : null;
   }
@@ -305,7 +298,6 @@
           else onNavigate("mint");
           break;
         case "settings": onNavigate("node"); break;
-        case "cards":    onNavigate("cards"); break;
       }
     }
   }
@@ -425,7 +417,7 @@
       {@const isTarget = mode === "dragging" && dragTarget === i}
       {@const targetOuterIdx = dragTarget !== null ? dragTarget - 1 : -1}
       {@const isAdjacent = dragTarget !== null && !isTarget && (
-        idx === (targetOuterIdx - 1 + 7) % 7 || idx === (targetOuterIdx + 1) % 7
+        idx === (targetOuterIdx - 1 + 6) % 6 || idx === (targetOuterIdx + 1) % 6
       )}
       {@const pushedPos = isTarget ? pushOut(pos, 8) : isAdjacent ? pushOut(pos, 4) : pos}
       {@const pushDx = pushedPos.x - pos.x}
@@ -456,7 +448,7 @@
           >
           <!-- Hex background fill (solid for assets, subtle for actions) -->
           <path
-            d={item.isSmall ? HS : H}
+            d={H}
             fill={assetFill}
             opacity={assetFillOpacity}
             class="hex-fill-solid"
@@ -464,7 +456,7 @@
 
           <!-- Hex border -->
           <path
-            d={item.isSmall ? HS : H}
+            d={H}
             fill="none"
             stroke="currentColor"
             stroke-width={item.isAsset ? 1.5 : 1.2}
@@ -475,7 +467,7 @@
           <!-- Action hex: subtle fill normally, solid fill on drag target -->
           {#if !item.isAsset}
             <path
-              d={item.isSmall ? HS : H}
+              d={H}
               fill="currentColor"
               opacity={isTarget ? 0.88 : 0.05}
               class="hex-fill"
@@ -485,7 +477,7 @@
           <!-- Asset hex: shimmer sweep on drag target -->
           {#if item.isAsset && isTarget}
             <path
-              d={item.isSmall ? HS : H}
+              d={H}
               fill="url(#shimmer)"
               opacity="1"
               class="hex-shimmer"
@@ -499,8 +491,8 @@
             {@const bdist = Math.sqrt(bdx * bdx + bdy * bdy)}
             {@const bnx = -bdy / bdist}
             {@const bny = bdx / bdist}
-            {@const cw = item.isSmall ? R * 0.35 : R * 0.55}
-            {@const hw = item.isSmall ? R * 0.13 : R * 0.2}
+            {@const cw = R * 0.55}
+            {@const hw = R * 0.2}
             <defs>
               <linearGradient id="beam-{i}" x1="{bdx}" y1="{bdy}" x2="0" y2="0" gradientUnits="userSpaceOnUse">
                 <stop offset="0%" stop-color={ASSETS[selectedAsset].color} stop-opacity="0.5" />
@@ -517,7 +509,7 @@
 
           <!-- Glow ring -->
           <path
-            d={item.isSmall ? HS : H}
+            d={H}
             fill="none"
             stroke="currentColor"
             stroke-width="2.5"

@@ -475,6 +475,192 @@ fn derive_nonce(ss_scan: &[u8], ss_spend: &[u8]) -> [u8; 12] {
     nonce
 }
 
+// ── Onion Routing Helpers ────────────────────────────────────────────
+
+/// Domain separator for onion-layer AEAD key derivation.
+const ONION_AEAD_DOMAIN: &[u8] = b"vess-onion-aead-v1";
+
+/// Derive the AEAD key for an onion layer from the scan shared secret.
+fn derive_onion_aead_key(ss_scan: &[u8]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(ss_scan);
+    h.update(ONION_AEAD_DOMAIN);
+    *h.finalize().as_bytes()
+}
+
+/// Wrap an `OnionPayload` as an `OnionLayer` encrypted to a relay's master address.
+///
+/// This is the sender-side operation. The caller provides the relay's public
+/// `MasterStealthAddress` and the serialized `OnionPayload` bytes. Returns an
+/// `OnionLayer` that only the relay (with the corresponding `StealthSecretKey`)
+/// can decrypt.
+pub fn wrap_onion_layer(
+    relay_address: &MasterStealthAddress,
+    next_hop: [u8; 32],
+    payload_bytes: &[u8],
+    tag_context: &[u8],
+) -> Result<vess_protocol::OnionLayer> {
+    // Encapsulate to scan key
+    let scan_ek = vec_to_ek(relay_address.scan_ek.as_slice())?;
+    let (ct_scan, ss_scan) = scan_ek
+        .encapsulate(&mut rand::thread_rng())
+        .map_err(|_| anyhow!("scan encapsulate failed"))?;
+
+    // Encapsulate to spend key
+    let spend_ek = vec_to_ek(relay_address.spend_ek.as_slice())?;
+    let (ct_spend, ss_spend) = spend_ek
+        .encapsulate(&mut rand::thread_rng())
+        .map_err(|_| anyhow!("spend encapsulate failed"))?;
+
+    let ss_scan_bytes: &[u8] = ss_scan.as_ref();
+    let ss_spend_bytes: &[u8] = ss_spend.as_ref();
+
+    // Compute view tag with context
+    let mut h = blake3::Hasher::new();
+    h.update(ss_scan_bytes);
+    h.update(tag_context);
+    let view_tag = h.finalize().as_bytes()[0];
+
+    // AEAD key from onion domain
+    let aead_key = derive_onion_aead_key(ss_scan_bytes);
+
+    // Nonce from ss_scan + ss_spend
+    let mut h_nonce = blake3::Hasher::new();
+    h_nonce.update(ss_scan_bytes);
+    h_nonce.update(ss_spend_bytes);
+    h_nonce.update(b"vess-onion-nonce-v1");
+    let nonce_hash = h_nonce.finalize();
+    let mut nonce = [0u8; 12];
+    nonce.copy_from_slice(&nonce_hash.as_bytes()[..12]);
+
+    // Encrypt payload
+    let cipher = ChaCha20Poly1305::new(GenericArray::from_slice(&aead_key));
+    let ciphertext = cipher
+        .encrypt(GenericArray::from_slice(&nonce), payload_bytes)
+        .map_err(|e| anyhow!("onion AEAD encrypt: {e}"))?;
+
+    Ok(vess_protocol::OnionLayer {
+        next_hop,
+        ct_scan: ct_scan.to_vec(),
+        ct_spend: ct_spend.to_vec(),
+        view_tag,
+        nonce,
+        ciphertext,
+    })
+}
+
+/// Decrypt an onion layer using the relay's secret key.
+///
+/// Returns the decrypted `OnionPayload` if successful, or an error if
+/// the KEM decapsulation fails, the AEAD tag doesn't verify, or the
+/// view tag doesn't match.
+pub fn unwrap_onion_layer(
+    secret: &StealthSecretKey,
+    layer: &vess_protocol::OnionLayer,
+    tag_context: &[u8],
+) -> Result<vess_protocol::OnionPayload> {
+    // Decapsulate scan key
+    let scan_dk = vec_to_dk(&secret.scan_dk)?;
+    let ct_scan = vec_to_ct(&layer.ct_scan)?;
+    let ss_scan = scan_dk
+        .decapsulate(&ct_scan)
+        .map_err(|_| anyhow!("scan decapsulate failed"))?;
+    let ss_scan_bytes: &[u8] = ss_scan.as_ref();
+
+    // Verify view tag
+    let mut h = blake3::Hasher::new();
+    h.update(ss_scan_bytes);
+    h.update(tag_context);
+    let expected_tag = h.finalize().as_bytes()[0];
+    if expected_tag != layer.view_tag {
+        // Not for us — return error to let caller skip
+        return Err(anyhow!("view tag mismatch"));
+    }
+
+    // Derive AEAD key
+    let aead_key = derive_onion_aead_key(ss_scan_bytes);
+
+    // Decrypt
+    let cipher = ChaCha20Poly1305::new(GenericArray::from_slice(&aead_key));
+    let plaintext = cipher
+        .decrypt(GenericArray::from_slice(&layer.nonce), layer.ciphertext.as_slice())
+        .map_err(|e| anyhow!("onion AEAD decrypt: {e}"))?;
+
+    // Deserialize OnionPayload
+    let payload: vess_protocol::OnionPayload = bincode::deserialize(&plaintext)?;
+    Ok(payload)
+}
+
+/// Encrypt an `OnionPayload` to a relay node's mesh public key.
+///
+/// This is the simple single-KEM path for onion routing — encrypt directly
+/// to the node's ML-KEM-768 `scan_ek` (mesh identity key), not to a wallet
+/// stealth address. The relay node decrypts with its mesh private key.
+/// No DKSAP dual-key, no view tag scanning — the relay knows it received
+/// an `OnionRoute` message.
+pub fn wrap_onion_layer_to_node(
+    relay_scan_ek: &[u8],
+    next_hop: [u8; 32],
+    payload_bytes: &[u8],
+) -> Result<vess_protocol::OnionLayer> {
+    let ek = vec_to_ek(relay_scan_ek)?;
+    let (ct_scan, ss) = ek
+        .encapsulate(&mut rand::thread_rng())
+        .map_err(|_| anyhow!("onion node encapsulate failed"))?;
+    let ss_bytes: &[u8] = ss.as_ref();
+
+    // AEAD key from onion domain
+    let aead_key = derive_onion_aead_key(ss_bytes);
+
+    // Nonce
+    let mut h_nonce = blake3::Hasher::new();
+    h_nonce.update(ss_bytes);
+    h_nonce.update(b"vess-onion-node-nonce-v1");
+    let nonce_hash = h_nonce.finalize();
+    let mut nonce = [0u8; 12];
+    nonce.copy_from_slice(&nonce_hash.as_bytes()[..12]);
+
+    let cipher = ChaCha20Poly1305::new(GenericArray::from_slice(&aead_key));
+    let ciphertext = cipher
+        .encrypt(GenericArray::from_slice(&nonce), payload_bytes)
+        .map_err(|e| anyhow!("onion node AEAD encrypt: {e}"))?;
+
+    Ok(vess_protocol::OnionLayer {
+        next_hop,
+        ct_scan: ct_scan.to_vec(),
+        ct_spend: Vec::new(), // unused for node-key path
+        view_tag: 0,          // unused for node-key path
+        nonce,
+        ciphertext,
+    })
+}
+
+/// Decrypt an onion layer using the relay node's mesh private key (scan_dk).
+///
+/// Single-KEM decryption — no DKSAP dual-key, no view tag scanning.
+/// The relay knows it received an OnionRoute and decrypts with its
+/// mesh identity key.
+pub fn decrypt_onion_with_node_key(
+    scan_dk: &[u8],
+    layer: &vess_protocol::OnionLayer,
+) -> Result<vess_protocol::OnionPayload> {
+    let dk = vec_to_dk(scan_dk)?;
+    let ct = vec_to_ct(&layer.ct_scan)?;
+    let ss = dk
+        .decapsulate(&ct)
+        .map_err(|_| anyhow!("onion node decapsulate failed"))?;
+    let ss_bytes: &[u8] = ss.as_ref();
+
+    let aead_key = derive_onion_aead_key(ss_bytes);
+    let cipher = ChaCha20Poly1305::new(GenericArray::from_slice(&aead_key));
+    let plaintext = cipher
+        .decrypt(GenericArray::from_slice(&layer.nonce), layer.ciphertext.as_slice())
+        .map_err(|e| anyhow!("onion node AEAD decrypt: {e}"))?;
+
+    let payload: vess_protocol::OnionPayload = bincode::deserialize(&plaintext)?;
+    Ok(payload)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -40,16 +40,16 @@ use vess_protocol::{
     BitcoinNetwork, DhtSeedConsumedRecord, DhtSeedOwnershipRecord, DhtSeedRequest,
     DhtSeedResponse, DhtSeedTagRecord, FetchedRecord, FindNodeResponse, GenesisProof,
     HandshakeChallenge, HandshakeResponse, MailboxCollectResponse, MailboxForwardAck,
-    MailboxSweepResponse, ManifestRecoverResponse, ManifestStore, OwnershipClaim,
-    OwnershipFetchResponse, OwnershipGenesis, PeerExchange, PeerExchangeResponse,
-    PulseMessage, ReforgeAttestation, RegistryQueryResponse, TagConfirm,
-    TagLookupResponse, TagLookupResult, TagStore,
+    MailboxSweepResponse, ManifestRecoverResponse, ManifestStore, OnionRoute,
+    OnionPayload, OwnershipClaim, OwnershipFetchResponse, OwnershipGenesis,
+    PeerExchange, PeerExchangeResponse, PulseMessage, ReforgeAttestation,
+    RegistryQueryResponse, TagConfirm, TagLookupResponse, TagLookupResult, TagStore,
 };
 use vess_vascular::MeshPulseNode;
 
 use vess_kloak::billfold::SpendCredential;
 use vess_kloak::payment::{receive_and_claim, ClaimedBill};
-use vess_stealth::{MasterStealthAddress, StealthSecretKey};
+use vess_stealth::{MasterStealthAddress, StealthSecretKey, decrypt_onion_with_node_key};
 
 /// Lock the artery state mutex, recovering from poisoning if another task panicked.
 /// Prevents a single poisoned mutex from crashing the entire node.
@@ -979,6 +979,7 @@ mod tests {
             is_testnet: false,
             events: VecDeque::new(),
             passive_mode: false,
+            own_scan_dk: None,
             payment_history: vess_kloak::payment::PaymentHistory::default(),
         }))
     }
@@ -3181,6 +3182,8 @@ pub struct ArteryState {
     pub swap_offers: BTreeMap<[u8; 32], Vec<vess_protocol::SwapOffer>>,
     pub swap_offer_tx: Option<tokio::sync::mpsc::UnboundedSender<vess_protocol::SwapOffer>>,
     pub node_id: [u8; 32],
+    /// This node's own mesh scan decapsulation key (for decrypting onion layers).
+    pub own_scan_dk: Option<Vec<u8>>,
     /// Kademlia routing table: 256 XOR-distance buckets of infrastructure
     /// relay peers. Never contains wallet users or payment recipients.
     pub routing_table: RoutingTable,
@@ -3327,6 +3330,7 @@ impl ArteryState {
             test_faucet_enabled: is_testnet,
             is_testnet,
             passive_mode: false,
+            own_scan_dk: None,
             payment_history: vess_kloak::payment::PaymentHistory::default(),
         }
     }
@@ -4145,6 +4149,11 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
 
     let node_id_str = node.id().to_string();
     let node_id_bytes: [u8; 32] = *node.id().as_bytes();
+    // Derive own scan_dk + scan_ek for onion layer decryption and relay
+    let (own_scan_dk, own_relay_ek) = {
+        let (secret, addr) = vess_mesh::generate_mesh_keys_from_seed(&mesh_seed, 0);
+        (Some(secret.network_scan_dk), Some(addr.network_scan_ek))
+    };
     if let Some(client) = &bitcoin_seed_client {
         let local_contact = node.contact();
         let allow_private = config.allow_private_bitcoin_seed_contact;
@@ -4226,6 +4235,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
         events: VecDeque::new(),
         limbo_payment_times: HashMap::new(),
         passive_mode: false,
+        own_scan_dk,
         payment_history: {
             let history_path = config.state_dir.join("payment_history.json");
             vess_kloak::payment::PaymentHistory::load(&history_path)
@@ -5170,6 +5180,9 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                             }
                             // Reset failure count on success.
                             s.peer_registry.record_handshake_success(&peer_hash);
+                            if let Some(ref ek) = resp.relay_ek {
+                                s.peer_registry.set_relay_ek(&peer_hash, ek.clone());
+                            }
                             push_peer_notification(
                                 &mut s,
                                 "vess_peer_verified",
@@ -5904,6 +5917,9 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                             } else {
                                 // Reset failure count on success.
                                 s.peer_registry.record_handshake_success(&peer_hash);
+                                if let Some(ref ek) = resp.relay_ek {
+                                    s.peer_registry.set_relay_ek(&peer_hash, ek.clone());
+                                }
                                 push_peer_notification(
                                     &mut s,
                                     "vess_peer_verified",
@@ -6146,9 +6162,11 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
     let h_ra_tx = ra_tx.clone();
     let h_pay_tx = pay_tx.clone();
     let h_fwd_tx = fwd_tx.clone();
+    let relay_ek_for_handshake = own_relay_ek.clone();
 
     // ── Spawn message listener so we can cancel on SIGTERM ──────────
     let listen_node = node.clone();
+    let onion_node = node.clone(); // for onion forwarding
     let limbo_ack_node = node.clone();
     let listen_handle = tokio::spawn(async move {
         listen_node.listen_messages_with_response(move |peer, msg| {
@@ -6225,6 +6243,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
             return Some(PulseMessage::HandshakeResponse(HandshakeResponse {
                 hmac,
                 pow_hash,
+                relay_ek: relay_ek_for_handshake.clone(),
             }));
         }
 
@@ -6661,7 +6680,6 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
 
             PulseMessage::RelayPayment(rp) => {
                 // ── Two-hop relay: unwrap and forward to DHT shard ──
-                // In passive mode, skip relay duties — only process own payments.
                 if state.passive_mode {
                     return None;
                 }
@@ -6669,8 +6687,6 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     warn!(%peer, "RelayPayment with ttl=0 — dropping");
                     return None;
                 }
-                // Final hop: unwrap and inject into normal gossip toward
-                // the recipient's DHT shard (by mailbox_key).
                 let mut payment = rp.payment;
                 if payment.mailbox_key.is_none() {
                     payment.mailbox_key = Some(rp.target_shard_key);
@@ -6678,6 +6694,51 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 let _ = h_pay_tx.send(payment);
                 info!(%peer, "relay payment unwrapped to gossip");
                 None
+            }
+
+            PulseMessage::OnionRoute(or) => {
+                // ── Onion-routed payment: decrypt one layer, forward or deliver ──
+                if state.passive_mode {
+                    return None;
+                }
+                // Use node's own mesh scan_dk to decrypt the onion layer
+                let scan_dk = match &state.own_scan_dk {
+                    Some(dk) => dk.clone(),
+                    None => {
+                        info!(%peer, "OnionRoute: no mesh scan_dk, forwarding");
+                        return Some(PulseMessage::OnionRoute(or));
+                    }
+                };
+
+                // Try single-KEM decrypt using mesh identity key
+                match decrypt_onion_with_node_key(&scan_dk, &or.outer) {
+                    Ok(OnionPayload::Forward { inner }) => {
+                        info!(%peer, "onion forward");
+                        let inner_route = OnionRoute { outer: *inner };
+                        if let Ok(contact) = crate::mesh_contact::decode_contact_bytes(&or.outer.next_hop) {
+                            let n = onion_node.clone();
+                            let msg = PulseMessage::OnionRoute(inner_route);
+                            tokio::spawn(async move {
+                                let _ = n.send_message(&contact, &msg).await;
+                            });
+                        }
+                        None
+                    }
+                    Ok(OnionPayload::Deliver { payment, shard_key }) => {
+                        info!(%peer, "onion delivery — unwrapping to gossip");
+                        let mut p = payment;
+                        if p.mailbox_key.is_none() {
+                            p.mailbox_key = Some(shard_key);
+                        }
+                        let _ = h_pay_tx.send(p);
+                        None
+                    }
+                    Err(_e) => {
+                        // Not for us — forward to the next_hop as-is
+                        info!(%peer, "OnionRoute: layer not for us, forwarding");
+                        Some(PulseMessage::OnionRoute(or))
+                    }
+                }
             }
 
             PulseMessage::Payment(p) => {

@@ -1,6 +1,7 @@
 <script lang="ts">
   import { createEventDispatcher } from "svelte";
   import { walletStatus, checkTag, createWallet, recoverWallet, setWalletPassword } from "../rpc/client";
+  import { BIP39_WORDS } from "../bip39-wordlist";
 
   const dispatch = createEventDispatcher();
 
@@ -132,12 +133,55 @@
   }
 
   // Step: import — recover from phrase
-  let importPhrase = "";
+  let importWords: string[] = Array(12).fill("");
+  let importFocused = 0;
+  let importSuggestions: string[] = [];
+
+  function importFilter(prefix: string): string[] {
+    const p = prefix.toLowerCase();
+    if (p.length === 0) return [];
+    return BIP39_WORDS.filter(w => w.startsWith(p)).slice(0, 8);
+  }
+
+  function importSetWord(index: number, value: string) {
+    importWords[index] = value.trim().toLowerCase();
+    importWords = [...importWords];
+    importSuggestions = importFilter(value);
+  }
+
+  function importAcceptSuggestion(word: string) {
+    importWords[importFocused] = word;
+    importWords = [...importWords];
+    importSuggestions = [];
+    // Move to next empty box
+    const next = importWords.findIndex((w, i) => i > importFocused && w === "");
+    if (next >= 0) importFocused = next;
+    else importFocused = Math.min(importFocused + 1, 11);
+  }
+
+  function importHandleKeydown(index: number, e: KeyboardEvent) {
+    if (e.key === " ") {
+      e.preventDefault();
+      const val = importWords[index].trim().toLowerCase();
+      if (importSuggestions.length > 0 && val.length > 0) {
+        importAcceptSuggestion(importSuggestions[0]);
+        return;
+      }
+      // No suggestion — skip to next box
+      const next = importWords.findIndex((w, i) => i > index && w === "");
+      if (next >= 0) importFocused = next;
+      else importFocused = Math.min(index + 1, 11);
+    }
+    if (e.key === "Backspace" && importWords[index] === "" && index > 0) {
+      importFocused = index - 1;
+    }
+  }
+
   async function doRecover() {
     error = "";
-    const words = importPhrase.trim().toLowerCase().split(/\s+/);
+    const words = importWords.map(w => w.trim().toLowerCase()).filter(w => w.length > 0);
     if (words.length !== 12) {
-      error = "enter exactly 12 words separated by spaces";
+      error = `enter all 12 words (${words.length} filled)`;
       return;
     }
     loading = true;
@@ -195,7 +239,6 @@
       {#if tagAvailable}
         <p class="text-xs text-green-400">✓ tag available</p>
         <p class="text-xs text-amber-400/80">Tags must be hardened by receiving a payment within 30 days of registration, otherwise they expire.</p>
-        <p class="text-xs text-green-400">✓ tag available</p>
       {:else if vesstag.length >= 2}
         <p class="text-xs text-red-400">{error || "checking..."}</p>
       {/if}
@@ -289,18 +332,40 @@
   {:else if step === "import"}
     <h1 class="text-xl font-bold" style="color: #88cddf">Recover Wallet</h1>
     <p class="text-sm text-gray-400">enter your 12-word recovery phrase</p>
-    <textarea
-      bind:value={importPhrase}
-      placeholder="word1 word2 word3 ... word12"
-      rows="3"
-      class="w-full rounded-xl px-4 py-3 text-sm bg-[#88cddf]12 text-gray-200 placeholder-[#88cddf]/30 focus:outline-none resize-none"
-      style="background: #88cddf18"
-    ></textarea>
+    <div class="grid grid-cols-3 gap-2 w-full">
+      {#each Array(12) as _, i}
+        <div class="flex flex-col gap-0.5 relative">
+          <span class="text-xs text-gray-600">{i + 1}.</span>
+          <input
+            value={importWords[i] || ""}
+            on:input={(e) => importSetWord(i, (e.target as HTMLInputElement).value)}
+            on:focus={() => { importFocused = i; importSuggestions = importFilter(importWords[i] || ""); }}
+            on:blur={() => setTimeout(() => importSuggestions = [], 150)}
+            on:keydown={(e) => importHandleKeydown(i, e)}
+            placeholder="..."
+            class="rounded-lg px-2 py-2 text-sm text-center bg-[#1a1a1a] text-gray-200 border border-[#323a3e] focus:outline-none focus:border-[#88cddf] transition-colors"
+          />
+          {#if importFocused === i && importSuggestions.length > 0}
+            <div class="absolute top-full left-0 right-0 z-10 bg-[#1e2629] border border-[#323a3e] rounded-lg mt-0.5 overflow-hidden shadow-xl">
+              {#each importSuggestions as s}
+                <button
+                  type="button"
+                  class="w-full text-left px-3 py-1.5 text-sm text-gray-300 hover:bg-[#88cddf]/20 hover:text-white transition-colors"
+                  on:mousedown|preventDefault={() => importAcceptSuggestion(s)}
+                >
+                  {s}
+                </button>
+              {/each}
+            </div>
+          {/if}
+        </div>
+      {/each}
+    </div>
     {#if error}
       <p class="text-xs text-red-400">{error}</p>
     {/if}
     <button on:click={() => { error = ""; step = "import-tag"; }}
-      disabled={importPhrase.trim().split(/\s+/).length !== 12}
+      disabled={importWords.filter(w => w.trim()).length !== 12}
       class="w-full py-3 rounded-xl font-semibold transition-all disabled:opacity-40"
       style="background: #88cddf; color: #1a1a1a;">
       Continue

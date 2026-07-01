@@ -2229,12 +2229,48 @@ async fn handle_send(
 
         if !relay_peers.is_empty() {
             let mailbox_key = payment.mailbox_key.unwrap_or(payment.stealth_id);
-            let relay_msg = PulseMessage::RelayPayment(vess_protocol::RelayPayment {
-                payment: payment.clone(),
-                target_shard_key: mailbox_key,
-                ttl: 1,
-            });
-            if let Ok(relay_bytes) = relay_msg.to_bytes() {
+
+            // Try 3-hop onion routing if we have relay_ek from verified peers
+            let pulse = {
+                let s = lock_state(&state);
+                let relay_eks: Vec<Vec<u8>> = relay_peers.iter()
+                    .take(3)
+                    .filter_map(|c| {
+                        let pid = c.node_id().map(|n| *n.as_bytes())?;
+                        s.peer_registry.relay_ek(&pid).map(|ek| ek.to_vec())
+                    })
+                    .collect();
+
+                if relay_eks.len() >= 2 {
+                    // Build onion: wrap payment for each relay's node key
+                    match vess_kloak::payment::wrap_payment_for_nodes(
+                        payment.clone(),
+                        &relay_eks,
+                        mailbox_key,
+                    ) {
+                        Ok(onion_msg) => {
+                            info!(hops = relay_eks.len(), "payment wrapped in onion route");
+                            onion_msg
+                        }
+                        Err(e) => {
+                            warn!("onion wrap failed, falling back to relay: {e}");
+                            PulseMessage::RelayPayment(vess_protocol::RelayPayment {
+                                payment: payment.clone(),
+                                target_shard_key: mailbox_key,
+                                ttl: 1,
+                            })
+                        }
+                    }
+                } else {
+                    PulseMessage::RelayPayment(vess_protocol::RelayPayment {
+                        payment: payment.clone(),
+                        target_shard_key: mailbox_key,
+                        ttl: 1,
+                    })
+                }
+            };
+
+            if let Ok(relay_bytes) = pulse.to_bytes() {
                 let arc_bytes = std::sync::Arc::new(relay_bytes);
                 for contact in &relay_peers {
                     let n = node.clone();
@@ -2247,7 +2283,12 @@ async fn handle_send(
                         ).await;
                     });
                 }
-                info!(count = relay_peers.len(), "payment relayed via 2-hop mixnet");
+                let method = if matches!(pulse, PulseMessage::OnionRoute(_)) {
+                    "3-hop onion"
+                } else {
+                    "2-hop relay"
+                };
+                info!(count = relay_peers.len(), "payment sent via {method}");
             }
         }
 

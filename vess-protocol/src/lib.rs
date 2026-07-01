@@ -394,6 +394,11 @@ pub enum PulseMessage {
     /// sender-recipient link at the network layer.
     RelayPayment(RelayPayment),
 
+    /// Onion-routed payment: 3-hop DKSAP-layered forwarding.
+    /// Each relay decrypts one layer and forwards the inner packet.
+    /// No single hop knows both sender and recipient.
+    OnionRoute(OnionRoute),
+
     /// Atomic swap offer for trustless cross-asset exchange.
     /// Stored in the DHT keyed by Blake3("vess-swap-v0" || asset_a || asset_b).
     SwapOffer(SwapOffer),
@@ -420,6 +425,63 @@ pub struct RelayPayment {
     /// Each relay decrements; when 0 the payment is forwarded to the shard.
     #[serde(default)]
     pub ttl: u8,
+}
+
+// ── Onion Routing ────────────────────────────────────────────────────
+
+/// A single encrypted layer of an onion-routed payment.
+///
+/// Each relay hop receives one `OnionLayer`. The relay trial-decrypts
+/// using its own DKSAP keys (same scan mechanism as regular payments),
+/// then either forwards the inner packet or delivers the payment.
+///
+/// The sender builds the onion inside-out:
+///   1. Wrap the `Payment` in `OnionPayload::Deliver`, encrypt to exit relay
+///   2. Wrap exit layer in `OnionPayload::Forward`, encrypt to middle relay
+///   3. Wrap middle layer in `OnionPayload::Forward`, encrypt to entry relay
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OnionLayer {
+    /// DHT key of the *next* hop: a relay node ID, a shard key, or
+    /// the final mailbox key. The decrypting relay uses this to route.
+    pub next_hop: [u8; 32],
+    /// ML-KEM-768 ciphertext encapsulated to this relay's scan_ek.
+    pub ct_scan: Vec<u8>,
+    /// ML-KEM-768 ciphertext encapsulated to this relay's spend_ek.
+    pub ct_spend: Vec<u8>,
+    /// View tag for this relay: `Blake3(ss_scan)[0]`.
+    pub view_tag: u8,
+    /// AEAD nonce (96 bits).
+    pub nonce: [u8; 12],
+    /// AEAD ciphertext — decrypts to bincode-serialized `OnionPayload`.
+    pub ciphertext: Vec<u8>,
+}
+
+/// What a relay finds after decrypting its `OnionLayer`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum OnionPayload {
+    /// There are more hops — forward the inner layer to `next_hop`.
+    Forward {
+        /// The next onion layer, encrypted to the following relay.
+        inner: Box<OnionLayer>,
+    },
+    /// This is the final relay — deliver the payment to the DHT shard.
+    Deliver {
+        /// The actual payment, stealth-encrypted to the recipient.
+        payment: Payment,
+        /// DHT shard key for mailbox delivery.
+        shard_key: [u8; 32],
+    },
+}
+
+/// Top-level onion-routed payment message.
+///
+/// The sender sends this to the entry relay. The entry relay decrypts
+/// the outer layer, extracts the next hop, and forwards the inner packet.
+/// After 3 hops, the exit relay delivers the payment to the DHT shard.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OnionRoute {
+    /// The outermost onion layer — entry relay decrypts this first.
+    pub outer: OnionLayer,
 }
 
 /// A stealth-encrypted payment from sender to recipient.
@@ -916,6 +978,12 @@ pub struct HandshakeResponse {
     /// computational resources.
     #[serde(default)]
     pub pow_hash: Vec<u8>,
+    /// Optional relay encapsulation key (ML-KEM-768) for onion routing.
+    /// Nodes that are willing to relay onion payments include this so
+    /// senders can encrypt onion layers to them. This is the node's
+    /// mesh identity scan_ek — separate from any wallet stealth address.
+    #[serde(default)]
+    pub relay_ek: Option<Vec<u8>>,
 }
 
 // ── Banishment ──────────────────────────────────────────────────────

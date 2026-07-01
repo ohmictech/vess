@@ -2118,6 +2118,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "argon2",
+ "bincode",
  "bip39",
  "blake3",
  "chacha20poly1305",
@@ -2185,12 +2186,14 @@ name = "vess-stealth"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bincode",
  "blake3",
  "chacha20poly1305",
  "ml-kem",
  "rand 0.8.6",
  "rand_chacha 0.3.1",
  "serde",
+ "vess-protocol",
  "zeroize",
 ]
 

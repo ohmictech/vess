@@ -1340,3 +1340,126 @@ mod tests {
         assert!(!is_noise_payment(b""));
     }
 }
+
+// ── Onion Routing ────────────────────────────────────────────────────
+
+/// Wrap a `Payment` in a 3-hop onion route.
+///
+/// Takes a list of relay `MasterStealthAddress`es (1–3 hops) and the
+/// final recipient's `mailbox_key`. Builds the onion inside-out:
+/// inner layer = payment delivered to shard, wrapped in DKSAP layers
+/// for each relay hop.
+///
+/// The `relays` list is ordered: relays[0] = entry, relays[1] = middle,
+/// relays[2] = exit. Fewer than 3 relays are supported — the onion
+/// simply has fewer layers.
+pub fn wrap_payment_as_onion(
+    payment: Payment,
+    relays: &[MasterStealthAddress],
+    mailbox_key: [u8; 32],
+) -> Result<PulseMessage> {
+    use vess_protocol::{OnionLayer, OnionPayload, OnionRoute};
+
+    if relays.is_empty() {
+        // No relays — just send as a regular payment
+        return Ok(PulseMessage::Payment(payment));
+    }
+
+    // Build innermost payload: Deliver to shard
+    let payload_bytes = bincode::serialize(&OnionPayload::Deliver {
+        payment,
+        shard_key: mailbox_key,
+    }).map_err(|e| anyhow!("serialize onion deliver: {e}"))?;
+
+    // Build from inside out: wrap for each relay, last relay is innermost
+    let mut inner_layer: Option<OnionLayer> = None;
+
+    for (i, relay) in relays.iter().enumerate().rev() {
+        let next_hop = if i + 1 < relays.len() {
+            // Forward to the next relay's node ID — for now use a
+            // deterministic key derived from the relay's spend_ek
+            let mut h = blake3::Hasher::new();
+            h.update(&relays[i + 1].spend_ek);
+            h.update(b"vess-onion-next-hop-v1");
+            *h.finalize().as_bytes()
+        } else {
+            // Last relay — deliver to mailbox
+            mailbox_key
+        };
+
+        let to_wrap = match inner_layer.take() {
+            Some(layer) => bincode::serialize(&OnionPayload::Forward {
+                inner: Box::new(layer),
+            }).map_err(|e| anyhow!("serialize onion forward: {e}"))?,
+            None => payload_bytes.clone(),
+        };
+
+        let tag_context = rand::random::<[u8; 32]>();
+        let layer = vess_stealth::wrap_onion_layer(
+            relay, next_hop, &to_wrap, &tag_context,
+        )?;
+
+        inner_layer = Some(layer);
+    }
+
+    Ok(PulseMessage::OnionRoute(OnionRoute {
+        outer: inner_layer.ok_or_else(|| anyhow!("no onion layers built"))?,
+    }))
+}
+
+/// Wrap a `Payment` in a 3-hop onion route using relay node public keys.
+///
+/// Takes a list of relay ML-KEM-768 `scan_ek` bytes (mesh identity keys)
+/// and the recipient's `mailbox_key`. Builds the onion inside-out using
+/// single-KEM encryption to each node's key.
+///
+/// `relay_eks` is ordered: [0] = entry, [1] = middle, [2] = exit.
+pub fn wrap_payment_for_nodes(
+    payment: Payment,
+    relay_eks: &[Vec<u8>],
+    mailbox_key: [u8; 32],
+) -> Result<PulseMessage> {
+    use vess_protocol::{OnionLayer, OnionPayload, OnionRoute};
+
+    if relay_eks.is_empty() {
+        return Ok(PulseMessage::Payment(payment));
+    }
+
+    // Build innermost payload: Deliver to shard
+    let payload_bytes = bincode::serialize(&OnionPayload::Deliver {
+        payment,
+        shard_key: mailbox_key,
+    }).map_err(|e| anyhow!("serialize onion deliver: {e}"))?;
+
+    // Build from inside out — last relay is innermost (exit)
+    let mut inner_layer: Option<OnionLayer> = None;
+
+    for i in (0..relay_eks.len()).rev() {
+        let next_hop = if i + 1 < relay_eks.len() {
+            // Forward to next relay — use Blake3 of its scan_ek as routing key
+            let mut h = blake3::Hasher::new();
+            h.update(&relay_eks[i + 1]);
+            h.update(b"vess-onion-next-hop-v1");
+            *h.finalize().as_bytes()
+        } else {
+            mailbox_key
+        };
+
+        let to_wrap = match inner_layer.take() {
+            Some(layer) => bincode::serialize(&OnionPayload::Forward {
+                inner: Box::new(layer),
+            }).map_err(|e| anyhow!("serialize onion forward: {e}"))?,
+            None => payload_bytes.clone(),
+        };
+
+        let layer = vess_stealth::wrap_onion_layer_to_node(
+            &relay_eks[i], next_hop, &to_wrap,
+        )?;
+
+        inner_layer = Some(layer);
+    }
+
+    Ok(PulseMessage::OnionRoute(OnionRoute {
+        outer: inner_layer.ok_or_else(|| anyhow!("no onion layers built"))?,
+    }))
+}
