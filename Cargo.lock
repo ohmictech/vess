@@ -2068,6 +2068,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "vess-bitcoin",
+ "vess-clock",
  "vess-foundry",
  "vess-kloak",
  "vess-mesh",
@@ -2093,6 +2094,19 @@ dependencies = [
  "tracing",
  "vess-foundry",
  "vess-mesh",
+]
+
+[[package]]
+name = "vess-clock"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "postcard",
+ "rand 0.8.6",
+ "serde",
+ "serde_json",
+ "tracing",
 ]
 
 [[package]]

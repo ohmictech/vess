@@ -2,6 +2,7 @@
 members = [
     "vess-bitcoin",
     "vess-mesh",
+    "vess-clock",
     "vess-vascular",
     "vess-foundry",
     "vess-stealth",

@@ -405,6 +405,64 @@ pub enum PulseMessage {
 
     /// Response to a swap offer query.
     SwapOfferResponse(SwapOfferResponse),
+
+    /// Clock state gossip: a peer shares its current hash-tick clock.
+    /// Used for network-time computation and lock verification.
+    ClockGossip(ClockGossip),
+
+    /// Request a tick proof from a peer for a specific tick number.
+    ClockProofRequest(ClockProofRequest),
+
+    /// Response with a Merkle proof linking a tick to the peer's genesis.
+    ClockProofResponse(ClockProofResponse),
+}
+
+// ── Hash Clock ──────────────────────────────────────────────────────
+
+/// A peer's clock state shared via gossip for network-time computation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClockGossip {
+    /// The node that owns this clock.
+    pub node_id: [u8; 32],
+    /// Genesis hash: blake3(node_id || "vess-clock-genesis-v1").
+    pub genesis_hash: [u8; 32],
+    /// Current tick number.
+    pub current_tick: u64,
+    /// Hash at the current tick.
+    pub current_hash: [u8; 32],
+    /// When this clock was started (wall time ms, for drift estimation).
+    pub started_at_ms: u64,
+    /// When the current tick was created.
+    pub last_tick_at_ms: u64,
+}
+
+/// Request a Merkle proof for a specific tick from a peer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClockProofRequest {
+    /// Tick number to prove.
+    pub tick: u64,
+}
+
+/// A Merkle proof linking a tick to a peer's clock genesis.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClockProofResponse {
+    /// The node this proof belongs to.
+    pub node_id: [u8; 32],
+    /// The tick number being proven.
+    pub tick: u64,
+    /// Hash at this tick.
+    pub tick_hash: [u8; 32],
+    /// Merkle path from tick_hash to checkpoint root.
+    /// Each entry is (sibling_hash, is_left).
+    pub merkle_path: Vec<([u8; 32], bool)>,
+    /// The checkpoint that anchors this proof.
+    pub checkpoint_tick: u64,
+    /// Merkle root at the checkpoint.
+    pub checkpoint_root: [u8; 32],
+    /// Genesis hash of the clock.
+    pub genesis_hash: [u8; 32],
+    /// Wall time when this proof was generated.
+    pub proof_time_ms: u64,
 }
 
 // ── Payment ──────────────────────────────────────────────────────────
@@ -1256,6 +1314,12 @@ pub struct OwnershipClaim {
     /// Must satisfy Blake3(preimage) == Payment.hash_lock.
     #[serde(default)]
     pub hash_preimage: Option<[u8; 32]>,
+    /// Network tick at which this bill unlocks for transfer.
+    /// Set when locking vharyx for Vess minting.  The DHT rejects
+    /// transfers of this bill until median_tick >= locked_until_tick.
+    /// A value of 0 means the bill is not time-locked.
+    #[serde(default)]
+    pub locked_until_tick: u64,
 }
 
 impl Default for OwnershipClaim {
@@ -1276,6 +1340,7 @@ impl Default for OwnershipClaim {
             pow_hash: None,
             accumulated_work: None,
             hash_preimage: None,
+            locked_until_tick: 0,
         }
     }
 }

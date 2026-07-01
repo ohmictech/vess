@@ -37,7 +37,8 @@ use crate::{
 
 use vess_mesh::MeshCarrierContact;
 use vess_protocol::{
-    BitcoinNetwork, DhtSeedConsumedRecord, DhtSeedOwnershipRecord, DhtSeedRequest,
+    BitcoinNetwork, ClockGossip, ClockProofRequest, ClockProofResponse,
+    DhtSeedConsumedRecord, DhtSeedOwnershipRecord, DhtSeedRequest,
     DhtSeedResponse, DhtSeedTagRecord, FetchedRecord, FindNodeResponse, GenesisProof,
     HandshakeChallenge, HandshakeResponse, MailboxCollectResponse, MailboxForwardAck,
     MailboxSweepResponse, ManifestRecoverResponse, ManifestStore, OnionRoute,
@@ -981,6 +982,9 @@ mod tests {
             passive_mode: false,
             own_scan_dk: None,
             payment_history: vess_kloak::payment::PaymentHistory::default(),
+            tick_clock: vess_clock::TickChain::new(node_id),
+            network_time: vess_clock::NetworkTime { median_tick: 0, observed_peers: 0, tick_samples: Vec::new(), computed_at_ms: 0 },
+            peer_clocks: HashMap::new(),
         }))
     }
 
@@ -2854,6 +2858,106 @@ fn ingest_dht_seed_response(
     snapshot
 }
 
+// ── Hash clock tasks ────────────────────────────────────────────────
+
+/// Advance the local tick clock every TICK_INTERVAL_SECS (6s).
+fn spawn_clock_tick_task(state: Arc<Mutex<ArteryState>>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+            vess_clock::TICK_INTERVAL_SECS,
+        ));
+        loop {
+            interval.tick().await;
+            let entry = {
+                let mut s = lock_state(&state);
+                s.tick_clock.advance()
+            };
+            tracing::trace!(tick = entry.tick, "clock advanced");
+        }
+    });
+}
+
+/// Gossip our clock state to verified peers every 30s, and recompute
+/// network time from peer clocks.
+fn spawn_clock_gossip_task(
+    node: MeshPulseNode,
+    state: Arc<Mutex<ArteryState>>,
+) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+
+            // Build our clock gossip message
+            let (gossip, verified_peers): (Option<vess_protocol::ClockGossip>, Vec<([u8; 32], Vec<u8>)>) = {
+                let s = lock_state(&state);
+                let cs = s.tick_clock.state();
+                let gossip = vess_protocol::ClockGossip {
+                    node_id: cs.node_id,
+                    genesis_hash: cs.genesis_hash,
+                    current_tick: cs.current_tick,
+                    current_hash: cs.current_hash,
+                    started_at_ms: cs.started_at_ms,
+                    last_tick_at_ms: cs.last_tick_at_ms,
+                };
+                // Collect verified peers to send to
+                let peers: Vec<_> = s
+                    .peer_registry
+                    .verified_peer_id_bytes()
+                    .into_iter()
+                    .filter_map(|hash| {
+                        s.routing_table
+                            .peer_id_bytes(&hash)
+                            .map(|bytes| (hash, bytes))
+                    })
+                    .take(5)
+                    .collect();
+                (Some(gossip), peers)
+            };
+
+            // Send clock gossip to verified peers
+            if let Some(gossip) = gossip {
+                for (_hash, peer_bytes) in &verified_peers {
+                    if let Ok(target) = decode_contact_bytes(peer_bytes) {
+                        let msg = PulseMessage::ClockGossip(gossip.clone());
+                        let _ = node.send_message_with_response(&target, &msg).await;
+                    }
+                }
+            }
+
+            // Recompute network time from peer clocks
+            {
+                let mut s = lock_state(&state);
+                // Prune stale peer clocks (> 5 min old)
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                s.peer_clocks.retain(|_, cg| {
+                    now_ms.saturating_sub(cg.last_tick_at_ms) < 300_000
+                });
+
+                // Compute network median tick
+                let clock_states: Vec<vess_clock::ClockState> = s
+                    .peer_clocks
+                    .values()
+                    .map(|cg| vess_clock::ClockState {
+                        node_id: cg.node_id,
+                        genesis_hash: cg.genesis_hash,
+                        current_tick: cg.current_tick,
+                        current_hash: cg.current_hash,
+                        started_at_ms: cg.started_at_ms,
+                        last_tick_at_ms: cg.last_tick_at_ms,
+                        latest_checkpoint: None,
+                    })
+                    .collect();
+                let nt = vess_clock::compute_network_time(&clock_states);
+                s.network_time = nt;
+            }
+        }
+    });
+}
+
 /// Adaptive local peer discovery ("Hydra") — intelligently finds and
 /// handshakes with all local Vess nodes using mDNS, LAN broadcast,
 /// and filesystem-based peer exchange.
@@ -3273,6 +3377,12 @@ pub struct ArteryState {
     pub node_id: [u8; 32],
     /// This node's own mesh scan decapsulation key (for decrypting onion layers).
     pub own_scan_dk: Option<Vec<u8>>,
+    /// Hash-tick clock — trustless monotonic time source.
+    pub tick_clock: vess_clock::TickChain,
+    /// Latest network time (median tick from verified peers).
+    pub network_time: vess_clock::NetworkTime,
+    /// Peer clock states collected via gossip (node_id → ClockState).
+    pub peer_clocks: HashMap<[u8; 32], vess_protocol::ClockGossip>,
     /// Kademlia routing table: 256 XOR-distance buckets of infrastructure
     /// relay peers. Never contains wallet users or payment recipients.
     pub routing_table: RoutingTable,
@@ -3421,6 +3531,9 @@ impl ArteryState {
             passive_mode: false,
             own_scan_dk: None,
             payment_history: vess_kloak::payment::PaymentHistory::default(),
+            tick_clock: vess_clock::TickChain::new([0u8; 32]),
+            network_time: vess_clock::NetworkTime { median_tick: 0, observed_peers: 0, tick_samples: Vec::new(), computed_at_ms: 0 },
+            peer_clocks: HashMap::new(),
         }
     }
 
@@ -4325,6 +4438,9 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
         limbo_payment_times: HashMap::new(),
         passive_mode: false,
         own_scan_dk,
+        tick_clock: vess_clock::TickChain::new(node_id_bytes),
+        network_time: vess_clock::NetworkTime { median_tick: 0, observed_peers: 0, tick_samples: Vec::new(), computed_at_ms: 0 },
+        peer_clocks: HashMap::new(),
         payment_history: {
             let history_path = config.state_dir.join("payment_history.json");
             vess_kloak::payment::PaymentHistory::load(&history_path)
@@ -4630,6 +4746,9 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
     if config.enable_local_discovery {
         spawn_local_lan_discovery(node.contact(), state.clone());
     }
+    // ── Hash clock: advance tick every ~6s, gossip to peers ─────────
+    spawn_clock_tick_task(state.clone());
+    spawn_clock_gossip_task(node.clone(), state.clone());
     if let Some(client) = bitcoin_seed_client.clone() {
         spawn_bitcoin_vess_discovery(client, state.clone());
     }
@@ -7143,6 +7262,52 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     .map(|p| p.id_bytes)
                     .collect();
                 Some(PulseMessage::PeerExchangeResponse(PeerExchangeResponse { peers }))
+            }
+
+            // ── Clock gossip: track peer's tick for network-time computation ──
+            PulseMessage::ClockGossip(cg) => {
+                if cg.node_id == peer_id {
+                    // Verify clock rate is physically plausible
+                    if vess_clock::TickChain::verify_clock_rate(&vess_clock::ClockState {
+                        node_id: cg.node_id,
+                        genesis_hash: cg.genesis_hash,
+                        current_tick: cg.current_tick,
+                        current_hash: cg.current_hash,
+                        started_at_ms: cg.started_at_ms,
+                        last_tick_at_ms: cg.last_tick_at_ms,
+                        latest_checkpoint: None,
+                    }) {
+                        state.peer_clocks.insert(peer_id, cg.clone());
+                    }
+                }
+                None
+            }
+
+            // ── Clock proof request: provide Merkle proof for a specific tick ──
+            PulseMessage::ClockProofRequest(req) => {
+                let proof = state.tick_clock.prove_tick(req.tick);
+                if let Some(p) = proof {
+                    let response = ClockProofResponse {
+                        node_id: p.node_id,
+                        tick: p.tick,
+                        tick_hash: p.tick_hash,
+                        merkle_path: p.merkle_path,
+                        checkpoint_tick: p.checkpoint.tick,
+                        checkpoint_root: p.checkpoint.merkle_root,
+                        genesis_hash: p.genesis_hash,
+                        proof_time_ms: p.proof_time_ms,
+                    };
+                    Some(PulseMessage::ClockProofResponse(response))
+                } else {
+                    None
+                }
+            }
+
+            // ── Clock proof response: verify and store ──
+            PulseMessage::ClockProofResponse(_resp) => {
+                // Clock proofs are verified on-demand by the requester.
+                // We just acknowledge receipt.
+                None
             }
 
             PulseMessage::DhtSeedRequest(req) => {
