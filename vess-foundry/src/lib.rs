@@ -382,27 +382,20 @@ pub fn derive_mint_id(digest: &[u8; 32], nonce: &[u8; 32]) -> [u8; 32] {
 }
 
 /// Bitcoin blocks per year (365.25 days × 144 blocks/day ≈ 52,560).
-pub const BLOCKS_PER_YEAR: u64 = 52_560;
-
-/// Minimum timelock duration in blocks (~0.1 years).
-pub const MIN_LOCK_BLOCKS: u64 = 5_256;
-
-/// Maximum timelock duration in blocks (~10 years).
-pub const MAX_LOCK_BLOCKS: u64 = 525_600;
-
-/// Compute the Vess amount from locked sats and lock duration in blocks.
+/// Compute the Vess amount from locked VHALIX and lock duration in years.
 ///
 /// ```text
-/// vess = locked_sats × lock_blocks / BLOCKS_PER_YEAR
+/// vess = locked_VHALIX × lock_years
 /// ```
 ///
 /// # Examples
 ///
-/// - 100 sats × 52,560 blocks / 52,560 = 100 Vess
-/// - 100 sats × 525,600 blocks / 52,560 = 1,000 Vess
-/// - 100 sats × 5,256 blocks / 52,560 = 10 Vess
-pub fn compute_vess_amount(locked_sats: u64, lock_blocks: u64) -> u64 {
-    (locked_sats as u128 * lock_blocks as u128 / BLOCKS_PER_YEAR as u128) as u64
+/// - 100 VHALIX × 1 year = 100 Vess
+/// - 100 VHALIX × 10 years = 1,000 Vess
+/// - 100 VHALIX × 0.1 years = 10 Vess
+pub fn compute_vess_amount(locked_vhalix: u64, lock_years_tenths: u64) -> u64 {
+    let years = lock_years_tenths as f64 / 10.0;
+    (locked_vhalix as f64 * years) as u64
 }
 
 /// Compute the canonical 1-2-5 output values for a bitcoin time-lock amount.
@@ -609,9 +602,9 @@ pub fn vichor_genesis_mint_id(nonce: &[u8; 32]) -> [u8; 32] {
 /// marginal cost grows linearly with duration. This creates natural
 /// market tiers where speculators must buy Vichor from the market,
 /// funding protocol development.
-pub fn vichor_required_for_years(locked_sats: u64, years: f64) -> u64 {
-    // 1 Vichor per 100,000 sat-years (linear in both amount and time).
-    (locked_sats as f64 * years / 100_000.0).ceil() as u64
+pub fn vichor_required_for_years(locked_vhalix: u64, years: f64) -> u64 {
+    // 1 Vichor per 100,000 VHALIX-years (linear in both amount and time).
+    (locked_vhalix as f64 * years / 100_000.0).ceil() as u64
 }
 
 /// Provably unspendable verification key hash. Any Vichor bill transferred
@@ -678,27 +671,19 @@ mod tests {
     use super::{
         bitcoin_timelock_mint_id, bitcoin_timelock_output_values,
         bitcoin_timelock_outputs_hash, bitcoin_timelock_payload_commitment,
-        compute_vess_amount, BLOCKS_PER_YEAR, MIN_LOCK_BLOCKS, MAX_LOCK_BLOCKS,
+        compute_vess_amount,
     };
 
     #[test]
-    fn compute_vess_amount_sat_blocks() {
-        // 100 sats × 52,560 blocks = 100 Vess
-        assert_eq!(compute_vess_amount(100, BLOCKS_PER_YEAR), 100);
-        // 100 sats × 525,600 blocks = 1,000 Vess (10×)
-        assert_eq!(compute_vess_amount(100, MAX_LOCK_BLOCKS), 1_000);
-        // 100 sats × 5,256 blocks = 10 Vess (0.1×)
-        assert_eq!(compute_vess_amount(100, MIN_LOCK_BLOCKS), 10);
-        // 1 VHALIX × 52,560 ticks = 100,000,000 Vess
-        assert_eq!(compute_vess_amount(100_000_000, BLOCKS_PER_YEAR), 100_000_000);
-        // 1 sat × 1 block = 0 Vess (rounds down, need at least 526 blocks for 1 Vess per 100 sats)
-        assert_eq!(compute_vess_amount(1, 1), 0);
-        // 100 sats × 526 blocks = 1 Vess (minimum precision)
-        assert_eq!(compute_vess_amount(100, 526), 1);
-        // Min lock: 100 sats × 5,256 blocks / 52,560 = 10 Vess
-        assert_eq!(compute_vess_amount(100, MIN_LOCK_BLOCKS), 10);
-        // Max lock: 100 sats × 525,600 blocks / 52,560 = 1,000 Vess
-        assert_eq!(compute_vess_amount(100, MAX_LOCK_BLOCKS), 1_000);
+    fn compute_vess_amount_vhalix_years() {
+        // 100 VHALIX × 1.0 year (10 tenths) = 100 Vess
+        assert_eq!(compute_vess_amount(100, 10), 100);
+        // 100 VHALIX × 10.0 years (100 tenths) = 1,000 Vess
+        assert_eq!(compute_vess_amount(100, 100), 1_000);
+        // 100 VHALIX × 0.1 years (1 tenth) = 10 Vess
+        assert_eq!(compute_vess_amount(100, 1), 10);
+        // 100,000,000 VHALIX × 1.0 year = 100,000,000 Vess
+        assert_eq!(compute_vess_amount(100_000_000, 10), 100_000_000);
     }
 
     #[test]
@@ -734,11 +719,11 @@ mod tests {
     #[test]
     fn bitcoin_timelock_payload_commits_to_owner_and_outputs() {
         let owner_hash = [0x11u8; 32];
-        let locked_sats = 52_550;
+        let locked_vhalix = 52_550;
         let outputs = vec![50_000, 2_000, 500, 50];
 
         let payload = bitcoin_timelock_payload_commitment(
-            &owner_hash, locked_sats, BLOCKS_PER_YEAR, &outputs, None,
+            &owner_hash, locked_vhalix, 10, &outputs, None,
         );
         let outputs_hash = bitcoin_timelock_outputs_hash(&outputs);
 
@@ -747,25 +732,25 @@ mod tests {
         assert_ne!(
             payload,
             bitcoin_timelock_payload_commitment(
-                &[0x22u8; 32], locked_sats, BLOCKS_PER_YEAR, &outputs, None,
+                &[0x22u8; 32], locked_vhalix, 10, &outputs, None,
             )
         );
         assert_ne!(
             payload,
             bitcoin_timelock_payload_commitment(
-                &owner_hash, locked_sats + 1, BLOCKS_PER_YEAR, &outputs, None,
+                &owner_hash, locked_vhalix + 1, 10, &outputs, None,
             )
         );
         assert_ne!(
             payload,
             bitcoin_timelock_payload_commitment(
-                &owner_hash, locked_sats, MIN_LOCK_BLOCKS, &outputs, None,
+                &owner_hash, locked_vhalix, 1, &outputs, None,
             )
         );
         assert_ne!(
             payload,
             bitcoin_timelock_payload_commitment(
-                &owner_hash, locked_sats, BLOCKS_PER_YEAR, &[52_550], None,
+                &owner_hash, locked_vhalix, 10, &[52_550], None,
             )
         );
     }

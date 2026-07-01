@@ -3,101 +3,150 @@
 
 # Vess
 
-**Bitcoin time-value credit protocol. Post-quantum. Feeless. Stateless.**
+**Post-quantum digital cash. CPU-mined commodity. Stateless P2P network.**
 
-Vess turns locked Bitcoin into spendable time-credits. Lock BTC via
-`OP_CHECKLOCKTIMEVERIFY` and receive Vess. 1 satoshi locked for 1 year = 1 Vess.
-The BTC returns after the lock expires. No burn, no bridge, no custodian. The economic value behind a unit of Vess represents the **opportunity-time** cost of locking your Bitcoin.
+Vess is a tri-asset stateless monetary system where value flows from physics through
+time into spendable currency. No blockchain, no fees, no validators.
 
-The protocol's intention and novelty is to fundamentally change what "access to credit" means. Rather than having to be in debt to someone else to acquire liquidity against your assets, Vess allows you to **directly** issue tokenized claims on future work against your own Bitcoin, trustlessly. Vess that is minted **permanently** exists.
+| Asset | Role | Supply | Backing |
+|-------|------|--------|---------|
+| **Vhalix** | Commodity | Unlimited, linear | CPU work (Argon2id) |
+| **Vess** | Currency | ≤ locked Vhalix | Work + time commitment |
+| **Vichor** | Equity | Fixed 1B | Network access premium |
 
-Once BTC is locked, the corresponding minted Vess is moved around as cryptographically self-contained bearer bonds that can be split and combined. As such, there is **no** global consensus mechanism, "blocks", or state, just a deterministic ownership registry hash table.
+## Vhalix — CPU-Mined Commodity
 
-Vess is built on maximum decentralization, piggybacking the BTC network with a builtin light client + self-audited transaction and block commitments. No node RPC required.
+Vhalix is created by computing Argon2id proofs-of-work. Each proof is an
+independent 1 GiB memory-hard hash computation taking ~30 minutes on a
+mid-range CPU. Proofs are bound to a specific `(owner, nonce)` pair —
+they cannot be reused, reordered, or stolen.
 
-Every Vess wallet is its own node, and has a regular Bitcoin wallet built in.
+### Mining Parameters
+
+| Parameter | Value | Purpose |
+|-----------|-------|---------|
+| Algorithm | Argon2id | Memory-hard, ASIC-resistant |
+| Memory | 1 GiB | Beyond commodity ASIC HBM capacity |
+| Time passes | 12 | ~30 min per proof |
+| Parallelism | 1 | Strictly single-core |
+
+### Denomination
+
+Proofs are batched into a Merkle tree and submitted as a single bill.
+The denomination follows the 1-2-5 series: the largest valid value
+≤ the number of proofs mined.
+
+```
+2295 proofs → denomination 2000 (excess: 295 → bounty pool)
+2005 proofs → denomination 2000 (excess: 5 → bare minimum)
+```
+
+Every bill requires at least 5 excess proofs. These become a **bounty pool**
+that pays verifiers 1 Vhalix per Argon2id recomputation they perform,
+creating a self-sustaining verification economy.
+
+### Fairness
+
+Argon2id at 1 GiB cannot be meaningfully accelerated by specialized
+hardware. A laptop and a server produce the same output per core per hour.
+The only way to scale is to buy more CPU cores — and every core produces
+at the same rate. No ASIC arms race, no mining cartels.
+
+## Vess — Time-Locked Currency
+
+Vhalix can be the basis for issuing Vess when locked for a duration (0.1–10 years).
+The lock is a commitment: "I mined this work, and I'm staking it for N years."
+This gives Vess its economic value. It's a currency backed by both past work
+and future time commitment.
+
+All Vess is fungible. Lock duration is the minter's commitment, not a
+property of the bills themselves.
+
+| Lock Duration | Vichor Required | Purpose |
+|---------------|-----------------|---------|
+| ≤ 1 year | None | Standard (free) |
+| 1–10 years | Proportional burn | Premium credit |
+| > 10 years | Not allowed | Cap at 10 years |
+
+## Vichor — Network Equity
+
+Vichor is a fixed-supply (1B) access token created in a one-time genesis
+event. It is not for governance, as the protocol is founder-led. Vichor grants
+access to premium time-lock durations beyond 1 year.
+
+Vichor is burned to unlock extended credit. The burn is permanent,
+reducing circulating supply. Demand for Vichor scales with demand for
+longer-term Vess issuance, creating natural market pricing.
+
+Vichor is a capitalization model that is non-extractive and essentially forces speculators to contribute to the network development, and user equity.
+
+```
+Vichor required = ceil(locked_vhalix × years / 100,000)
+```
+
+Traded on the built-in Swap DHT alongside Vhalix and Vess — no external
+exchange required.
+
+## Verification Economy
+
+Every Vhalix bill includes a bounty pool from its excess proofs. Any node
+can verify a bill by recomputing one Argon2id proof and submitting a
+`BountyGenesis` claim. The verifier receives 1 Vhalix per proof verified.
+
+| Role | Hardware | Time | Reward |
+|------|----------|------|--------|
+| Miner | Any CPU | Days/weeks per bill | Denomination value |
+| Verifier | Any CPU | 30 min per proof | 1 Vhalix per bounty |
 
 ## How It Works
 
-1. **Lock BTC** — Your wallet builds a CLTV time-lock transaction. BTC sits at your own address, locked for 0.1–10 years.
-2. **Mint Vess** — When the lock confirms, ownership records are gossiped to the DHT.
-3. **Spend** — Vess units are bearer instruments sent via tags (e.g. `+ALICE`)
-4. **Claim** — The recipient wallet automatically broadcasts an `OwnershipClaim` to the DHT to finalize receipt.
-
-## Vess & Vichor
-
-Vess and Vichor are two independent assets with distinct purposes.
-
-| | Vess | Vichor |
-|---|---|---|
-| **What** | Time-credit (sat-block) | Network stock |
-| **Supply** | Unlimited (backed by BTC locks) | Fixed 1,000,000,000 |
-| **Launch** | Fair — same formula for everyone | Dev holds initial supply |
-| **Purpose** | Spending, payments | Gating long locks, funding dev |
-
-### Vichor Gate
-
-Locks ≤1 year are freely accessible. Beyond that, Vichor must be burned proportionally, ensuring speculators are contributing to the network longevity and strength:
-
-Vichor is burned by transferring it to a provably unspendable address
-(`VICHOR_BURN_VK_HASH`). The burn proof is committed in the Bitcoin
-time-lock transaction's `OP_RETURN`, binding it to a specific mint.
-
-Users seeking longer issuance horizons create demand for a scarce network asset. That demand funds continued protocol development while permanently reducing the circulating supply through burns.
-
-Vichor exists as a network-positive funding mechanism, chosen over fees or extractive value. Every feature of Vess is available without it except extended leverage. It is not a governance token.
-
-### Self-Contained Liquidity
-
-Vichor never needs a CEX or DEX. The Swap DHT (`vess-swap-v0|btc|vichor`)
-is the only exchange it needs, retaining the same keys, same wallet, same network. Bitcoin, Vichor, and Vess can all be exchanged feelessly and P2P. No price oracles required.
+1. **Mine Vhalix** — Run Argon2id CPU proofs. Each takes ~30 min at 1 GiB.
+2. **Submit batch** — When enough proofs accumulate, end your minting session.
+3. **Lock → Vess** — Lock Vhalix for 0.1–10 years to mint Vess.
+4. **Spend** — Vess, Vhalix, and Vichor units move via tags (e.g. `+ALICE`)
 
 ## Tags
 
-Human-readable identities for payments (e.g. `+ALICE`). Once registered and paid to, the tag→address mapping is permanent. Unconfirmed tags last 30 days. Receiving Vess to a tag hardens it.
+Human-readable identities for payments (e.g. `+ALICE`). Once registered and
+paid to, the tag→address mapping is permanent. Unconfirmed tags last 30 days.
 
 - Lowercase alphanumeric only, 3–20 chars
-- Argon2id PoW (2 GiB) to claim
+- Argon2id PoW to claim
 
 ## Architecture
 
-Nodes form a peer-to-peer mesh with post-quantum handshakes (ML-KEM-768 + Falcon).
-Ownership state is replicated deterministically. 
+Nodes form a peer-to-peer mesh with post-quantum handshakes (ML-KEM-768 +
+ML-DSA-65). Ownership state is replicated deterministically across Kademlia
+DHT shards.
 
-- **No state machine** — deterministic registry rules
+- **No blockchain** — deterministic registry rules, gossip-based
 - **No fees** — no gas, no mempool, no fee auction
-- **No burn** — BTC returns after CLTV expiry
-- **No bridge** — native Bitcoin script
-- **No UTXOs or accounts** - payment amounts and recipients are obfuscated
+- **No validators** — every node independently verifies proofs
+- **No burn** — Vhalix is locked, not destroyed
+- **No accounts** — payment amounts and recipients are obfuscated
+
+## Sovereignty & Routing
+
+The Vess network is built on multiple layers of security, and node-to-node payments pass through multiple nodes to reach a destination, with an onion inspired payload.
+
+Payments travel as fixed byte size, denominational, encapsulated bills to single use stealth addresses. Payment recipients, senders, minters, verifiers, and amounts are all invisible.
+
+## Consensus
+
+Vess has no blockchain or ledger. Rather, each bill contains its own state history and commitment. A bill cryptographically traces back to its mint or timelock origin, and ownership of a bill is claimed by the receiver, rather than announced by the sender. Deeper ownership chains of a bill win, which are located deterministically on the network's distributed hash table. In the case of conflicting depths, lower hash wins. This renders doublespends deterministically, rather than probabilistically, impossible.
 
 ## Cryptography
 
-All Vess-native operations are post-quantum.
+All operations are post-quantum.
 
 | Purpose | Primitive |
-|---|---|
-| Mesh handshake | ML-KEM-768 + Falcon |
+|---------|-----------|
+| Mesh handshake | ML-KEM-768 + ML-DSA-65 |
 | Ownership signatures | ML-DSA-65 |
 | Stealth addressing | ML-KEM-768 (DKSAP) |
+| Mining | Argon2id (1 GiB, data-dependent memory) |
 | Hashing | Blake3 |
-| Wallet KDF | Argon2id |
 | Symmetric encryption | ChaCha20-Poly1305 |
-| Bitcoin integration | Native P2P + SegWit + CLTV |
-
-Transfers occur with strong default privacy through stealth addressing, payment encapsulation, and multiple hops on the network.
-
-## Why Vess
-
-| Bitcoin | Vess |
-|---|---|
-| Public transaction graph | No transfer history |
-| Fee market | Feeless |
-| ~10 min confirmation | Instant |
-| ECDSA / Schnorr | ML-DSA-65 (post-quantum) |
-| BTC is spent | BTC is locked, then returned |
-| Single asset | Vess (time-credit) + Vichor (stock) |
-
-Vess is **not** a sidechain, rollup, federated mint, or multisig bridge.
 
 ## License
 

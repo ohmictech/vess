@@ -18,7 +18,7 @@
 use serde::{Deserialize, Serialize};
 use blake3;
 /// Vess protocol version hash — Blake3 Merkle root of all workspace source.
-/// Lock 100 sats for 52,560 blocks (≈1 year) → 100 Vess.
+/// Lock 100 VHALIX for 1 year → 100 Vess.
 /// Development-only proof for local faucet bills.
 ///
 /// Nodes only accept this proof when local test faucet mode is explicitly
@@ -94,20 +94,19 @@ pub const VICHOR_BURN_VK_HASH: [u8; 32] = [
 ///
 /// Used to unlock time-lock durations beyond 1 year. The burn proof
 /// references one or more Vichor bills in the ownership registry and
-/// proves the owner authorizes their destruction. Once burned, the
-/// Proof that Vichor has been burned to unlock a time-lock duration.
+/// proves the owner authorizes their destruction.
 ///
-/// The burn happens **before** the BTC time-lock: Vichor bills are transferred
+/// The burn happens **before** the time-lock: Vichor bills are transferred
 /// to `VICHOR_BURN_VK_HASH` via an OwnershipClaim, the DHT marks them consumed,
-/// and this proof is produced. The `mint_timelock` function then references
+/// and this proof is produced. The lock creation function then references
 /// this proof — it checks that `total_burned >= vichor_required(duration)`.
 ///
 /// # Replay protection
 ///
 /// `mint_commitment` is a random nonce generated before either the burn
-/// or the time-lock exists. It links the burn proof to a specific mint
-/// without requiring the txid upfront. The digest is embedded in the
-/// Bitcoin OP_RETURN — reusing the same burn for a different mint would
+/// or the time-lock exists. It links the burn proof to a specific lock
+/// without requiring the mint_id upfront. The digest is embedded in the
+/// lock commitment — reusing the same burn for a different lock would
 /// require forging the commitment.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VichorBurnProof {

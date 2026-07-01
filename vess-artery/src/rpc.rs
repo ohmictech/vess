@@ -1028,8 +1028,8 @@ async fn handle_request(
         RpcRequest::GetTag => handle_get_tag(state),
         RpcRequest::CheckMyTag => handle_check_my_tag(state, node).await,
         RpcRequest::CenturyLocks => handle_century_locks(state),
-        RpcRequest::CenturyLockCreate { lock_proof_json } => {
-            handle_century_lock_create(state, &lock_proof_json, &senders.manifest_tx).await
+        RpcRequest::CenturyLockCreate { lock_proof_json, lock_years, vichor_burn_json } => {
+            handle_century_lock_create(state, &lock_proof_json, lock_years, &vichor_burn_json, &senders.manifest_tx).await
         }
         RpcRequest::VHALIXLock { VHALIX_mint_id, lock_years } => {
             handle_VHALIX_lock(state, &VHALIX_mint_id, lock_years, &senders.og_tx).await
@@ -1070,6 +1070,8 @@ pub struct MineChainStatus {
     /// Approximate elapsed time since mining started.
     pub elapsed_seconds: u64,
 }
+
+fn default_lock_years() -> f64 { 1.0 }
 
 fn handle_set_passive_mode(state: &Arc<Mutex<ArteryState>>, enabled: bool) -> RpcResponse {
     let mut s = lock_state(state);
@@ -4226,6 +4228,8 @@ fn handle_century_locks(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
 async fn handle_century_lock_create(
     state: &Arc<Mutex<ArteryState>>,
     lock_proof_json: &str,
+    lock_years: f64,
+    vichor_burn_json: &Option<String>,
     manifest_tx: &tokio::sync::mpsc::UnboundedSender<vess_protocol::ManifestStore>,
 ) -> RpcResponse {
     let proof: vess_protocol::VHALIXMinedProof =
@@ -4234,12 +4238,20 @@ async fn handle_century_lock_create(
             Err(e) => return RpcResponse::err(format!("invalid VHALIX proof JSON: {e}")),
         };
 
+    let vichor_burn: Option<vess_protocol::VichorBurnProof> = match vichor_burn_json {
+        Some(json) => match serde_json::from_str(json) {
+            Ok(bp) => Some(bp),
+            Err(e) => return RpcResponse::err(format!("invalid Vichor burn proof JSON: {e}")),
+        },
+        None => None,
+    };
+
     let mut s = lock_state(state);
     if s.wallet.is_none() {
         return RpcResponse::err("wallet must be unlocked to create a century lock");
     }
 
-    match s.create_century_lock(&proof, manifest_tx) {
+    match s.create_century_lock(&proof, lock_years, vichor_burn.as_ref(), manifest_tx) {
         Ok(lock) => RpcResponse::ok(RpcData::CenturyLockCreated {
             lock_id: crate::persistence::hex_key(&lock.lock_id),
             total_VHALIX: lock.total_locked,
