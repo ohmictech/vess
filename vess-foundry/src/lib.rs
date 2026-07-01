@@ -47,9 +47,9 @@ use serde::{Deserialize, Serialize};
 /// The denomination value always represents the smallest unit of the asset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Asset {
-    /// Vharyx — raw mined commodity (Argon2id CPU burn).
-    Vharyx,
-    /// Vess — time-locked vharyx, spendable currency.
+    /// VHALIX — raw mined commodity (Argon2id CPU burn).
+    VHALIX,
+    /// Vess — time-locked VHALIX, spendable currency.
     Vess,
     /// Vichor — fixed-supply (1B) network stock.
     Vichor,
@@ -58,7 +58,7 @@ pub enum Asset {
 impl Asset {
     pub fn name(&self) -> String {
         match self {
-            Asset::Vharyx => "vharyx".to_string(),
+            Asset::VHALIX => "VHALIX".to_string(),
             Asset::Vess => "vess".to_string(),
             Asset::Vichor => "vichor".to_string(),
         }
@@ -66,7 +66,7 @@ impl Asset {
 
     pub fn parse(s: &str) -> Option<Self> {
         match s {
-            "vharyx" | "VHARYX" | "Vharyx" => Some(Asset::Vharyx),
+            "VHALIX" | "VHALIX" | "VHALIX" => Some(Asset::VHALIX),
             "vess" | "VESS" | "Vess" => Some(Asset::Vess),
             "vichor" | "VICHOR" | "Vichor" => Some(Asset::Vichor),
             _ => None,
@@ -90,7 +90,7 @@ impl<'de> Deserialize<'de> for Asset {
 impl std::fmt::Display for Asset {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Asset::Vharyx => write!(f, "VHARYX"),
+            Asset::VHALIX => write!(f, "VHALIX"),
             Asset::Vess => write!(f, "VESS"),
             Asset::Vichor => write!(f, "VICHOR"),
         }
@@ -98,7 +98,7 @@ impl std::fmt::Display for Asset {
 }
 
 impl Default for Asset {
-    fn default() -> Self { Asset::Vharyx }
+    fn default() -> Self { Asset::VHALIX }
 }
 
 /// Bill denomination following the 1-2-5 series: any `d × 10^k` where
@@ -243,6 +243,30 @@ impl Denomination {
         values.into_iter().map(Denomination).collect()
     }
 
+    /// The largest valid 1-2-5 denomination ≤ `chain_length`.
+    ///
+    /// This is the core VHALIX minting rule: a hash chain of length N
+    /// produces a bill denominated at the largest 1-2-5 value ≤ N.
+    /// E.g. chain length 2295 → denomination 2000.
+    /// The excess proofs are the security margin — they prove the
+    /// miner didn't just barely squeak past the threshold.
+    pub fn max_valid_denomination(chain_length: u64) -> u64 {
+        let mut best: u64 = 1;
+        let mut power: u64 = 1;
+        loop {
+            for &d in &[1u64, 2, 5] {
+                match d.checked_mul(power) {
+                    Some(val) if val <= chain_length => best = val,
+                    _ => return best,
+                }
+            }
+            match power.checked_mul(10) {
+                Some(p) => power = p,
+                None => return best,
+            }
+        }
+    }
+
     /// Round a raw u64 amount to the nearest valid 1-2-5 denomination.
     /// Ties round up. Returns `D1` for 0.
     pub fn nearest(value: u64) -> Self {
@@ -315,8 +339,8 @@ pub struct VessBill {
     /// compute `chain_depth + 1` when building their OwnershipClaim.
     #[serde(default)]
     pub chain_depth: u64,
-    /// Origin asset: vharyx, vess, or vichor.
-    /// Bills of different assets cannot be combined.  Defaults to vharyx.
+    /// Origin asset: VHALIX, vess, or vichor.
+    /// Bills of different assets cannot be combined.  Defaults to VHALIX.
     /// for backward compatibility with pre-multi-asset wallets.
     #[serde(default)]
     pub asset: Asset,
@@ -488,12 +512,12 @@ pub fn bitcoin_timelock_mint_id(txid: &[u8; 32], output_index: u32) -> [u8; 32] 
 ///
 /// `mint_id = Blake3("vess-century-mint-id-v1" || txid || output_index_le || block_hash)`
 ///
-/// Derive the mint_id for a vharyx bill from a miner's node ID and bill nonce.
+/// Derive the mint_id for a VHALIX bill from a miner's node ID and bill nonce.
 ///
-/// `mint_id = Blake3("vess-vharyx-mint-v1" || miner_node_id || bill_nonce_be)`
-pub fn vharyx_mint_id(miner_node_id: &[u8; 32], bill_nonce: u64) -> [u8; 32] {
+/// `mint_id = Blake3("vess-VHALIX-mint-v1" || miner_node_id || bill_nonce_be)`
+pub fn VHALIX_mint_id(miner_node_id: &[u8; 32], bill_nonce: u64) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
-    h.update(b"vess-vharyx-mint-v1");
+    h.update(b"vess-VHALIX-mint-v1");
     h.update(miner_node_id);
     h.update(&bill_nonce.to_be_bytes());
     *h.finalize().as_bytes()
@@ -516,15 +540,15 @@ pub fn century_lock_per_tick_vess(total_locked: u64) -> u64 {
     ((total_locked as u128 + TICKS_PER_YEAR as u128 - 1) / TICKS_PER_YEAR as u128) as u64
 }
 
-/// Compute the Vess amount from locked vharyx and lock duration.
+/// Compute the Vess amount from locked VHALIX and lock duration.
 ///
-/// `vess = locked_vharyx × lock_years` (1:1 per year, free for 1 year)
+/// `vess = locked_VHALIX × lock_years` (1:1 per year, free for 1 year)
 /// Extended locks (1.1–10 years) require vichor burn.
-pub fn compute_vess_from_lock(locked_vharyx: u64, lock_years_tenths: u64) -> u64 {
+pub fn compute_vess_from_lock(locked_VHALIX: u64, lock_years_tenths: u64) -> u64 {
     // 1 year = 10 tenths.  Free tier: ≤10 tenths gives 1×.
     // Extended: proportional to years.
     let years = lock_years_tenths as f64 / 10.0;
-    (locked_vharyx as f64 * years) as u64
+    (locked_VHALIX as f64 * years) as u64
 }
 
 // ── Vichor genesis ──────────────────────────────────────────────────
@@ -665,7 +689,7 @@ mod tests {
         assert_eq!(compute_vess_amount(100, MAX_LOCK_BLOCKS), 1_000);
         // 100 sats × 5,256 blocks = 10 Vess (0.1×)
         assert_eq!(compute_vess_amount(100, MIN_LOCK_BLOCKS), 10);
-        // 1 Vharyx × 52,560 ticks = 100,000,000 Vess
+        // 1 VHALIX × 52,560 ticks = 100,000,000 Vess
         assert_eq!(compute_vess_amount(100_000_000, BLOCKS_PER_YEAR), 100_000_000);
         // 1 sat × 1 block = 0 Vess (rounds down, need at least 526 blocks for 1 Vess per 100 sats)
         assert_eq!(compute_vess_amount(1, 1), 0);

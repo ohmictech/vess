@@ -1140,7 +1140,7 @@ async fn cmd_recover(cli: &Cli, words: &str, wallet_name: Option<&str>) -> Resul
                 mint_id: entry.mint_id,
                 chain_tip: rec.chain_tip,
                 chain_depth: 0,
-                asset: vess_foundry::Asset::Btc,
+                asset: vess_foundry::Asset::Vess,
             };
 
             if verbose {

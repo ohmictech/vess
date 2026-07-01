@@ -71,6 +71,15 @@ pub const VICHOR_TOTAL_SUPPLY: u64 = 1_000_000_000;
 /// which the network will reject.
 pub const VICHOR_GENESIS_NONCE: [u8; 32] = *b"vess-vichor-genesis-v1----------";
 
+/// Canonical dev ML-DSA-65 verification key hash for the Vichor genesis.
+/// Only the key that hashes to this can sign the genesis proof.
+pub const VICHOR_GENESIS_VK_HASH: [u8; 32] = [
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // PLACEHOLDER
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Replace with actual
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // dev key hash
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
 /// Provably unspendable verification key. Any Vichor bill transferred to
 /// this owner is permanently burned — no one can sign a subsequent claim.
 /// `Blake3("vess-vichor-burn-v1")` → 32 bytes of nothingness.
@@ -126,9 +135,13 @@ pub enum GenesisProof {
     /// Existing Vess-native genesis proof bytes.
     Vess(Vec<u8>),
 
-    /// Vharyx mining proof: Argon2id CPU burn creates a vharyx bill.
+    /// VHALIX mining proof: Argon2id CPU burn creates a VHALIX bill.
     /// The proof contains a Merkle tree of argon2id state roots.
-    VharyxMined(VharyxMinedProof),
+    VHALIXMined(VHALIXMinedProof),
+
+    /// Verification bounty: proves an excess VHALIX proof was recomputed
+    /// and verified.  Creates a 5-VHALIX bill for the verifier.
+    BountyGenesis(BountyGenesisProof),
 
     /// One-time Vichor genesis: 1B supply held by dev, sold on swap DHT.
     VichorGenesis(VichorGenesisProof),
@@ -138,15 +151,49 @@ pub enum GenesisProof {
     LocalTestFaucet(LocalTestFaucetProof),
 }
 
-/// Proof that a miner performed Argon2id CPU work to create vharyx bills.
+/// A verifier proves they recomputed an excess VHALIX proof.
+///
+/// When a miner submits a VHALIXMinedProof with more proofs than the
+/// target denomination, the excess becomes a bounty pool.  A verifier
+/// picks one excess proof, recomputes Argon2id, and submits this as a
+/// genesis proof to claim a 5-VHALIX bounty bill.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BountyGenesisProof {
+    /// The genesis mint_id of the VHALIX bill being verified.
+    pub genesis_mint_id: [u8; 32],
+    /// The proof index within the batch (must be in excess range).
+    pub proof_index: u64,
+    /// The 32-byte Argon2id output — proves recomputation was done.
+    pub argon2_output: [u8; 32],
+    /// Verifier's ML-DSA-65 VK (receives the bounty bill).
+    pub verifier_vk: Vec<u8>,
+    /// Verifier's signature over the claim.
+    pub verifier_sig: Vec<u8>,
+}
+
+/// Proof that a miner performed Argon2id CPU work to create VHALIX bills.
 ///
 /// The miner runs `argon2id(m_cost=256MiB, t=3, p=1)` for each bill nonce,
 /// accumulates proofs in a batch, then submits them as a Merkle tree.
 /// Verifiers spot-check random leaves to confirm the work was done.
+///
+/// The proof uses ephemeral DKSAP keys so that the on-chain proof is
+/// cryptographically indistinguishable from a normal Vess payment.
+/// Even though the miner is sending to themselves, the proof does not
+/// reveal their master stealth address.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VharyxMinedProof {
-    /// Mesh node ID of the miner (binds proof to this identity).
-    pub miner_node_id: [u8; 32],
+pub struct VHALIXMinedProof {
+    /// Ephemeral scan encapsulation key (ML-KEM-768). Generated fresh
+    /// per batch so the proof cannot be linked to a master stealth address.
+    pub ephemeral_scan_ek: Vec<u8>,
+    /// Ephemeral spend encapsulation key.
+    pub ephemeral_spend_ek: Vec<u8>,
+    /// DKSAP scan ciphertext (encrypted to the owner's scan_ek).
+    pub ct_scan: Vec<u8>,
+    /// DKSAP spend ciphertext.
+    pub ct_spend: Vec<u8>,
+    /// View tag for fast scanning (as in normal Payment).
+    pub view_tag: u8,
     /// First bill nonce in this batch (inclusive).
     pub bill_nonce_start: u64,
     /// Last bill nonce in this batch (inclusive).
@@ -155,8 +202,42 @@ pub struct VharyxMinedProof {
     pub merkle_root: [u8; 32],
     /// Total Argon2id iterations across the batch (for denomination).
     pub total_compute_ticks: u64,
-    /// ML-DSA-65 signature by miner_node_id over the batch.
-    pub signature: Vec<u8>,
+    /// Per-wallet mining session counter (persisted across restarts).
+    pub session_nonce: u64,
+    /// Hash of the network tick that anchored this mining session.
+    /// Binds the mint_id to a specific point in network time.
+    pub tick_hash: [u8; 32],
+    /// `argon2_hash` of every proof in this batch, in nonce order.
+    /// Enables O(n) chain continuity verification at wire speed
+    /// (each hash is 32 bytes → ~2 KiB for a 64-proof batch).
+    #[serde(default)]
+    pub chain_hashes: Vec<[u8; 32]>,
+    /// ML-DSA-65 verification key of the bill owner.
+    pub owner_vk: Vec<u8>,
+    /// ML-DSA-65 signature by `owner_vk` over the batch commitment.
+    pub batch_sig: Vec<u8>,
+    /// Verification bounty: excess proofs beyond the denomination
+    /// that can be claimed by verifiers for a 5-VHALIX reward each.
+    #[serde(default)]
+    pub bounty: Option<VerificationBounty>,
+}
+
+/// Verification bounty attached to a VHALIX genesis proof.
+///
+/// When a miner submits a batch, the excess proofs beyond the
+/// 1-2-5 denomination become a bounty pool.  Verifiers can claim
+/// individual excess proofs by recomputing Argon2id — each successful
+/// verification pays the verifier 5 VHALIX from the miner's bill.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerificationBounty {
+    /// Proof index where the excess range begins (= denomination).
+    pub excess_start: u64,
+    /// Proof index where the excess range ends (= bill_nonce_end).
+    pub excess_end: u64,
+    /// Number of 1-VHALIX bounty units available (one per excess proof).
+    pub bounty_count: u64,
+    /// VHALIX per successful verification claim.
+    pub reward_per_claim: u64,
 }
 
 /// Top-level pulse message envelope.
@@ -842,6 +923,9 @@ pub struct DhtSeedOwnershipRecord {
     /// Encrypted bill recovery payload for the current owner.
     #[serde(default)]
     pub encrypted_bill: Vec<u8>,
+    /// Tick-lock value carried from the ownership record.
+    #[serde(default)]
+    pub locked_until_tick: u64,
 }
 
 /// A consumed-bill tombstone transferred during seed sync.
@@ -1216,7 +1300,7 @@ pub struct OwnershipClaim {
     #[serde(default)]
     pub hash_preimage: Option<[u8; 32]>,
     /// Network tick at which this bill unlocks for transfer.
-    /// Set when locking vharyx for Vess minting.  The DHT rejects
+    /// Set when locking VHALIX for Vess minting.  The DHT rejects
     /// transfers of this bill until median_tick >= locked_until_tick.
     /// A value of 0 means the bill is not time-locked.
     #[serde(default)]
@@ -1430,14 +1514,14 @@ pub const CENTURY_LOCK_TICKS: u64 = 100 * TICKS_PER_YEAR;
 
 /// State for an active century-lock faucet.
 ///
-/// When vharyx is locked for 100 years, it creates a perpetual Vess faucet
+/// When VHALIX is locked for 100 years, it creates a perpetual Vess faucet
 /// that mints one bill per network tick. Each bill is valued at
 /// `total_locked / TICKS_PER_YEAR` (rounded up).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CenturyLockState {
     /// Unique identifier: `Blake3("vess-century-lock-v1" || lock_nonce)`.
     pub lock_id: [u8; 32],
-    /// Total vharyx units locked.
+    /// Total VHALIX units locked.
     pub total_locked: u64,
     /// Vess amount per network tick: `ceil(total_locked / TICKS_PER_YEAR)`.
     pub per_tick_vess: u64,
@@ -1454,20 +1538,21 @@ pub struct CenturyLockState {
 }
 
 impl CenturyLockState {
-    /// Create a new century lock state from a vharyx mint_id and tick.
+    /// Create a new century lock state from a VHALIX mint_id and tick.
     pub fn new(
-        vharyx_mint_id: &[u8; 32],
+        VHALIX_mint_id: &[u8; 32],
         total_locked: u64,
         start_tick: u64,
+        lock_ticks: u64,
         owner_node_id: [u8; 32],
         created_at: u64,
     ) -> Self {
-        let per_tick_vess = (total_locked + TICKS_PER_YEAR - 1) / TICKS_PER_YEAR;
-        let end_tick = start_tick.saturating_add(CENTURY_LOCK_TICKS);
+        let per_tick_vess = (total_locked + lock_ticks.max(1) - 1) / lock_ticks.max(1);
+        let end_tick = start_tick.saturating_add(lock_ticks);
         let lock_id = {
             let mut h = blake3::Hasher::new();
             h.update(b"vess-century-lock-v1");
-            h.update(vharyx_mint_id);
+            h.update(VHALIX_mint_id);
             *h.finalize().as_bytes()
         };
         Self {

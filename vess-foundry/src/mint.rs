@@ -164,7 +164,7 @@ pub fn try_mint(denom: Denomination, owner_vk_hash: &[u8; 32]) -> MintOutcome {
             mint_id,
             chain_tip,
             chain_depth: 0,
-            asset: Asset::Vharyx,
+            asset: Asset::VHALIX,
         },
         proof_bytes,
     }
@@ -359,7 +359,7 @@ pub fn try_mint_d1(owner_vk_hash: &[u8; 32]) -> Option<CompletedSolve> {
         mint_id,
         chain_tip,
         chain_depth: 0,
-        asset: Asset::Vharyx,
+        asset: Asset::VHALIX,
     };
 
     Some(CompletedSolve { bill, nonce })
@@ -563,7 +563,7 @@ pub fn aggregate_solves(
                     mint_id,
                     chain_tip,
                     chain_depth: 0,
-                    asset: Asset::Vharyx,
+                    asset: Asset::VHALIX,
                 },
                 proof_bytes,
             ));
@@ -606,7 +606,7 @@ pub fn aggregate_solves(
                     mint_id,
                     chain_tip,
                     chain_depth: 0,
-                    asset: Asset::Vharyx,
+                    asset: Asset::VHALIX,
                 },
                 proof_bytes,
             ));

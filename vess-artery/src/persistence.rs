@@ -90,7 +90,7 @@ pub struct ArterySnapshot {
     pub century_locks: Vec<vess_protocol::CenturyLockState>,
     /// Last Bitcoin block height at which century locks were checked.
     #[serde(default)]
-    pub century_lock_last_block: u64,
+    pub century_lock_last_tick: u64,
 }
 
 impl ArterySnapshot {
@@ -113,7 +113,7 @@ impl ArterySnapshot {
             retained_consumed_records: BTreeMap::new(),
             limbo_payment_ids: Vec::new(),
             century_locks: Vec::new(),
-            century_lock_last_block: 0,
+            century_lock_last_tick: 0,
         }
     }
 }

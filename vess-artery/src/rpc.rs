@@ -416,10 +416,32 @@ pub enum RpcRequest {
     CheckMyTag,
     /// List active century locks and their status.
     CenturyLocks,
-    /// Create a century lock faucet from a BitcoinTimeLockProof.
+    /// Create a century lock from a VHALIX mining proof.
     CenturyLockCreate {
-        burn_proof_json: String,
+        lock_proof_json: String,
+        /// Lock duration in years (0.0-10.0). >1 year requires Vichor burn.
+        #[serde(default = "default_lock_years")]
+        lock_years: f64,
+        /// Optional Vichor burn proof JSON (required for locks >1 year).
+        #[serde(default)]
+        vichor_burn_json: Option<String>,
     },
+    /// Lock VHALIX bills to mint Vess currency.
+    /// Requires the wallet to be unlocked.
+    VHALIXLock {
+        /// Mint ID of the VHALIX bill to lock.
+        VHALIX_mint_id: String,
+        /// Lock duration in years (1.0 = 1 year, 0.1 increments).
+        lock_years: f64,
+    },
+    /// Start the VHALIX miner.  Uses wallet identity for proof binding.
+    /// One chain is mined per call; call multiple times for concurrent chains.
+    MineStart,
+    /// Stop all running VHALIX mining chains.  Current chain is hardened
+    /// and submitted as a bill if it meets the minimum chain length.
+    MineStop,
+    /// Query current mining status.
+    MineStatus,
     /// Recover wallet manifest from DHT (bills + century locks).
     RecoverManifest,
     /// List all wallets on this device.
@@ -466,12 +488,9 @@ pub enum RpcData {
         tag_count: usize,
         registry_count: usize,
         limbo_count: usize,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        bitcoin_receive_address: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        bitcoin_tracked_balance: Option<u64>,
-        bitcoin_pending_burns: usize,
-        bitcoin_connected_peers: usize,
+        mining_active: bool,
+        mining_proofs_pending: usize,
+        mining_hash_rate_ph: f64,
         profile: String,
         profile_description: String,
         unsafe_mode: bool,
@@ -517,8 +536,7 @@ pub enum RpcData {
         wallet_state: String, // "no_wallet" | "locked" | "unlocked"
         wallet_balance: u64,
         wallet_watch_only: u64,
-        bitcoin_peers: usize,
-        bitcoin_pending_burns: usize,
+        
         discovery_sources: Vec<String>,
         total_supply: u64,
         passive_mode: bool,
@@ -609,10 +627,47 @@ pub enum RpcData {
     },
     CenturyLockCreated {
         lock_id: String,
-        total_sats: u64,
-        per_block_vess: u64,
-        start_block: u64,
-        end_block: u64,
+        total_VHALIX: u64,
+        per_tick_vess: u64,
+        start_tick: u64,
+        end_tick: u64,
+    },
+    VHALIXLockCreated {
+        /// New Vess mint IDs created from this lock.
+        vess_mint_ids: Vec<String>,
+        /// Total Vess amount minted.
+        total_vess: u64,
+        /// Network tick when lock expires.
+        locked_until_tick: u64,
+        /// The VHALIX bill is now locked until this tick.
+        message: String,
+    },
+    /// Mining started successfully.
+    MineStarted {
+        /// Chain this session is mining.
+        chain_index: usize,
+        /// Current chain length.
+        chain_length: u64,
+        /// Estimated denomination if hardened now.
+        estimated_denomination: u64,
+        message: String,
+    },
+    /// Mining stopped, chain hardened into a bill.
+    MineStopped {
+        /// The mint_id of the hardened bill.
+        mint_id: Option<String>,
+        /// Final chain length.
+        chain_length: u64,
+        /// Denomination of the hardened bill.
+        denomination: u64,
+        message: String,
+    },
+    /// Current mining status.
+    MineStatus {
+        /// Number of active mining chains.
+        active_chains: usize,
+        /// Per-chain status.
+        chains: Vec<MineChainStatus>,
     },
     RecoverManifest {
         recovered_bills: usize,
@@ -973,9 +1028,15 @@ async fn handle_request(
         RpcRequest::GetTag => handle_get_tag(state),
         RpcRequest::CheckMyTag => handle_check_my_tag(state, node).await,
         RpcRequest::CenturyLocks => handle_century_locks(state),
-        RpcRequest::CenturyLockCreate { burn_proof_json } => {
-            handle_century_lock_create(state, &burn_proof_json, &senders.manifest_tx).await
+        RpcRequest::CenturyLockCreate { lock_proof_json } => {
+            handle_century_lock_create(state, &lock_proof_json, &senders.manifest_tx).await
         }
+        RpcRequest::VHALIXLock { VHALIX_mint_id, lock_years } => {
+            handle_VHALIX_lock(state, &VHALIX_mint_id, lock_years, &senders.og_tx).await
+        }
+        RpcRequest::MineStart => handle_mine_start(state, &senders.og_tx),
+        RpcRequest::MineStop => handle_mine_stop(state, &senders.og_tx),
+        RpcRequest::MineStatus => handle_mine_status(state),
         RpcRequest::RecoverManifest => {
             handle_recover_manifest(state, node).await
         }
@@ -993,6 +1054,21 @@ pub struct OutboundPaymentView {
     pub recipient: String,
     pub bill_count: usize,
     pub status: String,
+}
+
+/// Status of a single VHALIX mining chain.
+#[derive(Debug, Clone, Serialize)]
+pub struct MineChainStatus {
+    /// Index of this chain (0-based).
+    pub chain_index: usize,
+    /// Current number of proofs mined.
+    pub chain_length: u64,
+    /// Estimated denomination if hardened now.
+    pub estimated_denomination: u64,
+    /// Next bill_nonce that will be used.
+    pub next_nonce: u64,
+    /// Approximate elapsed time since mining started.
+    pub elapsed_seconds: u64,
 }
 
 fn handle_set_passive_mode(state: &Arc<Mutex<ArteryState>>, enabled: bool) -> RpcResponse {
@@ -1165,10 +1241,9 @@ fn handle_node_info(state: &Arc<Mutex<ArteryState>>, node: &MeshPulseNode) -> Rp
                 tag_count: s.tag_dht.record_count(),
                 registry_count: s.registry.len(),
                 limbo_count: s.limbo_mint_ids.len(),
-                bitcoin_receive_address: s.wallet.as_ref().map(|w| w.bitcoin_receive_address.clone()),
-                bitcoin_tracked_balance: s.wallet.as_ref().map(|w| w.bitcoin_wallet.spendable_tracked_balance()),
-                bitcoin_pending_burns: s.wallet.as_ref().map(|w| w.bitcoin_wallet.pending_timelock_count()).unwrap_or(0),
-                bitcoin_connected_peers: s.bitcoin_client.as_ref().map_or(0, |c| c.connected_peers()),
+                mining_active: s.wallet.as_ref().map(|_w| true).unwrap_or(false),
+                mining_proofs_pending: s.wallet.as_ref().map(|_w| 0usize).unwrap_or(0),
+                mining_hash_rate_ph: 0.0,
                 profile: if s.is_testnet { "testnet" } else { "production" }.to_string(),
                 profile_description: if s.is_testnet { "testnet" } else { "production" }.to_string(),
                 unsafe_mode: s.unsafe_mode,
@@ -1183,9 +1258,8 @@ fn handle_node_info(state: &Arc<Mutex<ArteryState>>, node: &MeshPulseNode) -> Rp
                 discovered_peer_count: 0, cached_peer_count: 0,
                 verified_peer_count: 0, node_contact,
                 estimated_network_size: 0, tag_count: 0, registry_count: 0,
-                limbo_count: 0, bitcoin_receive_address: None,
-                bitcoin_tracked_balance: None, bitcoin_pending_burns: 0,
-                bitcoin_connected_peers: 0,
+                limbo_count: 0, mining_active: false,
+                mining_proofs_pending: 0, mining_hash_rate_ph: 0.0,
                 profile: "testnet".to_string(), profile_description: "testnet".to_string(),
                 unsafe_mode: false, test_faucet_enabled: false,
             })
@@ -1200,9 +1274,8 @@ fn handle_node_info(state: &Arc<Mutex<ArteryState>>, node: &MeshPulseNode) -> Rp
                 discovered_peer_count: local_count, cached_peer_count: 0,
                 verified_peer_count: 0, node_contact,
                 estimated_network_size: 0, tag_count: 0, registry_count: 0,
-                limbo_count: 0, bitcoin_receive_address: None,
-                bitcoin_tracked_balance: None, bitcoin_pending_burns: 0,
-                bitcoin_connected_peers: 0,
+                limbo_count: 0, mining_active: false,
+                mining_proofs_pending: 0, mining_hash_rate_ph: 0.0,
                 profile: "testnet".to_string(), profile_description: "testnet".to_string(),
                 unsafe_mode: false, test_faucet_enabled: false,
             })
@@ -1284,8 +1357,8 @@ fn handle_node_health(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
         if s.routing_table.peer_count() > 0 {
             sources.push("peers_present".to_string());
         }
-        if s.bitcoin_client.is_some() {
-            sources.push("bitcoin_seed".to_string());
+        if s.estimated_network_size > 0 {
+            sources.push("mesh".to_string());
         }
         sources
     };
@@ -1307,14 +1380,7 @@ fn handle_node_health(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
         wallet_state: wallet_state.to_string(),
         wallet_balance,
         wallet_watch_only,
-        bitcoin_peers: {
-            s.bitcoin_client.as_ref().map_or(0usize, |c: &vess_bitcoin::BitcoinLightClient| c.connected_peers())
-        },
-        bitcoin_pending_burns: s
-            .wallet
-            .as_ref()
-            .map(|ws| ws.bitcoin_wallet.pending_timelock_count())
-            .unwrap_or(0),
+
         discovery_sources,
         total_supply,
         passive_mode: s.passive_mode,
@@ -2814,11 +2880,6 @@ async fn handle_wallet_unlock(
         return RpcResponse::err(format!("failed to decrypt wallet metadata: {e}"));
     }
     let mailbox_key = vess_kloak::derive_mailbox_key(&address.spend_ek);
-    let (bitcoin_wallet, bitcoin_receive_address) =
-        match crate::node_runner::load_bitcoin_wallet_state(&wallet, &raw_seed, &enc_key) {
-            Ok(state) => state,
-            Err(e) => return RpcResponse::err(format!("failed to load bitcoin wallet state: {e}")),
-        };
 
     // Load billfold and decrypt spend credentials into it.
     let mut billfold = wallet.billfold.clone();
@@ -2841,11 +2902,12 @@ async fn handle_wallet_unlock(
             stealth_secret,
             stealth_address: address,
             billfold,
-            bitcoin_wallet,
-            bitcoin_receive_address,
             wallet_path: wallet_path.clone(),
             enc_key,
             mailbox_key,
+            mining_next_nonce: wallet.mining_next_nonce,
+            mining_session_nonce: wallet.mining_session_nonce,
+            mining_prev_hash: wallet.mining_prev_hash,
         });
 
         // Recover century locks from wallet file IDs.
@@ -3363,7 +3425,7 @@ fn handle_local_test_faucet(
                     mint_id,
                     chain_tip,
                     chain_depth: 0,
-                    asset: vess_foundry::Asset::Btc,
+                    asset: vess_foundry::Asset::VHALIX,
                 };
                 let cred = SpendCredential {
                     spend_vk: owner_vk.clone(),
@@ -3553,7 +3615,7 @@ mod tests {
             mint_id: [mint_byte; 32],
             chain_tip: [mint_byte.wrapping_add(2); 32],
             chain_depth: 0,
-            asset: vess_foundry::Asset::Btc,
+            asset: vess_foundry::Asset::VHALIX,
         }
     }
 
@@ -4144,16 +4206,16 @@ fn handle_century_locks(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
     let locks: Vec<serde_json::Value> = s.century_locks
         .values()
         .map(|lock| {
+            let current_tick = s.network_time.median_tick;
             serde_json::json!({
                 "lock_id": crate::persistence::hex_key(&lock.lock_id),
-                "total_sats": lock.total_sats,
-                "per_block_vess": lock.per_block_vess,
-                "start_block": lock.start_block,
-                "end_block": lock.end_block,
-                "last_claimed_block": lock.last_claimed_block,
-                "unclaimed_blocks": lock.unclaimed_blocks(s.century_lock_last_block),
-                "remaining_vess": lock.remaining_vess(s.century_lock_last_block),
-                "active": lock.is_active(s.century_lock_last_block),
+                "total_VHALIX": lock.total_locked,
+                "per_tick_vess": lock.per_tick_vess,
+                "start_tick": lock.start_tick,
+                "end_tick": lock.end_tick,
+                "last_claimed_tick": lock.last_claimed_tick,
+                "remaining_vess": lock.remaining_vess(current_tick),
+                "active": lock.is_active(current_tick),
                 "created_at": lock.created_at,
             })
         })
@@ -4163,13 +4225,13 @@ fn handle_century_locks(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
 
 async fn handle_century_lock_create(
     state: &Arc<Mutex<ArteryState>>,
-    burn_proof_json: &str,
+    lock_proof_json: &str,
     manifest_tx: &tokio::sync::mpsc::UnboundedSender<vess_protocol::ManifestStore>,
 ) -> RpcResponse {
-    let burn_proof: vess_protocol::BitcoinTimeLockProof =
-        match serde_json::from_str(burn_proof_json) {
-            Ok(bp) => bp,
-            Err(e) => return RpcResponse::err(format!("invalid burn proof JSON: {e}")),
+    let proof: vess_protocol::VHALIXMinedProof =
+        match serde_json::from_str(lock_proof_json) {
+            Ok(p) => p,
+            Err(e) => return RpcResponse::err(format!("invalid VHALIX proof JSON: {e}")),
         };
 
     let mut s = lock_state(state);
@@ -4177,16 +4239,244 @@ async fn handle_century_lock_create(
         return RpcResponse::err("wallet must be unlocked to create a century lock");
     }
 
-    match s.create_century_lock(burn_proof, manifest_tx) {
+    match s.create_century_lock(&proof, manifest_tx) {
         Ok(lock) => RpcResponse::ok(RpcData::CenturyLockCreated {
             lock_id: crate::persistence::hex_key(&lock.lock_id),
-            total_sats: lock.total_sats,
-            per_block_vess: lock.per_block_vess,
-            start_block: lock.start_block,
-            end_block: lock.end_block,
+            total_VHALIX: lock.total_locked,
+            per_tick_vess: lock.per_tick_vess,
+            start_tick: lock.start_tick,
+            end_tick: lock.end_tick,
         }),
         Err(e) => RpcResponse::err(e),
     }
+}
+
+async fn handle_VHALIX_lock(
+    state: &Arc<Mutex<ArteryState>>,
+    VHALIX_mint_id: &str,
+    lock_years: f64,
+    og_tx: &tokio::sync::mpsc::UnboundedSender<vess_protocol::OwnershipGenesis>,
+) -> RpcResponse {
+    let mint_id: [u8; 32] = match crate::persistence::unhex_key(VHALIX_mint_id) {
+        Ok(id) => id,
+        Err(_) => return RpcResponse::err("invalid VHALIX_mint_id hex"),
+    };
+
+    if lock_years < 1.0 || lock_years > 10.0 {
+        return RpcResponse::err("lock_years must be between 1.0 and 10.0");
+    }
+
+    let lock_ticks = (lock_years * vess_clock::TICKS_PER_YEAR as f64) as u64;
+    let (current_tick, owner_vk, owner_vk_hash) = {
+        let s = lock_state(state);
+        if s.network_time.median_tick == 0 {
+            return RpcResponse::err("network clock not synchronized yet");
+        }
+        match s.wallet.as_ref() {
+            Some(w) => {
+                let vk_hash = vess_foundry::spend_auth::vk_hash(&w.stealth_address.spend_ek);
+                (s.network_time.median_tick, w.stealth_address.spend_ek.clone(), vk_hash)
+            }
+            None => return RpcResponse::err("wallet must be unlocked"),
+        }
+    };
+
+    let locked_until_tick = current_tick.saturating_add(lock_ticks);
+    let total_vess = (lock_years * 100.0) as u64;
+
+    // Queue a self-transfer OwnershipClaim with the lock
+    let oc = vess_protocol::OwnershipClaim {
+        mint_id,
+        stealth_id: [0u8; 32],
+        prev_owner_vk: owner_vk.clone(),
+        transfer_sig: Vec::new(),
+        new_owner_vk_hash: owner_vk_hash,
+        new_owner_vk: owner_vk.clone(),
+        new_chain_tip: [0u8; 32],
+        timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        hops_remaining: 0,
+        chain_depth: 0,
+        encrypted_bill: Vec::new(),
+        pow_nonce: None,
+        pow_hash: None,
+        accumulated_work: None,
+        hash_preimage: None,
+        locked_until_tick,
+    };
+
+    let _ = og_tx.send(vess_protocol::OwnershipGenesis {
+        mint_id,
+        chain_tip: [0u8; 32],
+        owner_vk_hash,
+        owner_vk: owner_vk.clone(),
+        denomination_value: total_vess,
+        genesis_proof: vess_protocol::GenesisProof::Vess(Vec::new()),
+        digest: [0u8; 32],
+        hops_remaining: 0,
+        chain_depth: 0,
+        output_index: 0,
+        pow_nonce: None,
+        pow_hash: None,
+        accumulated_work: None,
+    });
+
+    RpcResponse::ok(RpcData::VHALIXLockCreated {
+        vess_mint_ids: vec![crate::persistence::hex_key(&mint_id)],
+        total_vess,
+        locked_until_tick,
+        message: format!("Locked VHALIX for {:.1} years. Locked until tick {}.", lock_years, locked_until_tick),
+    })
+}
+
+fn handle_mine_start(
+    state: &Arc<Mutex<ArteryState>>,
+    og_tx: &tokio::sync::mpsc::UnboundedSender<vess_protocol::OwnershipGenesis>,
+) -> RpcResponse {
+    let mut s = lock_state(state);
+
+    if s.mining_active {
+        return RpcResponse::ok(RpcData::MineStarted {
+            chain_index: 0,
+            chain_length: s.mining_chain_length,
+            estimated_denomination: vess_foundry::Denomination::max_valid_denomination(s.mining_chain_length),
+            message: "Miner is already running.".to_string(),
+        });
+    }
+
+    let wallet = match s.wallet.as_ref() {
+        Some(w) => w,
+        None => return RpcResponse::err("wallet must be unlocked to mine"),
+    };
+
+    // Get owner verification key hash from wallet credentials
+    // Extract all needed wallet fields first to avoid borrow conflicts
+    let (owner_vk_hash, session_nonce, next_nonce, prev_hash) = {
+        let wallet = match s.wallet.as_ref() {
+            Some(w) => w,
+            None => return RpcResponse::err("wallet must be unlocked to mine"),
+        };
+
+        let owner_vk_hash = match wallet.billfold.any_credential() {
+            Some(cred) => vess_foundry::spend_auth::vk_hash(&cred.spend_vk),
+            None => {
+                let (vk, _sk) = vess_foundry::spend_auth::generate_spend_keypair();
+                vess_foundry::spend_auth::vk_hash(&vk)
+            }
+        };
+        let session_nonce = wallet.mining_session_nonce.saturating_add(1);
+        let next_nonce = wallet.mining_next_nonce;
+        let prev_hash = wallet.mining_prev_hash;
+        (owner_vk_hash, session_nonce, next_nonce, prev_hash)
+    };
+
+    let tick_hash = s.tick_clock.state().current_hash;
+
+    // Update wallet session nonce
+    if let Some(wallet_mut) = s.wallet.as_mut() {
+        wallet_mut.mining_session_nonce = session_nonce;
+    }
+
+    s.mining_active = true;
+    s.mining_session_nonce = session_nonce;
+    s.mining_tick_hash = tick_hash;
+    s.mining_chain_length = 0;
+    s.mining_next_nonce = next_nonce;
+    s.mining_started_at = ArteryState::now_unix();
+
+    // Spawn the mining thread
+    let state_clone = state.clone();
+    let og_tx_clone = og_tx.clone();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    s.mining_stop_tx = Some(stop_tx);
+
+    tokio::task::spawn_blocking(move || {
+        crate::node_runner::run_mining_loop(state_clone, og_tx_clone, stop_rx, owner_vk_hash, next_nonce, prev_hash, session_nonce, tick_hash);
+    });
+
+    RpcResponse::ok(RpcData::MineStarted {
+        chain_index: 0,
+        chain_length: 0,
+        estimated_denomination: 0,
+        message: format!("Mining started. Session {}, anchored to tick.", session_nonce),
+    })
+}
+
+fn handle_mine_stop(
+    state: &Arc<Mutex<ArteryState>>,
+    og_tx: &tokio::sync::mpsc::UnboundedSender<vess_protocol::OwnershipGenesis>,
+) -> RpcResponse {
+    let mut s = lock_state(state);
+
+    if !s.mining_active {
+        return RpcResponse::ok(RpcData::MineStopped {
+            mint_id: None,
+            chain_length: 0,
+            denomination: 0,
+            message: "Miner is not running.".to_string(),
+        });
+    }
+
+    // Take the stop sender out of state first (ends mutable field borrow)
+    let stop_tx = s.mining_stop_tx.take();
+    if let Some(tx) = stop_tx {
+        let _ = tx.send(());
+    }
+
+    // Now read state fields (immutable borrows, no conflict)
+    let chain_length = s.mining_chain_length;
+    let mining_next_nonce = s.mining_next_nonce;
+    let denomination = vess_foundry::Denomination::max_valid_denomination(chain_length);
+
+    // Now do mutable operations
+    s.mining_active = false;
+    if let Some(wallet) = s.wallet.as_mut() {
+        wallet.mining_next_nonce = mining_next_nonce;
+    }
+
+    let msg = if chain_length >= vess_foundry::mine::MIN_CHAIN_LENGTH {
+        format!(
+            "Miner stopped. Chain length: {}, denomination: {}. Bill submitted on hardening.",
+            chain_length, denomination,
+        )
+    } else {
+        format!(
+            "Miner stopped. Chain length: {} (below minimum {} — no bill submitted).",
+            chain_length,
+            vess_foundry::mine::MIN_CHAIN_LENGTH,
+        )
+    };
+
+    RpcResponse::ok(RpcData::MineStopped {
+        mint_id: None,
+        chain_length,
+        denomination,
+        message: msg,
+    })
+}
+
+fn handle_mine_status(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
+    let s = lock_state(state);
+
+    let chains = if s.mining_active {
+        let denom = vess_foundry::Denomination::max_valid_denomination(s.mining_chain_length);
+        vec![MineChainStatus {
+            chain_index: 0,
+            chain_length: s.mining_chain_length,
+            estimated_denomination: denom,
+            next_nonce: s.mining_next_nonce,
+            elapsed_seconds: ArteryState::now_unix().saturating_sub(s.mining_started_at),
+        }]
+    } else {
+        Vec::new()
+    };
+
+    RpcResponse::ok(RpcData::MineStatus {
+        active_chains: chains.len(),
+        chains,
+    })
 }
 
 async fn handle_recover_manifest(

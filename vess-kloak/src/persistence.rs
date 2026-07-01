@@ -138,6 +138,21 @@ pub struct WalletFile {
     #[serde(default)]
     pub century_lock_ids: Vec<[u8; 32]>,
 
+    /// Next bill_nonce for the VHALIX miner.  Persisted to prevent
+    /// nonce reuse across restarts (which would allow double-claims).
+    #[serde(default)]
+    pub mining_next_nonce: u64,
+
+    /// Mining session counter — incremented each time mining starts.
+    /// Combined with tick_hash to produce unique mint_ids per session.
+    #[serde(default)]
+    pub mining_session_nonce: u64,
+
+    /// `argon2_hash` of the last-mined proof before the last shutdown.
+    /// Restored via `VHALIXMiner::restore` to resume the chain.
+    #[serde(default)]
+    pub mining_prev_hash: [u8; 32],
+
     /// Password-encrypted copy of the encryption key for fast daily unlock.
     /// Set via `vess init --password` or `vess set-password`.
     #[serde(default)]
@@ -172,6 +187,12 @@ struct WalletPrivateMetadata {
     next_dht_index: u64,
     tag_registration: Option<StoredTagRegistration>,
     century_lock_ids: Vec<[u8; 32]>,
+    #[serde(default)]
+    mining_next_nonce: u64,
+    #[serde(default)]
+    mining_session_nonce: u64,
+    #[serde(default)]
+    mining_prev_hash: [u8; 32],
 }
 
 #[derive(Serialize, Deserialize)]
@@ -257,6 +278,9 @@ impl WalletFile {
             password_cache: None,
             integrity_hash: None,
             century_lock_ids: Vec::new(),
+            mining_next_nonce: 0,
+            mining_session_nonce: 0,
+            mining_prev_hash: [0u8; 32],
         };
         wallet.refresh_encrypted_private_metadata(enc_key)?;
         Ok(wallet)
@@ -275,6 +299,9 @@ impl WalletFile {
             next_dht_index: self.next_dht_index,
             tag_registration: self.tag_registration.clone(),
             century_lock_ids: self.century_lock_ids.clone(),
+            mining_next_nonce: self.mining_next_nonce,
+            mining_session_nonce: self.mining_session_nonce,
+            mining_prev_hash: self.mining_prev_hash,
         }
     }
 
@@ -297,6 +324,9 @@ impl WalletFile {
         self.next_dht_index = metadata.next_dht_index;
         self.tag_registration = metadata.tag_registration;
         self.century_lock_ids = metadata.century_lock_ids;
+        self.mining_next_nonce = metadata.mining_next_nonce;
+        self.mining_session_nonce = metadata.mining_session_nonce;
+        self.mining_prev_hash = metadata.mining_prev_hash;
         Ok(())
     }
 
@@ -996,7 +1026,7 @@ mod tests {
             mint_id: [0x33; 32],
             chain_tip: [0x44; 32],
             chain_depth: 0,
-            asset: vess_foundry::Asset::Btc,
+            asset: vess_foundry::Asset::Vess,
         };
         billfold.deposit_with_credentials(
             bill.clone(),

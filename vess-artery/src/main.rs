@@ -58,12 +58,9 @@ async fn main() {
         wallet_path,
         rpc_port: Some(rpc_port),
         wallet_password: None,
-        bitcoin_config: None,
         bind_addr,
         enable_local_discovery: true,
-        allow_private_bitcoin_seed_contact: false,
         reset_transient_peer_state: false,
-        is_testnet,
         test: false,
         bootstrap_dns: vec![],
     };

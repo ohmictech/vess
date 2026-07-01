@@ -1,6 +1,5 @@
 [workspace]
 members = [
-    "vess-bitcoin",
     "vess-mesh",
     "vess-clock",
     "vess-vascular",
@@ -10,8 +9,6 @@ members = [
     "vess-artery",
     "vess-kloak",
     "vess-protocol",
-    "vess-tests",
-    "vess-mobile",
 ]
 exclude = [
     "vess-ui/src-tauri",

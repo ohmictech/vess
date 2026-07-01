@@ -36,7 +36,7 @@ fn fresh_bill(denom: Denomination) -> VessBill {
         mint_id: rand::random(),
         chain_tip: rand::random(),
         chain_depth: 0,
-        asset: vess_foundry::Asset::Btc,
+        asset: vess_foundry::Asset::Vess,
     }
 }
 

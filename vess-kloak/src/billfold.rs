@@ -103,6 +103,12 @@ impl BillFold {
         self.spend_credentials.get(mint_id)
     }
 
+    /// Return any available spend credential (for miners and other
+    /// contexts where a specific bill isn't needed).
+    pub fn any_credential(&self) -> Option<&SpendCredential> {
+        self.spend_credentials.values().next()
+    }
+
     /// Total value of all bills in the billfold.
     pub fn balance(&self) -> u64 {
         self.bills.iter().map(|b| b.denomination.value()).sum()
@@ -260,7 +266,7 @@ mod tests {
             mint_id: rand::random(),
             chain_tip: rand::random(),
             chain_depth: 0,
-            asset: vess_foundry::Asset::Btc,
+            asset: vess_foundry::Asset::Vess,
         }
     }
 

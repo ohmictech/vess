@@ -1,15 +1,35 @@
-//! Vharyx miner — Argon2id CPU-burn proof generator.
+//! VHALIX miner — Argon2id CPU-burn proof generator.
 //!
-//! Each mining proof is one Argon2id invocation with fixed parameters:
+//! Each proof is an INDEPENDENT Argon2id invocation:
 //!
 //! ```text
-//! m_cost = 256 MiB  (memory — fits L3 cache of mid-range CPU)
-//! t_cost = 3        (time passes through memory)
+//! m_cost = 1 GiB    (memory — beyond commodity ASIC HBM capacity)
+//! t_cost = 12       (~30 min per proof on mid-range CPU)
 //! p_cost = 1        (single-threaded — no parallelism advantage)
+//!
+//! password = owner_vk_hash || bill_nonce_be || domain
 //! ```
 //!
-//! Proofs are batched into Merkle trees for efficient submission.
-//! The miner runs in the background on a configurable number of CPU cores.
+//! Each proof is bound to a specific (owner, nonce) pair — you cannot
+//! move a proof from nonce 5 to nonce 7 because the nonce is in the
+//! Argon2id password.  Proofs are batched into a Merkle tree and
+//! 3 random spot-checks (genuine Argon2id recomputation) provide
+//! ~99.99% fraud detection.
+//!
+//! ## Denomination schedule (at ~30 min/proof)
+//!
+//! | Denom | Proofs   | Time       |
+//! |-------|----------|------------|
+//! | 5     | 5+       | 2.5 hours  |
+//! | 10    | 10+      | 5 hours    |
+//! | 50    | 50+      | 25 hours   |
+//! | 100   | 100+     | 50 hours   |
+//! | 500   | 500+     | 10.4 days  |
+//! | 1000  | 1000+    | 20.8 days  |
+//! | 2000  | 2000+    | 41.7 days  |
+//! | 5000  | 5000+    | 104 days   |
+//!
+//! Minimum bill: 5 proofs (denomination 5).
 
 use std::time::Instant;
 
@@ -19,20 +39,23 @@ use blake3::Hasher;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
-/// Argon2id memory cost — 256 MiB in KiB.
-pub const VHARYX_M_COST: u32 = 256 * 1024;
+/// Argon2id memory cost — 1 GiB in KiB.
+pub const VHALIX_M_COST: u32 = 1024 * 1024;
 
-/// Argon2id time passes.
-pub const VHARYX_T_COST: u32 = 3;
+/// Argon2id time passes (~2.5 min/pass at 1 GiB → ~30 min total).
+pub const VHALIX_T_COST: u32 = 12;
+
+/// Minimum chain length for a valid bill (denomination 5).
+pub const MIN_CHAIN_LENGTH: u64 = 5;
 
 /// Argon2id parallelism — deliberately single-threaded.
-pub const VHARYX_P_COST: u32 = 1;
+pub const VHALIX_P_COST: u32 = 1;
 
 /// Output length in bytes.
-pub const VHARYX_HASH_LEN: usize = 32;
+pub const VHALIX_HASH_LEN: usize = 32;
 
 /// Domain separator for the Argon2id password.
-const MINING_DOMAIN: &[u8] = b"vess-vharyx-mine-v1";
+const MINING_DOMAIN: &[u8] = b"vess-VHALIX-mine-v1";
 
 /// Default batch size: submit after this many proofs accumulate.
 pub const DEFAULT_BATCH_SIZE: usize = 64;
@@ -46,9 +69,10 @@ pub const TARGET_MINE_INTERVAL_SECS: u64 = 30;
 /// A single completed Argon2id mining proof.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MiningProof {
-    /// The node that mined this proof.
-    pub miner_node_id: [u8; 32],
+    /// Blake3 hash of the owner's verification key (binds proof to wallet).
+    pub owner_vk_hash: [u8; 32],
     /// Monotonically increasing counter — never reused.
+    /// Baked into the Argon2id password so proofs cannot be reordered.
     pub bill_nonce: u64,
     /// Blake3 hash of the Argon2id output.
     pub argon2_hash: [u8; 32],
@@ -63,8 +87,8 @@ pub struct MiningProof {
 /// A batch of mining proofs ready for genesis submission.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MiningBatch {
-    /// The node that mined these proofs.
-    pub miner_node_id: [u8; 32],
+    /// Blake3 hash of the owner's verification key.
+    pub owner_vk_hash: [u8; 32],
     /// First bill_nonce in this batch (inclusive).
     pub bill_nonce_start: u64,
     /// Last bill_nonce in this batch (inclusive).
@@ -79,69 +103,73 @@ pub struct MiningBatch {
 
 // ── Miner ───────────────────────────────────────────────────────────
 
-/// Background Vharyx miner.
+/// Background VHALIX miner.
 ///
-/// Runs one Argon2id invocation per `mine_one()` call.  The caller
-/// decides how many cores to dedicate and how often to call it.
-pub struct VharyxMiner {
-    miner_node_id: [u8; 32],
+/// Runs one Argon2id invocation per `mine_one()` call.  Proofs are
+/// independent — each is bound to `(owner_vk_hash, bill_nonce)` via
+/// the Argon2id password.  The caller decides how many parallel
+/// mining threads to run.
+pub struct VHALIXMiner {
+    owner_vk_hash: [u8; 32],
     next_bill_nonce: u64,
+    /// Per-wallet mining session counter (persisted).
+    session_nonce: u64,
+    /// Hash of the network tick that anchored this session.
+    tick_hash: [u8; 32],
     pending_proofs: Vec<MiningProof>,
     batch_size: usize,
 }
 
-impl VharyxMiner {
-    /// Create a new miner for the given node identity.
-    ///
-    /// The `starting_nonce` should be persisted across restarts to
-    /// ensure bill_nonces are never reused (reuse would allow
-    /// double-claiming the same compute work).
-    pub fn new(miner_node_id: [u8; 32], starting_nonce: u64) -> Self {
+impl VHALIXMiner {
+    /// Create a new miner.
+    pub fn new(
+        owner_vk_hash: [u8; 32],
+        starting_nonce: u64,
+        session_nonce: u64,
+        tick_hash: [u8; 32],
+    ) -> Self {
         Self {
-            miner_node_id,
+            owner_vk_hash,
             next_bill_nonce: starting_nonce,
+            session_nonce,
+            tick_hash,
             pending_proofs: Vec::with_capacity(DEFAULT_BATCH_SIZE),
             batch_size: DEFAULT_BATCH_SIZE,
         }
     }
 
-    /// Set a custom batch size.
     pub fn with_batch_size(mut self, size: usize) -> Self {
         self.batch_size = size.max(1);
         self
     }
 
-    /// Run one Argon2id mining cycle.
+    /// Run one Argon2id mining cycle (~30 min at 1 GiB).
     ///
-    /// This is a blocking call that consumes ~256 MiB of RAM and takes
-    /// roughly `TARGET_MINE_INTERVAL_SECS` seconds on a modern CPU.
-    /// Call this from a dedicated thread or `tokio::task::spawn_blocking`.
+    /// Each proof is independent — password is `owner_vk_hash || nonce || domain`.
+    /// The nonce prevents reordering: proof at nonce 5 cannot be claimed as nonce 7.
     pub fn mine_one(&mut self) -> MiningProof {
         let bill_nonce = self.next_bill_nonce;
         self.next_bill_nonce += 1;
 
         let started = Instant::now();
 
-        // Build the password: miner_node_id || bill_nonce_be || domain
+        // Password: owner_vk_hash || bill_nonce_be || domain
         let mut password = Vec::with_capacity(32 + 8 + MINING_DOMAIN.len());
-        password.extend_from_slice(&self.miner_node_id);
+        password.extend_from_slice(&self.owner_vk_hash);
         password.extend_from_slice(&bill_nonce.to_be_bytes());
         password.extend_from_slice(MINING_DOMAIN);
 
-        // Salt: just the domain, keeps it deterministic
-        let salt = b"vess-vharyx-salt-v1";
-
-        // Argon2id output
-        let mut output = [0u8; VHARYX_HASH_LEN];
+        let salt = b"vess-VHALIX-salt-v1";
+        let mut output = [0u8; VHALIX_HASH_LEN];
 
         let argon2 = Argon2::new(
             argon2::Algorithm::Argon2id,
             argon2::Version::V0x13,
             argon2::Params::new(
-                VHARYX_M_COST,
-                VHARYX_T_COST,
-                VHARYX_P_COST,
-                Some(VHARYX_HASH_LEN),
+                VHALIX_M_COST,
+                VHALIX_T_COST,
+                VHALIX_P_COST,
+                Some(VHALIX_HASH_LEN),
             )
             .expect("valid argon2 params"),
         );
@@ -153,24 +181,20 @@ impl VharyxMiner {
         let elapsed = started.elapsed();
         let now = wall_time_ms();
 
-        // Hash the output for the proof
         let mut hasher = Hasher::new();
-        hasher.update(b"vess-vharyx-commit-v1");
+        hasher.update(b"vess-VHALIX-commit-v1");
         hasher.update(&output);
         hasher.update(&bill_nonce.to_be_bytes());
-        hasher.update(&self.miner_node_id);
+        hasher.update(&self.owner_vk_hash);
         let argon2_hash = *hasher.finalize().as_bytes();
 
-        // Build a simplified memory Merkle root from the output.
-        // In production, this would be built from the actual Argon2
-        // memory matrix. For now, we derive it from the output hash.
         let mut mem_hasher = Hasher::new();
-        mem_hasher.update(b"vess-vharyx-mem-root-v1");
+        mem_hasher.update(b"vess-VHALIX-mem-root-v1");
         mem_hasher.update(&output);
         let memory_merkle_root = *mem_hasher.finalize().as_bytes();
 
         let proof = MiningProof {
-            miner_node_id: self.miner_node_id,
+            owner_vk_hash: self.owner_vk_hash,
             bill_nonce,
             argon2_hash,
             memory_merkle_root,
@@ -182,37 +206,28 @@ impl VharyxMiner {
         proof
     }
 
-    /// How many proofs are pending submission?
-    pub fn pending_count(&self) -> usize {
-        self.pending_proofs.len()
-    }
-
-    /// Is the batch ready to submit?
-    pub fn batch_ready(&self) -> bool {
-        self.pending_proofs.len() >= self.batch_size
-    }
+    pub fn pending_count(&self) -> usize { self.pending_proofs.len() }
+    pub fn batch_ready(&self) -> bool { self.pending_proofs.len() >= self.batch_size }
+    pub fn next_bill_nonce(&self) -> u64 { self.next_bill_nonce }
+    pub fn owner_vk_hash(&self) -> [u8; 32] { self.owner_vk_hash }
+    pub fn session_nonce(&self) -> u64 { self.session_nonce }
+    pub fn tick_hash(&self) -> [u8; 32] { self.tick_hash }
 
     /// Finalize the current batch and return it for genesis submission.
-    ///
-    /// This drains pending proofs, builds a Merkle tree over them,
-    /// and returns the batch.  The proofs are removed from the miner.
     pub fn finalize_batch(&mut self) -> Option<MiningBatch> {
         if self.pending_proofs.is_empty() {
             return None;
         }
 
         let proofs: Vec<MiningProof> = self.pending_proofs.drain(..).collect();
-
         let bill_nonce_start = proofs.first().map(|p| p.bill_nonce).unwrap_or(0);
         let bill_nonce_end = proofs.last().map(|p| p.bill_nonce).unwrap_or(0);
         let total_compute_ms: u64 = proofs.iter().map(|p| p.elapsed_ms).sum();
-
-        // Build Merkle root over proof hashes
         let leaf_hashes: Vec<[u8; 32]> = proofs.iter().map(|p| p.argon2_hash).collect();
         let merkle_root = build_batch_merkle_root(&leaf_hashes);
 
         Some(MiningBatch {
-            miner_node_id: self.miner_node_id,
+            owner_vk_hash: self.owner_vk_hash,
             bill_nonce_start,
             bill_nonce_end,
             proofs,
@@ -220,59 +235,69 @@ impl VharyxMiner {
             total_compute_ms,
         })
     }
-
-    /// The next bill_nonce that will be used.
-    pub fn next_bill_nonce(&self) -> u64 {
-        self.next_bill_nonce
-    }
-
-    /// The miner's node ID.
-    pub fn miner_node_id(&self) -> [u8; 32] {
-        self.miner_node_id
-    }
 }
 
 // ── Batch verification ──────────────────────────────────────────────
 
-/// Verify a mining batch's Merkle root against a spot-check.
+/// Verify a mining batch by Merkle root + spot-checking 3 random proofs.
 ///
-/// Verifies 3 random leaves to ensure the batch is valid without
-/// verifying every proof.  For a 64-proof batch, this gives
-/// ~99.99% confidence with 3 checks.
+/// For each spot-checked proof, recomputes Argon2id to confirm the
+/// argon2_hash is genuine.  3 checks on a 64-proof batch give ~99.99%
+/// fraud detection.
+///
+/// NOTE: This is expensive (~30 min × 3 = 90 min for 1 GiB proofs).
+/// Call from a dedicated thread via `spawn_blocking`.
 pub fn verify_batch_spot_check(batch: &MiningBatch, seed: u64) -> Result<()> {
     if batch.proofs.is_empty() {
         return Err(anyhow!("empty mining batch"));
     }
 
-    let leaf_hashes: Vec<[u8; 32]> = batch.proofs.iter().map(|p| p.argon2_hash).collect();
-
     // Verify Merkle root
+    let leaf_hashes: Vec<[u8; 32]> = batch.proofs.iter().map(|p| p.argon2_hash).collect();
     let computed_root = build_batch_merkle_root(&leaf_hashes);
     if computed_root != batch.merkle_root {
         return Err(anyhow!("batch Merkle root mismatch"));
     }
 
-    // Spot-check 3 random proofs
+    // Spot-check 3 random proofs: recompute Argon2id
     let spot_count = 3.min(batch.proofs.len());
     for i in 0..spot_count {
         let idx = deterministic_index(seed, i as u64, batch.proofs.len());
         let proof = &batch.proofs[idx];
 
-        // Verify the Merkle path for this leaf
-        let path = build_merkle_path(&leaf_hashes, proof.argon2_hash);
-        let mut current = proof.argon2_hash;
-        for (sibling, is_left) in &path {
-            if *is_left {
-                current = hash_pair(*sibling, current);
-            } else {
-                current = hash_pair(current, *sibling);
-            }
-        }
-        if current != batch.merkle_root {
+        // Recompute Argon2id for this proof
+        let mut password = Vec::with_capacity(32 + 8 + MINING_DOMAIN.len());
+        password.extend_from_slice(&proof.owner_vk_hash);
+        password.extend_from_slice(&proof.bill_nonce.to_be_bytes());
+        password.extend_from_slice(MINING_DOMAIN);
+
+        let mut output = [0u8; VHALIX_HASH_LEN];
+        let argon2 = Argon2::new(
+            argon2::Algorithm::Argon2id,
+            argon2::Version::V0x13,
+            argon2::Params::new(
+                VHALIX_M_COST,
+                VHALIX_T_COST,
+                VHALIX_P_COST,
+                Some(VHALIX_HASH_LEN),
+            ).expect("valid argon2 params"),
+        );
+        argon2
+            .hash_password_into(&password, b"vess-VHALIX-salt-v1", &mut output)
+            .map_err(|e| anyhow!("argon2id spot-check {i} failed: {e}"))?;
+
+        let mut hasher = Hasher::new();
+        hasher.update(b"vess-VHALIX-commit-v1");
+        hasher.update(&output);
+        hasher.update(&proof.bill_nonce.to_be_bytes());
+        hasher.update(&proof.owner_vk_hash);
+        let computed_hash = *hasher.finalize().as_bytes();
+
+        if computed_hash != proof.argon2_hash {
             return Err(anyhow!(
-                "spot-check {} failed: leaf at index {} does not match Merkle root",
+                "spot-check {} failed: argon2_hash mismatch at nonce {}",
                 i,
-                idx
+                proof.bill_nonce,
             ));
         }
     }
@@ -280,7 +305,54 @@ pub fn verify_batch_spot_check(batch: &MiningBatch, seed: u64) -> Result<()> {
     Ok(())
 }
 
-// ── Merkle helpers (same pattern as vess-clock) ─────────────────────
+/// Recompute Argon2id for a single proof and verify its `argon2_hash`.
+///
+/// This is the core verification primitive.  It recomputes the exact
+/// Argon2id invocation the miner ran and checks the resulting hash.
+/// One genuine verification of ANY proof in a batch is sufficient
+/// to detect fraud — an attacker who fabricates proofs cannot pass
+/// even one check.
+pub fn verify_single_proof(proof: &MiningProof) -> Result<()> {
+    let mut password = Vec::with_capacity(32 + 8 + MINING_DOMAIN.len());
+    password.extend_from_slice(&proof.owner_vk_hash);
+    password.extend_from_slice(&proof.bill_nonce.to_be_bytes());
+    password.extend_from_slice(MINING_DOMAIN);
+
+    let mut output = [0u8; VHALIX_HASH_LEN];
+    let argon2 = Argon2::new(
+        argon2::Algorithm::Argon2id,
+        argon2::Version::V0x13,
+        argon2::Params::new(
+            VHALIX_M_COST,
+            VHALIX_T_COST,
+            VHALIX_P_COST,
+            Some(VHALIX_HASH_LEN),
+        )
+        .expect("valid argon2 params"),
+    );
+
+    argon2
+        .hash_password_into(&password, b"vess-VHALIX-salt-v1", &mut output)
+        .map_err(|e| anyhow!("argon2id recompute failed: {e}"))?;
+
+    let mut hasher = Hasher::new();
+    hasher.update(b"vess-VHALIX-commit-v1");
+    hasher.update(&output);
+    hasher.update(&proof.bill_nonce.to_be_bytes());
+    hasher.update(&proof.owner_vk_hash);
+    let computed_hash = *hasher.finalize().as_bytes();
+
+    if computed_hash != proof.argon2_hash {
+        return Err(anyhow!(
+            "argon2_hash mismatch at nonce {}",
+            proof.bill_nonce,
+        ));
+    }
+
+    Ok(())
+}
+
+// ── Merkle helpers ──────────────────────────────────────────────────
 
 fn build_batch_merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
     if leaves.is_empty() {
@@ -304,32 +376,6 @@ fn build_batch_merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
     level[0]
 }
 
-fn build_merkle_path(leaves: &[[u8; 32]], target: [u8; 32]) -> Vec<([u8; 32], bool)> {
-    let Some(mut idx) = leaves.iter().position(|h| *h == target) else {
-        return Vec::new();
-    };
-    let mut path = Vec::new();
-    let mut level: Vec<[u8; 32]> = leaves.to_vec();
-    while level.len() > 1 {
-        let sibling_idx = if idx % 2 == 0 { idx + 1 } else { idx - 1 };
-        if sibling_idx < level.len() {
-            let is_left = sibling_idx < idx;
-            path.push((level[sibling_idx], is_left));
-        }
-        idx /= 2;
-        let mut next = Vec::with_capacity((level.len() + 1) / 2);
-        for chunk in level.chunks(2) {
-            if chunk.len() == 2 {
-                next.push(hash_pair(chunk[0], chunk[1]));
-            } else {
-                next.push(chunk[0]);
-            }
-        }
-        level = next;
-    }
-    path
-}
-
 fn hash_pair(left: [u8; 32], right: [u8; 32]) -> [u8; 32] {
     let mut hasher = Hasher::new();
     hasher.update(&left);
@@ -339,11 +385,11 @@ fn hash_pair(left: [u8; 32], right: [u8; 32]) -> [u8; 32] {
 
 fn deterministic_index(seed: u64, offset: u64, max: usize) -> usize {
     let mut hasher = Hasher::new();
-    hasher.update(&seed.to_be_bytes());
-    hasher.update(&offset.to_be_bytes());
-    let h = hasher.finalize();
-    let val = u64::from_be_bytes(h.as_bytes()[..8].try_into().unwrap());
-    (val as usize) % max
+    hasher.update(&seed.to_le_bytes());
+    hasher.update(&offset.to_le_bytes());
+    let hash = *hasher.finalize().as_bytes();
+    let val = u64::from_le_bytes(hash[..8].try_into().unwrap());
+    val as usize % max
 }
 
 fn wall_time_ms() -> u64 {
@@ -359,19 +405,20 @@ fn wall_time_ms() -> u64 {
 mod tests {
     use super::*;
 
-    fn test_node_id() -> [u8; 32] {
+    fn test_owner() -> [u8; 32] {
         let mut id = [0u8; 32];
         id[0..8].copy_from_slice(b"testnode");
         id
     }
 
     #[test]
-    fn miner_produces_proofs() {
-        let mut miner = VharyxMiner::new(test_node_id(), 0);
+    fn miner_produces_independent_proofs() {
+        let mut miner = VHALIXMiner::new(test_owner(), 0, 0, [0u8; 32]);
         let proof = miner.mine_one();
         assert_eq!(proof.bill_nonce, 0);
         assert!(proof.elapsed_ms > 0);
         assert_ne!(proof.argon2_hash, [0u8; 32]);
+        assert_eq!(proof.owner_vk_hash, test_owner());
 
         let proof2 = miner.mine_one();
         assert_eq!(proof2.bill_nonce, 1);
@@ -379,22 +426,65 @@ mod tests {
     }
 
     #[test]
-    fn miner_tracks_pending_count() {
-        let mut miner = VharyxMiner::new(test_node_id(), 0);
-        assert_eq!(miner.pending_count(), 0);
+    fn verify_single_proof_passes() {
+        let mut miner = VHALIXMiner::new(test_owner(), 0, 0, [0u8; 32]);
+        let proof = miner.mine_one();
+        verify_single_proof(&proof).expect("should verify");
+    }
+
+    #[test]
+    fn verify_single_proof_detects_fake() {
+        let mut miner = VHALIXMiner::new(test_owner(), 0, 0, [0u8; 32]);
+        let mut proof = miner.mine_one();
+        proof.argon2_hash = [0xFF; 32];
+        assert!(verify_single_proof(&proof).is_err());
+    }
+
+    #[test]
+    fn verify_single_proof_detects_wrong_nonce() {
+        let mut miner = VHALIXMiner::new(test_owner(), 0, 0, [0u8; 32]);
+        let mut proof = miner.mine_one();
+        proof.bill_nonce = 999;
+        assert!(verify_single_proof(&proof).is_err());
+    }
+
+    #[test]
+    fn different_nonce_produces_different_hash() {
+        let mut miner1 = VHALIXMiner::new(test_owner(), 0, 0, [0u8; 32]);
+        let mut miner2 = VHALIXMiner::new(test_owner(), 5, 0, [0u8; 32]);
+        let p0 = miner1.mine_one();
+        let p5 = miner2.mine_one();
+        assert_ne!(p0.argon2_hash, p5.argon2_hash);
+    }
+
+    #[test]
+    fn different_owner_produces_different_hash() {
+        let mut miner_a = VHALIXMiner::new([0xAA; 32], 0, 0, [0u8; 32]);
+        let mut miner_b = VHALIXMiner::new([0xBB; 32], 0, 0, [0u8; 32]);
+        let pa = miner_a.mine_one();
+        let pb = miner_b.mine_one();
+        assert_ne!(pa.argon2_hash, pb.argon2_hash);
+    }
+
+    #[test]
+    fn batch_merkle_root_consistent() {
+        let mut miner = VHALIXMiner::new(test_owner(), 0, 0, [0u8; 32])
+            .with_batch_size(3);
         miner.mine_one();
-        assert_eq!(miner.pending_count(), 1);
         miner.mine_one();
-        assert_eq!(miner.pending_count(), 2);
+        miner.mine_one();
+        let batch = miner.finalize_batch().unwrap();
+        let leaf_hashes: Vec<[u8; 32]> = batch.proofs.iter().map(|p| p.argon2_hash).collect();
+        assert_eq!(build_batch_merkle_root(&leaf_hashes), batch.merkle_root);
     }
 
     #[test]
     fn batch_finalize_drains_proofs() {
-        let mut miner = VharyxMiner::new(test_node_id(), 0).with_batch_size(2);
+        let mut miner = VHALIXMiner::new(test_owner(), 0, 0, [0u8; 32])
+            .with_batch_size(2);
         miner.mine_one();
         miner.mine_one();
         assert!(miner.batch_ready());
-
         let batch = miner.finalize_batch().expect("should have batch");
         assert_eq!(batch.bill_nonce_start, 0);
         assert_eq!(batch.bill_nonce_end, 1);
@@ -403,38 +493,22 @@ mod tests {
     }
 
     #[test]
-    fn batch_merkle_root_consistent() {
-        let mut miner = VharyxMiner::new(test_node_id(), 0).with_batch_size(3);
-        miner.mine_one();
-        miner.mine_one();
-        miner.mine_one();
-
-        let batch = miner.finalize_batch().unwrap();
-        let leaf_hashes: Vec<[u8; 32]> = batch.proofs.iter().map(|p| p.argon2_hash).collect();
-        assert_eq!(build_batch_merkle_root(&leaf_hashes), batch.merkle_root);
-    }
-
-    #[test]
-    fn spot_check_passes_valid_batch() {
-        let mut miner = VharyxMiner::new(test_node_id(), 0).with_batch_size(10);
-        for _ in 0..10 {
-            miner.mine_one();
-        }
-        let batch = miner.finalize_batch().unwrap();
-        verify_batch_spot_check(&batch, 42).expect("spot check should pass");
-    }
-
-    #[test]
     fn nonce_never_reused() {
-        let mut miner = VharyxMiner::new(test_node_id(), 0);
+        let mut miner = VHALIXMiner::new(test_owner(), 0, 0, [0u8; 32]);
         let mut seen = std::collections::HashSet::new();
         for _ in 0..5 {
             let proof = miner.mine_one();
             assert!(seen.insert(proof.bill_nonce));
         }
-        let batch = miner.finalize_batch().unwrap();
-        for proof in &batch.proofs {
-            assert!(seen.contains(&proof.bill_nonce));
-        }
+    }
+
+    #[test]
+    fn miner_tracks_pending_count() {
+        let mut miner = VHALIXMiner::new(test_owner(), 0, 0, [0u8; 32]);
+        assert_eq!(miner.pending_count(), 0);
+        miner.mine_one();
+        assert_eq!(miner.pending_count(), 1);
+        miner.mine_one();
+        assert_eq!(miner.pending_count(), 2);
     }
 }

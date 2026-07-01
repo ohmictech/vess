@@ -73,9 +73,12 @@ pub struct OwnershipRecord {
     /// `Blake3("vess-claim-hash-v0" || mint_id || new_owner_vk_hash || transfer_sig)`
     /// Competing claims from the same previous owner are resolved by
     /// depth-first (longest chain wins), then lowest claim_hash as tiebreaker.
-    #[serde(default)]
     pub claim_hash: Option<[u8; 32]>,
-    /// Pre-transfer chain tip for the current transfer slot.
+    /// If set, this bill cannot be transferred until the network median
+    /// tick reaches this value.  Set by VHALIX lock claims, cleared
+    /// once the lock matures and a transfer is accepted.
+    #[serde(default)]
+    pub locked_until_tick: u64,
     #[serde(default)]
     pub prev_transfer_chain_tip: Option<[u8; 32]>,
     /// Number of ownership transfers since genesis. Genesis = 0, first
@@ -406,6 +409,7 @@ mod tests {
             chain_depth: 0,
             encrypted_bill: vec![],
             accumulated_work: None,
+            locked_until_tick: 0,
         }
     }
 
