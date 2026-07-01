@@ -343,6 +343,15 @@ impl PeerRegistry {
         self.peers.values().filter(|e| e.state == state).count()
     }
 
+    /// Return the node IDs of all currently verified peers.
+    pub fn verified_peer_id_bytes(&self) -> Vec<[u8; 32]> {
+        self.peers
+            .iter()
+            .filter(|(_, e)| e.state == PeerState::Verified)
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
     /// Return peer IDs whose verification is older than `max_age`.
     ///
     /// These peers should be re-challenged with the same handshake

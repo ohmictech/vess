@@ -1477,7 +1477,7 @@ const MAX_SERIALIZED_MESH_CONTACT_BYTES: usize = 16 * 1024;
 
 /// Maximum number of contacts accepted or returned in one peer-discovery response.
 /// Keep this small while contacts are JSON-serialized so UDP responses stay bounded.
-const MAX_PEER_EXCHANGE_PEERS: usize = 4;
+const MAX_PEER_EXCHANGE_PEERS: usize = 20;
 
 /// Maximum records returned by one seed-time DHT shard sync response.
 const MAX_DHT_SEED_TAGS: usize = 256;
@@ -2854,84 +2854,173 @@ fn ingest_dht_seed_response(
     snapshot
 }
 
+/// Adaptive local peer discovery ("Hydra") — intelligently finds and
+/// handshakes with all local Vess nodes using mDNS, LAN broadcast,
+/// and filesystem-based peer exchange.
+///
+/// **Strategy:**
+/// - **Aggressive mode**: When verified peers < 8, probes every 3s.
+/// - **Steady-state mode**: When ≥ 8 verified, backs off to 15s.
+/// - **mDNS responder**: Answers `_vess._udp.local` queries on 224.0.0.251:5353.
+/// - **mDNS browser**: Queries for other Vess nodes every 30s.
+/// - **File-based**: Publishes contact to `%LOCALAPPDATA%/Vess/local-peers/`.
 fn spawn_local_lan_discovery(local_contact: MeshCarrierContact, state: Arc<Mutex<ArteryState>>) {
+    const HYDRA_TARGET_PEERS: usize = 8;
+    const HYDRA_AGGRESSIVE_SECS: u64 = 3;
+    const HYDRA_STEADY_SECS: u64 = 15;
+
     let loopback_contact = match crate::local_discovery::loopback_contact(&local_contact) {
-        Ok(contact) => contact,
-        Err(error) => {
-            warn!(%error, "failed to build loopback Vess contact for local discovery");
+        Ok(c) => c,
+        Err(e) => {
+            warn!(%e, "failed to build loopback contact; using original");
             local_contact.clone()
         }
     };
 
-    if let Err(error) = crate::local_discovery::publish_local_contact(&loopback_contact) {
-        crate::local_discovery::log_publish_error(error);
+    // Publish immediately
+    if let Err(e) = crate::local_discovery::publish_local_contact(&loopback_contact) {
+        crate::local_discovery::log_publish_error(e);
     }
 
+    // ── mDNS responder ──
+    let node_id_str = match local_contact.node_id() {
+        Some(id) => id.to_string(),
+        None => {
+            warn!("hydra: no node ID, mDNS disabled");
+            return;
+        }
+    };
+    let mdns_contact = local_contact.clone();
     tokio::spawn(async move {
-        let self_node_id = {
-            let s = lock_state(&state);
-            s.node_id
-        };
-        let socket = match crate::local_discovery::bind_lan_discovery_socket(
-            crate::local_discovery::LAN_DISCOVERY_PORT,
-        ) {
-            Ok(socket) => Some(socket),
-            Err(error) => {
-                warn!(%error, "LAN Vess discovery listener unavailable; same-PC file discovery remains enabled");
-                None
+        let socket = match crate::local_discovery::bind_mdns_socket() {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(%e, "hydra mDNS responder bind failed");
+                return;
             }
         };
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        let mut buf = vec![0u8; 9000];
+        loop {
+            if let Ok((len, source)) = socket.recv_from(&mut buf).await {
+                if crate::local_discovery::is_vess_mdns_query(&buf[..len]) {
+                    let _ = crate::local_discovery::send_mdns_unicast_response(
+                        &socket, source, &node_id_str, &mdns_contact,
+                    ).await;
+                }
+            }
+        }
+    });
 
-        if let Some(socket) = socket {
-            let mut buffer = vec![0u8; 64 * 1024];
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {
-                        if let Err(error) = crate::local_discovery::publish_local_contact(&loopback_contact) {
-                            crate::local_discovery::log_publish_error(error);
-                        }
-                        if let Err(error) = crate::local_discovery::send_lan_announcement(&socket, &local_contact).await {
-                            warn!(%error, "failed to send Vess LAN discovery announcement");
-                        }
-                        if routing_table_has_capacity(&state) {
-                            if let Err(error) = crate::local_discovery::send_lan_probe(&socket).await {
-                                warn!(%error, "failed to send Vess LAN discovery probe");
-                            }
-                        }
-                        for contact in crate::local_discovery::discover_local_file_contacts(Some(self_node_id)) {
-                            queue_discovered_peer_contact(&state, contact, "local-file");
-                        }
-                    }
-                    recv = socket.recv_from(&mut buffer) => {
-                        let Ok((len, source)) = recv else {
-                            continue;
-                        };
-                        match crate::local_discovery::parse_lan_discovery_message(&buffer[..len], source) {
-                            Ok(crate::local_discovery::ParsedLanDiscovery::Probe) => {
-                                if let Err(error) = crate::local_discovery::send_probe_response(&socket, source, &local_contact).await {
-                                    warn!(%error, "failed to send Vess LAN discovery probe response");
+    // ── mDNS browser ──
+    let browser_state = state.clone();
+    tokio::spawn(async move {
+        let socket = match crate::local_discovery::bind_mdns_socket() {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(%e, "hydra mDNS browser bind failed");
+                return;
+            }
+        };
+        let mut buf = vec![0u8; 9000];
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    let _ = crate::local_discovery::send_mdns_query(&socket).await;
+                }
+                recv = socket.recv_from(&mut buf) => {
+                    if let Ok((len, source)) = recv {
+                        if let Some(contact_str) = crate::local_discovery::extract_contact_from_mdns_response(&buf[..len]) {
+                            if let Ok(contact) = vess_mesh::decode_mesh_contact_string(&contact_str) {
+                                if vess_mesh::validate_mesh_contact(&contact).is_ok() {
+                                    let self_id = { lock_state(&browser_state).node_id };
+                                    if let Some(peer_hash) = contact.node_id().map(|n| *n.as_bytes()) {
+                                        if peer_hash != self_id {
+                                            let lan_contact = crate::local_discovery::contact_from_lan_source(&contact, source).unwrap_or(contact);
+                                            queue_discovered_peer_contact(&browser_state, lan_contact, "mdns");
+                                        }
+                                    }
                                 }
                             }
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    // ── Main hydra loop: LAN broadcast + file discovery ──
+    let hydra_state = state.clone();
+    tokio::spawn(async move {
+        let self_node_id = { lock_state(&hydra_state).node_id };
+
+        let lan_socket = match crate::local_discovery::bind_lan_discovery_socket(
+            crate::local_discovery::LAN_DISCOVERY_PORT,
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(%e, "hydra LAN socket bind failed; file-only mode");
+                // Fallback to file-only
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+                loop {
+                    interval.tick().await;
+                    if let Err(e) = crate::local_discovery::publish_local_contact(&loopback_contact) {
+                        crate::local_discovery::log_publish_error(e);
+                    }
+                    for contact in crate::local_discovery::discover_local_file_contacts(Some(self_node_id)) {
+                        queue_discovered_peer_contact(&hydra_state, contact, "local-file");
+                    }
+                }
+            }
+        };
+
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(HYDRA_AGGRESSIVE_SECS));
+
+        // Initial burst
+        let _ = crate::local_discovery::send_lan_probe(&lan_socket).await;
+        let _ = crate::local_discovery::send_lan_announcement(&lan_socket, &local_contact).await;
+
+        loop {
+            let (verified_count, has_capacity) = {
+                let s = lock_state(&hydra_state);
+                (s.peer_registry.count_in_state(PeerState::Verified), s.routing_table.has_capacity())
+            };
+
+            let target_interval = if verified_count < HYDRA_TARGET_PEERS || !has_capacity {
+                std::time::Duration::from_secs(HYDRA_AGGRESSIVE_SECS)
+            } else {
+                std::time::Duration::from_secs(HYDRA_STEADY_SECS)
+            };
+            interval = tokio::time::interval(target_interval);
+
+            tokio::select! {
+                _ = interval.tick() => {
+                    if let Err(e) = crate::local_discovery::publish_local_contact(&loopback_contact) {
+                        crate::local_discovery::log_publish_error(e);
+                    }
+                    let _ = crate::local_discovery::send_lan_announcement(&lan_socket, &local_contact).await;
+                    if !has_capacity || verified_count < HYDRA_TARGET_PEERS {
+                        let _ = crate::local_discovery::send_lan_probe(&lan_socket).await;
+                    }
+                    for contact in crate::local_discovery::discover_local_file_contacts(Some(self_node_id)) {
+                        queue_discovered_peer_contact(&hydra_state, contact, "local-file");
+                    }
+                }
+                recv = lan_socket.recv_from(&mut buf) => {
+                    if let Ok((len, source)) = recv {
+                        match crate::local_discovery::parse_lan_discovery_message(&buf[..len], source) {
+                            Ok(crate::local_discovery::ParsedLanDiscovery::Probe) => {
+                                let _ = crate::local_discovery::send_probe_response(
+                                    &lan_socket, source, &local_contact,
+                                ).await;
+                            }
                             Ok(crate::local_discovery::ParsedLanDiscovery::Contact(contact)) => {
-                                queue_discovered_peer_contact(&state, contact, "lan");
+                                queue_discovered_peer_contact(&hydra_state, contact, "lan");
                             }
                             Err(_) => {}
                         }
                     }
-                }
-            }
-        } else {
-            loop {
-                interval.tick().await;
-                if let Err(error) = crate::local_discovery::publish_local_contact(&loopback_contact)
-                {
-                    crate::local_discovery::log_publish_error(error);
-                }
-                for contact in
-                    crate::local_discovery::discover_local_file_contacts(Some(self_node_id))
-                {
-                    queue_discovered_peer_contact(&state, contact, "local-file");
                 }
             }
         }
@@ -5748,33 +5837,45 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
         }
     });
 
-    // ── Periodic peer exchange ──────────────────────────────────────
+    // ── Hydra periodic peer exchange (push + pull) ──────────────────
+    // Every 15s: push our top peers to 3 random verified neighbors.
+    // When below target (<8 routable): also pull from known peers.
     let pex_node = node.clone();
     let pex_state = state.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
         loop {
             interval.tick().await;
 
-            let routable_count = {
+            let (routable_count, our_peers, targets): (usize, Vec<Vec<u8>>, Vec<Vec<u8>>) = {
                 let s = pex_state.lock().unwrap();
-                s.routing_table.routable_peers(|_| true).len()
+                let routable = s.routing_table.routable_peers(|_| true);
+                let count = routable.len();
+                let our = routable.iter()
+                    .filter(|p| !p.id_bytes.is_empty() && p.id_bytes.len() <= MAX_SERIALIZED_MESH_CONTACT_BYTES)
+                    .take(MAX_PEER_EXCHANGE_PEERS)
+                    .map(|p| p.id_bytes.clone())
+                    .collect();
+                // Pick up to 3 random verified peers to push to
+                let targets: Vec<Vec<u8>> = s.peer_registry
+                    .verified_peer_id_bytes()
+                    .into_iter()
+                    .filter_map(|hash| s.routing_table.peer_id_bytes(&hash))
+                    .take(20) // candidate pool
+                    .collect();
+                // Shuffle and pick 3
+                let mut rng = rand::thread_rng();
+                let mut targets = targets;
+                targets.shuffle(&mut rng);
+                targets.truncate(3);
+                (count, our, targets)
             };
 
-            if routable_count < 3 {
-                let peers_to_ask: Vec<Vec<u8>> = {
-                    let s = pex_state.lock().unwrap();
-                    s.routing_table
-                        .routable_peers(|_| true)
-                        .into_iter()
-                        .take(3)
-                        .map(|p| p.id_bytes)
-                        .collect()
-                };
-
-                for peer_bytes in peers_to_ask {
-                    let target = match decode_contact_bytes(&peer_bytes) {
-                        Ok(contact) => contact,
+            // Push our peers to verified neighbors (unsolicited PeerExchange → they respond)
+            if !our_peers.is_empty() {
+                for target_bytes in &targets {
+                    let target = match decode_contact_bytes(target_bytes) {
+                        Ok(c) => c,
                         Err(_) => continue,
                     };
                     let msg = PulseMessage::PeerExchange(PeerExchange {
@@ -5783,34 +5884,73 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     if let Ok(Some(PulseMessage::PeerExchangeResponse(resp))) =
                         pex_node.send_message_with_response(&target, &msg).await
                     {
-                        if resp.peers.len() > MAX_PEER_EXCHANGE_PEERS {
-                            warn!(
-                                count = resp.peers.len(),
-                                "peer exchange returned too many contacts; truncating response"
-                            );
-                        }
                         let mut s = pex_state.lock().unwrap();
                         let now = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs();
                         for new_peer_bytes in resp.peers.iter().take(MAX_PEER_EXCHANGE_PEERS) {
-                            let Some(hash) = peer_hash_from_contact_bytes(new_peer_bytes) else {
-                                continue;
-                            };
-                            if hash == s.node_id {
-                                continue;
-                            }
-                            if !s.routing_table.contains(&hash) {
-                                s.routing_table.insert(RoutingPeer {
-                                    id_hash: hash,
-                                    id_bytes: new_peer_bytes.clone(),
-                                    last_seen: now,
-                                    first_seen: now,
-                                });
+                            let Some(hash) = peer_hash_from_contact_bytes(new_peer_bytes) else { continue };
+                            if hash == s.node_id || s.routing_table.contains(&hash) { continue; }
+                            s.routing_table.insert(RoutingPeer {
+                                id_hash: hash,
+                                id_bytes: new_peer_bytes.clone(),
+                                last_seen: now,
+                                first_seen: now,
+                            });
+                            if !s.handshake_queue.contains(&hash) {
                                 s.handshake_queue.push(hash);
                             }
                         }
+                        s.estimated_network_size = s.routing_table.estimated_network_size();
+                        let repl = dht_replication_factor(s.estimated_network_size);
+                        s.tag_dht.set_k_replication(repl);
+                    }
+                }
+            }
+
+            // Pull from random peers when below target
+            if routable_count < 8 {
+                let pull_targets: Vec<Vec<u8>> = {
+                    let s = pex_state.lock().unwrap();
+                    s.routing_table.routable_peers(|_| true)
+                        .into_iter()
+                        .take(5)
+                        .map(|p| p.id_bytes)
+                        .collect()
+                };
+                for peer_bytes in &pull_targets {
+                    let target = match decode_contact_bytes(peer_bytes) {
+                        Ok(c) => c,
+                        Err(_) => continue,
+                    };
+                    let msg = PulseMessage::PeerExchange(PeerExchange {
+                        sender_id: pex_node.id().as_bytes().to_vec(),
+                    });
+                    if let Ok(Some(PulseMessage::PeerExchangeResponse(resp))) =
+                        pex_node.send_message_with_response(&target, &msg).await
+                    {
+                        let mut s = pex_state.lock().unwrap();
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        for new_peer_bytes in resp.peers.iter().take(MAX_PEER_EXCHANGE_PEERS) {
+                            let Some(hash) = peer_hash_from_contact_bytes(new_peer_bytes) else { continue };
+                            if hash == s.node_id || s.routing_table.contains(&hash) { continue; }
+                            s.routing_table.insert(RoutingPeer {
+                                id_hash: hash,
+                                id_bytes: new_peer_bytes.clone(),
+                                last_seen: now,
+                                first_seen: now,
+                            });
+                            if !s.handshake_queue.contains(&hash) {
+                                s.handshake_queue.push(hash);
+                            }
+                        }
+                        s.estimated_network_size = s.routing_table.estimated_network_size();
+                        let repl = dht_replication_factor(s.estimated_network_size);
+                        s.tag_dht.set_k_replication(repl);
                     }
                 }
             }
@@ -5952,6 +6092,32 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     };
 
                     if verified {
+                        // Ingest known_peers from the handshake response (hydra bootstrap)
+                        if !resp.known_peers.is_empty() {
+                            let mut s = hs_state.lock().unwrap();
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs();
+                            for peer_bytes in resp.known_peers.iter().take(MAX_PEER_EXCHANGE_PEERS) {
+                                if let Some(hash) = peer_hash_from_contact_bytes(peer_bytes) {
+                                    if hash != s.node_id && !s.routing_table.contains(&hash) {
+                                        s.routing_table.insert(RoutingPeer {
+                                            id_hash: hash,
+                                            id_bytes: peer_bytes.clone(),
+                                            last_seen: now,
+                                            first_seen: now,
+                                        });
+                                        if !s.handshake_queue.contains(&hash) {
+                                            s.handshake_queue.push(hash);
+                                        }
+                                    }
+                                }
+                            }
+                            let repl = dht_replication_factor(s.routing_table.estimated_network_size());
+                            s.tag_dht.set_k_replication(repl);
+                        }
+                        // Also do explicit peer exchange for additional peers
                         request_peer_exchange_from_peer(&hs_node, &target, &hs_state).await;
                         refresh_mailbox_forward_subscriptions(&hs_node, &hs_state).await;
                     }
@@ -6163,6 +6329,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
     let h_pay_tx = pay_tx.clone();
     let h_fwd_tx = fwd_tx.clone();
     let relay_ek_for_handshake = own_relay_ek.clone();
+    let hs_state_ref = st.clone(); // for extracting known peers in handshake response
 
     // ── Spawn message listener so we can cancel on SIGTERM ──────────
     let listen_node = node.clone();
@@ -6193,6 +6360,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
         // Quick routing update — lock briefly (try_lock so we never block
         // the message listener and prevent handshake processing).
         let node_id_local;
+        let mut known_peers_snapshot: Vec<Vec<u8>> = Vec::new();
         {
             let mut state = match st.try_lock() {
                 Ok(s) => s,
@@ -6229,6 +6397,13 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 state.handshake_queue.push(peer_id);
             }
             node_id_local = state.node_id;
+            // Snapshot known peer contacts for hydra bootstrap share
+            known_peers_snapshot = state.routing_table.routable_peers(|_| true)
+                .into_iter()
+                .filter(|p| !p.id_bytes.is_empty() && p.id_bytes.len() <= MAX_SERIALIZED_MESH_CONTACT_BYTES)
+                .take(MAX_PEER_EXCHANGE_PEERS)
+                .map(|p| p.id_bytes)
+                .collect();
         } // Lock released here — other tasks can now acquire it.
 
         // ── HandshakeChallenge: can be handled without the state lock ──
@@ -6244,6 +6419,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 hmac,
                 pow_hash,
                 relay_ek: relay_ek_for_handshake.clone(),
+                known_peers: known_peers_snapshot.clone(),
             }));
         }
 

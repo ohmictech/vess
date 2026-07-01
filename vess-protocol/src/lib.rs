@@ -984,6 +984,12 @@ pub struct HandshakeResponse {
     /// mesh identity scan_ek — separate from any wallet stealth address.
     #[serde(default)]
     pub relay_ek: Option<Vec<u8>>,
+    /// Known peer contacts (serialized mesh contact bytes) for hydra
+    /// bootstrapping. The responder includes up to 20 routable peers
+    /// so the challenger can rapidly populate its routing table without
+    /// an extra round trip.
+    #[serde(default)]
+    pub known_peers: Vec<Vec<u8>>,
 }
 
 // ── Banishment ──────────────────────────────────────────────────────

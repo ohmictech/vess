@@ -17,10 +17,22 @@ use vess_mesh::{
 use ipconfig::{IfType, OperStatus};
 
 pub const LAN_DISCOVERY_PORT: u16 = 18348;
+pub const MDNS_MULTICAST_ADDR: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 251);
+pub const MDNS_PORT: u16 = 5353;
+pub const VESS_MDNS_SERVICE: &str = "_vess._udp.local";
 const LOCAL_PEER_STALE_SECS: u64 = 120;
 const LAN_DISCOVERY_VERSION: u8 = 1;
 const MAX_LOCAL_PEER_RECORD_BYTES: usize = 64 * 1024;
 const MAX_LAN_DISCOVERY_MESSAGE_BYTES: usize = 64 * 1024;
+const MAX_MDNS_MESSAGE_BYTES: usize = 9000; // RFC 6762 recommends <9000 for legacy compatibility
+/// Minimum peers before discovery backs off from aggressive mode.
+const HYDRA_TARGET_PEERS: usize = 8;
+/// Aggressive probe interval (seconds) when below target.
+const HYDRA_AGGRESSIVE_INTERVAL_SECS: u64 = 3;
+/// Steady-state probe interval (seconds) when at or above target.
+const HYDRA_STEADY_INTERVAL_SECS: u64 = 15;
+/// Max parallel handshakes from the hydra drain.
+const HYDRA_MAX_PARALLEL_HANDSHAKES: usize = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LocalPeerRecord {
@@ -143,7 +155,7 @@ fn contact_with_ip(contact: &MeshCarrierContact, ip: IpAddr) -> Result<MeshCarri
     }
 }
 
-fn contact_from_lan_source(
+pub fn contact_from_lan_source(
     contact: &MeshCarrierContact,
     source: SocketAddr,
 ) -> Result<MeshCarrierContact> {
@@ -470,6 +482,225 @@ pub async fn discover_lan_peer_contacts(
 
 pub fn log_publish_error(error: anyhow::Error) {
     warn!(%error, "failed to publish local Vess peer contact");
+}
+
+// ── mDNS (RFC 6762) protocol primitives ────────────────────────────
+//
+// These are pure wire-format helpers.  The spawner functions that need
+// ArteryState live in node_runner.rs.
+
+/// Build an mDNS query for `_vess._udp.local` PTR records (service discovery).
+pub fn build_mdns_query() -> Vec<u8> {
+    let mut buf = Vec::with_capacity(64);
+    // DNS header: ID=0, FLAGS=0x0000 (standard query), QDCOUNT=1
+    buf.extend_from_slice(&[0x00, 0x00]); // Transaction ID
+    buf.extend_from_slice(&[0x00, 0x00]); // Flags
+    buf.extend_from_slice(&[0x00, 0x01]); // QDCOUNT = 1
+    buf.extend_from_slice(&[0x00, 0x00]); // ANCOUNT = 0
+    buf.extend_from_slice(&[0x00, 0x00]); // NSCOUNT = 0
+    buf.extend_from_slice(&[0x00, 0x00]); // ARCOUNT = 0
+    // Question: _vess._udp.local PTR
+    buf.push(5); buf.extend_from_slice(b"_vess");
+    buf.push(4); buf.extend_from_slice(b"_udp");
+    buf.push(5); buf.extend_from_slice(b"local");
+    buf.push(0x00); // Root
+    buf.extend_from_slice(&[0x00, 0x0C]); // QTYPE = PTR
+    buf.extend_from_slice(&[0x00, 0x01]); // QCLASS = IN
+    buf
+}
+
+/// Build an mDNS response advertising this node with PTR + SRV + TXT records.
+pub fn build_mdns_response(
+    node_id: &str,
+    contact_str: &str,
+    service_port: u16,
+) -> Result<Vec<u8>> {
+    let hostname = format!("{}.local", &node_id[..12]);
+    let hostname_bytes = hostname.as_bytes();
+    let mut hostname_labels = Vec::new();
+    for part in hostname.split('.') {
+        hostname_labels.push(part.len() as u8);
+        hostname_labels.extend_from_slice(part.as_bytes());
+    }
+    hostname_labels.push(0x00);
+
+    let txt_value = format!("contact={}", contact_str);
+    let txt_bytes = txt_value.as_bytes();
+    let mut txt_rdata = Vec::new();
+    txt_rdata.push(txt_bytes.len() as u8);
+    txt_rdata.extend_from_slice(txt_bytes);
+
+    let total = 12
+        + hostname_labels.len() + 4 + hostname_labels.len() + 2 + 2 + 2 + 2
+        + hostname_labels.len() + 2 + 2 + 2 + 2 + 6
+        + hostname_labels.len() + 2 + 2 + 2 + 2 + txt_rdata.len();
+    let mut buf = Vec::with_capacity(total);
+
+    // Header
+    buf.extend_from_slice(&[0x00, 0x00]); // ID
+    buf.extend_from_slice(&[0x84, 0x00]); // Flags: response + authoritative
+    buf.extend_from_slice(&[0x00, 0x00]); // QDCOUNT
+    buf.extend_from_slice(&[0x00, 0x03]); // ANCOUNT = 3
+    buf.extend_from_slice(&[0x00, 0x00]); // NSCOUNT
+    buf.extend_from_slice(&[0x00, 0x00]); // ARCOUNT
+
+    // PTR: _vess._udp.local → hostname
+    buf.push(5); buf.extend_from_slice(b"_vess");
+    buf.push(4); buf.extend_from_slice(b"_udp");
+    buf.push(5); buf.extend_from_slice(b"local"); buf.push(0x00);
+    buf.extend_from_slice(&[0x00, 0x0C, 0x00, 0x01]); // TYPE=PTR, CLASS=IN
+    buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x78]); // TTL=120
+    let ptr_len = hostname_labels.len() as u16;
+    buf.extend_from_slice(&ptr_len.to_be_bytes());
+    buf.extend_from_slice(&hostname_labels);
+
+    // SRV: hostname SRV 0 0 <port> hostname
+    buf.extend_from_slice(&hostname_labels);
+    buf.extend_from_slice(&[0x00, 0x21, 0x80, 0x01]); // TYPE=SRV, CLASS=IN+flush
+    buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x78]); // TTL=120
+    let srv_len = (6 + hostname_labels.len()) as u16;
+    buf.extend_from_slice(&srv_len.to_be_bytes());
+    buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // Priority=0, Weight=0
+    buf.extend_from_slice(&service_port.to_be_bytes());
+    buf.extend_from_slice(&hostname_labels);
+
+    // TXT: hostname TXT "contact=..."
+    buf.extend_from_slice(&hostname_labels);
+    buf.extend_from_slice(&[0x00, 0x10, 0x80, 0x01]); // TYPE=TXT, CLASS=IN+flush
+    buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x78]); // TTL=120
+    let txt_len = txt_rdata.len() as u16;
+    buf.extend_from_slice(&txt_len.to_be_bytes());
+    buf.extend_from_slice(&txt_rdata);
+
+    Ok(buf)
+}
+
+/// Check if a DNS message is an mDNS query for `_vess._udp.local`.
+pub fn is_vess_mdns_query(payload: &[u8]) -> bool {
+    if payload.len() < 12 { return false; }
+    let flags = u16::from_be_bytes([payload[2], payload[3]]);
+    if flags & 0x8000 != 0 { return false; } // QR=1 → response
+    let qdcount = u16::from_be_bytes([payload[4], payload[5]]);
+    if qdcount == 0 { return false; }
+    let mut pos = 12;
+    let mut labels: Vec<&[u8]> = Vec::new();
+    while pos < payload.len() && payload[pos] != 0 {
+        let len = payload[pos] as usize;
+        if len > 63 || pos + 1 + len > payload.len() { return false; }
+        pos += 1;
+        labels.push(&payload[pos..pos + len]);
+        pos += len;
+    }
+    labels.first().map(|l| *l == b"_vess").unwrap_or(false)
+}
+
+/// Parse contact string from an mDNS TXT record in a DNS response.
+pub fn parse_mdns_txt_contact(payload: &[u8]) -> Option<String> {
+    let mut pos = 0;
+    while pos < payload.len() {
+        let len = payload[pos] as usize;
+        pos += 1;
+        if pos + len > payload.len() { break; }
+        let kv = &payload[pos..pos + len];
+        pos += len;
+        if kv.starts_with(b"contact=") {
+            return String::from_utf8(kv[8..].to_vec()).ok();
+        }
+    }
+    None
+}
+
+/// Extract a contact string from a complete mDNS response packet.
+/// Walks the answer section looking for TXT records.
+pub fn extract_contact_from_mdns_response(payload: &[u8]) -> Option<String> {
+    if payload.len() < 12 { return None; }
+    let flags = u16::from_be_bytes([payload[2], payload[3]]);
+    if flags & 0x8000 == 0 { return None; } // not a response
+    let ancount = u16::from_be_bytes([payload[6], payload[7]]) as usize;
+    if ancount == 0 { return None; }
+
+    let qdcount = u16::from_be_bytes([payload[4], payload[5]]) as usize;
+    let mut pos = 12usize;
+
+    // Skip question section
+    for _ in 0..qdcount {
+        while pos < payload.len() && payload[pos] != 0 {
+            let len = payload[pos] as usize;
+            if len > 63 || pos + 1 + len > payload.len() { return None; }
+            pos += 1 + len;
+        }
+        if pos < payload.len() { pos += 1; }
+        pos += 4; // QTYPE + QCLASS
+    }
+
+    // Parse answer records
+    for _ in 0..ancount {
+        if pos + 10 > payload.len() { break; }
+        // Skip name (handle compression)
+        if payload[pos] & 0xC0 == 0xC0 { pos += 2; }
+        else {
+            while pos < payload.len() && payload[pos] != 0 {
+                let len = payload[pos] as usize;
+                if len > 63 || pos + 1 + len > payload.len() { return None; }
+                pos += 1 + len;
+            }
+            if pos < payload.len() { pos += 1; }
+        }
+        if pos + 10 > payload.len() { break; }
+        let rtype = u16::from_be_bytes([payload[pos], payload[pos + 1]]);
+        let rdlength = u16::from_be_bytes([payload[pos + 8], payload[pos + 9]]) as usize;
+        pos += 10;
+        if pos + rdlength > payload.len() { break; }
+        if rtype == 16 {
+            if let Some(contact) = parse_mdns_txt_contact(&payload[pos..pos + rdlength]) {
+                return Some(contact);
+            }
+        }
+        pos += rdlength;
+    }
+    None
+}
+
+/// Bind a UDP socket for mDNS (multicast 224.0.0.251:5353).
+pub fn bind_mdns_socket() -> Result<UdpSocket> {
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
+        .context("create mDNS socket")?;
+    socket.set_reuse_address(true).context("mDNS reuse addr")?;
+    #[cfg(all(unix, not(target_os = "android")))]
+    { let _ = socket.set_reuse_port(true); }
+    socket.bind(
+        &SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, MDNS_PORT)).into(),
+    ).context("bind mDNS socket")?;
+    socket.join_multicast_v4(&MDNS_MULTICAST_ADDR, &Ipv4Addr::UNSPECIFIED)
+        .context("join mDNS multicast")?;
+    socket.set_multicast_loop_v4(true).context("mDNS loopback")?;
+    socket.set_multicast_ttl_v4(255).context("mDNS TTL")?;
+    socket.set_nonblocking(true).context("mDNS nonblocking")?;
+    let std_socket: std::net::UdpSocket = socket.into();
+    UdpSocket::from_std(std_socket).context("Tokio mDNS socket")
+}
+
+/// Send an mDNS query to the multicast group.
+pub async fn send_mdns_query(socket: &UdpSocket) -> Result<()> {
+    let query = build_mdns_query();
+    let target = SocketAddr::V4(SocketAddrV4::new(MDNS_MULTICAST_ADDR, MDNS_PORT));
+    socket.send_to(&query, target).await
+        .context("send mDNS query")?;
+    Ok(())
+}
+
+/// Send an mDNS response to a querier (unicast).
+pub async fn send_mdns_unicast_response(
+    socket: &UdpSocket,
+    target: SocketAddr,
+    node_id: &str,
+    contact: &MeshCarrierContact,
+) -> Result<()> {
+    let contact_str = encode_mesh_contact_string(contact)?;
+    let response = build_mdns_response(node_id, &contact_str, LAN_DISCOVERY_PORT)?;
+    socket.send_to(&response, target).await
+        .context("send mDNS unicast response")?;
+    Ok(())
 }
 
 #[cfg(test)]
