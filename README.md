@@ -116,7 +116,7 @@ paid to, the tag→address mapping is permanent. Unconfirmed tags last 30 days.
 ## Architecture
 
 Nodes form a peer-to-peer mesh with post-quantum handshakes (ML-KEM-768 +
-ML-DSA-65). Ownership state is replicated deterministically across Kademlia
+Falcon). Ownership state is replicated deterministically across Kademlia
 DHT shards.
 
 - **No blockchain** — deterministic registry rules, gossip-based
@@ -141,7 +141,7 @@ All operations are post-quantum.
 
 | Purpose | Primitive |
 |---------|-----------|
-| Mesh handshake | ML-KEM-768 + ML-DSA-65 |
+| Mesh handshake | ML-KEM-768 + Falcon |
 | Ownership signatures | ML-DSA-65 |
 | Stealth addressing | ML-KEM-768 (DKSAP) |
 | Mining | Argon2id (1 GiB, data-dependent memory) |
