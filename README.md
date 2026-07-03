@@ -6,7 +6,7 @@
 **Post-quantum digital cash. CPU-mined commodity. Stateless P2P network.**
 
 Vess is a tri-asset stateless monetary system where value flows from physics through
-time into spendable currency. No blockchain, no fees, no validators.
+time into spendable currency. No blockchain, no payment fees, no validators, no trust.
 
 | Asset | Role | Supply | Backing |
 |-------|------|--------|---------|

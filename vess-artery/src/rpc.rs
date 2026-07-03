@@ -2908,9 +2908,7 @@ async fn handle_wallet_unlock(
             enc_key,
             mailbox_key,
             mining_next_nonce: wallet.mining_next_nonce,
-            mining_session_nonce: wallet.mining_session_nonce,
-            mining_prev_hash: wallet.mining_prev_hash,
-        });
+                                });
 
         // Recover century locks from wallet file IDs.
         // If the node already has these locks in its snapshot (normal restart),
@@ -4232,7 +4230,7 @@ async fn handle_century_lock_create(
     vichor_burn_json: &Option<String>,
     manifest_tx: &tokio::sync::mpsc::UnboundedSender<vess_protocol::ManifestStore>,
 ) -> RpcResponse {
-    let proof: vess_protocol::VHALIXMinedProof =
+    let proof: vess_foundry::mine::MintProof =
         match serde_json::from_str(lock_proof_json) {
             Ok(p) => p,
             Err(e) => return RpcResponse::err(format!("invalid VHALIX proof JSON: {e}")),
@@ -4352,8 +4350,8 @@ fn handle_mine_start(
     if s.mining_active {
         return RpcResponse::ok(RpcData::MineStarted {
             chain_index: 0,
-            chain_length: s.mining_chain_length,
-            estimated_denomination: vess_foundry::Denomination::max_valid_denomination(s.mining_chain_length),
+            chain_length: 0,
+            estimated_denomination: vess_foundry::Denomination::max_valid_denomination(0),
             message: "Miner is already running.".to_string(),
         });
     }
@@ -4365,36 +4363,35 @@ fn handle_mine_start(
 
     // Get owner verification key hash from wallet credentials
     // Extract all needed wallet fields first to avoid borrow conflicts
-    let (owner_vk_hash, session_nonce, next_nonce, prev_hash) = {
+    let (owner_vk, owner_vk_hash, session_nonce, next_nonce) = {
         let wallet = match s.wallet.as_ref() {
             Some(w) => w,
             None => return RpcResponse::err("wallet must be unlocked to mine"),
         };
 
-        let owner_vk_hash = match wallet.billfold.any_credential() {
-            Some(cred) => vess_foundry::spend_auth::vk_hash(&cred.spend_vk),
+        let (owner_vk, owner_vk_hash) = match wallet.billfold.any_credential() {
+            Some(cred) => (cred.spend_vk.clone(), vess_foundry::spend_auth::vk_hash(&cred.spend_vk)),
             None => {
                 let (vk, _sk) = vess_foundry::spend_auth::generate_spend_keypair();
-                vess_foundry::spend_auth::vk_hash(&vk)
+                (vk.clone(), vess_foundry::spend_auth::vk_hash(&vk))
             }
         };
-        let session_nonce = wallet.mining_session_nonce.saturating_add(1);
+        let session_nonce = wallet.mining_next_nonce.wrapping_add(1);
         let next_nonce = wallet.mining_next_nonce;
-        let prev_hash = wallet.mining_prev_hash;
-        (owner_vk_hash, session_nonce, next_nonce, prev_hash)
+        (owner_vk, owner_vk_hash, session_nonce, next_nonce)
     };
 
     let tick_hash = s.tick_clock.state().current_hash;
 
     // Update wallet session nonce
     if let Some(wallet_mut) = s.wallet.as_mut() {
-        wallet_mut.mining_session_nonce = session_nonce;
+        wallet_mut.mining_next_nonce = next_nonce;
     }
 
     s.mining_active = true;
-    s.mining_session_nonce = session_nonce;
-    s.mining_tick_hash = tick_hash;
-    s.mining_chain_length = 0;
+    
+    
+    
     s.mining_next_nonce = next_nonce;
     s.mining_started_at = ArteryState::now_unix();
 
@@ -4405,14 +4402,14 @@ fn handle_mine_start(
     s.mining_stop_tx = Some(stop_tx);
 
     tokio::task::spawn_blocking(move || {
-        crate::node_runner::run_mining_loop(state_clone, og_tx_clone, stop_rx, owner_vk_hash, next_nonce, prev_hash, session_nonce, tick_hash);
+        crate::node_runner::run_mining_loop(state_clone, og_tx_clone, stop_rx, owner_vk_hash, owner_vk, next_nonce);
     });
 
     RpcResponse::ok(RpcData::MineStarted {
         chain_index: 0,
         chain_length: 0,
         estimated_denomination: 0,
-        message: format!("Mining started. Session {}, anchored to tick.", session_nonce),
+        message: format!("Mining started. Nonce: {}", next_nonce),
     })
 }
 
@@ -4438,7 +4435,7 @@ fn handle_mine_stop(
     }
 
     // Now read state fields (immutable borrows, no conflict)
-    let chain_length = s.mining_chain_length;
+    let chain_length = 0;
     let mining_next_nonce = s.mining_next_nonce;
     let denomination = vess_foundry::Denomination::max_valid_denomination(chain_length);
 
@@ -4448,7 +4445,7 @@ fn handle_mine_stop(
         wallet.mining_next_nonce = mining_next_nonce;
     }
 
-    let msg = if chain_length >= vess_foundry::mine::MIN_CHAIN_LENGTH {
+    let msg = if chain_length >= 1 {
         format!(
             "Miner stopped. Chain length: {}, denomination: {}. Bill submitted on hardening.",
             chain_length, denomination,
@@ -4457,7 +4454,7 @@ fn handle_mine_stop(
         format!(
             "Miner stopped. Chain length: {} (below minimum {} — no bill submitted).",
             chain_length,
-            vess_foundry::mine::MIN_CHAIN_LENGTH,
+            1,
         )
     };
 
@@ -4473,10 +4470,10 @@ fn handle_mine_status(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
     let s = lock_state(state);
 
     let chains = if s.mining_active {
-        let denom = vess_foundry::Denomination::max_valid_denomination(s.mining_chain_length);
+        let denom = vess_foundry::Denomination::max_valid_denomination(0);
         vec![MineChainStatus {
             chain_index: 0,
-            chain_length: s.mining_chain_length,
+            chain_length: 0,
             estimated_denomination: denom,
             next_nonce: s.mining_next_nonce,
             elapsed_seconds: ArteryState::now_unix().saturating_sub(s.mining_started_at),

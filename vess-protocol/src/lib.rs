@@ -136,11 +136,7 @@ pub enum GenesisProof {
 
     /// VHALIX mining proof: Argon2id CPU burn creates a VHALIX bill.
     /// The proof contains a Merkle tree of argon2id state roots.
-    VHALIXMined(VHALIXMinedProof),
-
-    /// Verification bounty: proves an excess VHALIX proof was recomputed
-    /// and verified.  Creates a 5-VHALIX bill for the verifier.
-    BountyGenesis(BountyGenesisProof),
+    Mint(vess_foundry::mine::MintProof),
 
     /// One-time Vichor genesis: 1B supply held by dev, sold on swap DHT.
     VichorGenesis(VichorGenesisProof),

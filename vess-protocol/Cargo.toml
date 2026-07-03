@@ -8,6 +8,7 @@ license-file = "../LICENSE"
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["alloc"] }
 blake3 = "1"
+vess-foundry = { path = "../vess-foundry" }
 
 [dev-dependencies]
 blake3 = "1"

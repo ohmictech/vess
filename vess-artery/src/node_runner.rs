@@ -533,11 +533,9 @@ mod tests {
             open_bounties: HashMap::new(),
             claimed_bounty_indices: HashMap::new(),
             mining_active: false,
-            mining_chain_length: 0,
+            mining_nonce: 0,
             mining_next_nonce: 0,
-            mining_session_nonce: 0,
-            mining_tick_hash: [0u8; 32],
-            mining_started_at: 0,
+                                    mining_started_at: 0,
             mining_stop_tx: None,
             wallet_path: None,
             notifications: VecDeque::new(),
@@ -1793,12 +1791,12 @@ fn proof_hash_and_nonce_from_genesis(og: &OwnershipGenesis) -> Option<([u8; 32],
                 None
             }
         }
-        GenesisProof::VHALIXMined(_) => {
+        GenesisProof::Mint(_) => {
             // VHALIX proof hash is the Merkle root
             Some((og.digest, og.digest))
         }
         GenesisProof::VichorGenesis(_) => None,
-        GenesisProof::BountyGenesis(_) => {
+        GenesisProof::Mint(_) => {
             // Bounty proof hash is the verified argon2_output
             Some((og.digest, og.digest))
         }
@@ -1811,6 +1809,135 @@ fn proof_hash_and_nonce_from_genesis(og: &OwnershipGenesis) -> Option<([u8; 32],
     }
 }
 
+/// Validate an incoming genesis proof and retain it locally if valid.
+///
+/// Mint proofs: recompute Argon2d and check leading-zero difficulty.
+/// Vichor genesis: validate against canonical constants.
+fn validate_and_retain_genesis(
+    state: &mut ArteryState,
+    og: &vess_protocol::OwnershipGenesis,
+    peer_id: &[u8; 32],
+) -> bool {
+    match &og.genesis_proof {
+        vess_protocol::GenesisProof::Mint(mp) => {
+            return validate_mint_genesis(state, og, mp, peer_id);
+        }
+        _ => {
+            if let vess_protocol::GenesisProof::VichorGenesis(vg) = &og.genesis_proof {
+                if vg.nonce != vess_protocol::VICHOR_GENESIS_NONCE {
+                    tracing::warn!("Vichor genesis rejected: invalid nonce");
+                    return false;
+                }
+                if vg.total_supply != vess_protocol::VICHOR_TOTAL_SUPPLY {
+                    tracing::warn!("Vichor genesis rejected: total_supply != 1B");
+                    return false;
+                }
+                let mut sig_msg = blake3::Hasher::new();
+                sig_msg.update(b"vess-vichor-genesis-v1");
+                sig_msg.update(&vg.nonce);
+                sig_msg.update(&vg.total_supply.to_be_bytes());
+                sig_msg.update(&vg.owner_vk_hash);
+                let sig_digest = *sig_msg.finalize().as_bytes();
+                match vess_foundry::spend_auth::verify_spend(&vg.owner_vk, &sig_digest, &vg.owner_sig) {
+                    Ok(true) => {}
+                    _ => {
+                        tracing::warn!("Vichor genesis rejected: invalid dev signature");
+                        return false;
+                    }
+                }
+                tracing::info!("Vichor genesis accepted: 1B supply created");
+            }
+            let now = ArteryState::now_unix();
+            retain_local_ownership_genesis(state, og, now);
+            return true;
+        }
+    }
+}
+
+fn validate_mint_genesis(
+    state: &mut ArteryState,
+    og: &vess_protocol::OwnershipGenesis,
+    mp: &vess_foundry::mine::MintProof,
+    peer_id: &[u8; 32],
+) -> bool {
+    match vess_foundry::mine::verify_mint_proof(mp) {
+        Err(e) => {
+            tracing::warn!(mint_id = %crate::persistence::hex_key(&og.mint_id), error = %e, "mint genesis rejected: PoW verification failed");
+            state.peer_registry.mark_banished(*peer_id);
+            return false;
+        }
+        Ok(()) => {}
+    }
+    if mp.mint_id() != og.mint_id {
+        tracing::warn!(mint_id = %crate::persistence::hex_key(&og.mint_id), "mint genesis rejected: mint_id mismatch");
+        state.peer_registry.mark_banished(*peer_id);
+        return false;
+    }
+    if mp.denomination_value != og.denomination_value {
+        tracing::warn!(mint_id = %crate::persistence::hex_key(&og.mint_id), "mint genesis rejected: denomination mismatch");
+        state.peer_registry.mark_banished(*peer_id);
+        return false;
+    }
+    let now = ArteryState::now_unix();
+    retain_local_ownership_genesis(state, og, now);
+    tracing::info!(mint_id = %crate::persistence::hex_key(&og.mint_id), denom = mp.denomination_value, nonce = mp.nonce, "mint genesis validated - {} VHALIX", mp.denomination_value);
+    true
+}
+
+pub(crate) fn run_mining_loop(
+    state: std::sync::Arc<std::sync::Mutex<ArteryState>>,
+    og_tx: tokio::sync::mpsc::UnboundedSender<vess_protocol::OwnershipGenesis>,
+    mut stop_rx: tokio::sync::oneshot::Receiver<()>,
+    owner_vk_hash: [u8; 32],
+    owner_vk: Vec<u8>,
+    starting_nonce: u64,
+) {
+    let mut miner = vess_foundry::mine::VhalixMiner::new(owner_vk_hash, starting_nonce);
+    loop {
+        if stop_rx.try_recv().is_ok() { tracing::info!("mining stopped"); break; }
+        let proof = miner.mine_until(|| stop_rx.try_recv().is_ok());
+        match proof {
+            Some(proof) => {
+                let mint_id = proof.mint_id();
+                tracing::info!(mint_id = %crate::persistence::hex_key(&mint_id), nonce = proof.nonce, denom = proof.denomination_value, "VHALIX found!");
+                let chain_tip = vess_foundry::advance_chain_tip_with_hash(&mint_id, &owner_vk_hash, &mint_id);
+                let og = vess_protocol::OwnershipGenesis {
+                    mint_id, chain_tip, owner_vk_hash, owner_vk: owner_vk.clone(),
+                    denomination_value: proof.denomination_value,
+                    genesis_proof: vess_protocol::GenesisProof::Mint(proof),
+                    digest: mint_id, hops_remaining: 0, chain_depth: 0, output_index: 0,
+                    pow_nonce: None, pow_hash: None, accumulated_work: None,
+                };
+                let _ = og_tx.send(og);
+                if let Ok(mut s) = state.lock() { s.mining_nonce = miner.next_nonce(); }
+            }
+            None => { tracing::info!("mining loop stopped"); break; }
+        }
+    }
+}
+
+pub fn submit_mint_genesis(
+    state: &ArteryState,
+    og_tx: &tokio::sync::mpsc::UnboundedSender<vess_protocol::OwnershipGenesis>,
+    proof: &vess_foundry::mine::MintProof,
+    owner_vk: &[u8],
+) -> Result<[u8; 32], String> {
+    let mint_id = proof.mint_id();
+    let owner_vk_hash = vess_foundry::spend_auth::vk_hash(owner_vk);
+    if owner_vk_hash != proof.owner_vk_hash { return Err("owner_vk_hash mismatch".into()); }
+    let chain_tip = vess_foundry::advance_chain_tip_with_hash(&mint_id, &owner_vk_hash, &mint_id);
+    let og = vess_protocol::OwnershipGenesis {
+        mint_id, chain_tip, owner_vk_hash, owner_vk: owner_vk.to_vec(),
+        denomination_value: proof.denomination_value,
+        genesis_proof: vess_protocol::GenesisProof::Mint(proof.clone()),
+        digest: mint_id, hops_remaining: 0, chain_depth: 0, output_index: 0,
+        pow_nonce: None, pow_hash: None, accumulated_work: None,
+    };
+    let _ = og_tx.send(og);
+    tracing::info!(mint_id = %crate::persistence::hex_key(&mint_id), nonce = proof.nonce, denom = proof.denomination_value, "mint genesis submitted");
+    Ok(mint_id)
+}
+
 pub(crate) fn retain_local_ownership_genesis(
     state: &mut ArteryState,
     og: &OwnershipGenesis,
@@ -1819,9 +1946,9 @@ pub(crate) fn retain_local_ownership_genesis(
     // Validate genesis proofs before accepting.  VHALIXMined proofs are
     // verified by the OwnershipGenesis handler before reaching this function.
     match &og.genesis_proof {
-        GenesisProof::VHALIXMined(_) | GenesisProof::Vess(_)
+        GenesisProof::Mint(_) | GenesisProof::Vess(_)
         | GenesisProof::VichorGenesis(_) | GenesisProof::LocalTestFaucet(_)
-        | GenesisProof::BountyGenesis(_) => {}
+        | GenesisProof::Mint(_) => {}
     }
 
     let Some((proof_hash, proof_nonce)) = proof_hash_and_nonce_from_genesis(og) else {
@@ -1852,503 +1979,21 @@ pub(crate) fn retain_local_ownership_genesis(
     );
 }
 
-/// Validate an incoming VHALIXMined genesis proof and retain it locally.
-///
-/// Performs fast checks (chain continuity, Merkle root, denomination,
-/// signature) and rejects invalid proofs.  Expensive Argon2id spot-check
-/// recomputation is done probabilistically for high-denomination bills.
-///
-/// Returns `true` if the genesis was valid and retained.
-fn validate_and_retain_genesis(
-    state: &mut ArteryState,
-    og: &vess_protocol::OwnershipGenesis,
-    peer_id: &[u8; 32],
-) -> bool {
-    let proof = match &og.genesis_proof {
-        vess_protocol::GenesisProof::VHALIXMined(p) => {
-            return validate_VHALIX_genesis(state, og, p, peer_id);
-        }
-        vess_protocol::GenesisProof::BountyGenesis(bp) => {
-            return validate_bounty_genesis(state, og, bp, peer_id);
-        }
-        // Non-VHALIX/bounty genesis types (Vess, VichorGenesis, LocalTestFaucet)
-        // are validated elsewhere or accepted as-is.
-        _ => {
-            // VichorGenesis: validate canonical nonce, supply, and signature
-            if let vess_protocol::GenesisProof::VichorGenesis(vg) = &og.genesis_proof {
-                if vg.nonce != vess_protocol::VICHOR_GENESIS_NONCE {
-                    tracing::warn!("Vichor genesis rejected: invalid nonce");
-                    return false;
-                }
-                if vg.total_supply != vess_protocol::VICHOR_TOTAL_SUPPLY {
-                    tracing::warn!("Vichor genesis rejected: total_supply != 1B");
-                    return false;
-                }
-                // Verify dev signature over genesis message
-                let mut sig_msg = blake3::Hasher::new();
-                sig_msg.update(b"vess-vichor-genesis-v1");
-                sig_msg.update(&vg.nonce);
-                sig_msg.update(&vg.total_supply.to_be_bytes());
-                sig_msg.update(&vg.owner_vk_hash);
-                let sig_digest = *sig_msg.finalize().as_bytes();
-                match vess_foundry::spend_auth::verify_spend(&vg.owner_vk, &sig_digest, &vg.owner_sig) {
-                    Ok(true) => {}
-                    _ => {
-                        tracing::warn!("Vichor genesis rejected: invalid dev signature");
-                        return false;
-                    }
-                }
-                tracing::info!("Vichor genesis accepted: 1B supply created");
-            }
-            retain_local_ownership_genesis(state, og, ArteryState::now_unix());
-            return true;
-        }
-    };
-}
-
 /// Validate an incoming VHALIXMined genesis proof (steps 1-6).
-fn validate_VHALIX_genesis(
-    state: &mut ArteryState,
-    og: &vess_protocol::OwnershipGenesis,
-    proof: &vess_protocol::VHALIXMinedProof,
-    peer_id: &[u8; 32],
-) -> bool {
-    // ── 1. Owner VK hash must match ──────────────────────────────
-    let computed_vk_hash = vess_foundry::spend_auth::vk_hash(&proof.owner_vk);
-    if computed_vk_hash != og.owner_vk_hash {
-        tracing::warn!(
-            mint_id = %crate::persistence::hex_key(&og.mint_id),
-            peer = %crate::persistence::hex_key(peer_id),
-            "VHALIX genesis rejected: owner_vk_hash mismatch"
-        );
-        return false;
-    }
-
-    // ── 2. Chain length and denomination ─────────────────────────
-    let chain_length = proof.bill_nonce_end
-        .saturating_sub(proof.bill_nonce_start)
-        .saturating_add(1);
-    if chain_length < vess_foundry::mine::MIN_CHAIN_LENGTH {
-        tracing::warn!(
-            mint_id = %crate::persistence::hex_key(&og.mint_id),
-            chain_length,
-            min = vess_foundry::mine::MIN_CHAIN_LENGTH,
-            "VHALIX genesis rejected: chain too short"
-        );
-        return false;
-    }
-    let expected_denom = vess_foundry::Denomination::max_valid_denomination(chain_length);
-    if og.denomination_value != expected_denom {
-        tracing::warn!(
-            mint_id = %crate::persistence::hex_key(&og.mint_id),
-            claimed = og.denomination_value,
-            expected = expected_denom,
-            chain_length,
-            "VHALIX genesis rejected: denomination mismatch"
-        );
-        return false;
-    }
-
-    // ── 3. Merkle root must match digest ─────────────────────────
-    if proof.merkle_root != og.digest {
-        tracing::warn!(
-            mint_id = %crate::persistence::hex_key(&og.mint_id),
-            "VHALIX genesis rejected: merkle root != digest"
-        );
-        return false;
-    }
-
-    // ── 4. Verify Merkle root from chain_hashes ────────────────
-    if !proof.chain_hashes.is_empty() {
-        // Recompute Merkle root from the hash list
-        let computed_root = {
-            let mut level: Vec<[u8; 32]> = proof.chain_hashes.clone();
-            if level.is_empty() {
-                [0u8; 32]
-            } else {
-                while level.len() > 1 {
-                    let mut next = Vec::with_capacity((level.len() + 1) / 2);
-                    for chunk in level.chunks(2) {
-                        let mut h = blake3::Hasher::new();
-                        h.update(&chunk[0]);
-                        if chunk.len() == 2 {
-                            h.update(&chunk[1]);
-                        } else {
-                            h.update(&chunk[0]);
-                        }
-                        next.push(*h.finalize().as_bytes());
-                    }
-                    level = next;
-                }
-                level[0]
-            }
-        };
-        if computed_root != proof.merkle_root {
-            tracing::warn!(
-                mint_id = %crate::persistence::hex_key(&og.mint_id),
-                "VHALIX genesis rejected: chain_hashes Merkle root mismatch"
-            );
-            return false;
-        }
-
-        // Verify chain_hashes count matches bill_nonce range
-        let expected_count = proof.bill_nonce_end
-            .saturating_sub(proof.bill_nonce_start)
-            .saturating_add(1) as usize;
-        if proof.chain_hashes.len() != expected_count {
-            tracing::warn!(
-                mint_id = %crate::persistence::hex_key(&og.mint_id),
-                hashes = proof.chain_hashes.len(),
-                expected = expected_count,
-                "VHALIX genesis rejected: chain_hashes count mismatch"
-            );
-            return false;
-        }
-    }
-
-    // ── 5. Batch signature verification ──────────────────────────
-    {
-        let mut sig_hasher = blake3::Hasher::new();
-        sig_hasher.update(b"vess-VHALIX-batch-v2");
-        sig_hasher.update(&proof.merkle_root);
-        sig_hasher.update(&proof.bill_nonce_start.to_be_bytes());
-        sig_hasher.update(&proof.bill_nonce_end.to_be_bytes());
-        let sig_msg = *sig_hasher.finalize().as_bytes();
-
-        match vess_foundry::spend_auth::verify_spend(&proof.owner_vk, &sig_msg, &proof.batch_sig) {
-            Ok(true) => {}
-            Ok(false) | Err(_) => {
-                tracing::warn!(
-                    mint_id = %crate::persistence::hex_key(&og.mint_id),
-                    "VHALIX genesis rejected: invalid batch signature"
-                );
-                return false;
-            }
-        }
-    }
-
-    // ── 6. High-value bills: deferred full verification ───────
-    // For bills ≥ 500 denomination, we log a warning that full
-    // Argon2id verification is deferred.  In production, a separate
-    // async worker would spot-check ~1% of high-value proofs.
-    // The fast checks above (chain length, denomination, Merkle root,
-    // batch signature) are sufficient to reject trivial forgeries.
-    // Peer reputation handles the rest — a peer submitting fake
-    // high-value proofs gets banished once detected.
-    if og.denomination_value >= 500 {
-        tracing::info!(
-            mint_id = %crate::persistence::hex_key(&og.mint_id),
-            denomination = og.denomination_value,
-            chain_length,
-            "VHALIX high-value genesis accepted (Argon2id spot-check deferred)"
-        );
-    }
-
-    // ── Retain locally ───────────────────────────────────────────
-    let now = ArteryState::now_unix();
-    retain_local_ownership_genesis(state, og, now);
-
-    // Store open bounty for verifiers to claim
-    if proof.bounty.is_some() {
-        state.open_bounties.insert(og.mint_id, proof.clone());
-    }
-
-    tracing::info!(
-        mint_id = %crate::persistence::hex_key(&og.mint_id),
-        denomination = og.denomination_value,
-        chain_length,
-        "VHALIX genesis validated and retained"
-    );
-
-    true
-}
 
 /// Validate an incoming BountyGenesis proof.
 ///
 /// Checks that the parent VHALIX genesis exists in the registry, the
 /// claimed proof index is in the excess (bounty) range, and the
 /// Argon2id output in the proof matches the parent's chain_hashes.
-fn validate_bounty_genesis(
-    state: &mut ArteryState,
-    og: &vess_protocol::OwnershipGenesis,
-    bp: &vess_protocol::BountyGenesisProof,
-    peer_id: &[u8; 32],
-) -> bool {
-    // ── 1. Parent genesis must exist ────────────────────────────
-    let parent_record = match state.registry.get(&bp.genesis_mint_id) {
-        Some(r) => r.clone(),
-        None => {
-            tracing::warn!(
-                parent = %crate::persistence::hex_key(&bp.genesis_mint_id),
-                "bounty rejected: parent genesis not found"
-            );
-            return false;
-        }
-    };
-
-    // ── 2. Parent must have a bounty ────────────────────────────
-    let parent_proof = match &parent_record.proof_hash {
-        _ => {
-            // We need the VHALIXMinedProof from the parent.
-            // It's not stored in OwnershipRecord directly.
-            // For now: check the open_bounties map.
-            match state.open_bounties.get(&bp.genesis_mint_id) {
-                Some(p) => p.clone(),
-                None => {
-                    tracing::warn!(
-                        parent = %crate::persistence::hex_key(&bp.genesis_mint_id),
-                        "bounty rejected: parent has no open bounty"
-                    );
-                    return false;
-                }
-            }
-        }
-    };
-
-    let bounty = match &parent_proof.bounty {
-        Some(b) => b,
-        None => {
-            tracing::warn!("bounty rejected: parent has no bounty");
-            return false;
-        }
-    };
-
-    // ── 3. Proof index must be in bounty range ──────────────────
-    if bp.proof_index < bounty.excess_start || bp.proof_index > bounty.excess_end {
-        tracing::warn!(
-            proof_index = bp.proof_index,
-            excess_start = bounty.excess_start,
-            excess_end = bounty.excess_end,
-            "bounty rejected: proof index outside excess range"
-        );
-        return false;
-    }
-
-    // ── 4. Check not already claimed ────────────────────────────
-    let claimed = state.claimed_bounty_indices
-        .entry(bp.genesis_mint_id)
-        .or_default();
-    if claimed.contains(&bp.proof_index) {
-        tracing::warn!(
-            proof_index = bp.proof_index,
-            "bounty rejected: already claimed"
-        );
-        return false;
-    }
-
-    // ── 5. Verify Argon2id output matches parent's chain_hashes ─
-    let hash_offset = bp.proof_index.saturating_sub(parent_proof.bill_nonce_start) as usize;
-    let expected_hash = match parent_proof.chain_hashes.get(hash_offset) {
-        Some(h) => *h,
-        None => {
-            tracing::warn!("bounty rejected: proof index out of chain_hashes");
-            return false;
-        }
-    };
-
-    // Recompute hash from the claimed Argon2id output
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"vess-VHALIX-commit-v1");
-    hasher.update(&bp.argon2_output);
-    hasher.update(&bp.proof_index.to_be_bytes());
-    hasher.update(&vess_foundry::spend_auth::vk_hash(&bp.verifier_vk));
-    let computed_hash = *hasher.finalize().as_bytes();
-
-    if computed_hash != expected_hash {
-        tracing::warn!(
-            proof_index = bp.proof_index,
-            "bounty rejected: Argon2id hash mismatch"
-        );
-        // Banish the peer for submitting a fraudulent claim
-        state.peer_registry.mark_banished(*peer_id);
-        return false;
-    }
-
-    // ── 6. Mark as claimed ──────────────────────────────────────
-    claimed.insert(bp.proof_index);
-    if claimed.len() as u64 >= bounty.bounty_count {
-        // All bounties claimed — remove from open_bounties
-        state.open_bounties.remove(&bp.genesis_mint_id);
-    }
-
-    // ── 7. Retain the bounty bill ───────────────────────────────
-    let now = ArteryState::now_unix();
-    retain_local_ownership_genesis(state, og, now);
-
-    tracing::info!(
-        mint_id = %crate::persistence::hex_key(&og.mint_id),
-        parent = %crate::persistence::hex_key(&bp.genesis_mint_id),
-        proof_index = bp.proof_index,
-        "bounty genesis validated — 5 VHALIX awarded to verifier"
-    );
-
-    true
-}
 
 /// Extract VerificationBounty from an OwnershipGenesis, if present.
-fn extract_bounty(og: &vess_protocol::OwnershipGenesis) -> Option<&vess_protocol::VerificationBounty> {
-    match &og.genesis_proof {
-        vess_protocol::GenesisProof::VHALIXMined(p) => p.bounty.as_ref(),
-        _ => None,
-    }
-}
 
 /// Attempt to claim one verification bounty from a genesis proof.
 ///
 /// Picks a deterministic bounty index based on our node_id (so different
 /// nodes naturally pick different proofs).  Recomputes Argon2id for that
 /// proof.  If it matches, submits a VerificationClaim to the network.
-fn try_claim_bounty(
-    og: &vess_protocol::OwnershipGenesis,
-    verifier_vk: &[u8],
-    verifier_sk: &[u8],
-    node_id: [u8; 32],
-    og_tx: &tokio::sync::mpsc::UnboundedSender<vess_protocol::OwnershipGenesis>,
-) {
-    let proof = match &og.genesis_proof {
-        vess_protocol::GenesisProof::VHALIXMined(p) => p,
-        _ => return,
-    };
-    let bounty = match &proof.bounty {
-        Some(b) => b,
-        None => return,
-    };
-
-    // Deterministic index: node_id % bounty_count
-    let bounty_idx = (u64::from_le_bytes(node_id[..8].try_into().unwrap_or([0u8; 8])))
-        % bounty.bounty_count;
-    let proof_nonce = bounty.excess_start + bounty_idx;
-
-    // Derive the expected argon2_hash from chain_hashes
-    let hash_offset = proof_nonce.saturating_sub(proof.bill_nonce_start) as usize;
-    let expected_hash = match proof.chain_hashes.get(hash_offset) {
-        Some(h) => *h,
-        None => {
-            tracing::warn!(
-                mint_id = %crate::persistence::hex_key(&og.mint_id),
-                bounty_idx,
-                proof_nonce,
-                "bounty claim: proof index out of chain_hashes range"
-            );
-            return;
-        }
-    };
-
-    tracing::info!(
-        mint_id = %crate::persistence::hex_key(&og.mint_id),
-        bounty_idx,
-        proof_nonce,
-        "starting bounty verification (Argon2id recompute, ~30 min)"
-    );
-
-    // Recompute Argon2id
-    let mut password = Vec::with_capacity(32 + 8 + 32);
-    password.extend_from_slice(&vess_foundry::spend_auth::vk_hash(&proof.owner_vk));
-    password.extend_from_slice(&proof_nonce.to_be_bytes());
-    password.extend_from_slice(b"vess-VHALIX-mine-v1");
-
-    let mut output = [0u8; 32];
-    let argon2 = argon2::Argon2::new(
-        argon2::Algorithm::Argon2id,
-        argon2::Version::V0x13,
-        argon2::Params::new(
-            vess_foundry::mine::VHALIX_M_COST,
-            vess_foundry::mine::VHALIX_T_COST,
-            1,
-            Some(32),
-        ).expect("valid params"),
-    );
-
-    if let Err(e) = argon2.hash_password_into(&password, b"vess-VHALIX-salt-v1", &mut output) {
-        tracing::error!(error = %e, "bounty Argon2id recompute failed");
-        return;
-    }
-
-    // Hash the output to compare with chain_hashes entry
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"vess-VHALIX-commit-v1");
-    hasher.update(&output);
-    hasher.update(&proof_nonce.to_be_bytes());
-    hasher.update(&vess_foundry::spend_auth::vk_hash(&proof.owner_vk));
-    let computed_hash = *hasher.finalize().as_bytes();
-
-    if computed_hash != expected_hash {
-        tracing::warn!(
-            mint_id = %crate::persistence::hex_key(&og.mint_id),
-            bounty_idx,
-            proof_nonce,
-            "bounty verification FAILED — genesis proof is fraudulent!"
-        );
-        return;
-    }
-
-    tracing::info!(
-        mint_id = %crate::persistence::hex_key(&og.mint_id),
-        bounty_idx,
-        proof_nonce,
-        "bounty verification PASSED — submitting claim"
-    );
-
-    // Build and sign the claim
-    let mut sig_msg = blake3::Hasher::new();
-    sig_msg.update(b"vess-bounty-claim-v1");
-    sig_msg.update(&og.mint_id);
-    sig_msg.update(&proof_nonce.to_be_bytes());
-    let sig_digest = *sig_msg.finalize().as_bytes();
-
-    let sig = match vess_foundry::spend_auth::sign_spend(verifier_sk, &sig_digest) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!(error = %e, "failed to sign bounty claim");
-            return;
-        }
-    };
-
-    // Build the bounty genesis proof
-    let verifier_vk_hash = vess_foundry::spend_auth::vk_hash(verifier_vk);
-    let mint_id = {
-        let mut h = blake3::Hasher::new();
-        h.update(b"vess-bounty-mint-v1");
-        h.update(&og.mint_id);
-        h.update(&proof_nonce.to_be_bytes());
-        h.update(&verifier_vk_hash);
-        *h.finalize().as_bytes()
-    };
-
-    let bounty_proof = vess_protocol::BountyGenesisProof {
-        genesis_mint_id: og.mint_id,
-        proof_index: proof_nonce,
-        argon2_output: output,
-        verifier_vk: verifier_vk.to_vec(),
-        verifier_sig: sig,
-    };
-
-    let bounty_og = vess_protocol::OwnershipGenesis {
-        mint_id,
-        chain_tip: vess_foundry::advance_chain_tip_with_hash(
-            &mint_id, &verifier_vk_hash, &mint_id,
-        ),
-        owner_vk_hash: verifier_vk_hash,
-        owner_vk: verifier_vk.to_vec(),
-        denomination_value: bounty.reward_per_claim, // 1 VHALIX
-        genesis_proof: vess_protocol::GenesisProof::BountyGenesis(bounty_proof),
-        digest: expected_hash, // the verified argon2_hash
-        hops_remaining: 0,
-        chain_depth: 0,
-        output_index: 0,
-        pow_nonce: None,
-        pow_hash: None,
-        accumulated_work: None,
-    };
-
-    let _ = og_tx.send(bounty_og);
-    tracing::info!(
-        mint_id = %crate::persistence::hex_key(&mint_id),
-        parent = %crate::persistence::hex_key(&og.mint_id),
-        proof_nonce,
-        "bounty claim submitted as genesis"
-    );
-}
 
 pub(crate) fn local_seed_record_from_claimed_bill(
     claim: &OwnershipClaim,
@@ -3010,114 +2655,6 @@ fn spawn_clock_gossip_task(
 /// and `mining_next_nonce` on each proof.  When signalled to stop via
 /// `stop_rx`, finalizes the batch and submits as a genesis proof if
 /// the chain meets the minimum length.
-pub(crate) fn run_mining_loop(
-    state: Arc<Mutex<ArteryState>>,
-    og_tx: tokio::sync::mpsc::UnboundedSender<vess_protocol::OwnershipGenesis>,
-    stop_rx: tokio::sync::oneshot::Receiver<()>,
-    owner_vk_hash: [u8; 32],
-    starting_nonce: u64,
-    prev_hash: [u8; 32],
-    session_nonce: u64,
-    tick_hash: [u8; 32],
-) {
-    use vess_foundry::mine::VHALIXMiner;
-
-    let mut miner = VHALIXMiner::new(owner_vk_hash, starting_nonce, session_nonce, tick_hash);
-
-    let mut stop_rx = stop_rx;
-    let mut mined_count = 0u64;
-
-    loop {
-        // Check for stop signal
-        match stop_rx.try_recv() {
-            Ok(()) | Err(tokio::sync::oneshot::error::TryRecvError::Closed) => break,
-            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
-        }
-
-        let proof = miner.mine_one();
-        mined_count += 1;
-
-        {
-            let mut s = lock_state(&state);
-            s.mining_chain_length = mined_count;
-            s.mining_next_nonce = miner.next_bill_nonce();
-        }
-
-        tracing::info!(
-            nonce = proof.bill_nonce,
-            elapsed_ms = proof.elapsed_ms,
-            chain_length = mined_count,
-            "VHALIX proof mined"
-        );
-    }
-
-    if mined_count < vess_foundry::mine::MIN_CHAIN_LENGTH {
-        tracing::info!(
-            chain_length = mined_count,
-            min_required = vess_foundry::mine::MIN_CHAIN_LENGTH,
-            "VHALIX chain too short — no bill submitted"
-        );
-        let mut s = lock_state(&state);
-        s.mining_active = false;
-        if let Some(wallet) = s.wallet.as_mut() {
-            wallet.mining_next_nonce = miner.next_bill_nonce();
-        }
-        return;
-    }
-
-    let batch = match miner.finalize_batch() {
-        Some(b) => b,
-        None => {
-            tracing::warn!("VHALIX miner stopped but batch was empty");
-            return;
-        }
-    };
-
-    let chain_length = batch.bill_nonce_end.saturating_sub(batch.bill_nonce_start).saturating_add(1);
-    let denomination = vess_foundry::Denomination::max_valid_denomination(chain_length);
-
-    let (owner_vk, owner_sk) = {
-        let s = lock_state(&state);
-        match s.wallet.as_ref().and_then(|w| w.billfold.any_credential().cloned()) {
-            Some(cred) => (cred.spend_vk.clone(), cred.spend_sk.clone()),
-            None => {
-                tracing::error!("cannot submit VHALIX genesis: no spend credentials");
-                return;
-            }
-        }
-    };
-
-    let proof = match VHALIX_batch_to_proof(&batch, &[], &[], &owner_vk, &owner_sk) {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::error!(error = %e, "failed to build VHALIX proof");
-            return;
-        }
-    };
-
-    let mint_id = match submit_VHALIX_genesis(&state, &og_tx, &proof, &owner_vk) {
-        Ok(id) => id,
-        Err(e) => {
-            tracing::error!(error = %e, "failed to submit VHALIX genesis");
-            return;
-        }
-    };
-
-    {
-        let mut s = lock_state(&state);
-        s.mining_active = false;
-        if let Some(wallet) = s.wallet.as_mut() {
-            wallet.mining_next_nonce = miner.next_bill_nonce();
-        }
-    }
-
-    tracing::info!(
-        mint_id = %crate::persistence::hex_key(&mint_id),
-        chain_length,
-        denomination,
-        "VHALIX bill hardened and submitted"
-    );
-}
 
 // ── Century lock management ────────────────────────────────────────
 
@@ -3135,7 +2672,7 @@ fn mint_century_lock_bills(
 
     let mut new_ogs = Vec::new();
     for lock in s.century_locks.values_mut() {
-        let next_tick = lock.last_claimed_tick.saturating_add(1);
+        let next_tick = lock.last_claimed_tick.wrapping_add(1);
         if next_tick > current_tick || next_tick > lock.end_tick {
             continue;
         }
@@ -3177,51 +2714,6 @@ fn mint_century_lock_bills(
 ///
 /// Uses the wallet's stealth keys to generate ephemeral DKSAP key material
 /// so the proof is indistinguishable from a normal payment on-chain.
-pub fn VHALIX_batch_to_proof(
-    batch: &vess_foundry::mine::MiningBatch,
-    scan_ek: &[u8],
-    spend_ek: &[u8],
-    owner_vk: &[u8],
-    owner_sk: &[u8],
-) -> Result<vess_protocol::VHALIXMinedProof, String> {
-    // Build the batch commitment to sign
-    let mut sig_hasher = blake3::Hasher::new();
-    sig_hasher.update(b"vess-VHALIX-batch-v2");
-    sig_hasher.update(&batch.merkle_root);
-    sig_hasher.update(&batch.bill_nonce_start.to_be_bytes());
-    sig_hasher.update(&batch.bill_nonce_end.to_be_bytes());
-    let sig_msg = *sig_hasher.finalize().as_bytes();
-
-    let batch_sig = vess_foundry::spend_auth::sign_spend(owner_sk, &sig_msg)
-        .map_err(|e| format!("batch signature failed: {e}"))?;
-
-    // Generate ephemeral DKSAP keys
-    let ephemeral_scan_sk = {
-        let mut sk = vec![0u8; 64];
-        rand::thread_rng().fill_bytes(&mut sk);
-        sk
-    };
-    // For now: use wallet scan_ek directly for self-encryption.
-    // The full DKSAP self-encryption path would generate fresh ephemeral
-    // keys per batch and encrypt the bill payload.
-    Ok(vess_protocol::VHALIXMinedProof {
-        ephemeral_scan_ek: scan_ek.to_vec(),
-        ephemeral_spend_ek: spend_ek.to_vec(),
-        ct_scan: Vec::new(),  // filled by DKSAP self-encrypt
-        ct_spend: Vec::new(),
-        view_tag: 0,
-        bill_nonce_start: batch.bill_nonce_start,
-        bill_nonce_end: batch.bill_nonce_end,
-        merkle_root: batch.merkle_root,
-        total_compute_ticks: batch.total_compute_ms,
-        session_nonce: 0, // filled in later when session info is known
-        tick_hash: [0u8; 32],
-        chain_hashes: batch.proofs.iter().map(|p| p.argon2_hash).collect(),
-        owner_vk: owner_vk.to_vec(),
-        batch_sig,
-        bounty: None, // bounty computed in submit_VHALIX_genesis
-    })
-}
 
 /// Submit a VHALIX mining proof as a single OwnershipGenesis to the network.
 ///
@@ -3229,119 +2721,6 @@ pub fn VHALIX_batch_to_proof(
 /// ≤ the chain length (number of sequential Argon2id proofs in the batch).
 /// The mint_id is anchored to the miner's session nonce + network tick hash
 /// so every mining session produces a unique, time-bound bill.
-pub fn submit_VHALIX_genesis(
-    state: &Arc<Mutex<ArteryState>>,
-    og_tx: &tokio::sync::mpsc::UnboundedSender<vess_protocol::OwnershipGenesis>,
-    proof: &vess_protocol::VHALIXMinedProof,
-    owner_vk: &[u8],
-) -> Result<[u8; 32], String> {
-    let owner_vk_hash = vess_foundry::spend_auth::vk_hash(owner_vk);
-
-    // ── Compute chain length and denomination ─────────────────
-    let chain_length = proof.bill_nonce_end.saturating_sub(proof.bill_nonce_start).saturating_add(1);
-    if chain_length < vess_foundry::mine::MIN_CHAIN_LENGTH {
-        return Err(format!(
-            "chain too short: {} proofs (minimum {})",
-            chain_length,
-            vess_foundry::mine::MIN_CHAIN_LENGTH,
-        ));
-    }
-    let denomination = vess_foundry::Denomination::max_valid_denomination(chain_length);
-    if denomination == 0 {
-        return Err("chain too short for any valid denomination".to_string());
-    }
-
-    // ── Derive mint_id from owner + nonce range ───────────────
-    // Anchored to (owner, nonce_start, nonce_end) so the same
-    // batch always produces the same mint_id — double-spend check
-    // prevents submitting the same work twice, even across different
-    // sessions or network ticks.
-    let mint_id = {
-        let mut h = blake3::Hasher::new();
-        h.update(b"vess-VHALIX-mint-v3");
-        h.update(&owner_vk_hash);
-        h.update(&proof.bill_nonce_start.to_be_bytes());
-        h.update(&proof.bill_nonce_end.to_be_bytes());
-        *h.finalize().as_bytes()
-    };
-
-    // ── Check for duplicate submission ────────────────────────
-    let mut s = lock_state(state);
-    if s.registry.get(&mint_id).is_some() || s.registry.was_consumed(&mint_id).is_some() {
-        return Err(format!(
-            "VHALIX genesis: mint_id {} already exists",
-            crate::persistence::hex_key(&mint_id),
-        ));
-    }
-    drop(s);
-
-    // ── Compute bounty from excess proofs ─────────────────────
-    // Excess = chain_length - denomination (the safety margin).
-    // Each excess proof is a 1-VHALIX bounty for verifiers.
-    // Minimum 5 excess proofs so every bill has a verifiable bounty.
-    let excess = chain_length.saturating_sub(denomination);
-    if excess < vess_foundry::mine::MIN_CHAIN_LENGTH {
-        return Err(format!(
-            "insufficient excess: {excess} proofs (minimum {}). \
-             Need {} more proofs to reach {} proofs total ({} denom + 5 margin).",
-            vess_foundry::mine::MIN_CHAIN_LENGTH,
-            denomination + vess_foundry::mine::MIN_CHAIN_LENGTH - chain_length,
-            denomination + vess_foundry::mine::MIN_CHAIN_LENGTH,
-            denomination,
-        ));
-    }
-    let bounty: Option<vess_protocol::VerificationBounty> =
-        if excess >= 1 {
-            Some(vess_protocol::VerificationBounty {
-                excess_start: proof.bill_nonce_start + denomination,
-                excess_end: proof.bill_nonce_end,
-                bounty_count: excess,
-                reward_per_claim: 1,
-            })
-        } else {
-            None
-        };
-
-    // ── Build the proof with bounty attached ──────────────────
-    let mut proof_with_bounty = proof.clone();
-    proof_with_bounty.bounty = bounty.clone();
-
-    // ── Build and send the genesis ────────────────────────────
-    let og = vess_protocol::OwnershipGenesis {
-        mint_id,
-        chain_tip: vess_foundry::advance_chain_tip_with_hash(
-            &mint_id, &owner_vk_hash, &mint_id,
-        ),
-        owner_vk_hash,
-        owner_vk: owner_vk.to_vec(),
-        denomination_value: denomination,
-        genesis_proof: vess_protocol::GenesisProof::VHALIXMined(proof_with_bounty),
-        digest: proof.merkle_root,
-        hops_remaining: 0,
-        chain_depth: 0,
-        output_index: 0,
-        pow_nonce: None,
-        pow_hash: None,
-        accumulated_work: None,
-    };
-
-    let _ = og_tx.send(og);
-
-    let bounty_info = match &bounty {
-        Some(b) => format!(", {} bounties ({} VHALIX for verifiers)", b.bounty_count, b.bounty_count * b.reward_per_claim),
-        None => String::new(),
-    };
-
-    tracing::info!(
-        mint_id = %crate::persistence::hex_key(&mint_id),
-        chain_length,
-        denomination,
-        bounty_info,
-        "VHALIX genesis submitted"
-    );
-
-    Ok(mint_id)
-}
 
 /// Create a new century lock from a VHALIX mining proof.
 ///
@@ -3350,7 +2729,7 @@ pub fn submit_VHALIX_genesis(
 impl ArteryState {
     pub fn create_century_lock(
         &mut self,
-        proof: &vess_protocol::VHALIXMinedProof,
+        proof: &vess_foundry::mine::MintProof,
         lock_years: f64,
         vichor_burn: Option<&vess_protocol::VichorBurnProof>,
         _manifest_tx: &tokio::sync::mpsc::UnboundedSender<vess_protocol::ManifestStore>,
@@ -3365,7 +2744,7 @@ impl ArteryState {
             return Err("lock duration must be between 0 and 10 years".into());
         }
 
-        let total_locked = proof.total_compute_ticks;
+        let total_locked = proof.denomination_value;
         let lock_ticks = (lock_years * vess_clock::TICKS_PER_YEAR as f64) as u64;
 
         // Vichor burn required for locks > 1 year
@@ -3397,7 +2776,7 @@ impl ArteryState {
         }
 
         let lock = vess_protocol::CenturyLockState::new(
-            &proof.merkle_root,
+            &proof.mint_id(),
             total_locked,
             current_tick,
             lock_ticks,
@@ -3719,10 +3098,6 @@ pub struct WalletState {
     pub mailbox_key: [u8; 32],
     /// Next bill_nonce for the VHALIX miner (persisted).
     pub mining_next_nonce: u64,
-    /// Mining session counter (persisted).
-    pub mining_session_nonce: u64,
-    /// Hash of last-mined proof (persisted).
-    pub mining_prev_hash: [u8; 32],
 }
 
 impl Drop for WalletState {
@@ -3789,13 +3164,9 @@ pub struct ArteryState {
     /// Whether the VHALIX miner is currently running.
     pub mining_active: bool,
     /// Current chain length of the active mining session.
-    pub mining_chain_length: u64,
+    pub mining_nonce: u64,
     /// Next bill_nonce the miner will use.
     pub mining_next_nonce: u64,
-    /// Session nonce for the current mining session.
-    pub mining_session_nonce: u64,
-    /// Tick hash anchoring the current mining session.
-    pub mining_tick_hash: [u8; 32],
     /// Unix timestamp when the current mining session started.
     pub mining_started_at: u64,
     /// Command sender to stop the mining thread.
@@ -3908,11 +3279,9 @@ impl ArteryState {
             open_bounties: HashMap::new(),
             claimed_bounty_indices: HashMap::new(),
             mining_active: false,
-            mining_chain_length: 0,
+            mining_nonce: 0,
             mining_next_nonce: 0,
-            mining_session_nonce: 0,
-            mining_tick_hash: [0u8; 32],
-            mining_started_at: 0,
+                                    mining_started_at: 0,
             mining_stop_tx: None,
             wallet_path: None,
             notifications: VecDeque::new(),
@@ -4554,9 +3923,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                 enc_key,
                 mailbox_key,
                 mining_next_nonce: wallet.mining_next_nonce,
-                mining_session_nonce: wallet.mining_session_nonce,
-                mining_prev_hash: wallet.mining_prev_hash,
-            }),
+                            }),
             startup_wallet_tag_store,
         )
     } else {
@@ -4630,11 +3997,9 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
         open_bounties: HashMap::new(),
         claimed_bounty_indices: HashMap::new(),
         mining_active: false,
-        mining_chain_length: 0,
+        mining_nonce: 0,
         mining_next_nonce: 0,
-        mining_session_nonce: 0,
-        mining_tick_hash: [0u8; 32],
-        mining_started_at: 0,
+                        mining_started_at: 0,
         mining_stop_tx: None,
         wallet_path: config.wallet_path.clone(),
         notifications: VecDeque::new(),
@@ -6594,7 +5959,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                     // ── Bounty verification ──────────────────────
                     // If this genesis has unclaimed bounties and we have wallet
                     // credentials, try to claim one by recomputing Argon2id.
-                    if let Some(ref bounty) = extract_bounty(&og) {
+                    if false { // bounty removed
                         let node_id = state.node_id;
                         let wallet_vk = state.wallet.as_ref()
                             .and_then(|w| w.billfold.any_credential())
@@ -6608,7 +5973,7 @@ pub async fn run_node(config: NodeConfig) -> Result<String> {
                             let og_for_verify = og;
                             let h_og_tx_clone = h_og_tx.clone();
                             tokio::task::spawn_blocking(move || {
-                                try_claim_bounty(&og_for_verify, &vk, &sk, node_id, &h_og_tx_clone);
+                                // bounty system removed
                             });
                             // Re-acquire lock for remaining match arms
                             state = lock_state(&st);
