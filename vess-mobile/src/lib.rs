@@ -37,11 +37,11 @@ pub struct Balance {
     pub spendable: u64,
     pub watch_only: u64,
     pub bill_count: u64,
-    pub denominations: Vec<DenominationBreakdown>,
+    pub denominations: Vec<u64Breakdown>,
 }
 
 #[derive(uniffi::Record)]
-pub struct DenominationBreakdown {
+pub struct u64Breakdown {
     pub value: u64,
     pub count: u64,
 }

@@ -1,7 +1,7 @@
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::Duration;
 
-use vess_foundry::{Asset, Denomination, VessBill};
+use vess_foundry::{Asset, u64, Vess};
 use vess_kloak::billfold::BillFold;
 use vess_kloak::payment::{prepare_payment, try_receive_payment};
 use vess_kloak::recovery::{derive_raw_seed_with_params, RecoveryPhrase};
@@ -31,8 +31,8 @@ fn now_unix() -> u64 {
         .as_secs()
 }
 
-fn fresh_bill(denom: Denomination) -> VessBill {
-    VessBill {
+fn fresh_bill(denom: u64) -> Vess {
+    Vess {
         denomination: denom,
         digest: rand::random(),
         created_at: now_unix(),
@@ -199,7 +199,7 @@ fn payment_and_mesh_identities_are_separate_but_compatible() {
     assert_eq!(opened.session_key, route.session_key);
 
     let mut sender_billfold = BillFold::new();
-    sender_billfold.deposit(fresh_bill(Denomination::D10));
+    sender_billfold.deposit(fresh_bill(u64::D10));
 
     let payment = match prepare_payment(&sender_billfold, 10, &recipient_address)
         .unwrap()

@@ -136,7 +136,7 @@ pub enum GenesisProof {
 
     /// VHALIX mining proof: Argon2id CPU burn creates a VHALIX bill.
     /// The proof contains a Merkle tree of argon2id state roots.
-    Mint(vess_foundry::mine::MintProof),
+    Mint(vess_foundry::Vess),
 
     /// One-time Vichor genesis: 1B supply held by dev, sold on swap DHT.
     VichorGenesis(VichorGenesisProof),
@@ -316,6 +316,7 @@ pub enum PulseMessage {
     OwnershipGenesis(OwnershipGenesis),
 
     /// Store an encrypted wallet manifest in the DHT for recovery.
+    VessSubmit(vess_foundry::Vess),
     ManifestStore(ManifestStore),
 
     /// Recover an encrypted wallet manifest from the DHT.
@@ -893,7 +894,7 @@ pub struct DhtSeedOwnershipRecord {
     pub current_owner_vk_hash: [u8; 32],
     /// Full current owner verification key.
     pub current_owner_vk: Vec<u8>,
-    /// Denomination value for supply tracking.
+    /// u64 value for supply tracking.
     pub denomination_value: u64,
     /// Unix timestamp when this record was last updated.
     pub updated_at: u64,
@@ -934,7 +935,7 @@ pub struct DhtSeedConsumedRecord {
     pub output_mint_ids: Vec<[u8; 32]>,
     /// Unix timestamp when the bill was consumed.
     pub consumed_at: u64,
-    /// Denomination value of the consumed bill, if known.
+    /// u64 value of the consumed bill, if known.
     #[serde(default)]
     pub denomination_value: u64,
     /// Original bill digest, if known.
@@ -1190,7 +1191,7 @@ pub struct OwnershipGenesis {
     pub owner_vk_hash: [u8; 32],
     /// Full ML-DSA-65 verification key of the minter (for future transfer verification).
     pub owner_vk: Vec<u8>,
-    /// Denomination value for supply tracking.
+    /// u64 value for supply tracking.
     pub denomination_value: u64,
     /// Typed genesis proof for this bill.
     pub genesis_proof: GenesisProof,
@@ -1484,7 +1485,7 @@ pub struct FetchedRecord {
     pub mint_id: [u8; 32],
     /// Whether the record was found.
     pub found: bool,
-    /// Denomination value.
+    /// u64 value.
     pub denomination_value: u64,
     /// Current ownership chain tip (for recovery).
     pub chain_tip: [u8; 32],
@@ -1602,7 +1603,7 @@ pub struct DirectPayment {
     pub recipient_stealth_id: [u8; 32],
     /// Public bill identifiers (parallel arrays for inline verification).
     pub mint_ids: Vec<[u8; 32]>,
-    /// Denomination values of each bill.
+    /// u64 values of each bill.
     pub denomination_values: Vec<u64>,
     /// Unix timestamp when payment was created.
     pub created_at: u64,

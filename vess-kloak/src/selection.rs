@@ -1,4 +1,4 @@
-//! Denomination-selection algorithm for payments.
+//! u64-selection algorithm for payments.
 //!
 //! Given a target amount and a billfold, selects the optimal combination
 //! of bills to cover the amount with minimal waste (change + excess bill
@@ -14,7 +14,7 @@
 //! using too many individual bills (which increases proof size on the wire).
 
 use anyhow::{anyhow, Result};
-use vess_foundry::{Denomination, VessBill};
+use vess_foundry::{ Vess};
 
 /// Cost per additional bill in the selection (in denomination units).
 /// Higher values prefer fewer, larger bills.
@@ -36,14 +36,14 @@ pub struct SelectionResult {
     /// If > 0, the sender must reforge to split off change.
     pub change: u64,
     /// Suggested change denominations (largest-first).
-    pub change_denominations: Vec<Denomination>,
+    pub change_denominations: Vec<u64>,
 }
 
 /// Select bills from a slice to cover `amount` Vess.
 ///
 /// Prefers exact matches. If none exists, selects the combination
 /// with the least overpay. Returns indices into the `bills` slice.
-pub fn select_bills(bills: &[VessBill], amount: u64) -> Result<SelectionResult> {
+pub fn select_bills(bills: &[Vess], amount: u64) -> Result<SelectionResult> {
     select_bills_filtered(bills, amount, &[])
 }
 
@@ -57,7 +57,7 @@ pub fn select_bills(bills: &[VessBill], amount: u64) -> Result<SelectionResult> 
 ///
 /// The "best" solution minimizes `waste = change + BILL_COST * bill_count`.
 pub fn select_bills_filtered(
-    bills: &[VessBill],
+    bills: &[Vess],
     amount: u64,
     reserved: &[[u8; 32]],
 ) -> Result<SelectionResult> {
@@ -68,12 +68,12 @@ pub fn select_bills_filtered(
     // Build set of available indices (exclude reserved).
     let reserved_set: std::collections::HashSet<[u8; 32]> = reserved.iter().copied().collect();
     let available: Vec<usize> = (0..bills.len())
-        .filter(|&i| !reserved_set.contains(&bills[i].mint_id))
+        .filter(|&i| !reserved_set.contains(&bills[i].compute_vess_id()))
         .collect();
 
     let total: u64 = available
         .iter()
-        .map(|&i| bills[i].denomination.value())
+        .map(|&i| bills[i].amount)
         .sum();
     if total < amount {
         return Err(anyhow!("insufficient funds: need {amount}, have {total}"));
@@ -90,7 +90,7 @@ pub fn select_bills_filtered(
         _ => greedy_result,
     };
 
-    let total_selected: u64 = best.iter().map(|&i| bills[i].denomination.value()).sum();
+    let total_selected: u64 = best.iter().map(|&i| bills[i].amount).sum();
     let change = total_selected - amount;
     let change_denominations = decompose_amount(change);
 
@@ -104,10 +104,10 @@ pub fn select_bills_filtered(
 }
 
 /// Waste metric: change amount + per-bill overhead.
-fn waste(bills: &[VessBill], selected: &[usize], amount: u64) -> u64 {
+fn waste(bills: &[Vess], selected: &[usize], amount: u64) -> u64 {
     let total: u64 = selected
         .iter()
-        .map(|&i| bills[i].denomination.value())
+        .map(|&i| bills[i].amount)
         .sum();
     let change = total.saturating_sub(amount);
     change + selected.len() as u64 * BILL_COST
@@ -121,7 +121,7 @@ fn waste(bills: &[VessBill], selected: &[usize], amount: u64) -> u64 {
 ///   solution's waste.
 /// - The remaining capacity (sum of unconsidered bills) can't reach the
 ///   target even if all are included.
-fn bnb_select(bills: &[VessBill], available: &[usize], target: u64) -> Option<Vec<usize>> {
+fn bnb_select(bills: &[Vess], available: &[usize], target: u64) -> Option<Vec<usize>> {
     use rand::seq::SliceRandom;
 
     let mut rng = rand::thread_rng();
@@ -132,7 +132,7 @@ fn bnb_select(bills: &[VessBill], available: &[usize], target: u64) -> Option<Ve
     let n = order.len();
     let mut remaining = vec![0u64; n + 1];
     for i in (0..n).rev() {
-        remaining[i] = remaining[i + 1] + bills[order[i]].denomination.value();
+        remaining[i] = remaining[i + 1] + bills[order[i]].amount;
     }
 
     let mut best: Option<Vec<usize>> = None;
@@ -167,7 +167,7 @@ fn bnb_select(bills: &[VessBill], available: &[usize], target: u64) -> Option<Ve
         }
 
         let bill_idx = order[depth];
-        let bill_val = bills[bill_idx].denomination.value();
+        let bill_val = bills[bill_idx].amount;
 
         // Branch: exclude this bill.
         stack.push((depth + 1, sum, sel.clone()));
@@ -190,13 +190,13 @@ fn bnb_select(bills: &[VessBill], available: &[usize], target: u64) -> Option<Ve
 }
 
 /// Greedy largest-first selection with post-optimization.
-fn greedy_select(bills: &[VessBill], available: &[usize], amount: u64) -> Result<Vec<usize>> {
+fn greedy_select(bills: &[Vess], available: &[usize], amount: u64) -> Result<Vec<usize>> {
     let mut indices: Vec<usize> = available.to_vec();
     indices.sort_by(|&a, &b| {
         bills[b]
-            .denomination
-            .value()
-            .cmp(&bills[a].denomination.value())
+            .amount
+            
+            .cmp(&bills[a].amount)
     });
 
     let mut selected = Vec::new();
@@ -207,7 +207,7 @@ fn greedy_select(bills: &[VessBill], available: &[usize], amount: u64) -> Result
             break;
         }
         selected.push(idx);
-        running += bills[idx].denomination.value();
+        running += bills[idx].amount;
     }
 
     if running < amount {
@@ -217,9 +217,9 @@ fn greedy_select(bills: &[VessBill], available: &[usize], amount: u64) -> Result
     // Drop unnecessary small bills (smallest first).
     selected.sort_by(|&a, &b| {
         bills[a]
-            .denomination
-            .value()
-            .cmp(&bills[b].denomination.value())
+            .amount
+            
+            .cmp(&bills[b].amount)
     });
 
     let mut optimized = selected.clone();
@@ -227,7 +227,7 @@ fn greedy_select(bills: &[VessBill], available: &[usize], amount: u64) -> Result
         let without: u64 = optimized
             .iter()
             .filter(|&&i| i != idx)
-            .map(|&i| bills[i].denomination.value())
+            .map(|&i| bills[i].amount)
             .sum();
         if without >= amount {
             optimized.retain(|&i| i != idx);
@@ -241,16 +241,16 @@ fn greedy_select(bills: &[VessBill], available: &[usize], amount: u64) -> Result
 ///
 /// Works for any amount within the u64 range.
 /// Returns denominations sorted largest-first.
-pub fn decompose_amount(mut amount: u64) -> Vec<Denomination> {
+pub fn decompose_amount(mut amount: u64) -> Vec<u64> {
     if amount == 0 {
         return Vec::new();
     }
 
-    let series = Denomination::series_up_to(amount);
+    let series = vec![1u64,2,5,10,20,50,100];
     let mut result = Vec::new();
     for d in &series {
-        let v = d.value();
-        while amount >= v {
+        let v = d;
+        while amount >= *v {
             result.push(*d);
             amount -= v;
         }
@@ -261,10 +261,10 @@ pub fn decompose_amount(mut amount: u64) -> Vec<Denomination> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vess_foundry::VessBill;
+    use vess_foundry::Vess;
 
-    fn bill(denom: Denomination) -> VessBill {
-        VessBill {
+    fn bill(denom: u64) -> Vess {
+        Vess {
             denomination: denom,
             digest: [0xBB; 32],
             created_at: 1000,
@@ -273,13 +273,13 @@ mod tests {
             mint_id: rand::random(),
             chain_tip: rand::random(),
             chain_depth: 0,
-            asset: vess_foundry::Asset::Vess,
+            asset: u64::Vess,
         }
     }
 
     #[test]
     fn exact_match() {
-        let bills = vec![bill(Denomination::D10), bill(Denomination::D5)];
+        let bills = vec![bill(u64::D10), bill(u64::D5)];
         let result = select_bills(&bills, 15).unwrap();
         assert_eq!(result.total_selected, 15);
         assert_eq!(result.change, 0);
@@ -287,20 +287,20 @@ mod tests {
 
     #[test]
     fn overpay_with_change() {
-        let bills = vec![bill(Denomination::D20)];
+        let bills = vec![bill(u64::D20)];
         let result = select_bills(&bills, 15).unwrap();
         assert_eq!(result.total_selected, 20);
         assert_eq!(result.change, 5);
-        assert_eq!(result.change_denominations, vec![Denomination::D5]);
+        assert_eq!(result.change_denominations, vec![u64::D5]);
     }
 
     #[test]
     fn prefers_exact_over_overpay() {
         let bills = vec![
-            bill(Denomination::D1),
-            bill(Denomination::D5),
-            bill(Denomination::D10),
-            bill(Denomination::D20),
+            bill(u64::D1),
+            bill(u64::D5),
+            bill(u64::D10),
+            bill(u64::D20),
         ];
         let result = select_bills(&bills, 15).unwrap();
         // BnB should find the exact D10+D5 match rather than overpaying with D20.
@@ -310,23 +310,23 @@ mod tests {
 
     #[test]
     fn insufficient_funds() {
-        let bills = vec![bill(Denomination::D5)];
+        let bills = vec![bill(u64::D5)];
         assert!(select_bills(&bills, 10).is_err());
     }
 
     #[test]
     fn decompose_standard() {
         let d = decompose_amount(37);
-        let sum: u64 = d.iter().map(|x| x.value()).sum();
+        let sum: u64 = d.iter().map(|x| x).sum();
         assert_eq!(sum, 37);
         // 37 = 20 + 10 + 5 + 2
         assert_eq!(
             d,
             vec![
-                Denomination::D20,
-                Denomination::D10,
-                Denomination::D5,
-                Denomination::D2,
+                u64::D20,
+                u64::D10,
+                u64::D5,
+                u64::D2,
             ]
         );
     }
@@ -338,7 +338,7 @@ mod tests {
 
     #[test]
     fn select_for_zero_fails() {
-        let bills = vec![bill(Denomination::D5)];
+        let bills = vec![bill(u64::D5)];
         assert!(select_bills(&bills, 0).is_err());
     }
 }

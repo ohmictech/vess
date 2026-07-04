@@ -6,7 +6,7 @@
 use vess_artery::ownership_registry::OwnershipRecord;
 use vess_artery::{OwnershipRegistry, TagDht};
 use vess_foundry::spend_auth::generate_spend_keypair;
-use vess_foundry::{Denomination, VessBill};
+use vess_foundry::{ Vess};
 use vess_kloak::billfold::BillFold;
 use vess_kloak::payment::{prepare_payment, try_receive_payment, PaymentTracker};
 use vess_kloak::persistence::WalletFile;
@@ -28,8 +28,8 @@ fn now_unix() -> u64 {
         .as_secs()
 }
 
-fn fresh_bill(denom: Denomination) -> VessBill {
-    VessBill {
+fn fresh_bill(denom: u64) -> Vess {
+    Vess {
         denomination: denom,
         digest: rand::random(),
         created_at: now_unix(),
@@ -38,7 +38,7 @@ fn fresh_bill(denom: Denomination) -> VessBill {
         mint_id: rand::random(),
         chain_tip: rand::random(),
         chain_depth: 0,
-        asset: vess_foundry::Asset::Vess,
+        asset: u64::Vess,
     }
 }
 
@@ -48,9 +48,9 @@ fn fresh_bill(denom: Denomination) -> VessBill {
 fn full_payment_lifecycle() {
     // 1. Sender has a billfold with bills.
     let mut sender_billfold = BillFold::new();
-    sender_billfold.deposit(fresh_bill(Denomination::D10));
-    sender_billfold.deposit(fresh_bill(Denomination::D5));
-    sender_billfold.deposit(fresh_bill(Denomination::D2));
+    sender_billfold.deposit(fresh_bill(u64::D10));
+    sender_billfold.deposit(fresh_bill(u64::D5));
+    sender_billfold.deposit(fresh_bill(u64::D2));
 
     // 2. Recipient has a stealth address.
     let (recipient_secret, recipient_address) = generate_master_keys();
@@ -97,13 +97,13 @@ fn full_payment_lifecycle() {
     for bill in &received {
         let (vk, _sk) = generate_spend_keypair();
         let record = OwnershipRecord {
-            mint_id: bill.mint_id,
+            mint_id: bill.compute_vess_id(),
             chain_tip: bill.chain_tip,
             prev_transfer_chain_tip: None,
             current_owner_vk_hash: *blake3::hash(&vk).as_bytes(),
             current_owner_vk: vk.clone(),
 
-            denomination_value: bill.denomination.value(),
+            denomination_value: bill.amountvalue(),
             updated_at: now_unix(),
             proof_hash: [0u8; 32],
             digest: [0u8; 32],
@@ -277,8 +277,8 @@ fn wallet_create_backup_restore() {
     let encrypted = encrypt_secrets(&secret, &enc_key).unwrap();
 
     let mut billfold = BillFold::new();
-    billfold.deposit(fresh_bill(Denomination::D10));
-    billfold.deposit(fresh_bill(Denomination::D5));
+    billfold.deposit(fresh_bill(u64::D10));
+    billfold.deposit(fresh_bill(u64::D5));
 
     let wallet = WalletFile::new(address, encrypted, billfold, [0u8; 32], &enc_key).unwrap();
 
@@ -307,9 +307,9 @@ fn wallet_create_backup_restore() {
 #[test]
 fn bill_selection_exact_match() {
     let bills = vec![
-        fresh_bill(Denomination::D10),
-        fresh_bill(Denomination::D5),
-        fresh_bill(Denomination::D2),
+        fresh_bill(u64::D10),
+        fresh_bill(u64::D5),
+        fresh_bill(u64::D2),
     ];
 
     let result = select_bills(&bills, 10).unwrap();
@@ -319,7 +319,7 @@ fn bill_selection_exact_match() {
 
 #[test]
 fn bill_selection_with_change() {
-    let bills = vec![fresh_bill(Denomination::D20), fresh_bill(Denomination::D5)];
+    let bills = vec![fresh_bill(u64::D20), fresh_bill(u64::D5)];
 
     let result = select_bills(&bills, 10).unwrap();
     assert!(result.total_selected >= 10);
@@ -890,9 +890,9 @@ fn tag_hardening_and_pruning() {
 #[test]
 fn full_send_receive_attest_finalize() {
     let mut sender = BillFold::new();
-    sender.deposit(fresh_bill(Denomination::D50));
-    sender.deposit(fresh_bill(Denomination::D20));
-    sender.deposit(fresh_bill(Denomination::D10));
+    sender.deposit(fresh_bill(u64::D50));
+    sender.deposit(fresh_bill(u64::D20));
+    sender.deposit(fresh_bill(u64::D10));
 
     let (recipient_secret, recipient_address) = generate_master_keys();
 
@@ -925,7 +925,7 @@ fn full_send_receive_attest_finalize() {
         .unwrap()
         .expect("should decrypt");
 
-    let received_total: u64 = received.iter().map(|b| b.denomination.value()).sum();
+    let received_total: u64 = received.iter().map(|b| b.amount.sum();
     assert!(received_total >= 25);
 
     // Simulate double-registration check on artery.
@@ -933,13 +933,13 @@ fn full_send_receive_attest_finalize() {
     let (vk, _sk) = generate_spend_keypair();
     for bill in &received {
         let record = OwnershipRecord {
-            mint_id: bill.mint_id,
+            mint_id: bill.compute_vess_id(),
             chain_tip: bill.chain_tip,
             prev_transfer_chain_tip: None,
             current_owner_vk_hash: *blake3::hash(&vk).as_bytes(),
             current_owner_vk: vk.clone(),
 
-            denomination_value: bill.denomination.value(),
+            denomination_value: bill.amountvalue(),
             updated_at: now_unix(),
             proof_hash: [0u8; 32],
             digest: [0u8; 32],
@@ -959,13 +959,13 @@ fn full_send_receive_attest_finalize() {
     // Try double-registration.
     for bill in &received {
         let record = OwnershipRecord {
-            mint_id: bill.mint_id,
+            mint_id: bill.compute_vess_id(),
             chain_tip: bill.chain_tip,
             prev_transfer_chain_tip: None,
             current_owner_vk_hash: *blake3::hash(&vk).as_bytes(),
             current_owner_vk: vk.clone(),
 
-            denomination_value: bill.denomination.value(),
+            denomination_value: bill.amountvalue(),
             updated_at: now_unix(),
             proof_hash: [0u8; 32],
             digest: [0u8; 32],
@@ -992,9 +992,9 @@ fn full_send_receive_attest_finalize() {
 #[test]
 fn bill_selection_prefers_exact_denomination() {
     let bills = vec![
-        fresh_bill(Denomination::D10),
-        fresh_bill(Denomination::D10),
-        fresh_bill(Denomination::D5),
+        fresh_bill(u64::D10),
+        fresh_bill(u64::D10),
+        fresh_bill(u64::D5),
     ];
 
     let result = select_bills(&bills, 10).unwrap();
@@ -1008,7 +1008,7 @@ fn bill_selection_prefers_exact_denomination() {
 fn bill_selection_high_value() {
     let mut bills = Vec::new();
     for _ in 0..5 {
-        bills.push(fresh_bill(Denomination::D50000));
+        bills.push(fresh_bill(u64::D50000));
     }
 
     let result = select_bills(&bills, 200_000).unwrap();

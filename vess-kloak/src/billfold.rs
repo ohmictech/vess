@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use vess_foundry::{Denomination, VessBill};
+use vess_foundry::{ Vess};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// ML-DSA-65 spend credentials for a bill, indexed by mint_id.
@@ -25,7 +25,7 @@ impl std::fmt::Debug for SpendCredential {
 /// A wallet's collection of Vess bills.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct BillFold {
-    bills: Vec<VessBill>,
+    bills: Vec<Vess>,
     /// Mint IDs of bills currently in-flight or limbo.
     /// Reserved bills are excluded from selection but still owned.
     /// The sender can release them on retraction.
@@ -68,8 +68,8 @@ impl BillFold {
     /// Returns `false` (and does not store) if a bill with the same
     /// mint_id already exists — prevents duplicates from multi-path
     /// broadcast.
-    pub fn deposit(&mut self, bill: VessBill) -> bool {
-        if self.bills.iter().any(|b| b.mint_id == bill.mint_id) {
+    pub fn deposit(&mut self, bill: Vess) -> bool {
+        if self.bills.iter().any(|b| b.compute_vess_id() == bill.compute_vess_id()) {
             return false;
         }
         self.bills.push(bill);
@@ -77,8 +77,8 @@ impl BillFold {
     }
 
     /// Add a bill with its spend credentials in one call.
-    pub fn deposit_with_credentials(&mut self, bill: VessBill, cred: SpendCredential) -> bool {
-        let mint_id = bill.mint_id;
+    pub fn deposit_with_credentials(&mut self, bill: Vess, cred: SpendCredential) -> bool {
+        let mint_id = bill.compute_vess_id();
         if self.deposit(bill) {
             self.spend_credentials.insert(mint_id, cred);
             true
@@ -89,8 +89,8 @@ impl BillFold {
 
     /// Remove a bill by mint_id. Returns the removed bill if found.
     /// Also removes any stored spend credentials.
-    pub fn withdraw(&mut self, mint_id: &[u8; 32]) -> Option<VessBill> {
-        if let Some(pos) = self.bills.iter().position(|b| &b.mint_id == mint_id) {
+    pub fn withdraw(&mut self, mint_id: &[u8; 32]) -> Option<Vess> {
+        if let Some(pos) = self.bills.iter().position(|b| &b.compute_vess_id() == mint_id) {
             self.spend_credentials.remove(mint_id);
             Some(self.bills.remove(pos))
         } else {
@@ -111,7 +111,7 @@ impl BillFold {
 
     /// Total value of all bills in the billfold.
     pub fn balance(&self) -> u64 {
-        self.bills.iter().map(|b| b.denomination.value()).sum()
+        self.bills.iter().map(|b| b.amount).sum()
     }
 
     /// Number of bills.
@@ -120,29 +120,29 @@ impl BillFold {
     }
 
     /// All bills as a slice.
-    pub fn bills(&self) -> &[VessBill] {
+    pub fn bills(&self) -> &[Vess] {
         &self.bills
     }
 
     /// Mutable access to all bills.
-    pub fn bills_mut(&mut self) -> &mut Vec<VessBill> {
+    pub fn bills_mut(&mut self) -> &mut Vec<Vess> {
         &mut self.bills
     }
 
     /// Bills of a specific denomination.
-    pub fn bills_of(&self, denom: Denomination) -> Vec<&VessBill> {
+    pub fn bills_of(&self, denom: u64) -> Vec<&Vess> {
         self.bills
             .iter()
-            .filter(|b| b.denomination == denom)
+            .filter(|b| b.amount == denom)
             .collect()
     }
 
     /// Count of bills per denomination.
-    pub fn denomination_breakdown(&self) -> Vec<(Denomination, usize)> {
-        let mut counts: std::collections::BTreeMap<Denomination, usize> =
+    pub fn denomination_breakdown(&self) -> Vec<(u64, usize)> {
+        let mut counts: std::collections::BTreeMap<u64, usize> =
             std::collections::BTreeMap::new();
         for b in &self.bills {
-            *counts.entry(b.denomination).or_insert(0) += 1;
+            *counts.entry(b.amount).or_insert(0) += 1;
         }
         counts.into_iter().collect()
     }
@@ -189,10 +189,10 @@ impl BillFold {
     }
 
     /// Bills available for spending (excludes reserved).
-    pub fn available_bills(&self) -> Vec<&VessBill> {
+    pub fn available_bills(&self) -> Vec<&Vess> {
         self.bills
             .iter()
-            .filter(|b| !self.reserved.contains(&b.mint_id))
+            .filter(|b| !self.reserved.contains(&b.compute_vess_id()))
             .collect()
     }
 
@@ -200,7 +200,7 @@ impl BillFold {
     pub fn available_balance(&self) -> u64 {
         self.available_bills()
             .iter()
-            .map(|b| b.denomination.value())
+            .map(|b| b.amount)
             .sum()
     }
 
@@ -208,8 +208,8 @@ impl BillFold {
     pub fn spendable_balance(&self) -> u64 {
         self.available_bills()
             .into_iter()
-            .filter(|bill| self.spend_credentials.contains_key(&bill.mint_id))
-            .map(|bill| bill.denomination.value())
+            .filter(|bill| self.spend_credentials.contains_key(&bill.compute_vess_id()))
+            .map(|bill| bill.amount)
             .sum()
     }
 
@@ -217,8 +217,8 @@ impl BillFold {
     pub fn watch_only_balance(&self) -> u64 {
         self.available_bills()
             .into_iter()
-            .filter(|bill| !self.spend_credentials.contains_key(&bill.mint_id))
-            .map(|bill| bill.denomination.value())
+            .filter(|bill| !self.spend_credentials.contains_key(&bill.compute_vess_id()))
+            .map(|bill| bill.amount)
             .sum()
     }
 
@@ -252,12 +252,12 @@ impl BillFold {
 mod tests {
     use super::*;
 
-    fn test_bill(denom: Denomination, _age_secs: u64) -> VessBill {
+    fn test_bill(denom: u64, _age_secs: u64) -> Vess {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        VessBill {
+        Vess {
             denomination: denom,
             digest: [0xBB; 32],
             created_at: now,
@@ -266,16 +266,16 @@ mod tests {
             mint_id: rand::random(),
             chain_tip: rand::random(),
             chain_depth: 0,
-            asset: vess_foundry::Asset::Vess,
+            asset: u64::Vess,
         }
     }
 
     #[test]
     fn balance_and_count() {
         let mut bf = BillFold::new();
-        bf.deposit(test_bill(Denomination::D10, 0));
-        bf.deposit(test_bill(Denomination::D5, 0));
-        bf.deposit(test_bill(Denomination::D1, 0));
+        bf.deposit(test_bill(u64::D10, 0));
+        bf.deposit(test_bill(u64::D5, 0));
+        bf.deposit(test_bill(u64::D1, 0));
 
         assert_eq!(bf.balance(), 16);
         assert_eq!(bf.count(), 3);
@@ -284,34 +284,34 @@ mod tests {
     #[test]
     fn withdraw_by_mint_id() {
         let mut bf = BillFold::new();
-        let bill = test_bill(Denomination::D20, 0);
-        let mint_id = bill.mint_id;
+        let bill = test_bill(u64::D20, 0);
+        let mint_id = bill.compute_vess_id();
 
         bf.deposit(bill);
         assert_eq!(bf.count(), 1);
 
         let removed = bf.withdraw(&mint_id).unwrap();
-        assert_eq!(removed.denomination, Denomination::D20);
+        assert_eq!(removed.amount, u64::D20);
         assert_eq!(bf.count(), 0);
     }
 
     #[test]
     fn denomination_breakdown() {
         let mut bf = BillFold::new();
-        bf.deposit(test_bill(Denomination::D5, 0));
-        bf.deposit(test_bill(Denomination::D5, 0));
-        bf.deposit(test_bill(Denomination::D10, 0));
+        bf.deposit(test_bill(u64::D5, 0));
+        bf.deposit(test_bill(u64::D5, 0));
+        bf.deposit(test_bill(u64::D10, 0));
 
-        let breakdown = bf.denomination_breakdown();
-        assert!(breakdown.contains(&(Denomination::D5, 2)));
-        assert!(breakdown.contains(&(Denomination::D10, 1)));
+        let breakdown = bf.amount_breakdown();
+        assert!(breakdown.contains(&(u64::D5, 2)));
+        assert!(breakdown.contains(&(u64::D10, 1)));
     }
 
     #[test]
     fn spendable_and_watch_only_balances_are_separated() {
         let mut bf = BillFold::new();
-        let watch_only = test_bill(Denomination::D10, 0);
-        let spendable = test_bill(Denomination::D5, 0);
+        let watch_only = test_bill(u64::D10, 0);
+        let spendable = test_bill(u64::D5, 0);
         let spendable_mint_id = spendable.mint_id;
 
         bf.deposit(watch_only);

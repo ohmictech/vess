@@ -512,7 +512,7 @@ mod tests {
         let phrase = RecoveryPhrase::generate();
         let (secret, address) = recover_master_keys_with_params(&phrase, 1, 64, 1).unwrap();
 
-        let plaintext = b"VessBill from recovered keys";
+        let plaintext = b"Vess from recovered keys";
         let payload = vess_stealth::prepare_stealth_payload(&address, plaintext).unwrap();
         assert!(vess_stealth::scan_view_tag(&secret, &payload.ct_scan, payload.view_tag).unwrap());
         let (decrypted, _sid, _rk) = vess_stealth::open_stealth_payload(&secret, &payload).unwrap();

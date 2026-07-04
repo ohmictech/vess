@@ -5,7 +5,7 @@
 //! freshness-based reforging.
 
 use std::collections::BTreeMap;
-use vess_foundry::{Denomination, VessBill};
+use vess_foundry::{ Vess};
 
 /// A group of bills that can be consolidated into a higher denomination.
 #[derive(Debug, Clone)]
@@ -13,7 +13,7 @@ pub struct ConsolidationCandidate {
     /// Indices into the billfold of the bills to consolidate.
     pub indices: Vec<usize>,
     /// The target denomination after consolidation.
-    pub target_denomination: Denomination,
+    pub target_denomination: u64,
 }
 
 /// Scheduler that identifies bills eligible for consolidation.
@@ -30,26 +30,24 @@ impl ConsolidationScheduler {
     /// For each denomination present, checks whether N bills of that
     /// denomination can form a valid higher 1-2-5 denomination
     /// (i.e. `N × value` is itself a valid denomination).
-    pub fn scan(&self, bills: &[VessBill]) -> Vec<ConsolidationCandidate> {
-        let mut by_denom: BTreeMap<Denomination, Vec<usize>> = BTreeMap::new();
+    pub fn scan(&self, bills: &[Vess]) -> Vec<ConsolidationCandidate> {
+        let mut by_denom: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
         for (i, b) in bills.iter().enumerate() {
-            by_denom.entry(b.denomination).or_default().push(i);
+            by_denom.entry(b.amount).or_default().push(i);
         }
 
         let mut candidates = Vec::new();
         for (&source, indices) in &by_denom {
-            let src_val = source.value();
+            let src_val = source;
 
             // Try grouping 2..=count bills of this denomination.
             for count in 2..=indices.len() {
                 if let Some(target_val) = src_val.checked_mul(count as u64) {
-                    if Denomination::is_valid(target_val) {
-                        if let Some(target) = Denomination::from_value(target_val) {
-                            candidates.push(ConsolidationCandidate {
-                                indices: indices[..count].to_vec(),
-                                target_denomination: target,
-                            });
-                        }
+                    if target_val > 0 {
+                        candidates.push(ConsolidationCandidate {
+                            indices: indices[..count].to_vec(),
+                            target_denomination: target_val,
+                        });
                     }
                 }
             }
@@ -59,7 +57,7 @@ impl ConsolidationScheduler {
     }
 
     /// Quick check: are any consolidations possible?
-    pub fn has_candidates(&self, bills: &[VessBill]) -> bool {
+    pub fn has_candidates(&self, bills: &[Vess]) -> bool {
         !self.scan(bills).is_empty()
     }
 }
@@ -74,8 +72,8 @@ impl Default for ConsolidationScheduler {
 mod tests {
     use super::*;
 
-    fn make_bill(denom: Denomination) -> VessBill {
-        VessBill {
+    fn make_bill(denom: u64) -> Vess {
+        Vess {
             denomination: denom,
             digest: [0xBB; 32],
             created_at: 12345,
@@ -84,14 +82,14 @@ mod tests {
             mint_id: rand::random(),
             chain_tip: rand::random(),
             chain_depth: 0,
-            asset: vess_foundry::Asset::Vess,
+            asset: u64::Vess,
         }
     }
 
     #[test]
     fn no_consolidation_for_single_bills() {
         let scheduler = ConsolidationScheduler::new();
-        let bills = vec![make_bill(Denomination::D10), make_bill(Denomination::D5)];
+        let bills = vec![make_bill(u64::D10), make_bill(u64::D5)];
 
         assert!(!scheduler.has_candidates(&bills));
     }
@@ -99,24 +97,24 @@ mod tests {
     #[test]
     fn five_d1_can_consolidate_to_d5() {
         let scheduler = ConsolidationScheduler::new();
-        let bills: Vec<VessBill> = (0..5).map(|_| make_bill(Denomination::D1)).collect();
+        let bills: Vec<Vess> = (0..5).map(|_| make_bill(u64::D1)).collect();
 
         let candidates = scheduler.scan(&bills);
         assert!(!candidates.is_empty());
         // Should find at least the D5 consolidation.
         assert!(candidates
             .iter()
-            .any(|c| c.target_denomination == Denomination::D5));
+            .any(|c| c.target_denomination == u64::D5));
     }
 
     #[test]
     fn two_d1_can_consolidate_to_d2() {
         let scheduler = ConsolidationScheduler::new();
-        let bills: Vec<VessBill> = (0..2).map(|_| make_bill(Denomination::D1)).collect();
+        let bills: Vec<Vess> = (0..2).map(|_| make_bill(u64::D1)).collect();
 
         let candidates = scheduler.scan(&bills);
         assert!(candidates
             .iter()
-            .any(|c| c.target_denomination == Denomination::D2));
+            .any(|c| c.target_denomination == u64::D2));
     }
 }

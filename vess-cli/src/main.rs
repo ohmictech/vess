@@ -1117,21 +1117,21 @@ async fn cmd_recover(cli: &Cli, words: &str, wallet_name: Option<&str>) -> Resul
                 continue;
             }
 
-            let denomination = match vess_foundry::Denomination::from_value(rec.denomination_value)
+            let denomination = match |v: u64| Some(v)(rec.amount_value)
             {
                 Some(d) => d,
                 None => {
                     if verbose {
                         println!(
                             "  [{i}] unknown denomination value: {}",
-                            rec.denomination_value
+                            rec.amount_value
                         );
                     }
                     continue;
                 }
             };
 
-            let bill = vess_foundry::VessBill {
+            let bill = vess_foundry::Vess {
                 denomination,
                 digest: rec.digest,
                 created_at: 0,
@@ -1140,15 +1140,15 @@ async fn cmd_recover(cli: &Cli, words: &str, wallet_name: Option<&str>) -> Resul
                 mint_id: entry.mint_id,
                 chain_tip: rec.chain_tip,
                 chain_depth: 0,
-                asset: vess_foundry::Asset::Vess,
+                asset: u64::Vess,
             };
 
             if verbose {
                 println!(
                     "  [{}] recovered {} bill (mint_id: {})",
                     i,
-                    bill.denomination,
-                    hex(&bill.mint_id[..4]),
+                    bill.amount,
+                    hex(&bill.compute_vess_id()[..4]),
                 );
             }
             billfold.deposit(bill);
@@ -1224,7 +1224,7 @@ async fn cmd_balance(cli: &Cli) -> Result<()> {
     if cli.json {
         let breakdown: serde_json::Map<String, serde_json::Value> = wallet
             .billfold
-            .denomination_breakdown()
+            .amount_breakdown()
             .into_iter()
             .map(|(d, c)| (format!("{d}"), json!(c)))
             .collect();
@@ -1241,9 +1241,9 @@ async fn cmd_balance(cli: &Cli) -> Result<()> {
         println!("Balance: {} Vess", wallet.billfold.balance());
         println!("Bills:   {}", wallet.billfold.count());
 
-        let breakdown = wallet.billfold.denomination_breakdown();
+        let breakdown = wallet.billfold.amount_breakdown();
         if !breakdown.is_empty() {
-            println!("\nDenomination breakdown:");
+            println!("\nu64 breakdown:");
             for (denom, count) in breakdown {
                 println!("  {denom}: {count}");
             }
@@ -1654,7 +1654,7 @@ async fn cmd_register_tag(cli: &Cli, tag_str: &str) -> Result<()> {
 
     // â”€â”€ Auto-harden with first available bill â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     let (auto_hardening_attempted, hardened, hardening_error) = if let Some(bill) = wallet.billfold.bills().first() {
-        let mint_id = bill.mint_id;
+        let mint_id = bill.compute_vess_id();
         let confirm_digest = {
             let mut h = blake3::Hasher::new();
             h.update(b"vess-tag-confirm-v1");

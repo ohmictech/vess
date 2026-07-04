@@ -4,7 +4,7 @@
 //! payment splitting, relay wrapping, and tag DHT operations.
 
 use vess_foundry::spend_auth::generate_spend_keypair;
-use vess_foundry::{Denomination, VessBill};
+use vess_foundry::{ Vess};
 use vess_kloak::billfold::BillFold;
 use vess_kloak::billfold::SpendCredential;
 use vess_kloak::payment::{
@@ -26,8 +26,8 @@ fn now_unix() -> u64 {
         .as_secs()
 }
 
-fn fresh_bill(denom: Denomination) -> VessBill {
-    VessBill {
+fn fresh_bill(denom: u64) -> Vess {
+    Vess {
         denomination: denom,
         digest: rand::random(),
         created_at: now_unix(),
@@ -36,7 +36,7 @@ fn fresh_bill(denom: Denomination) -> VessBill {
         mint_id: rand::random(),
         chain_tip: rand::random(),
         chain_depth: 0,
-        asset: vess_foundry::Asset::Vess,
+        asset: u64::Vess,
     }
 }
 
@@ -50,8 +50,8 @@ fn payment_with_memo_round_trip() {
 
     for _ in 0..3 {
         let (vk, sk) = generate_spend_keypair();
-        let bill = fresh_bill(Denomination::D10);
-        let mint_id = bill.mint_id;
+        let bill = fresh_bill(u64::D10);
+        let mint_id = bill.compute_vess_id();
         creds.insert(mint_id, SpendCredential {
             spend_vk: vk,
             spend_sk: sk,
@@ -126,8 +126,8 @@ fn payment_cancel_releases_bills() {
 
     let (vk1, sk1) = generate_spend_keypair();
     let (vk2, sk2) = generate_spend_keypair();
-    let bill1 = fresh_bill(Denomination::D10);
-    let bill2 = fresh_bill(Denomination::D5);
+    let bill1 = fresh_bill(u64::D10);
+    let bill2 = fresh_bill(u64::D5);
     let mint1 = bill1.mint_id;
     let mint2 = bill2.mint_id;
 
@@ -163,8 +163,8 @@ fn payment_split_large_bill_count() {
     // Create 20 small bills (well above the auto-split threshold of 8).
     for _ in 0..20 {
         let (vk, sk) = generate_spend_keypair();
-        let bill = fresh_bill(Denomination::D1);
-        let mint_id = bill.mint_id;
+        let bill = fresh_bill(u64::D1);
+        let mint_id = bill.compute_vess_id();
         creds.insert(mint_id, SpendCredential {
             spend_vk: vk,
             spend_sk: sk,
@@ -191,7 +191,7 @@ fn payment_split_large_bill_count() {
             let (pt, _, _) = open_stealth_payload(&recipient_secret, &payload).unwrap();
             let unpadded = vess_stealth::unpad_plaintext(&pt).unwrap();
             let tp: TransferPayload = postcard::from_bytes(unpadded).unwrap();
-            total_value += tp.bills.iter().map(|b| b.denomination.value()).sum::<u64>();
+            total_value += tp.bills.iter().map(|b| b.amount.sum::<u64>();
         }
     }
 
@@ -205,7 +205,7 @@ fn payment_split_large_bill_count() {
 fn relay_payment_round_trip() {
     let (_recipient_secret, recipient_address) = generate_master_keys();
     let mut billfold = BillFold::new();
-    billfold.deposit(fresh_bill(Denomination::D10));
+    billfold.deposit(fresh_bill(u64::D10));
 
     // Create a real payment.
     let (msg, _pid, _indices) =

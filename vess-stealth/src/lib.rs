@@ -668,7 +668,7 @@ mod tests {
     #[test]
     fn round_trip_stealth_payload() {
         let (secret, address) = generate_master_keys();
-        let plaintext = b"VessBill{denomination:D10,nullifier:abc123}";
+        let plaintext = b"Vess{denomination:D10,nullifier:abc123}";
 
         let payload = prepare_stealth_payload(&address, plaintext).unwrap();
 
@@ -740,7 +740,7 @@ mod tests {
         let seed = [0xABu8; 64];
         let (secret, address) = generate_master_keys_from_seed(&seed);
 
-        let plaintext = b"VessBill from seed-derived keys";
+        let plaintext = b"Vess from seed-derived keys";
         let payload = prepare_stealth_payload(&address, plaintext).unwrap();
 
         assert!(scan_view_tag(&secret, &payload.ct_scan, payload.view_tag).unwrap());

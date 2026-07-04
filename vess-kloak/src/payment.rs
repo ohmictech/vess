@@ -16,7 +16,7 @@ use std::collections::HashMap;
 
 use crate::billfold::SpendCredential;
 use vess_foundry::spend_auth;
-use vess_foundry::VessBill;
+use vess_foundry::Vess;
 use vess_protocol::{Payment, PulseMessage};
 
 /// Payload encrypted inside stealth addressing for ownership transfers.
@@ -27,7 +27,7 @@ use vess_protocol::{Payment, PulseMessage};
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TransferPayload {
     /// The bills being transferred.
-    pub bills: Vec<VessBill>,
+    pub bills: Vec<Vess>,
     /// ML-DSA-65 verification key of the sender (one per bill).
     pub sender_vks: Vec<Vec<u8>>,
     /// Transfer authorization signatures (one per bill).
@@ -241,7 +241,7 @@ pub fn prepare_payment(
     let selection = select_bills(billfold.bills(), amount)?;
 
     // Collect relay metadata from the selected bills.
-    let bill_data: Vec<&VessBill> = selection
+    let bill_data: Vec<&Vess> = selection
         .send_indices
         .iter()
         .map(|&i| &billfold.bills()[i])
@@ -294,7 +294,7 @@ pub fn prepare_payment_with_transfer(
 ) -> Result<(PulseMessage, [u8; 32], Vec<usize>)> {
     let selection = select_bills(billfold.bills(), amount)?;
 
-    let bill_data: Vec<&VessBill> = selection
+    let bill_data: Vec<&Vess> = selection
         .send_indices
         .iter()
         .map(|&i| &billfold.bills()[i])
@@ -305,7 +305,7 @@ pub fn prepare_payment_with_transfer(
     // Build transfer auth: sign transfer_message per bill.
     // Use two-phase stealth API so the stealth_id used for signing
     // is the same one embedded in the final payload.
-    let bills_owned: Vec<VessBill> = bill_data.iter().map(|b| (*b).clone()).collect();
+    let bills_owned: Vec<Vess> = bill_data.iter().map(|b| (*b).clone()).collect();
 
     // Generate payment_id first so the view tag binds to it
     let payment_id: [u8; 32] = rand::random();
@@ -318,10 +318,10 @@ pub fn prepare_payment_with_transfer(
 
     for bill in &bills_owned {
         let cred = credentials
-            .get(&bill.mint_id)
+            .get(&bill.compute_vess_id())
             .ok_or_else(|| anyhow!("missing spend credential for bill mint_id"))?;
 
-        let msg = spend_auth::transfer_message(&bill.mint_id, &recipient_stealth_id, timestamp);
+        let msg = spend_auth::transfer_message(&bill.compute_vess_id(), &recipient_stealth_id, timestamp);
         let sig = spend_auth::sign_spend(&cred.spend_sk, &msg)?;
 
         sender_vks.push(cred.spend_vk.clone());
@@ -378,7 +378,7 @@ pub fn prepare_payment_split(
     memo: Option<String>,
 ) -> Result<Vec<(PulseMessage, [u8; 32])>> {
     let selection = select_bills(billfold.bills(), amount)?;
-    let all_bills: Vec<VessBill> = selection
+    let all_bills: Vec<Vess> = selection
         .send_indices
         .iter()
         .map(|&i| billfold.bills()[i].clone())
@@ -399,9 +399,9 @@ pub fn prepare_payment_split(
     let mut transfer_sigs = Vec::with_capacity(all_bills.len());
     for bill in &all_bills {
         let cred = credentials
-            .get(&bill.mint_id)
+            .get(&bill.compute_vess_id())
             .ok_or_else(|| anyhow!("missing spend credential for bill"))?;
-        let msg = spend_auth::transfer_message(&bill.mint_id, &stealth_ctx.stealth_id, timestamp);
+        let msg = spend_auth::transfer_message(&bill.compute_vess_id(), &stealth_ctx.stealth_id, timestamp);
         let sig = spend_auth::sign_spend(&cred.spend_sk, &msg)?;
         sender_vks.push(cred.spend_vk.clone());
         transfer_sigs.push(sig);
@@ -425,8 +425,8 @@ pub fn prepare_payment_split(
 
     // Too large: split bills into two halves and recurse.
     let mid = all_bills.len() / 2;
-    let left: Vec<VessBill> = all_bills[..mid].to_vec();
-    let right: Vec<VessBill> = all_bills[mid..].to_vec();
+    let left: Vec<Vess> = all_bills[..mid].to_vec();
+    let right: Vec<Vess> = all_bills[mid..].to_vec();
 
     let mut results = Vec::new();
     results.extend(prepare_payment_from_bills_split(&left, recipient, credentials, memo.clone())?);
@@ -438,7 +438,7 @@ pub fn prepare_payment_split(
 /// splits into multiple payments if the transfer-auth payload exceeds
 /// the uniform size limit.
 pub fn prepare_payment_from_bills_split(
-    bills: &[VessBill],
+    bills: &[Vess],
     recipient: &MasterStealthAddress,
     credentials: &HashMap<[u8; 32], crate::billfold::SpendCredential>,
     memo: Option<String>,
@@ -457,9 +457,9 @@ pub fn prepare_payment_from_bills_split(
     let mut transfer_sigs = Vec::with_capacity(bills.len());
     for bill in bills {
         let cred = credentials
-            .get(&bill.mint_id)
+            .get(&bill.compute_vess_id())
             .ok_or_else(|| anyhow!("missing spend credential for bill"))?;
-        let msg = spend_auth::transfer_message(&bill.mint_id, &stealth_ctx.stealth_id, timestamp);
+        let msg = spend_auth::transfer_message(&bill.compute_vess_id(), &stealth_ctx.stealth_id, timestamp);
         let sig = spend_auth::sign_spend(&cred.spend_sk, &msg)?;
         sender_vks.push(cred.spend_vk.clone());
         transfer_sigs.push(sig);
@@ -493,7 +493,7 @@ pub fn prepare_payment_from_bills_split(
 /// Used after reforge-based change splitting, where the caller has
 /// already produced the exact bills to send.
 pub fn prepare_payment_from_bills(
-    bills: &[VessBill],
+    bills: &[Vess],
     recipient: &MasterStealthAddress,
     credentials: &HashMap<[u8; 32], crate::billfold::SpendCredential>,
     memo: Option<String>,
@@ -511,10 +511,10 @@ pub fn prepare_payment_from_bills(
 
     for bill in bills {
         let cred = credentials
-            .get(&bill.mint_id)
+            .get(&bill.compute_vess_id())
             .ok_or_else(|| anyhow!("missing spend credential for bill mint_id"))?;
 
-        let msg = spend_auth::transfer_message(&bill.mint_id, &recipient_stealth_id, timestamp);
+        let msg = spend_auth::transfer_message(&bill.compute_vess_id(), &recipient_stealth_id, timestamp);
         let sig = spend_auth::sign_spend(&cred.spend_sk, &msg)?;
 
         sender_vks.push(cred.spend_vk.clone());
@@ -572,16 +572,16 @@ pub fn prepare_direct_payment(
 ) -> Result<(PulseMessage, [u8; 32], Vec<usize>)> {
     let selection = select_bills(billfold.bills(), amount)?;
 
-    let bill_data: Vec<&VessBill> = selection
+    let bill_data: Vec<&Vess> = selection
         .send_indices
         .iter()
         .map(|&i| &billfold.bills()[i])
         .collect();
 
-    let mint_ids: Vec<[u8; 32]> = bill_data.iter().map(|b| b.mint_id).collect();
-    let denomination_values: Vec<u64> = bill_data.iter().map(|b| b.denomination.value()).collect();
+    let mint_ids: Vec<[u8; 32]> = bill_data.iter().map(|b| b.compute_vess_id()).collect();
+    let denomination_values: Vec<u64> = bill_data.iter().map(|b| b.amount).collect();
 
-    let bills_owned: Vec<VessBill> = bill_data.iter().map(|b| (*b).clone()).collect();
+    let bills_owned: Vec<Vess> = bill_data.iter().map(|b| (*b).clone()).collect();
 
     let timestamp = now_unix();
     let mut sender_vks = Vec::with_capacity(bills_owned.len());
@@ -589,10 +589,10 @@ pub fn prepare_direct_payment(
 
     for bill in &bills_owned {
         let cred = credentials
-            .get(&bill.mint_id)
+            .get(&bill.compute_vess_id())
             .ok_or_else(|| anyhow!("missing spend credential for bill mint_id"))?;
 
-        let msg = spend_auth::transfer_message(&bill.mint_id, &recipient_stealth_id, timestamp);
+        let msg = spend_auth::transfer_message(&bill.compute_vess_id(), &recipient_stealth_id, timestamp);
         let sig = spend_auth::sign_spend(&cred.spend_sk, &msg)?;
 
         sender_vks.push(cred.spend_vk.clone());
@@ -663,7 +663,7 @@ pub fn receive_direct_payment(dp: &vess_protocol::DirectPayment) -> Result<Trans
 pub fn try_receive_payment(
     secret: &StealthSecretKey,
     payment: &Payment,
-) -> Result<Option<Vec<VessBill>>> {
+) -> Result<Option<Vec<Vess>>> {
     try_decrypt_stealth_payload(secret, &payment.stealth_payload, &payment.payment_id)
 }
 
@@ -675,7 +675,7 @@ pub fn try_decrypt_stealth_payload(
     secret: &StealthSecretKey,
     stealth_payload: &[u8],
     payment_id: &[u8; 32],
-) -> Result<Option<Vec<VessBill>>> {
+) -> Result<Option<Vec<Vess>>> {
     // Deserialize the stealth payload.
     let stealth: StealthPayload = postcard::from_bytes(stealth_payload)
         .map_err(|e| anyhow!("deserialize stealth payload: {e}"))?;
@@ -702,7 +702,7 @@ pub fn try_decrypt_stealth_payload(
         return Ok(None);
     }
 
-    let bills: Vec<VessBill> =
+    let bills: Vec<Vess> =
         postcard::from_bytes(plaintext).map_err(|e| anyhow!("deserialize bills: {e}"))?;
 
     Ok(Some(bills))
@@ -711,7 +711,7 @@ pub fn try_decrypt_stealth_payload(
 /// Try to decrypt a stealth payload as a [`TransferPayload`].
 ///
 /// Returns `None` if the view tag doesn't match (not for us).
-/// Falls back to legacy format (plain `Vec<VessBill>`) if the new format
+/// Falls back to legacy format (plain `Vec<Vess>`) if the new format
 /// doesn't parse.
 pub fn try_decrypt_transfer_payload(
     secret: &StealthSecretKey,
@@ -759,7 +759,7 @@ pub enum DecryptedTransfer {
 #[derive(Debug, Clone)]
 pub struct ClaimedBill {
     /// The bill with updated ownership chain.
-    pub bill: VessBill,
+    pub bill: Vess,
     /// ML-DSA-65 verification key for this bill.
     pub spend_vk: Vec<u8>,
     /// ML-DSA-65 signing key for this bill.
@@ -777,14 +777,14 @@ pub struct TransferClaimResult {
     pub memo: Option<String>,
 }
 
-fn encrypt_bill_for_recovery(bill: &VessBill, recovery_key: Option<[u8; 32]>) -> Vec<u8> {
+fn encrypt_bill_for_recovery(bill: &Vess, recovery_key: Option<[u8; 32]>) -> Vec<u8> {
     match recovery_key {
         Some(key) => {
             use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, KeyInit};
             let nonce_bytes = {
                 let mut h = blake3::Hasher::new();
                 h.update(&key);
-                h.update(&bill.mint_id);
+                h.update(&bill.compute_vess_id());
                 h.update(b"vess-claim-nonce-v1");
                 let hash = h.finalize();
                 let mut n = [0u8; 12];
@@ -829,7 +829,7 @@ pub fn claim_transfer_bills(
     for (i, bill) in payload.bills.into_iter().enumerate() {
         // 1. Verify sender's transfer authorization signature.
         let transfer_msg =
-            spend_auth::transfer_message(&bill.mint_id, &stealth_id, payload.timestamp);
+            spend_auth::transfer_message(&bill.compute_vess_id(), &stealth_id, payload.timestamp);
         match spend_auth::verify_spend(
             &payload.sender_vks[i],
             &transfer_msg,
@@ -845,10 +845,11 @@ pub fn claim_transfer_bills(
         let new_vk_hash = spend_auth::vk_hash(&new_vk);
 
         // 3. Compute new ownership chain tip.
-        let new_chain_tip = vess_foundry::advance_chain_tip(
+        let sig_hash = blake3::hash(&payload.transfer_sigs[i]);
+        let new_chain_tip = vess_foundry::advance_chain_tip_with_hash(
             &bill.chain_tip,
             &new_vk_hash,
-            &payload.transfer_sigs[i],
+            sig_hash.as_bytes(),
         );
 
         // 4. Build OwnershipClaim message.
@@ -860,7 +861,7 @@ pub fn claim_transfer_bills(
         //    Falls back to an empty blob when no recovery key is available (e.g. direct payment).
         let encrypted_bill = encrypt_bill_for_recovery(&bill, recovery_key);
         let claim = PulseMessage::OwnershipClaim(vess_protocol::OwnershipClaim {
-            mint_id: bill.mint_id,
+            mint_id: bill.compute_vess_id(),
             stealth_id,
             prev_owner_vk: payload.sender_vks[i].clone(),
             transfer_sig: payload.transfer_sigs[i].clone(),
@@ -901,21 +902,21 @@ pub fn claim_transfer_bills(
 
 /// Build `OwnershipGenesis` pulse messages for freshly minted bills.
 ///
-/// Takes the `(VessBill, proof_bytes)` pairs returned by
-/// [`vess_foundry::mint::aggregate_solves`] and the minter's ML-DSA-65
+/// Takes the `(Vess, proof_bytes)` pairs returned by
+/// [`// mint removed: aggregate_solves`] and the minter's ML-DSA-65
 /// spend credential.  Returns one `PulseMessage::OwnershipGenesis` per
 /// bill, ready to broadcast to the artery network.
-pub fn build_genesis_messages(bills: &[(VessBill, Vec<u8>)], owner_vk: &[u8]) -> Vec<PulseMessage> {
+pub fn build_genesis_messages(bills: &[(Vess, Vec<u8>)], owner_vk: &[u8]) -> Vec<PulseMessage> {
     let owner_vk_hash = spend_auth::vk_hash(owner_vk);
     bills
         .iter()
         .map(|(bill, proof_bytes)| {
             PulseMessage::OwnershipGenesis(vess_protocol::OwnershipGenesis {
-                mint_id: bill.mint_id,
+                mint_id: bill.compute_vess_id(),
                 chain_tip: bill.chain_tip,
                 owner_vk_hash,
                 owner_vk: owner_vk.to_vec(),
-                denomination_value: bill.denomination.value(),
+                denomination_value: bill.amount,
                 genesis_proof: vess_protocol::GenesisProof::Vess(proof_bytes.clone()),
                 digest: bill.digest,
                 hops_remaining: 6,
@@ -1178,11 +1179,11 @@ impl PaymentHistory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vess_foundry::Denomination;
+    use u64;
     use vess_stealth::generate_master_keys;
 
-    fn test_bill(denom: Denomination) -> VessBill {
-        VessBill {
+    fn test_bill(denom: u64) -> Vess {
+        Vess {
             denomination: denom,
             digest: rand::random(),
             created_at: now_unix(),
@@ -1191,7 +1192,7 @@ mod tests {
             mint_id: rand::random(),
             chain_tip: rand::random(),
             chain_depth: 0,
-            asset: vess_foundry::Asset::Vess,
+            asset: u64::Vess,
         }
     }
 
@@ -1202,9 +1203,9 @@ mod tests {
         let mut billfold = BillFold::new();
 
         // Create 3 test bills
-        let bill1 = test_bill(Denomination::D1);
-        let bill2 = test_bill(Denomination::D5);
-        let bill3 = test_bill(Denomination::D10);
+        let bill1 = test_bill(u64::D1);
+        let bill2 = test_bill(u64::D5);
+        let bill3 = test_bill(u64::D10);
 
         let id1 = bill1.mint_id;
         let id2 = bill2.mint_id;
@@ -1251,7 +1252,7 @@ mod tests {
         assert_eq!(billfold.balance(), 11);
 
         // Verify the remaining bills are correct
-        let remaining_ids: Vec<_> = billfold.bills().iter().map(|b| b.mint_id).collect();
+        let remaining_ids: Vec<_> = billfold.bills().iter().map(|b| b.compute_vess_id()).collect();
         assert!(remaining_ids.contains(&id1));
         assert!(!remaining_ids.contains(&id2)); // Removed
         assert!(remaining_ids.contains(&id3));
@@ -1285,8 +1286,8 @@ mod tests {
     fn prepare_and_receive_payment() {
         let (secret, address) = generate_master_keys();
         let mut billfold = BillFold::new();
-        billfold.deposit(test_bill(Denomination::D10));
-        billfold.deposit(test_bill(Denomination::D5));
+        billfold.deposit(test_bill(u64::D10));
+        billfold.deposit(test_bill(u64::D5));
 
         let (msg, _pid, indices) = prepare_payment(&billfold, 10, &address).unwrap();
         assert!(!indices.is_empty());

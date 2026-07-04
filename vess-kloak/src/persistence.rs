@@ -997,8 +997,8 @@ mod tests {
         let encrypted = encrypt_secrets(&secret, &enc_key).unwrap();
 
         let mut billfold = BillFold::new();
-        let bill = vess_foundry::VessBill {
-            denomination: vess_foundry::Denomination::D10,
+        let bill = vess_foundry::Vess {
+            denomination: u64::D10,
             digest: [0x11; 32],
             created_at: 1,
             stealth_id: [0x22; 32],
@@ -1006,7 +1006,7 @@ mod tests {
             mint_id: [0x33; 32],
             chain_tip: [0x44; 32],
             chain_depth: 0,
-            asset: vess_foundry::Asset::Vess,
+            asset: u64::Vess,
         };
         billfold.deposit_with_credentials(
             bill.clone(),
@@ -1030,7 +1030,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(loaded_billfold.balance(), 10);
-        assert!(loaded_billfold.get_credentials(&bill.mint_id).is_some());
+        assert!(loaded_billfold.get_credentials(&bill.compute_vess_id()).is_some());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

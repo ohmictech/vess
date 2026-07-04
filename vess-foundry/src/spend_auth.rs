@@ -2,7 +2,7 @@
 //!
 //! Each bill has an associated ML-DSA-65 keypair generated at creation
 //! time. The verification key hash (`vk_hash`) is stored publicly in the
-//! [`SealedBill`](crate::seal::SealedBill), while the full keypair is
+//! [`SealedBill`](// seal::SealedBill), while the full keypair is
 //! encrypted inside. Only the bill's owner can produce a valid spend
 //! signature.
 //!
@@ -123,7 +123,7 @@ pub fn verify_spend(vk_bytes: &[u8], message: &[u8; 32], sig_bytes: &[u8]) -> Re
     Ok(dilithium3::verify_detached_signature(&sig, message, &pk).is_ok())
 }
 
-/// Compute the verification key hash for a [`SealedBill`](crate::seal::SealedBill) commitment.
+/// Compute the verification key hash for a [`SealedBill`](// seal::SealedBill) commitment.
 pub fn vk_hash(vk_bytes: &[u8]) -> [u8; 32] {
     *blake3::hash(vk_bytes).as_bytes()
 }
