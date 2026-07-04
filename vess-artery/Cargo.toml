@@ -13,6 +13,7 @@ test-pow = ["vess-tag/test-pow"]
 test-mint = ["vess-foundry/test-mint"]
 
 [dependencies]
+hex = "0.4"
 vess-mesh = { path = "../vess-mesh" }
 vess-stealth = { path = "../vess-stealth" }
 vess-foundry = { path = "../vess-foundry" }

@@ -1525,6 +1525,7 @@ dependencies = [
  "cuckoofilter",
  "dirs-next",
  "futures",
+ "hex",
  "ipconfig",
  "postcard",
  "proptest",

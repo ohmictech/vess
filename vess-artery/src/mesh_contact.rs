@@ -42,5 +42,5 @@ pub(crate) fn contact_bytes_node_id(bytes: &[u8]) -> Option<[u8; 32]> {
 }
 
 pub(crate) fn parse_node_id_hex(value: &str) -> Option<[u8; 32]> {
-    unhex_key(value).ok()
+    unhex_key(value)
 }
