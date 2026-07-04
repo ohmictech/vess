@@ -119,6 +119,32 @@ pub fn verify_mined_vess(v: &Vess, current_epoch: u64) -> Result<(), String> {
     Ok(())
 }
 
+// ── Dev faucet ──────────────────────────────────────────────────────
+
+/// Create and sign a dev faucet Vess for the given epoch and recipient.
+/// The dev secret key must match `vess_protocol::DEV_VK`.
+pub fn create_faucet(dev_sk: &[u8], epoch: u64, owner_vk: &[u8], initial_pk: &[u8; 32]) -> Result<crate::Vess, String> {
+    let mut v = crate::Vess {
+        amount: 30_000, // DEV_FAUCET_AMOUNT
+        epoch, nonce: 0, initial_pk: *initial_pk,
+        owner_vk: owner_vk.to_vec(), prev_sig: vec![], chain_depth: 0,
+        consumed: vec![], change_sig: vec![], chain_tip: [0u8; 32],
+        digest: [0u8; 32], created_at: 0, stealth_id: [0u8; 32], dht_index: 0,
+    };
+
+    let mut msg = blake3::Hasher::new();
+    msg.update(b"vess-faucet-v1");
+    msg.update(&epoch.to_be_bytes());
+    msg.update(&v.amount.to_be_bytes());
+    msg.update(&v.owner_vk);
+    let sig_msg = *msg.finalize().as_bytes();
+
+    v.change_sig = crate::spend_auth::sign_spend(dev_sk, &sig_msg)
+        .map_err(|e| format!("sign faucet: {e}"))?;
+    v.chain_tip = crate::genesis_chain_tip(&v.compute_vess_id(), &v.owner_vk_hash());
+    Ok(v)
+}
+
 // ── Tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]

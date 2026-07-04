@@ -107,6 +107,12 @@ enum Command {
         amount: u64,
     },
 
+    /// Submit the dev faucet for the current epoch (dev password required).
+    DevFaucet {
+        /// Recipient: +tag or stealth address to receive the faucet.
+        recipient: String,
+    },
+
     /// Send Vess to a recipient (by +tag or stealth address).
     Send {
         /// Amount to send.
@@ -422,6 +428,7 @@ async fn dispatch_command(cli: &Cli) -> Result<()> {
             max,
         }) => cmd_notifications(&cli, *follow, *interval_ms, *max).await,
         Some(Command::Faucet { amount }) => cmd_faucet(&cli, *amount).await,
+        Some(Command::DevFaucet { recipient }) => cmd_dev_faucet(&cli, recipient).await,
         Some(Command::Send {
             amount,
             recipient,
@@ -1417,6 +1424,40 @@ async fn cmd_faucet(cli: &Cli, amount: u64) -> Result<()> {
             println!("Balance: {} Vess", resp["balance"]);
             println!("These bills are only valid on nodes started with VESS_LOCAL_TEST_FAUCET=1.");
         }
+    } else {
+        anyhow::bail!("{}", resp["error"].as_str().unwrap_or("unknown error"));
+    }
+    Ok(())
+}
+
+async fn cmd_dev_faucet(cli: &Cli, recipient: &str) -> Result<()> {
+    // Prompt for dev password (don't pass on command line — shell history leak)
+    let password = rpassword::prompt_password("Dev password: ")?;
+
+    // Derive dev secret key from password
+    let seed = derive_raw_seed(&password, b"vess-dev-faucet-v1");
+    let (sk, vk) = vess_foundry::spend_auth::generate_from_seed(&seed);
+
+    // Verify this password produces the correct dev VK
+    let vk_hash = vess_foundry::spend_auth::vk_hash(&vk);
+    let expected_hash = vess_foundry::spend_auth::vk_hash(&vess_protocol::DEV_VK);
+    if vk_hash != expected_hash {
+        anyhow::bail!("Incorrect dev password — derived VK does not match DEV_VK");
+    }
+
+    let epoch = vess_foundry::clock::current_epoch();
+    let faucet = vess_foundry::mine::create_faucet(&sk, epoch, &vk, &vk_hash)?;
+
+    // Submit to local node
+    let port = rpc_port(cli);
+    let resp = rpc_call(port, &json!({
+        "method": "faucet_submit",
+        "vess": serde_json::to_value(&faucet)?
+    })).await?;
+
+    if resp["ok"] == true {
+        println!("Dev faucet submitted for epoch {}: {} Vess → {}", epoch, faucet.amount, recipient);
+        println!("vess_id: {}", hex::encode(&faucet.compute_vess_id()[..8]));
     } else {
         anyhow::bail!("{}", resp["error"].as_str().unwrap_or("unknown error"));
     }

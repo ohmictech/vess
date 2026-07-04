@@ -11,9 +11,43 @@ pub struct VessStore {
     active: HashMap<[u8; 32], Vess>,
     /// Set of consumed Vess IDs (tombstoned — can never be spent again).
     consumed: HashSet<[u8; 32]>,
+    /// Epochs for which a dev faucet has already been claimed.
+    pub faucet_epochs: HashSet<u64>,
 }
 
 impl VessStore {
+    // ── Dev faucet ────────────────────────────────────────────────
+
+    /// Validate and store a dev faucet bill.
+    /// One per epoch, 20,000 Vess, signed by the dev key.
+    /// Owner can be any address the dev chooses to receive to.
+    pub fn validate_faucet(&mut self, v: &Vess) -> Result<(), String> {
+        if v.amount != vess_protocol::DEV_FAUCET_AMOUNT {
+            return Err(format!("faucet must be {} Vess", vess_protocol::DEV_FAUCET_AMOUNT));
+        }
+        if self.faucet_epochs.contains(&v.epoch) {
+            return Err(format!("faucet already claimed for epoch {}", v.epoch));
+        }
+
+        // Dev signs: "vess-faucet-v1" || epoch || amount || owner_vk
+        let mut msg = blake3::Hasher::new();
+        msg.update(b"vess-faucet-v1");
+        msg.update(&v.epoch.to_be_bytes());
+        msg.update(&v.amount.to_be_bytes());
+        msg.update(&v.owner_vk);
+        let sig_msg = *msg.finalize().as_bytes();
+
+        if !vess_foundry::spend_auth::verify_spend(
+            &vess_protocol::DEV_VK, &sig_msg, &v.change_sig,
+        ).unwrap_or(false) {
+            return Err("faucet: invalid dev signature".into());
+        }
+
+        self.faucet_epochs.insert(v.epoch);
+        self.upsert_one(v);
+        Ok(())
+    }
+
     // ── Batch upsert (payment + change) ────────────────────────────
 
     /// Validate and store a batch of Vess outputs sharing the same consumed inputs.
@@ -33,6 +67,11 @@ impl VessStore {
 
         // ── Mined Vess (no inputs) ──
         if consumed_ids.is_empty() {
+            // Faucet bills: special validation (dev key, epoch uniqueness)
+            if outputs.len() == 1 && outputs[0].is_faucet() {
+                return self.validate_faucet(&outputs[0]).map(|_| ());
+            }
+            // Regular mined Vess: Argon2d verification
             for v in outputs {
                 if v.is_mined() {
                     vess_foundry::mine::verify_mined_vess(v, clock::current_epoch())?;

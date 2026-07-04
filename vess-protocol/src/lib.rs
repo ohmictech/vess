@@ -17,6 +17,17 @@
 use serde::{Deserialize, Serialize};
 use vess_foundry::Vess;
 
+// ── Dev faucet ──────────────────────────────────────────────────────
+
+/// Dev subsidy per epoch.
+pub const DEV_FAUCET_AMOUNT: u64 = 30_000;
+
+/// Canonical dev ML-DSA-65 verification key (hardcoded, public).
+/// Every node verifies faucet signatures against this key.
+pub const DEV_VK: [u8; 1953] = [
+    0x00; 1953 // PLACEHOLDER — replace with actual dev VK before launch
+];
+
 // ── DHT trust ───────────────────────────────────────────────────────
 
 /// Signed DHT response — proves the responder owns real Vess.
@@ -44,6 +55,9 @@ pub enum PulseMessage {
 
     /// Submit a transfer/change Vess for DHT storage.
     VessSubmit(Vess),
+
+    /// Dev faucet submission — one per epoch, cryptographically verified.
+    FaucetSubmit(Vess),
 
     /// Register a VessTag by burning bills.
     TagRegister(TagRegister),

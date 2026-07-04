@@ -25,7 +25,12 @@ pub struct Vess {
 impl Vess {
     pub fn compute_vess_id(&self) -> [u8; 32] {
         let mut h = Hasher::new();
-        if self.is_mined() {
+        if self.is_faucet() {
+            h.update(b"vess-faucet-v1");
+            h.update(&self.amount.to_le_bytes());
+            h.update(&self.epoch.to_be_bytes());
+            // NOT including initial_pk or owner_vk — one bill per epoch
+        } else if self.is_mined() {
             h.update(b"vess-mined-v1");
             h.update(&self.amount.to_le_bytes());
             h.update(&self.epoch.to_le_bytes());
@@ -42,6 +47,7 @@ impl Vess {
 
     pub fn is_mined(&self) -> bool { self.epoch > 0 && self.nonce > 0 && self.consumed.is_empty() }
     pub fn is_changed(&self) -> bool { !self.consumed.is_empty() && self.epoch == 0 && self.nonce == 0 }
+    pub fn is_faucet(&self) -> bool { self.epoch > 0 && self.nonce == 0 && self.consumed.is_empty() }
 
     pub fn owner_vk_hash(&self) -> [u8; 32] { crate::spend_auth::vk_hash(&self.owner_vk) }
 
