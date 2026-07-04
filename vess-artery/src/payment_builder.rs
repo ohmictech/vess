@@ -1,10 +1,10 @@
 //! Payment builder — create change transactions (consume inputs, produce outputs).
 use std::sync::{Arc, Mutex};
 use vess_foundry::Vess;
-use crate::node_runner::NodeState;
+use crate::node_runner::ArteryState;
 
 pub fn build_payment(
-    state: &Arc<Mutex<NodeState>>,
+    state: &Arc<Mutex<ArteryState>>,
     amount: u64,
     recipient_vk: &[u8],
 ) -> Result<(Vess, Option<Vess>), String> {

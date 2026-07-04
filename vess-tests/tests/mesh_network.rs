@@ -11,7 +11,7 @@ use vess_mesh::{
 };
 use vess_protocol::{PeerExchange, PulseMessage, RegistryQuery, RegistryQueryResponse};
 use vess_stealth::generate_master_keys_from_seed;
-use vess_vascular::MeshPulseNode;
+use vess_mesh::MeshPulseNode;
 
 fn localhost_bind_addr() -> SocketAddr {
     SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))

@@ -1,5 +1,4 @@
 //! **vess-foundry** — Core Vess primitives.
-pub mod merkle;
 pub mod mine;
 pub mod spend_auth;
 pub mod vess;
@@ -27,3 +26,5 @@ pub fn genesis_chain_tip(mint_id: &[u8; 32], owner_vk_hash: &[u8; 32]) -> [u8; 3
 pub fn advance_chain_tip(prev: &[u8; 32], owner_vk_hash: &[u8; 32]) -> [u8; 32] {
     genesis_chain_tip(prev, owner_vk_hash)
 }
+
+pub mod clock;

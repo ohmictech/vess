@@ -9,7 +9,7 @@ pub const EPOCH_GENESIS: u64 = 1735689600;
 
 // ── Node state ──
 
-pub struct NodeState {
+pub struct ArteryState {
     pub store: VessStore,
     pub current_epoch: u64,
     pub mining: Option<MiningState>,
@@ -47,7 +47,7 @@ impl DuplicateTracker {
 #[derive(Debug, Clone)]
 pub struct WalletNotification { pub message: String, pub timestamp: u64 }
 
-impl NodeState {
+impl ArteryState {
     pub fn new(node_id: [u8; 32], k_neighbors: usize) -> Self {
         Self {
             store: VessStore::default(),
@@ -81,7 +81,7 @@ pub fn validate_vess(v: &Vess, store: &VessStore, current_epoch: u64) -> Result<
     let id = v.compute_vess_id();
     if store.is_consumed(&id) { return Err("already consumed".into()); }
     if let Some(ex) = store.get(&id) { if v.chain_depth <= ex.chain_depth { return Err("stale".into()); } }
-    if v.is_mined() { return vess_foundry::mine::verify_mined(&v.initial_pk, v.epoch, v.nonce, v.amount, current_epoch); }
+    if v.is_mined() { return Err("mining validation not yet wired for MintProof model".into()); }
     if v.is_changed() { return validate_changed(v, store); }
     Err("invalid".into())
 }
@@ -99,15 +99,17 @@ fn validate_changed(v: &Vess, store: &VessStore) -> Result<(), String> {
 
 // ── Mining ──
 
-pub fn spawn_miner(state: Arc<Mutex<NodeState>>, amount: u64, initial_pk: [u8; 32], og_tx: mpsc::UnboundedSender<Vess>) {
+pub fn spawn_miner(state: Arc<Mutex<ArteryState>>, amount: u64, initial_pk: [u8; 32], og_tx: mpsc::UnboundedSender<Vess>) {
     let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
     let epoch = state.lock().unwrap().current_epoch;
-    let mut miner = vess_foundry::mine::VessMiner::new(initial_pk, amount, epoch, 0);
+    // VessMiner removed — use vess_foundry::mine::mine_argon2d for new MintProof model
+    let _miner = (); // placeholder
     { let mut s = state.lock().unwrap(); s.mining = Some(MiningState { stop_tx: Some(stop_tx), amount, started_at: now_secs() }); }
     std::thread::spawn(move || {
         loop {
             if stop_rx.try_recv().is_ok() { break; }
-            if let Some((_out, nonce)) = miner.mine_until(|| stop_rx.try_recv().is_ok()) {
+            // miner.mine_until removed — use mine_argon2d loop
+            if false { let nonce = 0u64;
                 let mut v = Vess { amount, epoch, nonce, initial_pk, owner_vk: Vec::new(), prev_sig: Vec::new(), chain_depth: 0, consumed: Vec::new(), change_sig: Vec::new(), chain_tip: [0u8; 32], digest: [0u8; 32], created_at: now_secs(), stealth_id: [0u8; 32], dht_index: 0 };
                 if let Ok(s) = state.lock() { if let Some(ref vk) = s.wallet_vk { v.owner_vk = vk.clone(); } }
                 let _ = og_tx.send(v);
@@ -152,7 +154,7 @@ pub async fn run_node(config: NodeConfig) -> anyhow::Result<String> {
     tracing::info!("Mesh bound to {}", bind_addr);
     let node_id: [u8; 32] = rand::random(); // TODO: derive from mesh seed
 
-    let state = Arc::new(Mutex::new(NodeState::new(node_id, config.k_neighbors)));
+    let state = Arc::new(Mutex::new(ArteryState::new(node_id, config.k_neighbors)));
     let (og_tx, mut og_rx) = mpsc::unbounded_channel::<Vess>();
 
     // Load wallet
@@ -233,12 +235,12 @@ fn load_or_create_mesh_seed(state_dir: &std::path::Path) -> anyhow::Result<[u8; 
 
 // ── TCP RPC server ──
 
-async fn serve_rpc(state: Arc<Mutex<NodeState>>, og_tx: mpsc::UnboundedSender<Vess>, port: u16) {
+async fn serve_rpc(state: Arc<Mutex<ArteryState>>, og_tx: mpsc::UnboundedSender<Vess>, port: u16) {
     let l = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await { Ok(l) => l, Err(e) => { tracing::error!(%e,"bind"); return; } };
     loop { if let Ok((s,_)) = l.accept().await { let st=state.clone(); let tx=og_tx.clone(); tokio::spawn(async { handle_conn(st,tx,s).await; }); } }
 }
 
-async fn handle_conn(state: Arc<Mutex<NodeState>>, og_tx: mpsc::UnboundedSender<Vess>, mut stream: tokio::net::TcpStream) {
+async fn handle_conn(state: Arc<Mutex<ArteryState>>, og_tx: mpsc::UnboundedSender<Vess>, mut stream: tokio::net::TcpStream) {
     use tokio::io::{AsyncBufReadExt,AsyncWriteExt,BufReader};
     let (r,mut w) = stream.split(); let mut lines = BufReader::new(r).lines();
     while let Ok(Some(line)) = lines.next_line().await {

@@ -13,7 +13,6 @@ vess-foundry = { path = "../vess-foundry", features = ["test-mint"] }
 vess-stealth = { path = "../vess-stealth" }
 vess-tag = { path = "../vess-tag", features = ["test-pow"] }
 vess-protocol = { path = "../vess-protocol" }
-vess-vascular = { path = "../vess-vascular" }
 vess-bitcoin = { path = "../vess-bitcoin" }
 anyhow = "1"
 rand = "0.8"

@@ -6,12 +6,14 @@
 //!
 //! # Message Categories
 //!
-//! - [`Payment`] — Stealth-encrypted bill transfers.
+//! - [`Payment`] / [`DirectPayment`] — Stealth-encrypted bill transfers.
 //! - [`TagRegister`] — PoW-backed VessTag registration.
 //! - [`TagLookup`] / [`TagLookupResponse`] — Tag → stealth address resolution.
+//! - [`OwnershipGenesis`] / [`OwnershipClaim`] — Ownership registry operations.
 //! - [`MailboxCollect`] / [`MailboxSweep`] — Offline payment delivery.
 //! - [`RegistryQuery`] / [`RegistryQueryResponse`] — Ownership status lookup.
 //! - [`ManifestStore`] / [`ManifestRecover`] — Wallet recovery manifests.
+//! - Compute program / receipt records — programmable DHT-published compute.
 
 use serde::{Deserialize, Serialize};
 use blake3;
@@ -28,6 +30,147 @@ pub struct LocalTestFaucetProof {
     pub nonce: [u8; 32],
 }
 
+/// One-time genesis proof for the Vichor supply.
+///
+/// Vichor is a fixed-supply (1,000,000,000) network stock token. The entire
+/// supply is created in a single genesis event and held by the dev address.
+/// The dev sells Vichor on the swap DHT at market rates.
+///
+/// # Uniqueness
+///
+/// Only **one** `VichorGenesis` is ever valid. Uniqueness is enforced by:
+///
+/// 1. **Canonical nonce** — `VICHOR_GENESIS_NONCE` is baked into the protocol.
+///    Any proof with a different nonce is rejected. There is exactly one
+///    valid proof, ever.
+/// 2. **Dev key** — the `owner_vk` must match `VICHOR_GENESIS_VK`. Only the
+///    canonical dev key can sign the genesis.
+/// 3. **Total supply** — must equal `VICHOR_TOTAL_SUPPLY` (1,000,000,000).
+///
+/// Even the dev cannot print more Vichor — the nonce and supply are fixed
+/// at the protocol level.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VichorGenesisProof {
+    /// Must equal [`VICHOR_GENESIS_NONCE`]. Any other value is invalid.
+    pub nonce: [u8; 32],
+    /// Total supply: must equal [`VICHOR_TOTAL_SUPPLY`].
+    pub total_supply: u64,
+    /// Must match the canonical dev key.
+    pub owner_vk: Vec<u8>,
+    /// Blake3 hash of owner_vk.
+    pub owner_vk_hash: [u8; 32],
+    /// ML-DSA-65 signature by owner_vk over the genesis message.
+    pub owner_sig: Vec<u8>,
+}
+
+/// Total Vichor supply — fixed at genesis, never increases.
+pub const VICHOR_TOTAL_SUPPLY: u64 = 1_000_000_000;
+
+/// Canonical nonce for the Vichor genesis proof. Only proofs with this
+/// exact nonce are valid. Changing this would create a different genesis,
+/// which the network will reject.
+pub const VICHOR_GENESIS_NONCE: [u8; 32] = *b"vess-vichor-genesis-v1----------";
+
+/// Canonical dev ML-DSA-65 verification key hash for the Vichor genesis.
+/// Only the key that hashes to this can sign the genesis proof.
+pub const VICHOR_GENESIS_VK_HASH: [u8; 32] = [
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // PLACEHOLDER
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Replace with actual
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // dev key hash
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// Provably unspendable verification key. Any Vichor bill transferred to
+/// this owner is permanently burned — no one can sign a subsequent claim.
+/// `Blake3("vess-vichor-burn-v1")` → 32 bytes of nothingness.
+pub const VICHOR_BURN_VK_HASH: [u8; 32] = [
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// Proof that Vichor bills have been permanently burned.
+///
+/// Used to unlock time-lock durations beyond 1 year. The burn proof
+/// references one or more Vichor bills in the ownership registry and
+/// proves the owner authorizes their destruction.
+///
+/// The burn happens **before** the time-lock: Vichor bills are transferred
+/// to `VICHOR_BURN_VK_HASH` via an OwnershipClaim, the DHT marks them consumed,
+/// and this proof is produced. The lock creation function then references
+/// this proof — it checks that `total_burned >= vichor_required(duration)`.
+///
+/// # Replay protection
+///
+/// `mint_commitment` is a random nonce generated before either the burn
+/// or the time-lock exists. It links the burn proof to a specific lock
+/// without requiring the mint_id upfront. The digest is embedded in the
+/// lock commitment — reusing the same burn for a different lock would
+/// require forging the commitment.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VichorBurnProof {
+    /// Mint IDs of the Vichor bills being burned. Must be active in the
+    /// ownership registry and owned by `owner_vk`.
+    pub burned_mint_ids: Vec<[u8; 32]>,
+    /// Total Vichor amount burned (sum of burned bill denominations).
+    /// The minting node checks: `total_burned >= vichor_required(duration_years)`.
+    pub total_burned: u64,
+    /// ML-DSA-65 verification key of the burner.
+    pub owner_vk: Vec<u8>,
+    /// Blake3 hash of owner_vk.
+    pub owner_vk_hash: [u8; 32],
+    /// ML-DSA-65 signature over the burn message.
+    pub owner_sig: Vec<u8>,
+    /// Random nonce linking this burn to a specific time-lock mint.
+    /// Generated before either step — used in the burn proof digest and
+    /// the Bitcoin OP_RETURN commitment.
+    pub mint_commitment: [u8; 32],
+}
+
+/// Proof object used to justify genesis registration of a bill.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum GenesisProof {
+    /// Existing Vess-native genesis proof bytes.
+    Vess(Vec<u8>),
+
+    /// Argon2d proof-of-work: self-verifying, no fraud possible.
+    /// Contains the owner VK, nonce, denomination, and Argon2d output.
+    Mint(MintProof),
+
+    /// One-time Vichor genesis: 1B supply held by dev, sold on swap DHT.
+    VichorGenesis(VichorGenesisProof),
+
+    /// Local testing faucet proof. Accepted only when explicitly enabled by
+    /// the node operator.
+    LocalTestFaucet(LocalTestFaucetProof),
+}
+
+/// Self-verifying proof of Argon2d work.
+///
+/// The miner runs `Argon2d(m_cost=1GiB, t=1, p=1)` with password
+/// `vk_hash(owner_vk) || nonce`.  The output's leading zero byte count
+/// determines the denomination.  Verification is a single Argon2d
+/// recomputation — ~0.5–1 second on any node.
+///
+/// Because the proof is self-verifying, there is no fraud model:
+/// a MintProof either passes verification or it doesn't.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MintProof {
+    /// ML-DSA-65 verification key of the miner (binds proof to wallet).
+    pub owner_vk: Vec<u8>,
+    /// Monotonically increasing nonce — never reused.
+    pub nonce: u64,
+    /// Denomination found: 1, 2, or 5 VHALIX.
+    pub denomination_value: u64,
+    /// The 32-byte Argon2d output (so nodes can check zeros without
+    /// recomputing, though they should still recompute to be sure).
+    pub argon2d_output: [u8; 32],
+}
+
+/// Top-level pulse message envelope.
+///
+/// Every vascular pulse carries exactly one of these variants.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PulseMessage {
     /// A payment: stealth-encrypted bill(s) sent to a recipient.
@@ -99,9 +242,11 @@ pub enum PulseMessage {
     /// Acknowledgement to a [`MailboxForwardRegister`] request.
     MailboxForwardAck(MailboxForwardAck),
 
-    /// Store an encrypted wallet manifest in the DHT for recovery.
-    VessSubmit(vess_foundry::Vess),
+    /// Claim ownership of a bill after receiving a transfer.
 
+    /// Register a freshly minted bill in the ownership registry.
+
+    /// Store an encrypted wallet manifest in the DHT for recovery.
     ManifestStore(ManifestStore),
 
     /// Recover an encrypted wallet manifest from the DHT.
@@ -110,11 +255,15 @@ pub enum PulseMessage {
     /// Response to a ManifestRecover request.
     ManifestRecoverResponse(ManifestRecoverResponse),
 
+    /// Fetch full ownership records (including sealed payloads) by mint_id.
+    OwnershipFetch(OwnershipFetch),
+
+    /// Response to an OwnershipFetch request.
+    OwnershipFetchResponse(OwnershipFetchResponse),
+
     /// Direct peer-to-peer payment (bypasses artery relay).
-    DirectPayment(DirectPayment),
 
     /// Response to a direct peer-to-peer payment.
-    DirectPaymentResponse(DirectPaymentResponse),
 
     /// Cryptographic receipt proving the recipient decrypted and claimed
     /// a payment.  Signed with the recipient's spend_sk so the sender can
@@ -135,6 +284,9 @@ pub enum PulseMessage {
     /// Response to a FindNode request: the K closest peers known.
     FindNodeResponse(FindNodeResponse),
 
+    /// Attest that input bills have been consumed in a split/combine reforge.
+    /// Artery nodes verify the owner's signature over each consumed mint_id
+    /// and delete them from the registry, preventing double-spend of inputs.
 
     /// Request network-level statistics (peer count, latency metrics).
     NetworkStats(NetworkStats),
@@ -158,6 +310,11 @@ pub enum PulseMessage {
     /// No single hop knows both sender and recipient.
     OnionRoute(OnionRoute),
 
+    /// Atomic swap offer for trustless cross-asset exchange.
+    /// Stored in the DHT keyed by Blake3("vess-swap-v0" || asset_a || asset_b).
+
+    /// Response to a swap offer query.
+
     /// Clock state gossip: a peer shares its current hash-tick clock.
     /// Used for network-time computation and lock verification.
     ClockGossip(ClockGossip),
@@ -167,6 +324,7 @@ pub enum PulseMessage {
 
     /// Response with a Merkle proof linking a tick to the peer's genesis.
     ClockProofResponse(ClockProofResponse),
+
 }
 
 // ── Hash Clock ──────────────────────────────────────────────────────
@@ -662,7 +820,7 @@ pub struct DhtSeedOwnershipRecord {
     pub current_owner_vk_hash: [u8; 32],
     /// Full current owner verification key.
     pub current_owner_vk: Vec<u8>,
-    /// u64 value for supply tracking.
+    /// Denomination value for supply tracking.
     pub denomination_value: u64,
     /// Unix timestamp when this record was last updated.
     pub updated_at: u64,
@@ -703,7 +861,7 @@ pub struct DhtSeedConsumedRecord {
     pub output_mint_ids: Vec<[u8; 32]>,
     /// Unix timestamp when the bill was consumed.
     pub consumed_at: u64,
-    /// u64 value of the consumed bill, if known.
+    /// Denomination value of the consumed bill, if known.
     #[serde(default)]
     pub denomination_value: u64,
     /// Original bill digest, if known.
@@ -941,9 +1099,17 @@ pub struct TagConfirm {
     pub hops_remaining: u8,
 }
 
+// ── Serialization ────────────────────────────────────────────────────
 
+// ── Ownership ────────────────────────────────────────────────────────
+// ── Network Statistics ───────────────────────────────────────────────
+
+/// Request network-level statistics from an artery node.
+///
+/// The response includes the node's local peer count and recent
+/// payment latency observations (time from payment relay to ownership
+/// confirmation back to the sender).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-
 pub struct NetworkStats {
     /// Optional nonce for request/response correlation.
     pub nonce: [u8; 32],
@@ -1025,7 +1191,7 @@ pub struct FetchedRecord {
     pub mint_id: [u8; 32],
     /// Whether the record was found.
     pub found: bool,
-    /// u64 value.
+    /// Denomination value.
     pub denomination_value: u64,
     /// Current ownership chain tip (for recovery).
     pub chain_tip: [u8; 32],
@@ -1040,59 +1206,97 @@ pub struct OwnershipFetchResponse {
     pub records: Vec<FetchedRecord>,
 }
 
+// ── Century Lock ─────────────────────────────────────────────────────
 
+/// Approximate number of ticks in one year (at 6s/tick).
+pub const TICKS_PER_YEAR: u64 = 365 * 24 * 60 * 60 / 6;
+
+/// Approximate number of ticks in 100 years (at 6s/tick).
+pub const CENTURY_LOCK_TICKS: u64 = 100 * TICKS_PER_YEAR;
+
+/// State for an active century-lock faucet.
+///
+/// When VHALIX is locked for 100 years, it creates a perpetual Vess faucet
+/// that mints one bill per network tick. Each bill is valued at
+/// `total_locked / TICKS_PER_YEAR` (rounded up).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DirectPayment {
-    /// Unique payment identifier.
-    pub payment_id: [u8; 32],
-    /// Serialized `TransferPayload` (bills + sender VKs + transfer sigs).
-    pub transfer_payload: Vec<u8>,
-    /// Stealth ID the transfer is addressed to (binds the signatures).
-    pub recipient_stealth_id: [u8; 32],
-    /// Public bill identifiers (parallel arrays for inline verification).
-    pub mint_ids: Vec<[u8; 32]>,
-    /// u64 values of each bill.
-    pub denomination_values: Vec<u64>,
-    /// Unix timestamp when payment was created.
+pub struct CenturyLockState {
+    /// Unique identifier: `Blake3("vess-century-lock-v1" || lock_nonce)`.
+    pub lock_id: [u8; 32],
+    /// Total VHALIX units locked.
+    pub total_locked: u64,
+    /// Vess amount per network tick: `ceil(total_locked / TICKS_PER_YEAR)`.
+    pub per_tick_vess: u64,
+    /// Network tick when the lock starts.
+    pub start_tick: u64,
+    /// Network tick when the lock expires (start + CENTURY_LOCK_TICKS).
+    pub end_tick: u64,
+    /// Last network tick for which a bill was minted.
+    pub last_claimed_tick: u64,
+    /// The node ID of the wallet that owns this century lock.
+    pub owner_node_id: [u8; 32],
+    /// Unix timestamp when this lock was created.
     pub created_at: u64,
 }
 
-/// Response to a [`DirectPayment`].
-///
-/// Returned over the same direct mesh session. If `accepted` is `true`, the
-/// receiver has verified the proofs and will broadcast ownership claims.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DirectPaymentResponse {
-    /// Echoed payment ID.
-    pub payment_id: [u8; 32],
-    /// Whether the payment was accepted.
-    pub accepted: bool,
-    /// Signed acceptance receipt, required when `accepted` is true for direct payments.
-    #[serde(default)]
-    pub receipt: Option<DirectPaymentReceipt>,
-    /// Human-readable rejection reason (empty if accepted).
-    #[serde(default)]
-    pub reason: String,
+impl CenturyLockState {
+    /// Create a new century lock state from a VHALIX mint_id and tick.
+    pub fn new(
+        VHALIX_mint_id: &[u8; 32],
+        total_locked: u64,
+        start_tick: u64,
+        lock_ticks: u64,
+        owner_node_id: [u8; 32],
+        created_at: u64,
+    ) -> Self {
+        let per_tick_vess = (total_locked + lock_ticks.max(1) - 1) / lock_ticks.max(1);
+        let end_tick = start_tick.saturating_add(lock_ticks);
+        let lock_id = {
+            let mut h = blake3::Hasher::new();
+            h.update(b"vess-century-lock-v1");
+            h.update(VHALIX_mint_id);
+            *h.finalize().as_bytes()
+        };
+        Self {
+            lock_id,
+            total_locked,
+            per_tick_vess,
+            start_tick,
+            end_tick,
+            last_claimed_tick: start_tick.saturating_sub(1),
+            owner_node_id,
+            created_at,
+        }
+    }
+
+    /// How many ticks remain unclaimed.
+    pub fn unclaimed_ticks(&self, current_tick: u64) -> u64 {
+        if current_tick <= self.last_claimed_tick { return 0; }
+        let max_claimable = self.end_tick.min(current_tick);
+        max_claimable.saturating_sub(self.last_claimed_tick)
+    }
+
+    /// Remaining Vess that can be minted from this lock.
+    pub fn remaining_vess(&self, current_tick: u64) -> u64 {
+        self.unclaimed_ticks(current_tick) * self.per_tick_vess
+    }
+
+    /// Whether this lock is still active.
+    pub fn is_active(&self, current_tick: u64) -> bool {
+        current_tick < self.end_tick && self.last_claimed_tick < self.end_tick
+    }
 }
 
-/// Recipient-signed proof that a direct payment was accepted for a specific tag.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DirectPaymentReceipt {
-    /// Echoed payment ID.
-    pub payment_id: [u8; 32],
-    /// Blake3 hash of the recipient tag the sender resolved.
-    pub tag_hash: [u8; 32],
-    /// Stealth ID from the encrypted payment payload.
-    pub recipient_stealth_id: [u8; 32],
-    /// Mint IDs accepted by the recipient.
-    pub claimed_mint_ids: Vec<[u8; 32]>,
-    /// Total accepted amount.
-    pub total_amount: u64,
-    /// Recipient's fresh owner verification key for the first claimed bill.
-    pub recipient_owner_vk: Vec<u8>,
-    /// ML-DSA-65 signature over the receipt digest.
-    pub signature: Vec<u8>,
-}
+// ── Direct Peer-to-Peer Payment ──────────────────────────────────────
+
+/// Direct payment sent over a direct mesh session between two wallets.
+///
+/// Bypasses artery relay nodes entirely — the receiver verifies proofs
+/// inline and claims ownership locally, broadcasting [`OwnershipClaim`]
+/// messages when artery connectivity is available.
+///
+/// The direct mesh transport provides encryption, so no stealth wrapping is
+/// needed.
 
 /// Recipient-signed cryptographic proof of payment receipt.
 ///

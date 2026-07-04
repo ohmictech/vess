@@ -35,7 +35,7 @@ use vess_mesh::{
 use vess_protocol::{PulseMessage, TagLookup, TagRegister};
 use vess_stealth::generate_master_keys_from_seed;
 use vess_tag::VessTag;
-use vess_vascular::MeshPulseNode;
+use vess_mesh::MeshPulseNode;
 
 #[derive(Parser)]
 #[command(name = "vess", version, about = "Vess â€” stateless P2P digital cash")]

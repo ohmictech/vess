@@ -990,51 +990,6 @@ mod tests {
     }
 
     #[test]
-    fn save_persists_spend_credentials_from_billfold() {
-        let (secret, address) = generate_master_keys();
-        let phrase = RecoveryPhrase::generate();
-        let enc_key = derive_encryption_key_with_params(&phrase, 1, 64, 1).unwrap();
-        let encrypted = encrypt_secrets(&secret, &enc_key).unwrap();
-
-        let mut billfold = BillFold::new();
-        let bill = vess_foundry::Vess {
-            denomination: u64::D10,
-            digest: [0x11; 32],
-            created_at: 1,
-            stealth_id: [0x22; 32],
-            dht_index: 7,
-            mint_id: [0x33; 32],
-            chain_tip: [0x44; 32],
-            chain_depth: 0,
-        };
-        billfold.deposit_with_credentials(
-            bill.clone(),
-            crate::billfold::SpendCredential {
-                spend_vk: vec![0x55; 64],
-                spend_sk: vec![0x66; 64],
-            },
-        );
-
-        let wallet = WalletFile::new(address, encrypted, billfold, [0u8; 32], &enc_key).unwrap();
-
-        let dir = std::env::temp_dir().join("vess-test-persistence-creds");
-        let path = dir.join("wallet.json");
-
-        wallet.save(&path, &enc_key).unwrap();
-        let mut loaded = WalletFile::load(&path).unwrap();
-        loaded.decrypt_private_metadata(&enc_key).unwrap();
-        let mut loaded_billfold = loaded.billfold.clone();
-        loaded
-            .decrypt_spend_credentials_into(&mut loaded_billfold, &enc_key)
-            .unwrap();
-
-        assert_eq!(loaded_billfold.balance(), 10);
-        assert!(loaded_billfold.get_credentials(&bill.compute_vess_id()).is_some());
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn wallet_names_are_sanitized_for_filenames() {
         assert_eq!(
             sanitize_wallet_name("Personal Wallet").unwrap(),

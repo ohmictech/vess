@@ -774,7 +774,6 @@ fn artery_snapshot_save_load() {
         mailbox: std::collections::BTreeMap::new(),
         known_peers: vec![[0x01; 32]],
         limbo_entries: std::collections::BTreeMap::new(),
-        peer_reputations: vec![],
         hardening_proofs: vec![],
         banned_peers: vec![[0xBB; 32]],
         ownership_records: vec![record1, record2],

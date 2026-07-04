@@ -64,7 +64,7 @@ fn main() {
     let workspace_root = manifest_dir.parent().unwrap();
 
     let crate_dirs = [
-        "vess-vascular",
+        "vess-mesh",
         "vess-foundry",
         "vess-stealth",
         "vess-tag",

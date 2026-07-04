@@ -5,6 +5,7 @@ edition = "2021"
 license-file = "../LICENSE"
 
 [dependencies]
+vess-protocol = { path = "../vess-protocol" }
 anyhow = "1"
 async-trait = "0.1"
 blake3 = "1"

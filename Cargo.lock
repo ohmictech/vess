@@ -1543,22 +1543,8 @@ dependencies = [
  "vess-sovereign",
  "vess-stealth",
  "vess-tag",
- "vess-vascular",
  "windows-sys 0.59.0",
  "zeroize",
-]
-
-[[package]]
-name = "vess-clock"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "blake3",
- "postcard",
- "rand 0.8.6",
- "serde",
- "serde_json",
- "tracing",
 ]
 
 [[package]]
@@ -1594,6 +1580,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "vess-protocol",
 ]
 
 [[package]]
@@ -1656,18 +1643,6 @@ dependencies = [
  "serde",
  "vess-foundry",
  "vess-stealth",
-]
-
-[[package]]
-name = "vess-vascular"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "rand 0.8.6",
- "tokio",
- "tracing",
- "vess-mesh",
- "vess-protocol",
 ]
 
 [[package]]
