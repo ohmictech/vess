@@ -6,14 +6,12 @@
 //!
 //! # Message Categories
 //!
-//! - [`Payment`] / [`DirectPayment`] — Stealth-encrypted bill transfers.
+//! - [`Payment`] — Stealth-encrypted bill transfers.
 //! - [`TagRegister`] — PoW-backed VessTag registration.
 //! - [`TagLookup`] / [`TagLookupResponse`] — Tag → stealth address resolution.
-//! - [`OwnershipGenesis`] / [`OwnershipClaim`] — Ownership registry operations.
 //! - [`MailboxCollect`] / [`MailboxSweep`] — Offline payment delivery.
 //! - [`RegistryQuery`] / [`RegistryQueryResponse`] — Ownership status lookup.
 //! - [`ManifestStore`] / [`ManifestRecover`] — Wallet recovery manifests.
-//! - Compute program / receipt records — programmable DHT-published compute.
 
 use serde::{Deserialize, Serialize};
 use blake3;
@@ -30,214 +28,6 @@ pub struct LocalTestFaucetProof {
     pub nonce: [u8; 32],
 }
 
-/// One-time genesis proof for the Vichor supply.
-///
-/// Vichor is a fixed-supply (1,000,000,000) network stock token. The entire
-/// supply is created in a single genesis event and held by the dev address.
-/// The dev sells Vichor on the swap DHT at market rates.
-///
-/// # Uniqueness
-///
-/// Only **one** `VichorGenesis` is ever valid. Uniqueness is enforced by:
-///
-/// 1. **Canonical nonce** — `VICHOR_GENESIS_NONCE` is baked into the protocol.
-///    Any proof with a different nonce is rejected. There is exactly one
-///    valid proof, ever.
-/// 2. **Dev key** — the `owner_vk` must match `VICHOR_GENESIS_VK`. Only the
-///    canonical dev key can sign the genesis.
-/// 3. **Total supply** — must equal `VICHOR_TOTAL_SUPPLY` (1,000,000,000).
-///
-/// Even the dev cannot print more Vichor — the nonce and supply are fixed
-/// at the protocol level.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VichorGenesisProof {
-    /// Must equal [`VICHOR_GENESIS_NONCE`]. Any other value is invalid.
-    pub nonce: [u8; 32],
-    /// Total supply: must equal [`VICHOR_TOTAL_SUPPLY`].
-    pub total_supply: u64,
-    /// Must match the canonical dev key.
-    pub owner_vk: Vec<u8>,
-    /// Blake3 hash of owner_vk.
-    pub owner_vk_hash: [u8; 32],
-    /// ML-DSA-65 signature by owner_vk over the genesis message.
-    pub owner_sig: Vec<u8>,
-}
-
-/// Total Vichor supply — fixed at genesis, never increases.
-pub const VICHOR_TOTAL_SUPPLY: u64 = 1_000_000_000;
-
-/// Canonical nonce for the Vichor genesis proof. Only proofs with this
-/// exact nonce are valid. Changing this would create a different genesis,
-/// which the network will reject.
-pub const VICHOR_GENESIS_NONCE: [u8; 32] = *b"vess-vichor-genesis-v1----------";
-
-/// Canonical dev ML-DSA-65 verification key hash for the Vichor genesis.
-/// Only the key that hashes to this can sign the genesis proof.
-pub const VICHOR_GENESIS_VK_HASH: [u8; 32] = [
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // PLACEHOLDER
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Replace with actual
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // dev key hash
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-];
-
-/// Provably unspendable verification key. Any Vichor bill transferred to
-/// this owner is permanently burned — no one can sign a subsequent claim.
-/// `Blake3("vess-vichor-burn-v1")` → 32 bytes of nothingness.
-pub const VICHOR_BURN_VK_HASH: [u8; 32] = [
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-];
-
-/// Proof that Vichor bills have been permanently burned.
-///
-/// Used to unlock time-lock durations beyond 1 year. The burn proof
-/// references one or more Vichor bills in the ownership registry and
-/// proves the owner authorizes their destruction.
-///
-/// The burn happens **before** the time-lock: Vichor bills are transferred
-/// to `VICHOR_BURN_VK_HASH` via an OwnershipClaim, the DHT marks them consumed,
-/// and this proof is produced. The lock creation function then references
-/// this proof — it checks that `total_burned >= vichor_required(duration)`.
-///
-/// # Replay protection
-///
-/// `mint_commitment` is a random nonce generated before either the burn
-/// or the time-lock exists. It links the burn proof to a specific lock
-/// without requiring the mint_id upfront. The digest is embedded in the
-/// lock commitment — reusing the same burn for a different lock would
-/// require forging the commitment.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VichorBurnProof {
-    /// Mint IDs of the Vichor bills being burned. Must be active in the
-    /// ownership registry and owned by `owner_vk`.
-    pub burned_mint_ids: Vec<[u8; 32]>,
-    /// Total Vichor amount burned (sum of burned bill denominations).
-    /// The minting node checks: `total_burned >= vichor_required(duration_years)`.
-    pub total_burned: u64,
-    /// ML-DSA-65 verification key of the burner.
-    pub owner_vk: Vec<u8>,
-    /// Blake3 hash of owner_vk.
-    pub owner_vk_hash: [u8; 32],
-    /// ML-DSA-65 signature over the burn message.
-    pub owner_sig: Vec<u8>,
-    /// Random nonce linking this burn to a specific time-lock mint.
-    /// Generated before either step — used in the burn proof digest and
-    /// the Bitcoin OP_RETURN commitment.
-    pub mint_commitment: [u8; 32],
-}
-
-/// Proof object used to justify genesis registration of a bill.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum GenesisProof {
-    /// Existing Vess-native genesis proof bytes.
-    Vess(Vec<u8>),
-
-    /// VHALIX mining proof: Argon2id CPU burn creates a VHALIX bill.
-    /// The proof contains a Merkle tree of argon2id state roots.
-    Mint(vess_foundry::Vess),
-
-    /// One-time Vichor genesis: 1B supply held by dev, sold on swap DHT.
-    VichorGenesis(VichorGenesisProof),
-
-    /// Local testing faucet proof. Accepted only when explicitly enabled by
-    /// the node operator.
-    LocalTestFaucet(LocalTestFaucetProof),
-}
-
-/// A verifier proves they recomputed an excess VHALIX proof.
-///
-/// When a miner submits a VHALIXMinedProof with more proofs than the
-/// target denomination, the excess becomes a bounty pool.  A verifier
-/// picks one excess proof, recomputes Argon2id, and submits this as a
-/// genesis proof to claim a 5-VHALIX bounty bill.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BountyGenesisProof {
-    /// The genesis mint_id of the VHALIX bill being verified.
-    pub genesis_mint_id: [u8; 32],
-    /// The proof index within the batch (must be in excess range).
-    pub proof_index: u64,
-    /// The 32-byte Argon2id output — proves recomputation was done.
-    pub argon2_output: [u8; 32],
-    /// Verifier's ML-DSA-65 VK (receives the bounty bill).
-    pub verifier_vk: Vec<u8>,
-    /// Verifier's signature over the claim.
-    pub verifier_sig: Vec<u8>,
-}
-
-/// Proof that a miner performed Argon2id CPU work to create VHALIX bills.
-///
-/// The miner runs `argon2id(m_cost=256MiB, t=3, p=1)` for each bill nonce,
-/// accumulates proofs in a batch, then submits them as a Merkle tree.
-/// Verifiers spot-check random leaves to confirm the work was done.
-///
-/// The proof uses ephemeral DKSAP keys so that the on-chain proof is
-/// cryptographically indistinguishable from a normal Vess payment.
-/// Even though the miner is sending to themselves, the proof does not
-/// reveal their master stealth address.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VHALIXMinedProof {
-    /// Ephemeral scan encapsulation key (ML-KEM-768). Generated fresh
-    /// per batch so the proof cannot be linked to a master stealth address.
-    pub ephemeral_scan_ek: Vec<u8>,
-    /// Ephemeral spend encapsulation key.
-    pub ephemeral_spend_ek: Vec<u8>,
-    /// DKSAP scan ciphertext (encrypted to the owner's scan_ek).
-    pub ct_scan: Vec<u8>,
-    /// DKSAP spend ciphertext.
-    pub ct_spend: Vec<u8>,
-    /// View tag for fast scanning (as in normal Payment).
-    pub view_tag: u8,
-    /// First bill nonce in this batch (inclusive).
-    pub bill_nonce_start: u64,
-    /// Last bill nonce in this batch (inclusive).
-    pub bill_nonce_end: u64,
-    /// Merkle root over all (bill_nonce, argon2_state_root) pairs.
-    pub merkle_root: [u8; 32],
-    /// Total Argon2id iterations across the batch (for denomination).
-    pub total_compute_ticks: u64,
-    /// Per-wallet mining session counter (persisted across restarts).
-    pub session_nonce: u64,
-    /// Hash of the network tick that anchored this mining session.
-    /// Binds the mint_id to a specific point in network time.
-    pub tick_hash: [u8; 32],
-    /// `argon2_hash` of every proof in this batch, in nonce order.
-    /// Enables O(n) chain continuity verification at wire speed
-    /// (each hash is 32 bytes → ~2 KiB for a 64-proof batch).
-    #[serde(default)]
-    pub chain_hashes: Vec<[u8; 32]>,
-    /// ML-DSA-65 verification key of the bill owner.
-    pub owner_vk: Vec<u8>,
-    /// ML-DSA-65 signature by `owner_vk` over the batch commitment.
-    pub batch_sig: Vec<u8>,
-    /// Verification bounty: excess proofs beyond the denomination
-    /// that can be claimed by verifiers for a 5-VHALIX reward each.
-    #[serde(default)]
-    pub bounty: Option<VerificationBounty>,
-}
-
-/// Verification bounty attached to a VHALIX genesis proof.
-///
-/// When a miner submits a batch, the excess proofs beyond the
-/// 1-2-5 denomination become a bounty pool.  Verifiers can claim
-/// individual excess proofs by recomputing Argon2id — each successful
-/// verification pays the verifier 5 VHALIX from the miner's bill.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VerificationBounty {
-    /// Proof index where the excess range begins (= denomination).
-    pub excess_start: u64,
-    /// Proof index where the excess range ends (= bill_nonce_end).
-    pub excess_end: u64,
-    /// Number of 1-VHALIX bounty units available (one per excess proof).
-    pub bounty_count: u64,
-    /// VHALIX per successful verification claim.
-    pub reward_per_claim: u64,
-}
-
-/// Top-level pulse message envelope.
-///
-/// Every vascular pulse carries exactly one of these variants.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PulseMessage {
     /// A payment: stealth-encrypted bill(s) sent to a recipient.
@@ -309,14 +99,9 @@ pub enum PulseMessage {
     /// Acknowledgement to a [`MailboxForwardRegister`] request.
     MailboxForwardAck(MailboxForwardAck),
 
-    /// Claim ownership of a bill after receiving a transfer.
-    OwnershipClaim(OwnershipClaim),
-
-    /// Register a freshly minted bill in the ownership registry.
-    OwnershipGenesis(OwnershipGenesis),
-
     /// Store an encrypted wallet manifest in the DHT for recovery.
     VessSubmit(vess_foundry::Vess),
+
     ManifestStore(ManifestStore),
 
     /// Recover an encrypted wallet manifest from the DHT.
@@ -324,12 +109,6 @@ pub enum PulseMessage {
 
     /// Response to a ManifestRecover request.
     ManifestRecoverResponse(ManifestRecoverResponse),
-
-    /// Fetch full ownership records (including sealed payloads) by mint_id.
-    OwnershipFetch(OwnershipFetch),
-
-    /// Response to an OwnershipFetch request.
-    OwnershipFetchResponse(OwnershipFetchResponse),
 
     /// Direct peer-to-peer payment (bypasses artery relay).
     DirectPayment(DirectPayment),
@@ -356,10 +135,6 @@ pub enum PulseMessage {
     /// Response to a FindNode request: the K closest peers known.
     FindNodeResponse(FindNodeResponse),
 
-    /// Attest that input bills have been consumed in a split/combine reforge.
-    /// Artery nodes verify the owner's signature over each consumed mint_id
-    /// and delete them from the registry, preventing double-spend of inputs.
-    ReforgeAttestation(ReforgeAttestation),
 
     /// Request network-level statistics (peer count, latency metrics).
     NetworkStats(NetworkStats),
@@ -382,13 +157,6 @@ pub enum PulseMessage {
     /// Each relay decrypts one layer and forwards the inner packet.
     /// No single hop knows both sender and recipient.
     OnionRoute(OnionRoute),
-
-    /// Atomic swap offer for trustless cross-asset exchange.
-    /// Stored in the DHT keyed by Blake3("vess-swap-v0" || asset_a || asset_b).
-    SwapOffer(SwapOffer),
-
-    /// Response to a swap offer query.
-    SwapOfferResponse(SwapOfferResponse),
 
     /// Clock state gossip: a peer shares its current hash-tick clock.
     /// Used for network-time computation and lock verification.
@@ -1173,237 +941,9 @@ pub struct TagConfirm {
     pub hops_remaining: u8,
 }
 
-// ── Serialization ────────────────────────────────────────────────────
 
-// ── Ownership ────────────────────────────────────────────────────────
-
-/// Register a freshly minted bill in the artery ownership registry.
-///
-/// Sent by the minter after a successful mint. The artery verifies the
-/// STARK proof and seeds the ownership registry with the genesis chain tip.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OwnershipGenesis {
-    /// Permanent bill identity: `Blake3("vess-mint-id-v0" || digest || nonce)`.
-    pub mint_id: [u8; 32],
-    /// Genesis chain tip: `Blake3("vess-chain-v0" || mint_id || owner_vk_hash)`.
-    pub chain_tip: [u8; 32],
-    /// Blake3 hash of the minter's ML-DSA-65 verification key.
-    pub owner_vk_hash: [u8; 32],
-    /// Full ML-DSA-65 verification key of the minter (for future transfer verification).
-    pub owner_vk: Vec<u8>,
-    /// u64 value for supply tracking.
-    pub denomination_value: u64,
-    /// Typed genesis proof for this bill.
-    pub genesis_proof: GenesisProof,
-    /// Genesis commitment hash.
-    ///
-    /// For Vess-native bills this is the VM or compound proof digest.
-    /// For Bitcoin-burned bills this is the burn bundle commitment hash.
-    pub digest: [u8; 32],
-    /// Remaining gossip hops (decremented at each relay, stops at 0).
-    pub hops_remaining: u8,
-    /// Chain depth at genesis is always 0.
-    #[serde(default)]
-    pub chain_depth: u64,
-    /// Output index within a split/combine reforge (0-based).
-    /// Set to 0 for regular minted bills. Used by verifiers to derive
-    /// and confirm the `mint_id` of a reforge output without a random nonce.
-    #[serde(default)]
-    pub output_index: u32,
-    /// Argon2id PoW nonce for genesis anti-spam.
-    #[serde(default)]
-    pub pow_nonce: Option<[u8; 32]>,
-    /// Argon2id PoW hash.
-    #[serde(default)]
-    pub pow_hash: Option<[u8; 32]>,
-    /// Accumulated propagation work.
-    #[serde(default)]
-    pub accumulated_work: Option<u64>,
-}
 
-impl Default for OwnershipGenesis {
-    fn default() -> Self {
-        Self {
-            mint_id: [0u8; 32],
-            chain_tip: [0u8; 32],
-            owner_vk_hash: [0u8; 32],
-            owner_vk: Vec::new(),
-            denomination_value: 0,
-            genesis_proof: GenesisProof::Vess(Vec::new()),
-            digest: [0u8; 32],
-            hops_remaining: 0,
-            chain_depth: 0,
-            output_index: 0,
-            pow_nonce: None,
-            pow_hash: None,
-            accumulated_work: None,
-        }
-    }
-}
-
-/// Claim ownership of a bill after receiving a transfer.
-///
-/// The receiver broadcasts this to rotate ownership in the artery registry.
-/// The artery verifies the previous owner's transfer signature, computes
-/// the expected new chain tip, and updates the registry.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OwnershipClaim {
-    /// Permanent bill identity.
-    pub mint_id: [u8; 32],
-    /// Stealth ID the transfer was addressed to (included in transfer_message).
-    pub stealth_id: [u8; 32],
-    /// Full ML-DSA-65 verification key of the PREVIOUS owner.
-    /// The artery checks `Blake3(prev_owner_vk) == stored current_owner_vk_hash`.
-    #[serde(default)]
-    pub prev_owner_vk: Vec<u8>,
-    /// Transfer authorization signature from the previous owner.
-    /// Signs `transfer_message(mint_id, stealth_id, timestamp)`.
-    #[serde(default)]
-    pub transfer_sig: Vec<u8>,
-    /// Blake3 hash of the NEW owner's ML-DSA-65 verification key.
-    pub new_owner_vk_hash: [u8; 32],
-    /// Full ML-DSA-65 verification key of the new owner (stored for next transfer).
-    #[serde(default)]
-    pub new_owner_vk: Vec<u8>,
-    /// Expected new chain tip: `Blake3(prev_chain_tip || new_owner_vk_hash || sig_hash)`.
-    pub new_chain_tip: [u8; 32],
-    /// Unix timestamp (must match the signed transfer message).
-    pub timestamp: u64,
-    /// Remaining gossip hops (decremented at each relay, stops at 0).
-    pub hops_remaining: u8,
-    /// Chain depth after this transfer. Must equal the previous depth + 1.
-    /// Deeper chains win in conflict resolution — this makes bills
-    /// "harder to dispute" with every successive transfer.
-    #[serde(default)]
-    pub chain_depth: u64,
-    /// Encrypted bill data for DHT recovery. The bill is encrypted to the
-    /// new owner's stealth address — only they can decrypt it. Artery nodes
-    /// store this opaque blob so the recipient can recover the bill from
-    /// the DHT if they lose their local copy.
-    #[serde(default)]
-    pub encrypted_bill: Vec<u8>,
-    /// Argon2id PoW nonce for claim anti-spam.
-    #[serde(default)]
-    pub pow_nonce: Option<[u8; 32]>,
-    /// Argon2id PoW hash.
-    #[serde(default)]
-    pub pow_hash: Option<[u8; 32]>,
-    /// Accumulated propagation work.
-    #[serde(default)]
-    pub accumulated_work: Option<u64>,
-    /// Optional preimage for hash-locked payments (atomic swaps).
-    /// Must satisfy Blake3(preimage) == Payment.hash_lock.
-    #[serde(default)]
-    pub hash_preimage: Option<[u8; 32]>,
-    /// Network tick at which this bill unlocks for transfer.
-    /// Set when locking VHALIX for Vess minting.  The DHT rejects
-    /// transfers of this bill until median_tick >= locked_until_tick.
-    /// A value of 0 means the bill is not time-locked.
-    #[serde(default)]
-    pub locked_until_tick: u64,
-}
-
-impl Default for OwnershipClaim {
-    fn default() -> Self {
-        Self {
-            mint_id: [0u8; 32],
-            stealth_id: [0u8; 32],
-            prev_owner_vk: Vec::new(),
-            transfer_sig: Vec::new(),
-            new_owner_vk_hash: [0u8; 32],
-            new_owner_vk: Vec::new(),
-            new_chain_tip: [0u8; 32],
-            timestamp: 0,
-            hops_remaining: 0,
-            chain_depth: 0,
-            encrypted_bill: Vec::new(),
-            pow_nonce: None,
-            pow_hash: None,
-            accumulated_work: None,
-            hash_preimage: None,
-            locked_until_tick: 0,
-        }
-    }
-}
-
-// ── Atomic Swap ─────────────────────────────────────────────────────
-
-/// A posted offer to swap one asset for another via atomic hash-locked
-/// payments. Stored in the DHT at Blake3("vess-swap-v0" || min(a,b) || max(a,b)).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SwapOffer {
-    pub offer_asset: String,
-    pub offer_amount: u64,
-    pub want_asset: String,
-    pub want_amount: u64,
-    pub recipient: String,
-    pub hash_lock: [u8; 32],
-    pub expires_at: u64,
-    pub offerer_node_id: Vec<u8>,
-}
-
-impl SwapOffer {
-    pub fn dht_key(&self) -> [u8; 32] {
-        swap_dht_key(&self.offer_asset, &self.want_asset)
-    }
-}
-
-pub fn swap_dht_key(a: &str, b: &str) -> [u8; 32] {
-    let (first, second) = if a < b { (a, b) } else { (b, a) };
-    let mut h = blake3::Hasher::new();
-    h.update(b"vess-swap-v0");
-    h.update(first.as_bytes());
-    h.update(b"|");
-    h.update(second.as_bytes());
-    *h.finalize().as_bytes()
-}
-
-/// Response to a SwapOffer query. Returns matching offers stored by this node.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SwapOfferResponse {
-    /// Matching swap offers for the requested pair.
-    pub offers: Vec<SwapOffer>,
-}
-
-// ── Reforge Attestation ──────────────────────────────────────────────
-
-/// Attest that input bills have been consumed in a split/combine reforge.
-///
-/// The wallet broadcasts this after performing a reforge (split or combine).
-/// Artery nodes verify that the sender owns each consumed input, then delete
-/// those mint_ids from the registry. The new output bills are registered
-/// separately via [`OwnershipGenesis`] messages.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReforgeAttestation {
-    /// Mint IDs of the bills consumed (split apart or combined).
-    pub consumed_mint_ids: Vec<[u8; 32]>,
-    /// ML-DSA-65 verification key of the owner who performed the reforge.
-    pub owner_vk: Vec<u8>,
-    /// One signature per consumed mint_id, proving the owner authorised
-    /// the consumption. Signs `Blake3("vess-reforge-consume-v0" || mint_id || reforge_id)`.
-    pub consume_sigs: Vec<Vec<u8>>,
-    /// Deterministic reforge identity: ties the consumption to a specific
-    /// reforge event. `Blake3("vess-reforge-id-v0" || sorted consumed_mint_ids)`.
-    pub reforge_id: [u8; 32],
-    /// Mint IDs of the new output bills created by this reforge.
-    ///
-    /// Included so nodes that held records for the consumed bills can store
-    /// tombstones pointing to the new bills, enabling wallets to trace funds
-    /// through split/combine operations.
-    #[serde(default)]
-    pub output_mint_ids: Vec<[u8; 32]>,
-    /// Remaining gossip hops (decremented at each relay, stops at 0).
-    pub hops_remaining: u8,
-}
-
-// ── Network Statistics ───────────────────────────────────────────────
-
-/// Request network-level statistics from an artery node.
-///
-/// The response includes the node's local peer count and recent
-/// payment latency observations (time from payment relay to ownership
-/// confirmation back to the sender).
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkStats {
     /// Optional nonce for request/response correlation.
     pub nonce: [u8; 32],
@@ -1500,99 +1040,7 @@ pub struct OwnershipFetchResponse {
     pub records: Vec<FetchedRecord>,
 }
 
-// ── Century Lock ─────────────────────────────────────────────────────
 
-/// Approximate number of ticks in one year (at 6s/tick).
-pub const TICKS_PER_YEAR: u64 = 365 * 24 * 60 * 60 / 6;
-
-/// Approximate number of ticks in 100 years (at 6s/tick).
-pub const CENTURY_LOCK_TICKS: u64 = 100 * TICKS_PER_YEAR;
-
-/// State for an active century-lock faucet.
-///
-/// When VHALIX is locked for 100 years, it creates a perpetual Vess faucet
-/// that mints one bill per network tick. Each bill is valued at
-/// `total_locked / TICKS_PER_YEAR` (rounded up).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CenturyLockState {
-    /// Unique identifier: `Blake3("vess-century-lock-v1" || lock_nonce)`.
-    pub lock_id: [u8; 32],
-    /// Total VHALIX units locked.
-    pub total_locked: u64,
-    /// Vess amount per network tick: `ceil(total_locked / TICKS_PER_YEAR)`.
-    pub per_tick_vess: u64,
-    /// Network tick when the lock starts.
-    pub start_tick: u64,
-    /// Network tick when the lock expires (start + CENTURY_LOCK_TICKS).
-    pub end_tick: u64,
-    /// Last network tick for which a bill was minted.
-    pub last_claimed_tick: u64,
-    /// The node ID of the wallet that owns this century lock.
-    pub owner_node_id: [u8; 32],
-    /// Unix timestamp when this lock was created.
-    pub created_at: u64,
-}
-
-impl CenturyLockState {
-    /// Create a new century lock state from a VHALIX mint_id and tick.
-    pub fn new(
-        VHALIX_mint_id: &[u8; 32],
-        total_locked: u64,
-        start_tick: u64,
-        lock_ticks: u64,
-        owner_node_id: [u8; 32],
-        created_at: u64,
-    ) -> Self {
-        let per_tick_vess = (total_locked + lock_ticks.max(1) - 1) / lock_ticks.max(1);
-        let end_tick = start_tick.saturating_add(lock_ticks);
-        let lock_id = {
-            let mut h = blake3::Hasher::new();
-            h.update(b"vess-century-lock-v1");
-            h.update(VHALIX_mint_id);
-            *h.finalize().as_bytes()
-        };
-        Self {
-            lock_id,
-            total_locked,
-            per_tick_vess,
-            start_tick,
-            end_tick,
-            last_claimed_tick: start_tick.saturating_sub(1),
-            owner_node_id,
-            created_at,
-        }
-    }
-
-    /// How many ticks remain unclaimed.
-    pub fn unclaimed_ticks(&self, current_tick: u64) -> u64 {
-        if current_tick <= self.last_claimed_tick { return 0; }
-        let max_claimable = self.end_tick.min(current_tick);
-        max_claimable.saturating_sub(self.last_claimed_tick)
-    }
-
-    /// Remaining Vess that can be minted from this lock.
-    pub fn remaining_vess(&self, current_tick: u64) -> u64 {
-        self.unclaimed_ticks(current_tick) * self.per_tick_vess
-    }
-
-    /// Whether this lock is still active.
-    pub fn is_active(&self, current_tick: u64) -> bool {
-        current_tick < self.end_tick && self.last_claimed_tick < self.end_tick
-    }
-}
-
-// ── Direct Peer-to-Peer Payment ──────────────────────────────────────
-
-/// Direct payment sent over a direct mesh session between two wallets.
-///
-/// Bypasses artery relay nodes entirely — the receiver verifies proofs
-/// inline and claims ownership locally, broadcasting [`OwnershipClaim`]
-/// messages when artery connectivity is available.
-///
-/// The direct mesh transport provides encryption, so no stealth wrapping is
-/// needed. The `transfer_payload` is a serialized `TransferPayload`
-/// (defined in `vess-sovereign`) containing the bills, sender verification
-/// keys, and transfer authorization signatures.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DirectPayment {
     /// Unique payment identifier.

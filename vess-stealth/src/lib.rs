@@ -455,7 +455,7 @@ fn derive_aead_key(ss_scan: &[u8]) -> [u8; 32] {
 }
 
 /// Derive a per-payment key for encrypting the claim recovery blob
-/// (`encrypted_bill` in `OwnershipClaim`).  Uses a separate domain from
+/// (`encrypted_bill` in `Vess`).  Uses a separate domain from
 /// the payload AEAD key so the two purposes never share key material.
 fn derive_recovery_key(ss_scan: &[u8]) -> [u8; 32] {
     let mut h = Hasher::new();

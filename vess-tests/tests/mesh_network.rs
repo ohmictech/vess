@@ -41,7 +41,7 @@ fn fresh_bill(denom: u64) -> Vess {
         mint_id: rand::random(),
         chain_tip: rand::random(),
         chain_depth: 0,
-        asset: Asset::Vess,
+        asset: 1,
     }
 }
 

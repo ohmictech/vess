@@ -19,19 +19,14 @@
 //!   → Recipient claims via OwnershipClaim
 //! ```
 
-pub mod auto_reforge;
 pub mod billfold;
-pub mod payment;
+// pub mod payment; // removed - replaced by artery payment_builder
 pub mod persistence;
 pub mod recovery;
 pub mod selection;
 pub mod tag_cache;
 
-pub use auto_reforge::ConsolidationScheduler;
 pub use billfold::BillFold;
-pub use payment::{
-    cleanup_rejected_bills, derive_mailbox_key, extract_mint_ids_from_claims, PaymentTracker,
-};
 pub use persistence::WalletFile;
 pub use recovery::{EncryptedSecrets, RecoveryPhrase};
 pub use selection::select_bills;

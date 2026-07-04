@@ -7,8 +7,8 @@
 //! (the deeper chain_depth claim wins).
 //!
 //! Bills are removed from limbo when:
-//! - The recipient claims them (OwnershipClaim processed).
-//! - A newer OwnershipClaim with deeper chain_depth supersedes them.
+//! - The recipient claims them (Vess processed).
+//! - A newer Vess with deeper chain_depth supersedes them.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -125,7 +125,7 @@ impl LimboBuffer {
 
     /// Remove limbo entries containing any of the given bill_ids (mint_ids).
     ///
-    /// Used on the **claim** (OwnershipClaim) path to clean up limbo
+    /// Used on the **claim** (Vess) path to clean up limbo
     /// storage when bills change ownership.  Returns the removed entries.
     pub fn remove_by_bill_ids(&mut self, bill_ids: &[[u8; 32]]) -> Vec<LimboEntry> {
         let mut removed = Vec::new();

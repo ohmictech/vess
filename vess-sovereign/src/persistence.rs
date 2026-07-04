@@ -134,7 +134,7 @@ pub struct WalletFile {
 
     /// Active century lock IDs owned by this wallet.
     /// Persisted so recovery from seed phrase restores the faucet.
-    /// The full CenturyLockState is recovered from the DHT manifest or node snapshot.
+    /// The full // // CenturyLockState removed removed is recovered from the DHT manifest or node snapshot.
     #[serde(default)]
     pub century_lock_ids: Vec<[u8; 32]>,
 
@@ -1006,7 +1006,6 @@ mod tests {
             mint_id: [0x33; 32],
             chain_tip: [0x44; 32],
             chain_depth: 0,
-            asset: u64::Vess,
         };
         billfold.deposit_with_credentials(
             bill.clone(),

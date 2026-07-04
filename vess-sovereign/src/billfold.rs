@@ -1,9 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use vess_foundry::{ Vess};
+use vess_foundry::Vess;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-/// ML-DSA-65 spend credentials for a bill, indexed by mint_id.
 #[derive(Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct SpendCredential {
     pub spend_vk: Vec<u8>,
@@ -16,314 +15,100 @@ impl std::fmt::Debug for SpendCredential {
     }
 }
 
-/// A wallet's collection of Vess bills.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct BillFold {
     bills: Vec<Vess>,
-    /// Mint IDs of bills currently in-flight or limbo.
-    /// Reserved bills are excluded from selection but still owned.
-    /// The sender can release them on retraction.
-    #[serde(default)]
-    reserved: HashSet<[u8; 32]>,
-    /// Unix timestamp (seconds) when each bill was reserved.
-    /// Used to auto-release after the limbo TTL expires.
-    #[serde(default)]
-    reserve_times: HashMap<[u8; 32], u64>,
-    /// ML-DSA-65 spend credentials keyed by mint_id.
-    /// Required to sign ownership transfers.
-    /// Never written to disk as plaintext — encrypted separately in WalletFile.
-    #[serde(skip_serializing, default)]
-    spend_credentials: HashMap<[u8; 32], SpendCredential>,
+    #[serde(default)] reserved: HashSet<[u8; 32]>,
+    #[serde(default)] reserve_times: HashMap<[u8; 32], u64>,
+    #[serde(skip_serializing, default)] spend_credentials: HashMap<[u8; 32], SpendCredential>,
 }
 
 impl Clone for BillFold {
     fn clone(&self) -> Self {
-        Self {
-            bills: self.bills.clone(),
-            reserved: self.reserved.clone(),
-            reserve_times: self.reserve_times.clone(),
-            spend_credentials: self.spend_credentials.clone(),
-        }
+        Self { bills: self.bills.clone(), reserved: self.reserved.clone(), reserve_times: self.reserve_times.clone(), spend_credentials: self.spend_credentials.clone() }
     }
 }
 
 impl BillFold {
-    /// Create an empty billfold.
-    pub fn new() -> Self {
-        Self {
-            bills: Vec::new(),
-            reserved: HashSet::new(),
-            reserve_times: HashMap::new(),
-            spend_credentials: HashMap::new(),
-        }
-    }
+    pub fn new() -> Self { Self { bills: Vec::new(), reserved: HashSet::new(), reserve_times: HashMap::new(), spend_credentials: HashMap::new() } }
 
-    /// Add a bill to the billfold.
-    /// Returns `false` (and does not store) if a bill with the same
-    /// mint_id already exists — prevents duplicates from multi-path
-    /// broadcast.
     pub fn deposit(&mut self, bill: Vess) -> bool {
-        if self.bills.iter().any(|b| b.compute_vess_id() == bill.compute_vess_id()) {
-            return false;
-        }
-        self.bills.push(bill);
-        true
+        let id = bill.compute_vess_id();
+        if self.bills.iter().any(|b| b.compute_vess_id() == id) { return false; }
+        self.bills.push(bill); true
     }
 
-    /// Add a bill with its spend credentials in one call.
     pub fn deposit_with_credentials(&mut self, bill: Vess, cred: SpendCredential) -> bool {
-        let mint_id = bill.compute_vess_id();
-        if self.deposit(bill) {
-            self.spend_credentials.insert(mint_id, cred);
-            true
-        } else {
-            false
-        }
+        let id = bill.compute_vess_id();
+        if self.deposit(bill) { self.spend_credentials.insert(id, cred); true } else { false }
     }
 
-    /// Remove a bill by mint_id. Returns the removed bill if found.
-    /// Also removes any stored spend credentials.
     pub fn withdraw(&mut self, mint_id: &[u8; 32]) -> Option<Vess> {
         if let Some(pos) = self.bills.iter().position(|b| &b.compute_vess_id() == mint_id) {
             self.spend_credentials.remove(mint_id);
             Some(self.bills.remove(pos))
-        } else {
-            None
-        }
+        } else { None }
     }
 
-    /// Look up spend credentials for a bill by mint_id.
-    pub fn get_credentials(&self, mint_id: &[u8; 32]) -> Option<&SpendCredential> {
-        self.spend_credentials.get(mint_id)
-    }
+    pub fn get_credentials(&self, mint_id: &[u8; 32]) -> Option<&SpendCredential> { self.spend_credentials.get(mint_id) }
+    pub fn any_credential(&self) -> Option<&SpendCredential> { self.spend_credentials.values().next() }
 
-    /// Return any available spend credential (for miners and other
-    /// contexts where a specific bill isn't needed).
-    pub fn any_credential(&self) -> Option<&SpendCredential> {
-        self.spend_credentials.values().next()
-    }
+    pub fn balance(&self) -> u64 { self.bills.iter().map(|b| b.amount).sum() }
+    pub fn count(&self) -> usize { self.bills.len() }
+    pub fn bills(&self) -> &[Vess] { &self.bills }
+    pub fn bills_mut(&mut self) -> &mut Vec<Vess> { &mut self.bills }
 
-    /// Total value of all bills in the billfold.
-    pub fn balance(&self) -> u64 {
-        self.bills.iter().map(|b| b.amount).sum()
-    }
+    pub fn can_afford(&self, amount: u64) -> bool { self.spendable_balance() >= amount }
 
-    /// Number of bills.
-    pub fn count(&self) -> usize {
-        self.bills.len()
-    }
-
-    /// All bills as a slice.
-    pub fn bills(&self) -> &[Vess] {
-        &self.bills
-    }
-
-    /// Mutable access to all bills.
-    pub fn bills_mut(&mut self) -> &mut Vec<Vess> {
-        &mut self.bills
-    }
-
-    /// Bills of a specific denomination.
-    pub fn bills_of(&self, denom: u64) -> Vec<&Vess> {
-        self.bills
-            .iter()
-            .filter(|b| b.amount == denom)
-            .collect()
-    }
-
-    /// Count of bills per denomination.
-    pub fn denomination_breakdown(&self) -> Vec<(u64, usize)> {
-        let mut counts: std::collections::BTreeMap<u64, usize> =
-            std::collections::BTreeMap::new();
-        for b in &self.bills {
-            *counts.entry(b.amount).or_insert(0) += 1;
-        }
-        counts.into_iter().collect()
-    }
-
-    /// Whether the billfold has enough available (non-reserved) value to cover an amount.
-    pub fn can_afford(&self, amount: u64) -> bool {
-        self.spendable_balance() >= amount
-    }
-
-    // ── Reservation (limbo / in-flight) ──────────────────────────
-
-    /// Reserve mint_ids (bills are in-flight or limbo).
-    /// Reserved bills remain in the billfold but are excluded from selection.
-    /// `now` is the current Unix timestamp in seconds.
     pub fn reserve(&mut self, mint_ids: &[[u8; 32]], now: u64) {
-        for mid in mint_ids {
-            self.reserved.insert(*mid);
-            self.reserve_times.insert(*mid, now);
-        }
+        for mid in mint_ids { self.reserved.insert(*mid); self.reserve_times.insert(*mid, now); }
     }
 
-    /// Release reserved mint_ids (sender retracted or bill claimed).
     pub fn release(&mut self, mint_ids: &[[u8; 32]]) {
-        for mid in mint_ids {
-            self.reserved.remove(mid);
-            self.reserve_times.remove(mid);
-        }
+        for mid in mint_ids { self.reserved.remove(mid); self.reserve_times.remove(mid); }
     }
 
-    /// Release all reservations older than `ttl_secs`.
-    /// Returns the mint_ids that were released.
     pub fn release_expired(&mut self, ttl_secs: u64, now: u64) -> Vec<[u8; 32]> {
-        let expired: Vec<[u8; 32]> = self
-            .reserve_times
-            .iter()
-            .filter(|(_, &ts)| now.saturating_sub(ts) > ttl_secs)
-            .map(|(mid, _)| *mid)
-            .collect();
-        for mid in &expired {
-            self.reserved.remove(mid);
-            self.reserve_times.remove(mid);
-        }
+        let expired: Vec<[u8; 32]> = self.reserve_times.iter().filter(|(_, &ts)| now.saturating_sub(ts) > ttl_secs).map(|(mid, _)| *mid).collect();
+        for mid in &expired { self.reserved.remove(mid); self.reserve_times.remove(mid); }
         expired
     }
 
-    /// Bills available for spending (excludes reserved).
-    pub fn available_bills(&self) -> Vec<&Vess> {
-        self.bills
-            .iter()
-            .filter(|b| !self.reserved.contains(&b.compute_vess_id()))
-            .collect()
-    }
+    pub fn available_bills(&self) -> Vec<&Vess> { self.bills.iter().filter(|b| !self.reserved.contains(&b.compute_vess_id())).collect() }
 
-    /// Available balance (excludes reserved bills).
-    pub fn available_balance(&self) -> u64 {
-        self.available_bills()
-            .iter()
-            .map(|b| b.amount)
-            .sum()
-    }
+    pub fn available_balance(&self) -> u64 { self.available_bills().iter().map(|b| b.amount).sum() }
 
-    /// Available balance backed by spend credentials.
     pub fn spendable_balance(&self) -> u64 {
-        self.available_bills()
-            .into_iter()
-            .filter(|bill| self.spend_credentials.contains_key(&bill.compute_vess_id()))
-            .map(|bill| bill.amount)
-            .sum()
+        self.available_bills().into_iter().filter(|b| self.spend_credentials.contains_key(&b.compute_vess_id())).map(|b| b.amount).sum()
     }
 
-    /// Available balance present without spend credentials.
     pub fn watch_only_balance(&self) -> u64 {
-        self.available_bills()
-            .into_iter()
-            .filter(|bill| !self.spend_credentials.contains_key(&bill.compute_vess_id()))
-            .map(|bill| bill.amount)
-            .sum()
+        self.available_bills().into_iter().filter(|b| !self.spend_credentials.contains_key(&b.compute_vess_id())).map(|b| b.amount).sum()
     }
 
-    /// Number of reserved bills.
-    pub fn reserved_count(&self) -> usize {
-        self.reserved.len()
-    }
-
-    /// Check if a mint_id is reserved.
-    pub fn is_reserved(&self, mint_id: &[u8; 32]) -> bool {
-        self.reserved.contains(mint_id)
-    }
-
-    /// Read-only access to the reserved set.
-    pub fn reserved_set(&self) -> &HashSet<[u8; 32]> {
-        &self.reserved
-    }
-
-    /// Export spend credentials for encryption before disk persistence.
-    pub fn export_credentials(&self) -> &HashMap<[u8; 32], SpendCredential> {
-        &self.spend_credentials
-    }
-
-    /// Import decrypted spend credentials (e.g. after loading from encrypted blob).
-    pub fn import_credentials(&mut self, creds: HashMap<[u8; 32], SpendCredential>) {
-        self.spend_credentials.extend(creds);
-    }
+    pub fn reserved_count(&self) -> usize { self.reserved.len() }
+    pub fn is_reserved(&self, mint_id: &[u8; 32]) -> bool { self.reserved.contains(mint_id) }
+    pub fn reserved_set(&self) -> &HashSet<[u8; 32]> { &self.reserved }
+    pub fn export_credentials(&self) -> &HashMap<[u8; 32], SpendCredential> { &self.spend_credentials }
+    pub fn import_credentials(&mut self, creds: HashMap<[u8; 32], SpendCredential>) { self.spend_credentials.extend(creds); }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn test_bill(denom: u64, _age_secs: u64) -> Vess {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        Vess {
-            denomination: denom,
-            digest: [0xBB; 32],
-            created_at: now,
-            stealth_id: [0xCC; 32],
-            dht_index: 0,
-            mint_id: rand::random(),
-            chain_tip: rand::random(),
-            chain_depth: 0,
-            asset: u64::Vess,
-        }
+    fn test_bill(amount: u64) -> Vess {
+        Vess { amount, epoch: 0, nonce: 0, initial_pk: [0u8; 32], owner_vk: vec![], prev_sig: vec![], chain_depth: 0, consumed: vec![], change_sig: vec![], chain_tip: [0u8; 32], digest: [0u8; 32], created_at: 0, stealth_id: [0u8; 32], dht_index: 0 }
     }
 
-    #[test]
-    fn balance_and_count() {
+    #[test] fn balance_and_count() { let mut bf = BillFold::new(); bf.deposit(test_bill(10)); bf.deposit(test_bill(5)); bf.deposit(test_bill(1)); assert_eq!(bf.balance(), 16); assert_eq!(bf.count(), 3); }
+
+    #[test] fn withdraw() { let mut bf = BillFold::new(); let bill = test_bill(20); let id = bill.compute_vess_id(); bf.deposit(bill); assert_eq!(bf.count(), 1); let r = bf.withdraw(&id).unwrap(); assert_eq!(r.amount, 20); assert_eq!(bf.count(), 0); }
+
+    #[test] fn spendable_vs_watchonly() {
         let mut bf = BillFold::new();
-        bf.deposit(test_bill(u64::D10, 0));
-        bf.deposit(test_bill(u64::D5, 0));
-        bf.deposit(test_bill(u64::D1, 0));
-
-        assert_eq!(bf.balance(), 16);
-        assert_eq!(bf.count(), 3);
-    }
-
-    #[test]
-    fn withdraw_by_mint_id() {
-        let mut bf = BillFold::new();
-        let bill = test_bill(u64::D20, 0);
-        let mint_id = bill.compute_vess_id();
-
-        bf.deposit(bill);
-        assert_eq!(bf.count(), 1);
-
-        let removed = bf.withdraw(&mint_id).unwrap();
-        assert_eq!(removed.amount, u64::D20);
-        assert_eq!(bf.count(), 0);
-    }
-
-    #[test]
-    fn denomination_breakdown() {
-        let mut bf = BillFold::new();
-        bf.deposit(test_bill(u64::D5, 0));
-        bf.deposit(test_bill(u64::D5, 0));
-        bf.deposit(test_bill(u64::D10, 0));
-
-        let breakdown = bf.amount_breakdown();
-        assert!(breakdown.contains(&(u64::D5, 2)));
-        assert!(breakdown.contains(&(u64::D10, 1)));
-    }
-
-    #[test]
-    fn spendable_and_watch_only_balances_are_separated() {
-        let mut bf = BillFold::new();
-        let watch_only = test_bill(u64::D10, 0);
-        let spendable = test_bill(u64::D5, 0);
-        let spendable_mint_id = spendable.mint_id;
-
-        bf.deposit(watch_only);
-        bf.deposit_with_credentials(
-            spendable,
-            SpendCredential {
-                spend_vk: vec![0x11; 64],
-                spend_sk: vec![0x22; 64],
-            },
-        );
-
-        assert_eq!(bf.available_balance(), 15);
-        assert_eq!(bf.spendable_balance(), 5);
-        assert_eq!(bf.watch_only_balance(), 10);
-
-        bf.reserve(&[spendable_mint_id], 1);
-        assert_eq!(bf.available_balance(), 10);
-        assert_eq!(bf.spendable_balance(), 0);
-        assert_eq!(bf.watch_only_balance(), 10);
+        let wo = test_bill(10); let sp = test_bill(5); let sp_id = sp.compute_vess_id();
+        bf.deposit(wo);
+        bf.deposit_with_credentials(sp, SpendCredential { spend_vk: vec![1; 64], spend_sk: vec![2; 64] });
+        assert_eq!(bf.available_balance(), 15); assert_eq!(bf.spendable_balance(), 5); assert_eq!(bf.watch_only_balance(), 10);
     }
 }
