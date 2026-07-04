@@ -106,7 +106,7 @@ mod tests {
 
     #[test] fn spendable_vs_watchonly() {
         let mut bf = BillFold::new();
-        let wo = test_bill(10); let sp = test_bill(5); let sp_id = sp.compute_vess_id();
+        let wo = test_bill(10); let sp = test_bill(5); let _sp_id = sp.compute_vess_id();
         bf.deposit(wo);
         bf.deposit_with_credentials(sp, SpendCredential { spend_vk: vec![1; 64], spend_sk: vec![2; 64] });
         assert_eq!(bf.available_balance(), 15); assert_eq!(bf.spendable_balance(), 5); assert_eq!(bf.watch_only_balance(), 10);

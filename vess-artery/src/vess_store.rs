@@ -13,8 +13,16 @@ impl VessStore {
         let id = v.compute_vess_id();
         if self.consumed.contains_key(&id) { return false; }
         if let Some(existing) = self.active.get(&id) {
+            // Deeper chain always wins
             if v.chain_depth < existing.chain_depth { return false; }
-            if v.chain_depth == existing.chain_depth && id >= existing.compute_vess_id() { return false; }
+            if v.chain_depth > existing.chain_depth {
+                self.active.insert(id, v.clone());
+                return true;
+            }
+            // Equal depth: lower compute_vess_id wins (deterministic tiebreaker).
+            // The vess_id incorporates the full proof data, making it a unique,
+            // unpredictable but deterministic fingerprint per competing claim.
+            if id >= existing.compute_vess_id() { return false; }
         }
         self.active.insert(id, v.clone());
         true

@@ -1,26 +1,24 @@
-//! VHALIX miner — Argon2d proof-of-work.
-//!
-//! Hash-based difficulty model (like Bitcoin):
+//! VHALIX miner — Argon2d proof-of-work with epoch expiry.
 //!
 //! ```text
 //! Argon2d(m_cost=1 GiB, t_cost=1, p_cost=1)
-//! password = vk_hash(owner_vk) || nonce
+//! password = miner_id || epoch || nonce
 //!
 //! Difficulty: count leading zero bytes of the 32-byte output.
 //! - 5 zeros → 1 VHALIX (base difficulty)
 //! - 6 zeros → 2 VHALIX (256× harder)
 //! - 7 zeros → 5 VHALIX (65,536× harder)
-//! ```
 //!
-//! Each Argon2d invocation takes ~0.5–1 second on a single core at 1 GiB.
-//! Verification is equally fast — every node recomputes the exact
-//! Argon2d call and checks leading zeros.  A `MintProof` is self-verifying:
-//! fraud is mathematically impossible.
+//! Proofs expire after 2 epochs (48 hours). Nodes must re-mine to
+//! maintain DHT trust. The miner_id is the node's public mesh ID,
+//! so the proof is bound to a specific node without revealing its
+//! wallet keys.
+//! ```
 
 use argon2::Argon2;
 use serde::{Deserialize, Serialize};
 
-// ── Difficulty constants ────────────────────────────────────────────
+// ── Mining params ───────────────────────────────────────────────────
 
 /// Argon2d memory cost — 1 GiB in KiB (1,048,576 KiB).
 pub const ARGON2D_M_COST: u32 = 1024 * 1024;
@@ -35,20 +33,15 @@ pub const ARGON2D_P_COST: u32 = 1;
 pub const ARGON2D_HASH_LEN: usize = 32;
 
 /// Domain separator for the Argon2d password.
-const MINING_DOMAIN: &[u8] = b"vess-VHALIX-mine-v2";
+const MINING_DOMAIN: &[u8] = b"vess-VHALIX-mine-v3";
 
 /// Salt for Argon2d.
-const MINING_SALT: &[u8] = b"vess-VHALIX-salt-v2";
+const MINING_SALT: &[u8] = b"vess-VHALIX-salt-v3";
+
+/// Maximum epoch age before a MintProof is rejected (2 epochs = 48 hours).
+pub const MAX_PROOF_EPOCH_AGE: u64 = 2;
 
 // ── Tunable difficulty ──────────────────────────────────────────────
-//
-// These define the minimum number of leading zero BYTES required for
-// each denomination.  Each additional zero byte is 256× harder.
-//
-// Tune these so that finding a proof takes a reasonable amount of time
-// on a mid-range CPU (~0.5–1 sec per attempt at 1 GiB).
-//
-// For testing, lower these.  For production, raise them.
 
 /// Leading zero bytes required for 1 VHALIX.
 pub const DIFF_ZEROS_1: u32 = 5;
@@ -63,36 +56,40 @@ pub const DIFF_ZEROS_5: u32 = 7;
 
 /// A self-verifying proof of Argon2d work.
 ///
-/// Anyone can verify this proof by recomputing:
+/// Bound to a specific node (via `miner_id`) and epoch.
+/// Expires after `MAX_PROOF_EPOCH_AGE` epochs (48 hours).
+///
+/// Verification:
 /// ```text
-/// output = Argon2d(vk_hash(owner_vk) || nonce)
+/// output = Argon2d(miner_id || epoch || nonce)
 /// zeros = count_leading_zero_bytes(output)
 /// zeros ≥ threshold for denomination_value
+/// current_epoch - epoch ≤ MAX_PROOF_EPOCH_AGE
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MintProof {
-    /// ML-DSA-65 verification key of the miner (binds proof to wallet).
-    pub owner_vk: Vec<u8>,
+    /// The miner's public mesh node_id (32 bytes).
+    pub miner_id: [u8; 32],
+    /// Epoch when this proof was mined (from `vess_foundry::clock`).
+    pub epoch: u64,
     /// Monotonically increasing counter — never reused.
     pub nonce: u64,
     /// Denomination found: 1, 2, or 5.
     pub denomination_value: u64,
-    /// The Argon2d output (32 bytes).  Included so verifiers can check
-    /// leading zeros without recomputing — they can still recompute
-    /// to be sure.
+    /// The Argon2d output (32 bytes). Included so verifiers can check
+    /// leading zeros without recomputing, but recomputation is cheap.
     pub argon2d_output: [u8; 32],
 }
 
 // ── Core mining functions ───────────────────────────────────────────
 
-/// Run one Argon2d hash for a given (owner_vk, nonce) pair.
+/// Run one Argon2d hash for a given (miner_id, epoch, nonce) triple.
 ///
 /// Returns the 32-byte Argon2d output.
-pub fn mine_argon2d(owner_vk: &[u8], nonce: u64) -> [u8; 32] {
-    let vk_hash = crate::spend_auth::vk_hash(owner_vk);
-
-    let mut password = Vec::with_capacity(32 + 8 + MINING_DOMAIN.len());
-    password.extend_from_slice(&vk_hash);
+pub fn mine_argon2d(miner_id: &[u8; 32], epoch: u64, nonce: u64) -> [u8; 32] {
+    let mut password = Vec::with_capacity(32 + 8 + 8 + MINING_DOMAIN.len());
+    password.extend_from_slice(miner_id);
+    password.extend_from_slice(&epoch.to_be_bytes());
     password.extend_from_slice(&nonce.to_be_bytes());
     password.extend_from_slice(MINING_DOMAIN);
 
@@ -134,15 +131,9 @@ pub fn count_leading_zero_bytes(hash: &[u8; 32]) -> u32 {
 ///
 /// Returns 0 if the difficulty is too low for any denomination.
 pub fn zeros_to_denomination(zeros: u32) -> u64 {
-    if zeros >= DIFF_ZEROS_5 {
-        return 5;
-    }
-    if zeros >= DIFF_ZEROS_2 {
-        return 2;
-    }
-    if zeros >= DIFF_ZEROS_1 {
-        return 1;
-    }
+    if zeros >= DIFF_ZEROS_5 { return 5; }
+    if zeros >= DIFF_ZEROS_2 { return 2; }
+    if zeros >= DIFF_ZEROS_1 { return 1; }
     0
 }
 
@@ -152,20 +143,33 @@ pub fn denomination_to_zeros(denom: u64) -> u32 {
         5 => DIFF_ZEROS_5,
         2 => DIFF_ZEROS_2,
         1 => DIFF_ZEROS_1,
-        _ => u32::MAX, // invalid denomination
+        _ => u32::MAX,
     }
 }
 
 // ── Verification ────────────────────────────────────────────────────
 
-/// Verify a MintProof by recomputing Argon2d and checking difficulty.
+/// Verify a MintProof by recomputing Argon2d and checking difficulty + epoch freshness.
 ///
-/// Returns `Ok(())` if the proof is valid, `Err(msg)` otherwise.
-/// This is cheap (~0.5–1 sec at 1 GiB) and can be called on every
-/// node that receives a MintProof.
-pub fn verify_mint_proof(proof: &MintProof) -> Result<(), String> {
+/// Returns `Ok(())` if valid, `Err(msg)` otherwise.
+/// Cheap (~0.5–1 sec at 1 GiB) — can be called by every node.
+pub fn verify_mint_proof(proof: &MintProof, current_epoch: u64) -> Result<(), String> {
+    // Check epoch freshness — proofs expire after MAX_PROOF_EPOCH_AGE epochs
+    if current_epoch.saturating_sub(proof.epoch) > MAX_PROOF_EPOCH_AGE {
+        return Err(format!(
+            "proof expired: epoch {} vs current {} (max age {})",
+            proof.epoch, current_epoch, MAX_PROOF_EPOCH_AGE
+        ));
+    }
+    if proof.epoch > current_epoch {
+        return Err(format!(
+            "proof from future: epoch {} > current {}",
+            proof.epoch, current_epoch
+        ));
+    }
+
     // Recompute Argon2d
-    let output = mine_argon2d(&proof.owner_vk, proof.nonce);
+    let output = mine_argon2d(&proof.miner_id, proof.epoch, proof.nonce);
 
     // Verify the claimed output matches
     if output != proof.argon2d_output {
@@ -194,7 +198,7 @@ pub fn verify_mint_proof(proof: &MintProof) -> Result<(), String> {
 }
 
 /// Quick check: verify the leading zeros of a stored proof's output
-/// without recomputing Argon2d.  This trusts that the output is genuine;
+/// without recomputing Argon2d. Trusts the output is genuine;
 /// use `verify_mint_proof` for full verification.
 pub fn check_leading_zeros(output: &[u8; 32]) -> u64 {
     zeros_to_denomination(count_leading_zero_bytes(output))
@@ -206,33 +210,38 @@ pub fn check_leading_zeros(output: &[u8; 32]) -> u64 {
 mod tests {
     use super::*;
 
-    fn test_vk() -> Vec<u8> {
-        vec![0xAB; 1953] // ML-DSA-65 key size placeholder for test
+    fn test_miner_id() -> [u8; 32] {
+        [0xAB; 32]
     }
 
     #[test]
     fn argon2d_produces_32_bytes() {
-        let vk = test_vk();
-        let output = mine_argon2d(&vk, 0);
+        let output = mine_argon2d(&test_miner_id(), 0, 0);
         assert_eq!(output.len(), 32);
-        assert_ne!(output, [0u8; 32]); // vanishingly unlikely to be all zeros
+        assert_ne!(output, [0u8; 32]);
     }
 
     #[test]
     fn different_nonce_different_output() {
-        let vk = test_vk();
-        let o0 = mine_argon2d(&vk, 0);
-        let o1 = mine_argon2d(&vk, 1);
+        let mid = test_miner_id();
+        let o0 = mine_argon2d(&mid, 0, 0);
+        let o1 = mine_argon2d(&mid, 0, 1);
         assert_ne!(o0, o1);
     }
 
     #[test]
-    fn different_vk_different_output() {
-        let vk_a = vec![0xAA; 1953];
-        let vk_b = vec![0xBB; 1953];
-        let oa = mine_argon2d(&vk_a, 0);
-        let ob = mine_argon2d(&vk_b, 0);
+    fn different_miner_id_different_output() {
+        let oa = mine_argon2d(&[0xAA; 32], 0, 0);
+        let ob = mine_argon2d(&[0xBB; 32], 0, 0);
         assert_ne!(oa, ob);
+    }
+
+    #[test]
+    fn different_epoch_different_output() {
+        let mid = test_miner_id();
+        let o0 = mine_argon2d(&mid, 0, 0);
+        let o1 = mine_argon2d(&mid, 1, 0);
+        assert_ne!(o0, o1);
     }
 
     #[test]
@@ -241,8 +250,7 @@ mod tests {
         assert_eq!(count_leading_zero_bytes(&h), 0);
         h[0] = 0;
         assert_eq!(count_leading_zero_bytes(&h), 1);
-        h[1] = 0;
-        h[2] = 0;
+        h[1] = 0; h[2] = 0;
         assert_eq!(count_leading_zero_bytes(&h), 3);
         assert_eq!(count_leading_zero_bytes(&[0u8; 32]), 32);
     }
@@ -259,32 +267,51 @@ mod tests {
     }
 
     #[test]
+    fn verify_mint_proof_rejects_expired() {
+        let mid = test_miner_id();
+        let output = mine_argon2d(&mid, 5, 42);
+        let proof = MintProof {
+            miner_id: mid, epoch: 5, nonce: 42,
+            denomination_value: 1, argon2d_output: output,
+        };
+        // Current epoch is 8, proof from epoch 5 → age 3 > max 2
+        assert!(verify_mint_proof(&proof, 8).is_err());
+    }
+
+    #[test]
+    fn verify_mint_proof_accepts_fresh() {
+        let mid = test_miner_id();
+        let output = mine_argon2d(&mid, 6, 42);
+        let proof = MintProof {
+            miner_id: mid, epoch: 6, nonce: 42,
+            denomination_value: 1, argon2d_output: output,
+        };
+        // Current epoch is 8, proof from epoch 6 → age 2 = max 2 → valid
+        assert!(verify_mint_proof(&proof, 8).is_ok());
+    }
+
+    #[test]
     fn verify_mint_proof_rejects_invalid_denom() {
-        let vk = test_vk();
-        let output = mine_argon2d(&vk, 42);
+        let mid = test_miner_id();
+        let output = mine_argon2d(&mid, 0, 42);
         let zeros = count_leading_zero_bytes(&output);
         let wrong_denom = if zeros_to_denomination(zeros) == 1 { 5 } else { 1 };
         let proof = MintProof {
-            owner_vk: vk,
-            nonce: 42,
-            denomination_value: wrong_denom,
-            argon2d_output: output,
+            miner_id: mid, epoch: 0, nonce: 42,
+            denomination_value: wrong_denom, argon2d_output: output,
         };
-        assert!(verify_mint_proof(&proof).is_err());
+        assert!(verify_mint_proof(&proof, 0).is_err());
     }
 
     #[test]
     fn verify_mint_proof_rejects_wrong_output() {
-        let vk = test_vk();
-        let output = mine_argon2d(&vk, 0);
-        let mut fake_output = output;
-        fake_output[0] ^= 0xFF;
+        let mid = test_miner_id();
+        let mut output = mine_argon2d(&mid, 0, 0);
+        output[0] ^= 0xFF;
         let proof = MintProof {
-            owner_vk: vk,
-            nonce: 0,
-            denomination_value: 1,
-            argon2d_output: fake_output,
+            miner_id: mid, epoch: 0, nonce: 0,
+            denomination_value: 1, argon2d_output: output,
         };
-        assert!(verify_mint_proof(&proof).is_err());
+        assert!(verify_mint_proof(&proof, 0).is_err());
     }
 }

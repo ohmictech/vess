@@ -43,6 +43,7 @@ pub struct ConsumedRecord {
 
 #[derive(Debug, Clone)]
 pub struct OwnershipRegistry {
+    #[allow(dead_code)]
     node_id: [u8; 32],
     records: HashMap<[u8; 32], OwnershipRecord>,
     consumed: HashMap<[u8; 32], ConsumedRecord>,

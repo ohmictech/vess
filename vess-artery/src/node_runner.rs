@@ -2,16 +2,13 @@
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use vess_foundry::Vess;
+use vess_foundry::clock;
 use crate::vess_store::VessStore;
-
-pub const EPOCH_SECS: u64 = 86400;
-pub const EPOCH_GENESIS: u64 = 1735689600;
 
 // ── Node state ──
 
 pub struct ArteryState {
     pub store: VessStore,
-    pub current_epoch: u64,
     pub mining: Option<MiningState>,
     pub wallet_vk: Option<Vec<u8>>,
     pub wallet_sk: Option<Vec<u8>>,
@@ -51,7 +48,6 @@ impl ArteryState {
     pub fn new(node_id: [u8; 32], k_neighbors: usize) -> Self {
         Self {
             store: VessStore::default(),
-            current_epoch: current_epoch_utc(),
             mining: None, wallet_vk: None, wallet_sk: None, node_id,
             tag_dht: crate::tag_dht::TagDht::new(node_id, k_neighbors),
             limbo: crate::limbo_buffer::LimboBuffer::new(),
@@ -68,16 +64,11 @@ impl ArteryState {
     }
 }
 
-pub fn current_epoch_utc() -> u64 {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-    now.saturating_sub(EPOCH_GENESIS) / EPOCH_SECS
-}
-
 fn now_secs() -> u64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() }
 
 // ── Validation ──
 
-pub fn validate_vess(v: &Vess, store: &VessStore, current_epoch: u64) -> Result<(), String> {
+pub fn validate_vess(v: &Vess, store: &VessStore, _current_epoch: u64) -> Result<(), String> {
     let id = v.compute_vess_id();
     if store.is_consumed(&id) { return Err("already consumed".into()); }
     if let Some(ex) = store.get(&id) { if v.chain_depth <= ex.chain_depth { return Err("stale".into()); } }
@@ -101,7 +92,7 @@ fn validate_changed(v: &Vess, store: &VessStore) -> Result<(), String> {
 
 pub fn spawn_miner(state: Arc<Mutex<ArteryState>>, amount: u64, initial_pk: [u8; 32], og_tx: mpsc::UnboundedSender<Vess>) {
     let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
-    let epoch = state.lock().unwrap().current_epoch;
+    let epoch = clock::current_epoch();
     // VessMiner removed — use vess_foundry::mine::mine_argon2d for new MintProof model
     let _miner = (); // placeholder
     { let mut s = state.lock().unwrap(); s.mining = Some(MiningState { stop_tx: Some(stop_tx), amount, started_at: now_secs() }); }
@@ -146,7 +137,7 @@ pub async fn run_node(config: NodeConfig) -> anyhow::Result<String> {
     tokio::spawn(async move { let _ = tokio::signal::ctrl_c().await; let _ = shutdown_tx.send(()); });
 
     // Load or create mesh seed
-    let mesh_seed = load_or_create_mesh_seed(&config.state_dir)?;
+    let _mesh_seed = load_or_create_mesh_seed(&config.state_dir)?;
     let bind_addr = config.bind_addr.unwrap_or_else(||
         std::net::SocketAddr::V4(std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0)));
     
@@ -178,16 +169,13 @@ pub async fn run_node(config: NodeConfig) -> anyhow::Result<String> {
     // Epoch ticker
     let cs = state.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
         loop {
             interval.tick().await;
             let mut s = cs.lock().unwrap();
-            let new_epoch = current_epoch_utc();
-            if new_epoch != s.current_epoch {
-                s.store.prune_consumed(new_epoch.saturating_sub(4));
-                s.current_epoch = new_epoch;
-                tracing::info!(epoch = new_epoch, "epoch rollover");
-            }
+            let epoch = clock::current_epoch();
+            s.store.prune_consumed(epoch.saturating_sub(4));
+            tracing::debug!(epoch, "epochly prune");
         }
     });
 

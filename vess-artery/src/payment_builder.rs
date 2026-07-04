@@ -24,7 +24,7 @@ pub fn build_payment(
             ids.push(v.compute_vess_id());
         }
         if total < amount { return Err(format!("insufficient: {total} < {amount}")); }
-        (ids, total, mine[0].initial_pk, s.current_epoch)
+        (ids, total, mine[0].initial_pk, vess_foundry::clock::current_epoch())
     };
 
     let change_amount = total - amount;

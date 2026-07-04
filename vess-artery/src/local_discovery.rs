@@ -24,15 +24,6 @@ const LOCAL_PEER_STALE_SECS: u64 = 120;
 const LAN_DISCOVERY_VERSION: u8 = 1;
 const MAX_LOCAL_PEER_RECORD_BYTES: usize = 64 * 1024;
 const MAX_LAN_DISCOVERY_MESSAGE_BYTES: usize = 64 * 1024;
-const MAX_MDNS_MESSAGE_BYTES: usize = 9000; // RFC 6762 recommends <9000 for legacy compatibility
-/// Minimum peers before discovery backs off from aggressive mode.
-const HYDRA_TARGET_PEERS: usize = 8;
-/// Aggressive probe interval (seconds) when below target.
-const HYDRA_AGGRESSIVE_INTERVAL_SECS: u64 = 3;
-/// Steady-state probe interval (seconds) when at or above target.
-const HYDRA_STEADY_INTERVAL_SECS: u64 = 15;
-/// Max parallel handshakes from the hydra drain.
-const HYDRA_MAX_PARALLEL_HANDSHAKES: usize = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LocalPeerRecord {
@@ -516,7 +507,7 @@ pub fn build_mdns_response(
     service_port: u16,
 ) -> Result<Vec<u8>> {
     let hostname = format!("{}.local", &node_id[..12]);
-    let hostname_bytes = hostname.as_bytes();
+    let _hostname_bytes = hostname.as_bytes();
     let mut hostname_labels = Vec::new();
     for part in hostname.split('.') {
         hostname_labels.push(part.len() as u8);
