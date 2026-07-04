@@ -3425,7 +3425,7 @@ fn handle_local_test_faucet(
                     mint_id,
                     chain_tip,
                     chain_depth: 0,
-                    asset: vess_foundry::Asset::VHALIX,
+                    asset: vess_foundry::Asset::Cold,
                 };
                 let cred = SpendCredential {
                     spend_vk: owner_vk.clone(),
@@ -3615,7 +3615,7 @@ mod tests {
             mint_id: [mint_byte; 32],
             chain_tip: [mint_byte.wrapping_add(2); 32],
             chain_depth: 0,
-            asset: vess_foundry::Asset::VHALIX,
+            asset: vess_foundry::Asset::Cold,
         }
     }
 

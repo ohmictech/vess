@@ -47,9 +47,11 @@ use serde::{Deserialize, Serialize};
 /// The denomination value always represents the smallest unit of the asset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Asset {
-    /// VHALIX — raw mined commodity (Argon2id CPU burn).
-    VHALIX,
-    /// Vess — time-locked VHALIX, spendable currency.
+    /// Cold Vess — raw mined commodity (Argon2d PoW). Can be spent,
+    /// which triggers a 7-year lock and issues hot Vess to the recipient.
+    Cold,
+    /// Vess — hot currency in circulation. Created when Cold is spent.
+    /// Cannot be re-locked or combined with Cold.
     Vess,
     /// Vichor — fixed-supply (1B) network stock.
     Vichor,
@@ -58,7 +60,7 @@ pub enum Asset {
 impl Asset {
     pub fn name(&self) -> String {
         match self {
-            Asset::VHALIX => "VHALIX".to_string(),
+            Asset::Cold => "Cold".to_string(),
             Asset::Vess => "vess".to_string(),
             Asset::Vichor => "vichor".to_string(),
         }
@@ -66,7 +68,7 @@ impl Asset {
 
     pub fn parse(s: &str) -> Option<Self> {
         match s {
-            "VHALIX" | "VHALIX" | "VHALIX" => Some(Asset::VHALIX),
+            "Cold" | "Cold" | "Cold" => Some(Asset::Cold),
             "vess" | "VESS" | "Vess" => Some(Asset::Vess),
             "vichor" | "VICHOR" | "Vichor" => Some(Asset::Vichor),
             _ => None,
@@ -90,7 +92,7 @@ impl<'de> Deserialize<'de> for Asset {
 impl std::fmt::Display for Asset {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Asset::VHALIX => write!(f, "VHALIX"),
+            Asset::Cold => write!(f, "Cold"),
             Asset::Vess => write!(f, "VESS"),
             Asset::Vichor => write!(f, "VICHOR"),
         }
@@ -98,7 +100,7 @@ impl std::fmt::Display for Asset {
 }
 
 impl Default for Asset {
-    fn default() -> Self { Asset::VHALIX }
+    fn default() -> Self { Asset::Cold }
 }
 
 /// Bill denomination following the 1-2-5 series: any `d × 10^k` where

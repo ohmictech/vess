@@ -348,7 +348,7 @@ mod tests {
             mint_id: [0xAA; 32],
             chain_tip: [0xDD; 32],
             chain_depth: 0,
-            asset: crate::Asset::VHALIX, // test helper default
+            asset: crate::Asset::Cold, // test helper default
         }
     }
 
