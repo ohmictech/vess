@@ -49,20 +49,17 @@ async fn main() {
         .ok()
         .map(PathBuf::from);
 
-    let config = vess_artery::node_runner::NodeConfig {
+            let config = vess_artery::node_runner::NodeConfig {
+        state_dir,
+        wallet_path,
+        wallet_password: None,
+        rpc_port: Some(rpc_port),
+        bind_addr,
         k_neighbors: if is_testnet { 4 } else { 20 },
         max_hops: 6,
-        state_dir,
         bootstrap: vec![],
-        ready_tx: None,
-        wallet_path,
-        rpc_port: Some(rpc_port),
-        wallet_password: None,
-        bind_addr,
         enable_local_discovery: true,
-        reset_transient_peer_state: false,
-        test: false,
-        bootstrap_dns: vec![],
+        test: is_testnet,
     };
 
     tracing::info!(

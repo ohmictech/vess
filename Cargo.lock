@@ -1537,7 +1537,6 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "vess-clock",
  "vess-foundry",
  "vess-kloak",
  "vess-mesh",

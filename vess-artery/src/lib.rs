@@ -27,6 +27,8 @@ pub mod kademlia;
 pub mod limbo_buffer;
 pub mod local_discovery;
 pub mod mesh_contact;
+pub mod dispatcher;
+pub mod payment_builder;
 pub mod node_runner;
 pub mod persistence;
 pub mod reputation;
