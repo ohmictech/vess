@@ -20,7 +20,7 @@ vess-foundry = { path = "../vess-foundry" }
 vess-protocol = { path = "../vess-protocol" }
 vess-tag = { path = "../vess-tag" }
 vess-vascular = { path = "../vess-vascular" }
-vess-kloak = { path = "../vess-kloak" }
+vess-sovereign = { path = "../vess-sovereign" }
 argon2 = "0.5"
 blake3 = "1"
 cuckoofilter = "0.5"

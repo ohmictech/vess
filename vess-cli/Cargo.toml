@@ -11,7 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 vess-vascular = { path = "../vess-vascular" }
-vess-kloak = { path = "../vess-kloak" }
+vess-sovereign = { path = "../vess-sovereign" }
 vess-foundry = { path = "../vess-foundry" }
 vess-stealth = { path = "../vess-stealth" }
 vess-protocol = { path = "../vess-protocol" }

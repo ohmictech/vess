@@ -69,7 +69,7 @@ fn main() {
         "vess-stealth",
         "vess-tag",
         "vess-artery",
-        "vess-kloak",
+        "vess-sovereign",
         "vess-protocol",
     ];
 

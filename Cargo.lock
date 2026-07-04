@@ -1538,9 +1538,9 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "vess-foundry",
- "vess-kloak",
  "vess-mesh",
  "vess-protocol",
+ "vess-sovereign",
  "vess-stealth",
  "vess-tag",
  "vess-vascular",
@@ -1580,28 +1580,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "vess-kloak"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "argon2",
- "bincode",
- "bip39",
- "blake3",
- "chacha20poly1305",
- "postcard",
- "rand 0.8.6",
- "serde",
- "serde_json",
- "tracing",
- "vess-foundry",
- "vess-protocol",
- "vess-stealth",
- "vess-tag",
- "zeroize",
-]
-
-[[package]]
 name = "vess-mesh"
 version = "0.1.0"
 dependencies = [
@@ -1627,6 +1605,28 @@ dependencies = [
  "proptest",
  "serde",
  "vess-foundry",
+]
+
+[[package]]
+name = "vess-sovereign"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "argon2",
+ "bincode",
+ "bip39",
+ "blake3",
+ "chacha20poly1305",
+ "postcard",
+ "rand 0.8.6",
+ "serde",
+ "serde_json",
+ "tracing",
+ "vess-foundry",
+ "vess-protocol",
+ "vess-stealth",
+ "vess-tag",
+ "zeroize",
 ]
 
 [[package]]

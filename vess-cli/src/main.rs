@@ -19,15 +19,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing_subscriber::EnvFilter;
 
-use vess_kloak::persistence::{
+use vess_sovereign::persistence::{
     list_wallets, named_wallet_path, read_active_wallet_path, set_active_wallet_path,
     WalletDescriptor, WalletFile,
 };
-use vess_kloak::recovery::{
+use vess_sovereign::recovery::{
     derive_key_from_password, derive_raw_seed, encrypt_secrets, encryption_key_from_seed,
     recover_master_keys, spend_seed_from_raw_seed, RecoveryPhrase,
 };
-use vess_kloak::BillFold;
+use vess_sovereign::BillFold;
 use vess_mesh::{
     decode_mesh_contact, decode_mesh_contact_string, encode_mesh_contact_string,
     validate_mesh_contact, MeshCarrier, MeshCarrierContact, PqUdpMeshCarrier,
@@ -354,7 +354,7 @@ fn wallet_path(cli: &Cli) -> Result<PathBuf> {
     } else {
         let wallets = list_wallets()?;
         match wallets.len() {
-            0 => vess_kloak::persistence::default_wallet_path(),
+            0 => vess_sovereign::persistence::default_wallet_path(),
             1 => Ok(wallets[0].path.clone()),
             _ => anyhow::bail!(
                 "multiple wallets found; use --wallet-name <+tag>, --wallet <path>, or open Vess interactively to choose one"
@@ -371,7 +371,7 @@ fn wallet_create_path(cli: &Cli, name: Option<&str>) -> Result<(PathBuf, Option<
     if let Some(name) = name {
         return Ok((named_wallet_path(name)?, Some(name.trim().to_string())));
     }
-    Ok((vess_kloak::persistence::default_wallet_path()?, None))
+    Ok((vess_sovereign::persistence::default_wallet_path()?, None))
 }
 
 fn normalize_wallet_tag_name(value: &str) -> Result<String> {
@@ -1571,7 +1571,7 @@ async fn cmd_register_tag(cli: &Cli, tag_str: &str) -> Result<()> {
         anyhow::anyhow!("VESS_WALLET_PASSWORD required for register-tag (encrypts tag signing key)")
     })?;
     let raw_seed = wallet.unlock_with_password(&password)?;
-    let enc_key = vess_kloak::recovery::encryption_key_from_seed(&raw_seed);
+    let enc_key = vess_sovereign::recovery::encryption_key_from_seed(&raw_seed);
     wallet.decrypt_private_metadata(&enc_key)?;
 
     let tag = VessTag::new(tag_str)?;

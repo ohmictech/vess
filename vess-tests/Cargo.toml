@@ -8,7 +8,7 @@ publish = false
 [dependencies]
 vess-mesh = { path = "../vess-mesh" }
 vess-artery = { path = "../vess-artery", features = ["test-pow", "test-mint"] }
-vess-kloak = { path = "../vess-kloak" }
+vess-sovereign = { path = "../vess-sovereign" }
 vess-foundry = { path = "../vess-foundry", features = ["test-mint"] }
 vess-stealth = { path = "../vess-stealth" }
 vess-tag = { path = "../vess-tag", features = ["test-pow"] }

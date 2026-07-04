@@ -21,7 +21,7 @@ rand = "0.8"
 hex = "0.4"
 
 vess-artery = { path = "../vess-artery" }
-vess-kloak = { path = "../vess-kloak" }
+vess-sovereign = { path = "../vess-sovereign" }
 vess-stealth = { path = "../vess-stealth" }
 vess-tag = { path = "../vess-tag" }
 

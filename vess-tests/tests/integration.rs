@@ -7,13 +7,13 @@ use vess_artery::ownership_registry::OwnershipRecord;
 use vess_artery::{OwnershipRegistry, TagDht};
 use vess_foundry::spend_auth::generate_spend_keypair;
 use vess_foundry::{ Vess};
-use vess_kloak::billfold::BillFold;
-use vess_kloak::payment::{prepare_payment, try_receive_payment, PaymentTracker};
-use vess_kloak::persistence::WalletFile;
-use vess_kloak::recovery::{
+use vess_sovereign::billfold::BillFold;
+use vess_sovereign::payment::{prepare_payment, try_receive_payment, PaymentTracker};
+use vess_sovereign::persistence::WalletFile;
+use vess_sovereign::recovery::{
     decrypt_secrets, derive_encryption_key_with_params, encrypt_secrets, RecoveryPhrase,
 };
-use vess_kloak::selection::select_bills;
+use vess_sovereign::selection::select_bills;
 use vess_protocol::PulseMessage;
 use vess_stealth::generate_master_keys;
 use vess_tag::{validate_registration, TagRegistration, VessTag};

@@ -1001,8 +1001,8 @@ pub fn extract_mint_ids_from_claims(claims: &[PulseMessage]) -> Vec<[u8; 32]> {
 /// # Example
 ///
 /// ```no_run
-/// # use vess_kloak::payment::cleanup_rejected_bills;
-/// # use vess_kloak::billfold::BillFold;
+/// # use vess_sovereign::payment::cleanup_rejected_bills;
+/// # use vess_sovereign::billfold::BillFold;
 /// let deposited_ids = vec![[0x01; 32], [0x02; 32]];
 /// let active_response = vec![true, false]; // Bill 2 was rejected
 ///

@@ -5,9 +5,9 @@
 
 use vess_foundry::spend_auth::generate_spend_keypair;
 use vess_foundry::{ Vess};
-use vess_kloak::billfold::BillFold;
-use vess_kloak::billfold::SpendCredential;
-use vess_kloak::payment::{
+use vess_sovereign::billfold::BillFold;
+use vess_sovereign::billfold::SpendCredential;
+use vess_sovereign::payment::{
     claim_transfer_bills, is_noise_payment, prepare_noise_payment,
     prepare_payment, prepare_payment_from_bills_split,
     prepare_payment_with_transfer,
@@ -15,7 +15,7 @@ use vess_kloak::payment::{
 use vess_protocol::{PulseMessage, RelayPayment};
 use vess_stealth::{generate_master_keys, open_stealth_payload};
 use vess_stealth::StealthPayload;
-use vess_kloak::payment::TransferPayload;
+use vess_sovereign::payment::TransferPayload;
 use vess_artery::TagDht;
 use blake3;
 

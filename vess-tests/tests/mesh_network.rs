@@ -2,9 +2,9 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::Duration;
 
 use vess_foundry::{Asset, u64, Vess};
-use vess_kloak::billfold::BillFold;
-use vess_kloak::payment::{prepare_payment, try_receive_payment};
-use vess_kloak::recovery::{derive_raw_seed_with_params, RecoveryPhrase};
+use vess_sovereign::billfold::BillFold;
+use vess_sovereign::payment::{prepare_payment, try_receive_payment};
+use vess_sovereign::recovery::{derive_raw_seed_with_params, RecoveryPhrase};
 use vess_mesh::{
     decode_mesh_contact, encode_mesh_contact, generate_mesh_keys_from_seed,
     generate_route_handshake, open_route_handshake,

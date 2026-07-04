@@ -1591,7 +1591,7 @@ impl CenturyLockState {
 ///
 /// The direct mesh transport provides encryption, so no stealth wrapping is
 /// needed. The `transfer_payload` is a serialized `TransferPayload`
-/// (defined in `vess-kloak`) containing the bills, sender verification
+/// (defined in `vess-sovereign`) containing the bills, sender verification
 /// keys, and transfer authorization signatures.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DirectPayment {

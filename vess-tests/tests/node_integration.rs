@@ -15,7 +15,7 @@ use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
 use vess_artery::node_runner::{run_node, NodeConfig};
-use vess_kloak::{
+use vess_sovereign::{
     persistence::WalletFile,
     recovery::{self, RecoveryPhrase},
     BillFold,

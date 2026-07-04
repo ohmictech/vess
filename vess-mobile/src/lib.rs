@@ -4,9 +4,9 @@ use std::sync::{Mutex, OnceLock};
 
 use serde_json::Value;
 
-use vess_kloak::persistence::{named_wallet_path, set_active_wallet_path, WalletFile};
-use vess_kloak::recovery::{derive_raw_seed, encrypt_secrets, encryption_key_from_seed, spend_seed_from_raw_seed, RecoveryPhrase};
-use vess_kloak::BillFold;
+use vess_sovereign::persistence::{named_wallet_path, set_active_wallet_path, WalletFile};
+use vess_sovereign::recovery::{derive_raw_seed, encrypt_secrets, encryption_key_from_seed, spend_seed_from_raw_seed, RecoveryPhrase};
+use vess_sovereign::BillFold;
 use vess_stealth::generate_master_keys_from_seed;
 use vess_tag::VessTag;
 
@@ -363,7 +363,7 @@ pub fn get_status() -> Result<NodeStatus, VessError> {
 
 #[uniffi::export]
 pub fn get_stealth_address() -> Result<String, VessError> {
-    let active_path = vess_kloak::persistence::read_active_wallet_path()
+    let active_path = vess_sovereign::persistence::read_active_wallet_path()
         .map_err(|_| VessError::WalletError)?
         .ok_or(VessError::WalletError)?;
     let data = std::fs::read_to_string(&active_path).map_err(|_| VessError::WalletError)?;

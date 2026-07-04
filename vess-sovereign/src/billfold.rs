@@ -1,9 +1,3 @@
-//! BillFold — a collection of owned Vess bills.
-//!
-//! The billfold is the wallet's primary data structure. It stores bills,
-//! tracks total balance, and provides query methods for denomination
-//! breakdown. Bills are stored permanently in the DHT and never expire.
-
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use vess_foundry::{ Vess};

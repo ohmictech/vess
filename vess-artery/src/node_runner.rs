@@ -158,7 +158,7 @@ pub async fn run_node(config: NodeConfig) -> anyhow::Result<String> {
     // Load wallet
     if let Some(ref wallet_path) = config.wallet_path {
         if wallet_path.exists() {
-            match vess_kloak::WalletFile::load(wallet_path) {
+            match vess_sovereign::WalletFile::load(wallet_path) {
                 Ok(wallet) => {
                     let mut s = state.lock().unwrap();
                     if let Some(cred) = wallet.billfold.any_credential() {
