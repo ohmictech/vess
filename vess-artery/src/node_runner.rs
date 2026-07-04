@@ -174,7 +174,7 @@ pub async fn run_node(config: NodeConfig) -> anyhow::Result<String> {
             interval.tick().await;
             let mut s = cs.lock().unwrap();
             let epoch = clock::current_epoch();
-            s.store.prune_consumed(epoch.saturating_sub(4));
+            s.store.prune_deep_buried(epoch);
             tracing::debug!(epoch, "epochly prune");
         }
     });

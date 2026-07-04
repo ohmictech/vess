@@ -8,7 +8,7 @@ pub fn build_payment(
     amount: u64,
     recipient_vk: &[u8],
 ) -> Result<(Vess, Option<Vess>), String> {
-    let (consumed_ids, total, initial_pk, epoch) = {
+    let (consumed_ids, total, initial_pk, _epoch) = {
         let s = state.lock().unwrap();
         let sender_vk = s.wallet_vk.as_ref().ok_or("no wallet key")?;
         let owner_hash = vess_foundry::spend_auth::vk_hash(sender_vk);
@@ -63,10 +63,7 @@ pub fn build_payment(
     signed_payment.change_sig = sig.clone();
     let signed_change = change.map(|mut c| { c.change_sig = sig; c });
 
-    {
-        let mut s = state.lock().unwrap();
-        s.store.consume(&consumed_ids, epoch);
-    }
+    // Inputs are consumed atomically inside validate_and_upsert for the change Vess
 
     Ok((signed_payment, signed_change))
 }

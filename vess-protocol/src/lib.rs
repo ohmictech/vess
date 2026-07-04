@@ -16,28 +16,6 @@
 
 use serde::{Deserialize, Serialize};
 use vess_foundry::Vess;
-/// Self-verifying proof of Argon2d work.
-///
-/// The miner runs `Argon2d(m_cost=1GiB, t=1, p=1)` with password
-/// `miner_id || epoch || nonce`.  The output's leading zero byte count
-/// determines the denomination.  Verification is a single Argon2d
-/// recomputation — ~0.5–1 second on any node.
-///
-/// Proofs expire after `MAX_PROOF_EPOCH_AGE` epochs (48 hours).
-/// Nodes must re-mine to maintain DHT trust.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MintProof {
-    /// The miner's public mesh node_id.  Public — peers already know this.
-    pub miner_id: [u8; 32],
-    /// Epoch when this proof was mined (from `vess_foundry::clock`).
-    pub epoch: u64,
-    /// Monotonically increasing nonce — never reused.
-    pub nonce: u64,
-    /// Denomination found: 1, 2, or 5 VHALIX.
-    pub denomination_value: u64,
-    /// The 32-byte Argon2d output.
-    pub argon2d_output: [u8; 32],
-}
 
 // ── DHT trust ───────────────────────────────────────────────────────
 
@@ -63,9 +41,6 @@ pub struct SignedDhtResponse {
 pub enum PulseMessage {
     /// A payment: stealth-encrypted bill(s) sent to a recipient.
     Payment(Payment),
-
-    /// Submit a mined Vess bill to the network.
-    Mint(MintProof),
 
     /// Submit a transfer/change Vess for DHT storage.
     VessSubmit(Vess),
