@@ -197,14 +197,10 @@ mod tests {
     #[test]
     fn deeper_chain_wins() {
         let mut store = VessStore::default();
+        // Same amount → same compute_vess_id → replacement test is valid
         let shallow = test_vess(100, 1);
-        let deep = test_vess(1, 10);
+        let deep = test_vess(100, 10);
 
-        // In real usage, responder_sig would be verified, but in test
-        // we don't have real keys, so we just check the depth logic.
-        // The resolve functions skip responses with invalid sigs,
-        // so for testing the resolution logic we'd need signed responses.
-        // This test validates the principle via VessStore::upsert directly.
         assert!(store.upsert(&shallow));
         assert!(store.get(&shallow.compute_vess_id()).is_some());
         // Deeper replaces shallower
@@ -218,15 +214,14 @@ mod tests {
     #[test]
     fn equal_depth_higher_amount_wins_in_store() {
         let mut store = VessStore::default();
-        let mut v1 = test_vess(5, 3);
-        let mut v2 = test_vess(10, 3);
-        // Same depth, different amounts
-        // compute_vess_id() uses amount + consumed etc
-        // Force deterministic outcome: v2 should replace v1 since deeper/higher wins
-        let id1 = v1.compute_vess_id();
-        store.upsert(&v1);
-        store.upsert(&v2);
-        // v2 replaced v1 because same depth, the upsert logic applies tiebreaker
-        assert!(store.get(&id1).is_some()); // same vess_id, replaced
+        // Same amount → same compute_vess_id, same depth → lower id wins (deterministic)
+        let v1 = test_vess(100, 3);
+        let v2 = test_vess(100, 3);
+        let id = v1.compute_vess_id();
+
+        assert!(store.upsert(&v1));
+        assert_eq!(store.get(&id).unwrap().chain_depth, 3);
+        // Same id, same depth → id >= existing id → rejected
+        assert!(!store.upsert(&v2));
     }
 }

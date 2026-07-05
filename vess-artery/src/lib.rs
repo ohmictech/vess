@@ -28,6 +28,7 @@ pub mod limbo_buffer;
 pub mod local_discovery;
 pub mod mesh_contact;
 pub mod dht_resolver;
+pub mod onion;
 pub mod payment_builder;
 pub mod node_runner;
 pub mod ownership_registry;

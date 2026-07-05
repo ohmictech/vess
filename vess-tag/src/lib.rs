@@ -297,6 +297,11 @@ pub struct TagRecord {
     /// is permanently locked and cannot be overwritten.
     #[serde(default)]
     pub hardened_at: Option<u64>,
+    /// Epoch until which the original registrant has exclusive claim.
+    /// After this epoch, if unhardened, the tag is open to anyone.
+    /// Set to `registered_epoch + 30` on creation. `None` for legacy records.
+    #[serde(default)]
+    pub grace_until_epoch: Option<u64>,
 }
 
 impl TagRecord {
@@ -305,9 +310,17 @@ impl TagRecord {
         self.hardened_at.is_some()
     }
 
-    /// Whether this tag can be overwritten.
-    pub fn can_be_overwritten(&self) -> bool {
-        !self.is_hardened()
+    /// Whether this tag can be overwritten by a new registration.
+    /// Returns false if hardened OR still within the 30-epoch grace period.
+    pub fn can_be_overwritten(&self, current_epoch: Option<u64>) -> bool {
+        if self.is_hardened() {
+            return false;
+        }
+        match (self.grace_until_epoch, current_epoch) {
+            (Some(grace), Some(now)) => now > grace,
+            (Some(_), None) => false, // can't determine — be conservative
+            (None, _) => true,        // legacy record, no grace set
+        }
     }
 }
 

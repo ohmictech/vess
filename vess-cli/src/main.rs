@@ -4,8 +4,8 @@
 //!   init        Create a new wallet with seed phrase
 //!   recover     Recover wallet from seed phrase (DHT manifest)
 //!   balance     Show wallet balance
-//!   send        Send Vess to recipient
-//!   receive     Show receiving address
+//!   send        Send Vess to a tag
+//!   receive     Show your tag for receiving payments
 //!   node        Start artery node (DHT + mining + mesh)
 //!   mine        Start/stop/status mining
 //!   dev-faucet  Submit dev faucet (dev only)
@@ -58,15 +58,15 @@ enum Command {
     /// Show wallet balance.
     Balance,
 
-    /// Show receiving address.
+    /// Show your tag for receiving payments.
     #[command(alias = "recv")]
     Receive,
 
-    /// Send Vess to a recipient.
+    /// Send Vess to a tag.
     Send {
         /// Amount in Vess.
         amount: u64,
-        /// Recipient: +tag or stealth address hex.
+        /// Recipient tag (e.g. +alice).
         recipient: String,
     },
 
@@ -208,17 +208,24 @@ async fn main() -> Result<()> {
     }
 }
 
-// ── RPC helper ──────────────────────────────────────────────────────
+// ── RPC helper (TCP JSON-line) ──────────────────────────────────────
 
 async fn rpc(port: u16, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(format!("http://127.0.0.1:{}/rpc", port))
-        .json(&json!({"method": method, "params": params}))
-        .send()
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let addr = format!("127.0.0.1:{}", port);
+    let stream = tokio::net::TcpStream::connect(&addr)
         .await
-        .context("rpc request failed — is the node running?")?;
-    let body: serde_json::Value = resp.json().await?;
+        .context(format!("cannot connect to node at {addr} — is it running?"))?;
+    let (reader, mut writer) = stream.into_split();
+
+    let req = serde_json::json!({"method": method, "params": params});
+    let req_line = format!("{}\n", serde_json::to_string(&req)?);
+    writer.write_all(req_line.as_bytes()).await?;
+    writer.shutdown().await?;
+
+    let mut lines = BufReader::new(reader).lines();
+    let resp_line = lines.next_line().await?.context("no response from node")?;
+    let body: serde_json::Value = serde_json::from_str(&resp_line)?;
     if body["ok"].as_bool().unwrap_or(false) {
         Ok(body["data"].clone())
     } else {
@@ -238,14 +245,6 @@ fn wallets_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join("vess")
         .join("wallets")
-}
-
-/// Blake3 hex of the first 16 bytes of the master address for display.
-fn short_addr(addr: &vess_stealth::MasterStealthAddress) -> String {
-    let mut h = blake3::Hasher::new();
-    h.update(&addr.scan_ek);
-    h.update(&addr.spend_ek);
-    hex::encode(&h.finalize().as_bytes()[..16])
 }
 
 // ── Commands ────────────────────────────────────────────────────────
@@ -296,7 +295,7 @@ async fn cmd_init(name: &Option<String>) -> Result<()> {
     wallet.save(&path, &enc_key)?;
 
     println!("\nWallet '{}' created.", wallet_name);
-    println!("Address: {}", short_addr(&wallet.master_address));
+    println!("Register a tag to receive payments: vess tag register <yourname>");
     Ok(())
 }
 
@@ -332,19 +331,19 @@ async fn cmd_recover(name: &Option<String>) -> Result<()> {
     wallet.save(&path, &enc_key)?;
 
     println!("\nWallet '{}' recovered.", wallet_name);
-    println!("Address: {}", short_addr(&wallet.master_address));
     println!("Use 'vess node --wallet {}' to start syncing.", wallet_name);
+    println!("Register a tag to receive payments: vess tag register <yourname>");
     Ok(())
 }
 
 async fn cmd_receive(port: u16) -> Result<()> {
     let resp = rpc(port, "receive", json!({})).await?;
-    let addr = resp["address"].as_str().unwrap_or("?");
-    println!("Your address: {}", addr);
     if let Some(tag) = resp["tag"].as_str() {
-        println!("Tag: +{}", tag);
+        println!("Your tag: +{}", tag);
+        println!("Share this to receive payments.");
     } else {
-        println!("Tag: (none registered)");
+        println!("No tag registered yet.");
+        println!("Register one with: vess tag register <yourname>");
     }
     Ok(())
 }
@@ -381,37 +380,51 @@ async fn cmd_dev_faucet(port: u16) -> Result<()> {
 }
 
 async fn cmd_node(
-    _port: u16,
+    rpc_port: u16,
     bind: &Option<String>,
     bootstrap: &[String],
     state_dir: &Option<PathBuf>,
     wallet_name: &Option<String>,
 ) -> Result<()> {
-    let bind_addr = bind
-        .clone()
-        .unwrap_or_else(|| "0.0.0.0:18348".to_string());
+    let bind_addr: Option<std::net::SocketAddr> = bind.as_ref().and_then(|b| b.parse().ok());
     let state = state_dir.clone().unwrap_or_else(|| {
         dirs_next::data_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join("vess")
             .join("artery")
     });
-
-    println!("Starting Vess node...");
-    println!("  bind:      {}", bind_addr);
-    println!("  state:     {}", state.display());
-    println!("  bootstrap: {:?}", bootstrap);
-    if let Some(w) = wallet_name {
-        println!("  wallet:    {}", w);
-    }
-
-    // Load wallet if specified
-    let _wallet_path = wallet_name
+    let wallet_path = wallet_name
         .as_ref()
         .map(|n| wallets_dir().join(format!("{}.json", n)));
 
+    let config = vess_artery::node_runner::NodeConfig {
+        state_dir: state,
+        wallet_path,
+        wallet_password: None,
+        rpc_port: Some(rpc_port),
+        bind_addr,
+        k_neighbors: 20,
+        max_hops: 6,
+        bootstrap: bootstrap.to_vec(),
+        enable_local_discovery: true,
+        test: false,
+    };
+
+    println!("Starting Vess node...");
+    println!("  bind:      {}", bind.as_deref().unwrap_or("0.0.0.0:0"));
+    if let Some(w) = wallet_name {
+        println!("  wallet:    {}", w);
+    }
+    println!("  bootstrap: {:?}", bootstrap);
     println!();
-    println!("Node startup is handled by the artery binary directly.");
-    println!("Use: cargo run --bin vess-artery");
+
+    match vess_artery::node_runner::run_node(config).await {
+        Ok(node_id) => {
+            println!("Node {} shut down.", node_id);
+        }
+        Err(e) => {
+            anyhow::bail!("node crashed: {e}");
+        }
+    }
     Ok(())
 }

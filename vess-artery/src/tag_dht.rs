@@ -65,16 +65,37 @@ impl TagDht {
     /// Store a tag record locally.
     ///
     /// Returns `false` if:
-    /// - A record for this tag already exists (first-broadcast-wins), OR
+    /// - A hardened tag already exists for this key (permanent), OR
+    /// - An unhardened tag exists but is still within its 30-epoch grace period, OR
     /// - The address already has a different tag registered (one-tag-per-address).
-    pub fn store(&mut self, record: TagRecord) -> bool {
+    ///
+    /// If the existing tag is unhardened AND past its grace period,
+    /// it is overwritten by the new record.
+    /// If the incoming record has no `grace_until_epoch` set, it defaults
+    /// to `current_epoch + 30`.
+    pub fn store(&mut self, mut record: TagRecord) -> bool {
+        let current_epoch = vess_foundry::clock::current_epoch();
+        // Set grace period if not already set
+        if record.grace_until_epoch.is_none() {
+            record.grace_until_epoch = Some(current_epoch + 30);
+        }
         let key = record.dht_key();
-        if self.records.contains_key(&key) {
-            return false; // Tag already claimed.
+        if let Some(existing) = self.records.get(&key) {
+            if existing.is_hardened() {
+                return false;
+            }
+            if !existing.can_be_overwritten(Some(current_epoch)) {
+                return false;
+            }
+            // Grace expired, unhardened — allow overwrite (fall through)
         }
         let addr_fp = record.address_fingerprint();
         if self.addr_to_tag.contains_key(&addr_fp) {
-            return false; // Address already has a tag.
+            return false;
+        }
+        // Remove old addr→tag mapping if overwriting
+        if let Some(old) = self.records.get(&key) {
+            self.addr_to_tag.remove(&old.address_fingerprint());
         }
         self.addr_to_tag.insert(addr_fp, key);
         self.records.insert(key, record);
@@ -194,15 +215,21 @@ impl TagDht {
         self.records.get(&key).and_then(|r| r.hardened_at).is_some()
     }
 
-    /// Purge unhardened tags whose registration has expired.
+    /// Purge unhardened tags whose registration grace period has expired.
+    ///
+    /// Tags are eligible for purge when BOTH:
+    /// - They are unhardened, AND
+    /// - Their grace_until_epoch has passed (30 epochs / 30 days).
     ///
     /// Returns the number of tags removed.
-    pub fn purge_unhardened(&mut self, now: u64) -> usize {
-        let ttl = 365*24*60*60*100u64;
+    pub fn purge_unhardened(&mut self, current_epoch: u64) -> usize {
         let expired_keys: Vec<[u8; 32]> = self
             .records
             .iter()
-            .filter(|(_, r)| r.hardened_at.is_none() && now.saturating_sub(r.registered_at) >= ttl)
+            .filter(|(_, r)| {
+                r.hardened_at.is_none()
+                    && r.grace_until_epoch.map_or(true, |g| current_epoch > g)
+            })
             .map(|(k, _)| *k)
             .collect();
         let count = expired_keys.len();
@@ -243,6 +270,7 @@ mod tests {
             registrant_vk: Vec::new(),
             signature: Vec::new(),
             hardened_at: None,
+            grace_until_epoch: None,
         }
     }
 
@@ -256,6 +284,7 @@ mod tests {
             registrant_vk: Vec::new(),
             signature: Vec::new(),
             hardened_at: None,
+            grace_until_epoch: None,
         }
     }
 
@@ -343,32 +372,36 @@ mod tests {
     fn purge_unhardened_tags() {
         let mut dht = TagDht::new([0x00; 32], 3);
 
-        // Tag registered at t=1000.
+        // Alice: unhardened, grace expired at epoch 100
         let mut rec = make_record("alice");
-        rec.registered_at = 1000;
-        assert!(dht.store(rec));
+        rec.grace_until_epoch = Some(100);
+        rec.registered_at = 1;
+        dht.records.insert(rec.dht_key(), rec.clone());
+        dht.addr_to_tag.insert(rec.address_fingerprint(), rec.dht_key());
 
-        // Tag registered at t=1000 but hardened.
+        // Bob: hardened at epoch 50
         let mut rec2 = make_record("bob");
-        rec2.registered_at = 1000;
-        assert!(dht.store(rec2));
-        let bill_id = [0x55; 32];
-        dht.harden("bob", &bill_id, 2000);
+        rec2.grace_until_epoch = Some(130);
+        rec2.registered_at = 1;
+        rec2.hardened_at = Some(50);
+        dht.records.insert(rec2.dht_key(), rec2.clone());
+        dht.addr_to_tag.insert(rec2.address_fingerprint(), rec2.dht_key());
 
-        // Tag registered recently at t=9_000_000.
+        // Charlie: unhardened, grace expires at epoch 200
         let mut rec3 = make_record("charlie");
-        rec3.registered_at = 9_000_000;
-        assert!(dht.store(rec3));
+        rec3.grace_until_epoch = Some(200);
+        rec3.registered_at = 50;
+        dht.records.insert(rec3.dht_key(), rec3.clone());
+        dht.addr_to_tag.insert(rec3.address_fingerprint(), rec3.dht_key());
 
         assert_eq!(dht.record_count(), 3);
 
-        // Purge at now = 1000 + TAG_PRUNE_SECS + 1 (alice should be pruned).
-        let now = 1000 + 365*24*60*60*100u64 + 1;
-        let pruned = dht.purge_unhardened(now);
+        // At epoch 150: alice expired (100<150), bob hardened (kept), charlie still in grace (200>150)
+        let pruned = dht.purge_unhardened(150);
         assert_eq!(pruned, 1);
-        assert!(dht.lookup("alice").is_none()); // pruned
-        assert!(dht.lookup("bob").is_some()); // hardened, kept
-        assert!(dht.lookup("charlie").is_some()); // too recent to prune
+        assert!(dht.lookup("alice").is_none()); // grace expired, unhardened → pruned
+        assert!(dht.lookup("bob").is_some());   // hardened → kept
+        assert!(dht.lookup("charlie").is_some()); // still in grace → kept
     }
 
     #[test]

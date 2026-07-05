@@ -162,9 +162,15 @@ impl VessStore {
     /// Store without validation (for locally-created bills).
     pub fn upsert_one(&mut self, v: &Vess) -> bool {
         let id = v.compute_vess_id();
+        // Reject if this bill was already consumed
         if self.consumed.contains(&id) {
             return false;
         }
+        // Mark all consumed inputs as spent to prevent double-spend
+        for cid in &v.consumed {
+            self.consumed.insert(*cid);
+        }
+        // Chain depth conflict resolution
         if let Some(existing) = self.active.get(&id) {
             if v.chain_depth < existing.chain_depth {
                 return false;
@@ -173,7 +179,7 @@ impl VessStore {
                 self.active.insert(id, v.clone());
                 return true;
             }
-            // Equal depth: deterministic tiebreaker
+            // Equal depth: deterministic tiebreaker (lower compute_vess_id wins)
             if id >= existing.compute_vess_id() {
                 return false;
             }

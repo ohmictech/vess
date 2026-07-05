@@ -1,4 +1,5 @@
 //! Vess artery — full node with mesh networking, wallet, mining, RPC.
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use vess_foundry::Vess;
@@ -24,6 +25,14 @@ pub struct ArteryState {
     pub manifest_tx: Option<mpsc::UnboundedSender<vess_protocol::ManifestStore>>,
     /// Blake3 hash of the wallet's seed phrase (for DHT lookup).
     pub wallet_seed_hash: Option<[u8; 32]>,
+    /// Known peer node IDs (from bootstrap, discovery, or persisted snapshot).
+    pub known_peers: HashSet<[u8; 32]>,
+    /// Node ID → contact string (for dialing).
+    pub peer_endpoints: HashMap<[u8; 32], String>,
+    /// Banned node IDs.
+    pub banned_peers: HashSet<[u8; 32]>,
+    /// Channel to dynamically add peers at runtime.
+    pub add_peer_tx: Option<mpsc::UnboundedSender<String>>,
 }
 
 pub struct MiningState {
@@ -62,6 +71,10 @@ impl ArteryState {
             wallet_path: None,
             manifest_tx: None,
             wallet_seed_hash: None,
+            known_peers: HashSet::new(),
+            peer_endpoints: HashMap::new(),
+            banned_peers: HashSet::new(),
+            add_peer_tx: None,
         }
     }
     pub fn notify(&mut self, msg: &str) {
@@ -99,7 +112,7 @@ impl ArteryState {
     }
 }
 
-fn now_secs() -> u64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() }
+pub fn now_secs() -> u64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() }
 
 // ── Validation ──
 
@@ -127,21 +140,60 @@ fn validate_changed(v: &Vess, store: &VessStore) -> Result<(), String> {
 
 pub fn spawn_miner(state: Arc<Mutex<ArteryState>>, amount: u64, initial_pk: [u8; 32], og_tx: mpsc::UnboundedSender<Vess>) {
     let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
-    let epoch = clock::current_epoch();
-    // VessMiner removed — use vess_foundry::mine::mine_argon2d for new MintProof model
-    let _miner = (); // placeholder
-    { let mut s = state.lock().unwrap(); s.mining = Some(MiningState { stop_tx: Some(stop_tx), amount, started_at: now_secs() }); }
+    let epoch = vess_foundry::clock::current_epoch();
+    {
+        let mut s = state.lock().unwrap();
+        s.mining = Some(MiningState { stop_tx: Some(stop_tx), amount, started_at: now_secs() });
+    }
+
+    let cs = state.clone();
     std::thread::spawn(move || {
+        let mut nonce: u64 = 0;
         loop {
-            if stop_rx.try_recv().is_ok() { break; }
-            // miner.mine_until removed — use mine_argon2d loop
-            if false { let nonce = 0u64;
-                let mut v = Vess { amount, epoch, nonce, initial_pk, owner_vk: Vec::new(), prev_sig: Vec::new(), chain_depth: 0, consumed: Vec::new(), change_sig: Vec::new(), chain_tip: [0u8; 32], digest: [0u8; 32], created_at: now_secs(), stealth_id: [0u8; 32], dht_index: 0 };
-                if let Ok(s) = state.lock() { if let Some(ref vk) = s.wallet_vk { v.owner_vk = vk.clone(); } }
-                let _ = og_tx.send(v);
-            } else { break; }
+            if stop_rx.try_recv().is_ok() {
+                break;
+            }
+
+            // Try nonce
+            let hash = vess_foundry::mine::mine_argon2d(&initial_pk, epoch, nonce, amount);
+            let bits = vess_foundry::mine::leading_zero_bits(&hash);
+
+            let required_bits = vess_foundry::mine::amount_to_bits(amount);
+            if bits >= required_bits {
+                // Found a valid proof!
+                let owner_vk = {
+                    let s = cs.lock().unwrap();
+                    s.wallet_vk.clone()
+                };
+                if let Some(vk) = owner_vk {
+                    let v = Vess {
+                        amount,
+                        epoch,
+                        nonce,
+                        initial_pk,
+                        owner_vk: vk,
+                        prev_sig: Vec::new(),
+                        chain_depth: 0,
+                        consumed: Vec::new(),
+                        change_sig: Vec::new(),
+                        chain_tip: [0u8; 32],
+                        digest: hash,
+                        created_at: now_secs(),
+                        stealth_id: [0u8; 32],
+                        dht_index: 0,
+                    };
+                    let _ = og_tx.send(v);
+                    break;
+                }
+            }
+
+            nonce = nonce.wrapping_add(1);
+            // Yield every 1000 attempts
+            if nonce % 1000 == 0 {
+                std::thread::yield_now();
+            }
         }
-        if let Ok(mut s) = state.lock() { s.mining = None; }
+        let _ = cs.lock().map(|mut s| s.mining = None);
     });
 }
 
@@ -171,17 +223,48 @@ pub async fn run_node(config: NodeConfig) -> anyhow::Result<String> {
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     tokio::spawn(async move { let _ = tokio::signal::ctrl_c().await; let _ = shutdown_tx.send(()); });
 
-    // Load or create mesh seed
-    let _mesh_seed = load_or_create_mesh_seed(&config.state_dir)?;
+    // Load or create mesh seed, extend to 64 bytes for key derivation
+    let mesh_seed32 = load_or_create_mesh_seed(&config.state_dir)?;
+    let mut mesh_seed = [0u8; 64];
+    mesh_seed[..32].copy_from_slice(&mesh_seed32);
     let bind_addr = config.bind_addr.unwrap_or_else(||
         std::net::SocketAddr::V4(std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0)));
-    
-    let _node = bind_addr; // mesh binding stub
-    tracing::info!("Mesh bound to {}", bind_addr);
-    let node_id: [u8; 32] = rand::random(); // TODO: derive from mesh seed
+
+    // Derive node ID from mesh seed
+    let (_, mesh_address) = vess_mesh::generate_mesh_keys_from_seed(&mesh_seed, 0);
+    let node_id = *mesh_address.node_id.as_bytes();
+
+    // Load persisted snapshot
+    let storage = crate::persistence::NodeStorage::open(&config.state_dir)?;
+    let snapshot = storage.load().unwrap_or_else(|_| crate::persistence::ArterySnapshot {
+        node_id, peer_list: vec![], known_peers: vec![], peer_endpoints: vec![], banned_peers: vec![],
+    });
 
     let state = Arc::new(Mutex::new(ArteryState::new(node_id, config.k_neighbors)));
+
+    // Restore persisted peers
+    {
+        let mut s = state.lock().unwrap();
+        for &pid in &snapshot.known_peers { s.known_peers.insert(pid); }
+        for ep in &snapshot.peer_endpoints {
+            if let Ok(contact) = vess_mesh::decode_mesh_contact_string(ep) {
+                if let Some(id) = contact.node_id().map(|n| *n.as_bytes()) {
+                    s.peer_endpoints.insert(id, ep.clone());
+                    s.known_peers.insert(id);
+                }
+            }
+        }
+        for &pid in &snapshot.banned_peers { s.banned_peers.insert(pid); }
+    }
+
     let (og_tx, mut og_rx) = mpsc::unbounded_channel::<Vess>();
+
+    // ── Dynamic peer-add channel ──
+    let (add_peer_tx, mut add_peer_rx) = mpsc::unbounded_channel::<String>();
+    {
+        let mut s = state.lock().unwrap();
+        s.add_peer_tx = Some(add_peer_tx);
+    }
 
     // Load wallet
     if let Some(ref wallet_path) = config.wallet_path {
@@ -214,6 +297,57 @@ pub async fn run_node(config: NodeConfig) -> anyhow::Result<String> {
         }
     });
 
+    // ── Local discovery (LAN broadcast + mDNS) ──
+    let discovery_state = state.clone();
+    let discovery_node_id = node_id;
+    let discovery_mesh_address = mesh_address.clone();
+    let discovery_bind = bind_addr;
+    tokio::spawn(async move {
+        run_local_discovery(discovery_state, discovery_node_id, &discovery_mesh_address, discovery_bind).await;
+    });
+
+    // ── Process bootstrap peers ──
+    for bs in &config.bootstrap {
+        let bs = bs.trim().to_string();
+        if bs.is_empty() { continue; }
+        if let Ok(contact) = vess_mesh::decode_mesh_contact_string(&bs) {
+            if let Some(id) = contact.node_id().map(|n| *n.as_bytes()) {
+                if id != node_id {
+                    let mut s = state.lock().unwrap();
+                    s.known_peers.insert(id);
+                    s.peer_endpoints.insert(id, bs.clone());
+                    tracing::info!(peer=%hex::encode(&id[..8]), "bootstrap peer added");
+                }
+            }
+        } else {
+            // Try parsing as ip:port and create a contact string
+            tracing::warn!(bootstrap=%bs, "unrecognized bootstrap format, skipping");
+        }
+    }
+
+    // ── Periodic snapshot persistence ──
+    let persist_state = state.clone();
+    let persist_dir = config.state_dir.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+        loop {
+            interval.tick().await;
+            let s = persist_state.lock().unwrap();
+            let snap = crate::persistence::ArterySnapshot {
+                node_id: s.node_id,
+                peer_list: s.known_peers.iter().copied().collect(),
+                known_peers: s.known_peers.iter().copied().collect(),
+                peer_endpoints: s.peer_endpoints.values().cloned().collect(),
+                banned_peers: s.banned_peers.iter().copied().collect(),
+            };
+            if let Ok(storage) = crate::persistence::NodeStorage::open(&persist_dir) {
+                if let Err(e) = storage.save(&snap) {
+                    tracing::warn!(%e, "failed to persist snapshot");
+                }
+            }
+        }
+    });
+
     // RPC server
     let rpc_port = config.rpc_port.unwrap_or(9821);
     let rs = state.clone(); let rt = og_tx.clone();
@@ -226,7 +360,32 @@ pub async fn run_node(config: NodeConfig) -> anyhow::Result<String> {
         tokio::select! {
             _ = shutdown_rx.recv() => {
                 tracing::info!("shutting down");
+                // Final persistence
+                let s = state.lock().unwrap();
+                let snap = crate::persistence::ArterySnapshot {
+                    node_id: s.node_id,
+                    peer_list: s.known_peers.iter().copied().collect(),
+                    known_peers: s.known_peers.iter().copied().collect(),
+                    peer_endpoints: s.peer_endpoints.values().cloned().collect(),
+                    banned_peers: s.banned_peers.iter().copied().collect(),
+                };
+                if let Ok(storage) = crate::persistence::NodeStorage::open(&config.state_dir) {
+                    let _ = storage.save(&snap);
+                }
                 break;
+            }
+            Some(contact_str) = add_peer_rx.recv() => {
+                // Dynamic peer add at runtime
+                if let Ok(contact) = vess_mesh::decode_mesh_contact_string(&contact_str) {
+                    if let Some(id) = contact.node_id().map(|n| *n.as_bytes()) {
+                        let mut s = state.lock().unwrap();
+                        if id != s.node_id && !s.banned_peers.contains(&id) {
+                            s.known_peers.insert(id);
+                            s.peer_endpoints.insert(id, contact_str);
+                            tracing::info!(peer=%hex::encode(&id[..8]), "peer added at runtime");
+                        }
+                    }
+                }
             }
             Some(v) = og_rx.recv() => {
                 let mut s = state.lock().unwrap();
@@ -239,6 +398,97 @@ pub async fn run_node(config: NodeConfig) -> anyhow::Result<String> {
     }
 
     Ok(hex::encode(&node_id[..8]))
+}
+
+/// Background task: LAN broadcast + mDNS discovery loop.
+async fn run_local_discovery(
+    state: Arc<Mutex<ArteryState>>,
+    node_id: [u8; 32],
+    mesh_address: &vess_mesh::MeshAddress,
+    bind_addr: std::net::SocketAddr,
+) {
+    // Build our own contact for announcements
+    let our_contact = vess_mesh::MeshCarrierContact::UdpSocket {
+        addr: bind_addr.to_string(),
+        mesh_address: mesh_address.clone(),
+    };
+
+    // Initial discovery sweep
+    let discovered = crate::local_discovery::discover_lan_peer_contacts(
+        std::time::Duration::from_secs(5),
+        Some(node_id),
+    ).await;
+
+    {
+        let mut s = state.lock().unwrap();
+        for contact in &discovered {
+            if let Some(id) = contact.node_id().map(|n| *n.as_bytes()) {
+                if id != node_id && !s.banned_peers.contains(&id) {
+                    if let Ok(contact_str) = vess_mesh::encode_mesh_contact_string(contact) {
+                        s.known_peers.insert(id);
+                        s.peer_endpoints.insert(id, contact_str);
+                        tracing::debug!(peer=%hex::encode(&id[..8]), "discovered peer");
+                    }
+                }
+            }
+        }
+    }
+
+    // Periodic re-discovery + announcement
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+    loop {
+        tick.tick().await;
+
+        // Announce ourselves on LAN
+        if let Ok(socket) = crate::local_discovery::bind_lan_discovery_socket(0) {
+            let _ = crate::local_discovery::send_lan_announcement(&socket, &our_contact).await;
+        }
+
+        // mDNS: query for other Vess nodes
+        if let Ok(mdns_socket) = crate::local_discovery::bind_mdns_socket() {
+            let _ = crate::local_discovery::send_mdns_query(&mdns_socket).await;
+            // Listen briefly for responses
+            let mut buf = vec![0u8; 2048];
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+            loop {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() { break; }
+                let recv = tokio::time::timeout(remaining, mdns_socket.recv_from(&mut buf)).await;
+                if let Ok(Ok((len, _src))) = recv {
+                    if let Some(contact_str) = crate::local_discovery::extract_contact_from_mdns_response(&buf[..len]) {
+                        if let Ok(contact) = vess_mesh::decode_mesh_contact_string(&contact_str) {
+                            if let Some(id) = contact.node_id().map(|n| *n.as_bytes()) {
+                                let mut s = state.lock().unwrap();
+                                if id != node_id && !s.banned_peers.contains(&id) {
+                                    s.known_peers.insert(id);
+                                    s.peer_endpoints.insert(id, contact_str);
+                                    tracing::debug!(peer=%hex::encode(&id[..8]), "discovered via mDNS");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Re-probe LAN for new peers
+        let discovered = crate::local_discovery::discover_lan_peer_contacts(
+            std::time::Duration::from_secs(3),
+            Some(node_id),
+        ).await;
+
+        let mut s = state.lock().unwrap();
+        for contact in &discovered {
+            if let Some(id) = contact.node_id().map(|n| *n.as_bytes()) {
+                if id != node_id && !s.banned_peers.contains(&id) {
+                    if let Ok(contact_str) = vess_mesh::encode_mesh_contact_string(contact) {
+                        s.known_peers.insert(id);
+                        s.peer_endpoints.insert(id, contact_str);
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn load_or_create_mesh_seed(state_dir: &std::path::Path) -> anyhow::Result<[u8; 32]> {
