@@ -40,8 +40,7 @@ pub fn handle_rpc(state: &Arc<Mutex<ArteryState>>, og_tx: &mpsc::UnboundedSender
         "manifest_push" => rpc_manifest_push(state),
         "mailbox_sweep" => rpc_mailbox_sweep(state, &req.params),
         "mailbox_register" => rpc_mailbox_register(state, &req.params),
-        "claim" => rpc_claim(state, &req.params),
-        "auto_claim" => rpc_auto_claim(state),
+        "claim" => rpc_claim(state),
         "notifications" => rpc_notifications(state),
         "recover_manifest" => rpc_recover_manifest(state, &req.params),
         "wallet_info" => rpc_wallet_info(state),
@@ -539,50 +538,6 @@ fn rpc_manifest_push(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
     RpcResponse { ok: true, data: serde_json::json!({"message": "manifest sharded to DHT", "bills_backed_up": bills.len()}) }
 }
 
-// ── Claim ────────────────────────────────────────────────────────────
-
-fn rpc_claim(state: &Arc<Mutex<ArteryState>>, params: &serde_json::Value) -> RpcResponse {
-    let key_hex = params["mailbox_key"].as_str().unwrap_or("");
-    let key = match hex::decode(key_hex) {
-        Ok(v) if v.len() == 32 => {
-            let mut k = [0u8; 32]; k.copy_from_slice(&v); k
-        }
-        _ => return RpcResponse { ok: false, data: serde_json::json!({"error": "invalid mailbox_key"}) },
-    };
-
-    // Sweep mailbox
-    let payloads = {
-        let s = state.lock().unwrap();
-        s.limbo.sweep_by_mailbox_key(&key, 64)
-    };
-
-    let mut claimed = 0u64;
-    let mut results = Vec::new();
-
-    for payload in &payloads {
-        // Trial-decrypt with wallet keys
-        let s = state.lock().unwrap();
-        let (_wallet_vk, _wallet_sk) = match (&s.wallet_vk, &s.wallet_sk) {
-            (Some(vk), Some(sk)) => (vk.clone(), sk.clone()),
-            _ => break,
-        };
-        drop(s);
-
-        // Try to deserialize the stealth payload and decrypt
-        if let Ok(stealth) = serde_json::from_slice::<vess_stealth::StealthPayload>(payload) {
-            // The bill is inside — this needs the full stealth opening flow
-            // For now, track that we found payloads
-            claimed += 1;
-            results.push(hex::encode(&stealth.stealth_id[..8]));
-        }
-    }
-
-    RpcResponse { ok: true, data: serde_json::json!({
-        "claimed": claimed,
-        "stealth_ids": results,
-    })}
-}
-
 // ── Wallet Info ─────────────────────────────────────────────────────
 
 fn rpc_wallet_info(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
@@ -597,9 +552,9 @@ fn rpc_wallet_info(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
     }
 }
 
-// ── Auto Claim ──────────────────────────────────────────────────────
+// ── Claim (auto: derives keys, sweeps all epochs) ───────────────────
 
-fn rpc_auto_claim(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
+fn rpc_claim(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
     let (spend_ek, last_sweep) = {
         let s = state.lock().unwrap();
         // Get the wallet's spend encapsulation key from the tag DHT (via wallet VK fingerprint)

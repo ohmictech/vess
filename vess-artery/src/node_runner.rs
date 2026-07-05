@@ -324,7 +324,7 @@ pub async fn run_node(config: NodeConfig) -> anyhow::Result<String> {
     let mesh_node = Arc::new(mesh_node);
 
     // ── Auto-register with relay / rendezvous servers ──
-    let observed_relay = if let Some(relay_addr) = config.relay_addr {
+    let _observed_relay = if let Some(relay_addr) = config.relay_addr {
         match mesh_node.register_with_relay(relay_addr).await {
             Ok(observed) => {
                 tracing::info!(%observed, %relay_addr, "registered with relay server, observed address");
@@ -337,7 +337,7 @@ pub async fn run_node(config: NodeConfig) -> anyhow::Result<String> {
         }
     } else { None };
 
-    let observed_rendezvous = if let Some(rendezvous_addr) = config.rendezvous_addr {
+    let _observed_rendezvous = if let Some(rendezvous_addr) = config.rendezvous_addr {
         match mesh_node.register_with_rendezvous(rendezvous_addr).await {
             Ok(observed) => {
                 tracing::info!(%observed, %rendezvous_addr, "registered with rendezvous server, observed address");
@@ -400,7 +400,30 @@ pub async fn run_node(config: NodeConfig) -> anyhow::Result<String> {
     if let Some(ref wallet_path) = config.wallet_path {
         if wallet_path.exists() {
             match vess_sovereign::WalletFile::load(wallet_path) {
-                Ok(wallet) => {
+                Ok(mut wallet) => {
+                    // Unlock with password if set
+                    if let Some(ref password) = config.wallet_password {
+                        let unlocked = wallet.unlock_with_password(password);
+                        if let Ok(raw_seed) = unlocked {
+                            let enc_key = vess_sovereign::recovery::encryption_key_from_seed(&raw_seed);
+                            // Decrypt spend credentials from the encrypted blob
+                            if let Some(ref blob) = wallet.encrypted_spend_credentials {
+                                if let Ok(json) = blob.decrypt(&enc_key) {
+                                    #[derive(serde::Deserialize)]
+                                    struct StoredCred { mint_id: [u8; 32], credential: vess_sovereign::billfold::SpendCredential }
+                                    if let Ok(stored) = serde_json::from_slice::<Vec<StoredCred>>(&json) {
+                                        let creds: HashMap<[u8; 32], _> = stored.into_iter()
+                                            .map(|c| (c.mint_id, c.credential)).collect();
+                                        wallet.billfold.import_credentials(creds);
+                                        tracing::info!("wallet unlocked with password");
+                                    }
+                                }
+                            }
+                        } else {
+                            tracing::warn!("wallet password incorrect — wallet loaded as watch-only");
+                        }
+                    }
+
                     let mut s = state.lock().unwrap();
                     if let Some(cred) = wallet.billfold.any_credential() {
                         s.wallet_vk = Some(cred.spend_vk.clone());
@@ -881,6 +904,8 @@ fn handle_mesh_message(
                         last_seen: now_secs(), first_seen: now_secs(),
                     };
                     s.routing_table.insert(rp);
+                    // Track NAT traversal hints for this peer
+                    s.peer_hints.entry(id).or_default();
                 }
             }
             None
@@ -918,18 +943,6 @@ fn handle_mesh_message(
                     }
                 }
             }
-            None
-        }
-
-        // ── BanishmentProof: verify and banish ──
-        vess_protocol::PulseMessage::BanishmentProof(proof) => {
-            let mut s = state.lock().unwrap();
-            // TODO: full reporter signature verification
-            s.banned_peers.insert(proof.peer_id);
-            s.peer_endpoints.remove(&proof.peer_id);
-            s.known_peers.remove(&proof.peer_id);
-            s.routing_table.remove(&proof.peer_id);
-            tracing::warn!(peer=%hex::encode(&proof.peer_id[..8]), "peer banished via network proof");
             None
         }
 

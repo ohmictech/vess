@@ -105,6 +105,10 @@ enum Command {
         #[arg(long)]
         relay: Option<String>,
 
+        /// Wallet password (prompts interactively if omitted).
+        #[arg(long)]
+        password: Option<String>,
+
         /// State directory.
         #[arg(long)]
         state_dir: Option<PathBuf>,
@@ -114,7 +118,7 @@ enum Command {
         wallet: Option<String>,
     },
 
-    /// Claim buffered payments from mailbox (auto-derives key + sweeps all epochs).
+    /// Claim buffered payments from mailbox (auto-derives key, sweeps all epochs).
     Claim,
 
     /// Show wallet notifications.
@@ -128,8 +132,6 @@ enum Command {
 enum TagCmd {
     /// Register a new VessTag.
     Register { tag: String },
-    /// Look up a VessTag.
-    Lookup { tag: String },
 }
 
 #[derive(Subcommand)]
@@ -194,11 +196,6 @@ async fn main() -> Result<()> {
                     .await
                     .map(|r| println!("registered: {}", r["tag"].as_str().unwrap_or("?")))
             }
-            TagCmd::Lookup { tag } => {
-                rpc(port, "tag_lookup", json!({"tag": tag}))
-                    .await
-                    .map(|r| println!("{}", r["stealth_id"].as_str().unwrap_or("not found")))
-            }
         },
         Command::DevFaucet => cmd_dev_faucet(port).await,
         Command::Mint(mint) => match mint {
@@ -236,11 +233,12 @@ async fn main() -> Result<()> {
             bootstrap,
             rendezvous,
             relay,
+            password,
             state_dir,
             wallet,
-        } => cmd_node(port, bind, bootstrap, rendezvous, relay, state_dir, wallet).await,
+        } => cmd_node(port, bind, bootstrap, rendezvous, relay, password, state_dir, wallet).await,
         Command::Claim => {
-            rpc(port, "auto_claim", json!({}))
+            rpc(port, "claim", json!({}))
                 .await
                 .map(|r| {
                     println!("Claimed {} payments ({} epochs scanned)",
@@ -312,6 +310,24 @@ fn wallets_dir() -> PathBuf {
         .join("wallets")
 }
 
+/// Prompt for a wallet password (with confirmation on creation).
+fn prompt_wallet_password(is_new: bool) -> Result<String> {
+    if is_new {
+        println!("\nSet a password to encrypt your wallet locally.");
+        let password = rpassword::prompt_password("Password: ")?;
+        if password.len() < 8 {
+            anyhow::bail!("password must be at least 8 characters");
+        }
+        let confirm = rpassword::prompt_password("Confirm:   ")?;
+        if password != confirm {
+            anyhow::bail!("passwords don't match");
+        }
+        Ok(password)
+    } else {
+        Ok(rpassword::prompt_password("Wallet password: ")?)
+    }
+}
+
 // ── Commands ────────────────────────────────────────────────────────
 
 async fn cmd_init(name: &Option<String>) -> Result<()> {
@@ -336,20 +352,23 @@ async fn cmd_init(name: &Option<String>) -> Result<()> {
         anyhow::bail!("phrases don't match — try again");
     }
 
-    // 3. Derive keys
+    // 3. Prompt for wallet password
+    let password = prompt_wallet_password(true)?;
+
+    // 4. Derive keys
     let seed = recovery::derive_raw_seed(&phrase)?;
     let enc_key = recovery::encryption_key_from_seed(&seed);
     let spend_seed = recovery::spend_seed_from_raw_seed(&seed);
     let (secret, master_address) = recovery::recover_master_keys(&phrase)?;
     let encrypted_secrets = recovery::encrypt_secrets(&secret, &enc_key)?;
 
-    // 4. Save wallet
+    // 5. Save wallet
     let dir = wallets_dir();
     std::fs::create_dir_all(&dir)?;
     let wallet_name = name.clone().unwrap_or_else(|| "default".to_string());
     let path = dir.join(format!("{}.json", wallet_name));
 
-    let wallet = WalletFile::new(
+    let mut wallet = WalletFile::new(
         master_address,
         encrypted_secrets,
         BillFold::new(),
@@ -357,9 +376,10 @@ async fn cmd_init(name: &Option<String>) -> Result<()> {
         &enc_key,
     )?;
 
+    wallet.set_password_cache(&seed, &password)?;
     wallet.save(&path, &enc_key)?;
 
-    println!("\nWallet '{}' created.", wallet_name);
+    println!("\nWallet '{}' created (password-protected).", wallet_name);
     println!("Register a tag to receive payments: vess tag register <yourname>");
     Ok(())
 }
@@ -402,13 +422,16 @@ async fn cmd_recover(name: &Option<String>) -> Result<()> {
         }
     }
 
-    // 5. Save wallet
+    // 5. Prompt for wallet password
+    let password = prompt_wallet_password(true)?;
+
+    // 6. Save wallet
     let dir = wallets_dir();
     std::fs::create_dir_all(&dir)?;
     let wallet_name = name.clone().unwrap_or_else(|| "recovered".to_string());
     let path = dir.join(format!("{}.json", wallet_name));
 
-    let wallet = WalletFile::new(
+    let mut wallet = WalletFile::new(
         master_address,
         encrypted_secrets,
         billfold,
@@ -416,6 +439,7 @@ async fn cmd_recover(name: &Option<String>) -> Result<()> {
         &enc_key,
     )?;
 
+    wallet.set_password_cache(&seed, &password)?;
     wallet.save(&path, &enc_key)?;
 
     println!("\nWallet '{}' recovered.", wallet_name);
@@ -471,10 +495,22 @@ async fn cmd_node(
     rpc_port: u16,
     bind: &Option<String>,
     bootstrap: &[String],
+    rendezvous: &Option<String>,
+    relay: &Option<String>,
+    password: &Option<String>,
     state_dir: &Option<PathBuf>,
     wallet_name: &Option<String>,
 ) -> Result<()> {
     let bind_addr: Option<std::net::SocketAddr> = bind.as_ref().and_then(|b| b.parse().ok());
+    let rendezvous_addr: Option<std::net::SocketAddr> = rendezvous.as_ref().and_then(|b| b.parse().ok());
+    let relay_addr: Option<std::net::SocketAddr> = relay.as_ref().and_then(|b| b.parse().ok());
+
+    // Prompt for password if wallet is specified but no --password given
+    let wallet_password = match (wallet_name, password) {
+        (Some(_), Some(pw)) => Some(pw.clone()),
+        (Some(_), None) => Some(prompt_wallet_password(false)?),
+        _ => None,
+    };
     let state = state_dir.clone().unwrap_or_else(|| {
         dirs_next::data_dir()
             .unwrap_or_else(|| PathBuf::from("."))
@@ -488,7 +524,7 @@ async fn cmd_node(
     let config = vess_artery::node_runner::NodeConfig {
         state_dir: state,
         wallet_path,
-        wallet_password: None,
+        wallet_password,
         rpc_port: Some(rpc_port),
         bind_addr,
         k_neighbors: 20,
@@ -496,12 +532,20 @@ async fn cmd_node(
         bootstrap: bootstrap.to_vec(),
         enable_local_discovery: true,
         test: false,
+        rendezvous_addr,
+        relay_addr,
     };
 
     println!("Starting Vess node...");
-    println!("  bind:      {}", bind.as_deref().unwrap_or("0.0.0.0:0"));
+    println!("  bind:       {}", bind.as_deref().unwrap_or("0.0.0.0:0"));
     if let Some(w) = wallet_name {
-        println!("  wallet:    {}", w);
+        println!("  wallet:     {}", w);
+    }
+    if rendezvous_addr.is_some() {
+        println!("  rendezvous: {}", rendezvous.as_deref().unwrap_or(""));
+    }
+    if relay_addr.is_some() {
+        println!("  relay:      {}", relay.as_deref().unwrap_or(""));
     }
     println!("  bootstrap: {:?}", bootstrap);
     println!();
