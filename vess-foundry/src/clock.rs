@@ -1,7 +1,7 @@
 //! Simple epoch clock — 24-hour windows since genesis.
 //!
 //! One epoch = 86400 seconds. The current epoch number is deterministic
-//! from wall time. Useful for time-locks, mining epochs, and bill expiry.
+//! from wall time. Useful for time-locks, minting epochs, and bill expiry.
 
 /// One epoch in seconds.
 pub const EPOCH_SECS: u64 = 86400;

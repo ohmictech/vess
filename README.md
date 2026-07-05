@@ -12,6 +12,8 @@ Every Vess is born in a memory-hard Argon2d 1GB hashing session. Hit enough lead
 
 Argon2d was selected to level the playing field. All that matters in terms of minting power is effectively your core count and memory bandwidth, which are much harder to scale industrially than pure hashing silicon. Consumer hardware is sufficient to be worth minting.
 
+There is no supply limit or difficulty adjustment, because Vess was not created to be a speculative asset, it was created to represent tokenized energy. This is not problematic because unlike fiat currency, which is birthed into existence arbitrarily, every single Vess requires energy expenditure. Devaluation is not the result of a growing supply of Vess, because each unit has a baseline cost of production. The supply simply expands to match the electricity injected.
+
 ### HASH TABLE ###
 
 Vess is stored on the network's distributed hash table, keyed by its ID. Conflicting Vess is resolved deterministically, with the longest chain depth winning out, and ties broken by lowest hash. This renders double spends impossible as long as there is at least a single honest node responding to a DHT request.

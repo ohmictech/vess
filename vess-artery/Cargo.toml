@@ -4,10 +4,6 @@ version = "0.1.0"
 edition = "2021"
 license-file = "../LICENSE"
 
-[[bin]]
-name = "vess-artery"
-path = "src/main.rs"
-
 [features]
 test-pow = ["vess-tag/test-pow"]
 test-mint = ["vess-foundry/test-mint"]

@@ -14,6 +14,8 @@ pub struct ArterySnapshot {
     pub peer_endpoints: Vec<String>,
     #[serde(default)]
     pub banned_peers: Vec<[u8; 32]>,
+    #[serde(default)]
+    pub last_sweep_epoch: Option<u64>,
 }
 
 pub struct NodeStorage {
@@ -35,7 +37,7 @@ impl NodeStorage {
             let data = std::fs::read_to_string(&path)?;
             Ok(serde_json::from_str(&data)?)
         } else {
-            Ok(ArterySnapshot { node_id: [0u8; 32], peer_list: vec![], known_peers: vec![], peer_endpoints: vec![], banned_peers: vec![] })
+            Ok(ArterySnapshot { node_id: [0u8; 32], peer_list: vec![], known_peers: vec![], peer_endpoints: vec![], banned_peers: vec![], last_sweep_epoch: None })
         }
     }
     pub fn save(&self, snap: &ArterySnapshot) -> Result<()> {

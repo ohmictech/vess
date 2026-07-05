@@ -7,7 +7,7 @@
 //!   send        Send Vess to a tag
 //!   receive     Show your tag for receiving payments
 //!   node        Start artery node (DHT + mining + mesh)
-//!   mine        Start/stop/status mining
+//!   mint        Start/stop/status minting
 //!   dev-faucet  Submit dev faucet (dev only)
 //!   status      Show node status
 //!   tag         VessTag operations (register/lookup)
@@ -20,7 +20,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use serde_json::json;
 
-use vess_foundry::mine;
+use vess_foundry::mint;
 use vess_foundry::spend_auth;
 use vess_sovereign::billfold::BillFold;
 use vess_sovereign::persistence::WalletFile;
@@ -80,9 +80,9 @@ enum Command {
     /// Submit the dev faucet for the current epoch.
     DevFaucet,
 
-    /// Start/stop/status mining.
+    /// Start/stop/status minting.
     #[command(subcommand)]
-    Mine(MineCmd),
+    Mint(MintCmd),
 
     /// Push wallet manifest to DHT for recovery.
     Manifest,
@@ -106,6 +106,12 @@ enum Command {
         wallet: Option<String>,
     },
 
+    /// Claim buffered payments from mailbox (auto-derives key + sweeps all epochs).
+    Claim,
+
+    /// Show wallet notifications.
+    Notifications,
+
     /// Show node status.
     Status,
 }
@@ -119,12 +125,16 @@ enum TagCmd {
 }
 
 #[derive(Subcommand)]
-enum MineCmd {
-    /// Start mining.
-    Start,
-    /// Stop mining.
+enum MintCmd {
+    /// Start continuous minting.
+    Start {
+        /// Target amount per bill (default 1).
+        #[arg(default_value = "1")]
+        amount: u64,
+    },
+    /// Stop minting.
     Stop,
-    /// Show mining status.
+    /// Show minting status.
     Status,
 }
 
@@ -145,7 +155,19 @@ async fn main() -> Result<()> {
         Command::Balance => {
             rpc(port, "balance", json!({}))
                 .await
-                .map(|r| println!("{} Vess", r["total"].as_u64().unwrap_or(0)))
+                .map(|r| {
+                    let total = r["total"].as_u64().unwrap_or(0);
+                    let count = r["bill_count"].as_u64().unwrap_or(0);
+                    println!("{} Vess ({} bills)", total, count);
+                    if let Some(bills) = r["bills"].as_array() {
+                        for b in bills {
+                            let id = b["mint_id"].as_str().unwrap_or("?");
+                            let amt = b["amount"].as_u64().unwrap_or(0);
+                            let ep = b["epoch"].as_u64().unwrap_or(0);
+                            println!("  {}  {} Vess  epoch {}", id, amt, ep);
+                        }
+                    }
+                })
         }
         Command::Receive => cmd_receive(port).await,
         Command::Send { amount, recipient, direct } => {
@@ -171,26 +193,27 @@ async fn main() -> Result<()> {
             }
         },
         Command::DevFaucet => cmd_dev_faucet(port).await,
-        Command::Mine(mine) => match mine {
-            MineCmd::Start => {
-                rpc(port, "mine_start", json!({}))
+        Command::Mint(mint) => match mint {
+            MintCmd::Start { amount } => {
+                rpc(port, "mint_start", json!({"amount": amount}))
                     .await
                     .map(|r| println!("{}", r["message"].as_str().unwrap_or("?")))
             }
-            MineCmd::Stop => {
-                rpc(port, "mine_stop", json!({}))
+            MintCmd::Stop => {
+                rpc(port, "mint_stop", json!({}))
                     .await
                     .map(|r| println!("{}", r["message"].as_str().unwrap_or("?")))
             }
-            MineCmd::Status => {
-                rpc(port, "mine_status", json!({})).await.map(|r| {
+            MintCmd::Status => {
+                rpc(port, "mint_status", json!({})).await.map(|r| {
                     if r["active"].as_bool().unwrap_or(false) {
                         println!(
-                            "mining: {}s elapsed",
+                            "minting: {} Vess target, {}s elapsed",
+                            r["amount"].as_u64().unwrap_or(0),
                             r["seconds"].as_u64().unwrap_or(0)
                         );
                     } else {
-                        println!("not mining");
+                        println!("not minting");
                     }
                 })
             }
@@ -206,6 +229,30 @@ async fn main() -> Result<()> {
             state_dir,
             wallet,
         } => cmd_node(port, bind, bootstrap, state_dir, wallet).await,
+        Command::Claim => {
+            rpc(port, "auto_claim", json!({}))
+                .await
+                .map(|r| {
+                    println!("Claimed {} payments ({} epochs scanned)",
+                        r["claimed"].as_u64().unwrap_or(0),
+                        r["epochs_scanned"].as_u64().unwrap_or(0));
+                })
+        }
+        Command::Notifications => {
+            rpc(port, "notifications", json!({})).await.map(|r| {
+                if let Some(notes) = r["notifications"].as_array() {
+                    if notes.is_empty() {
+                        println!("No notifications.");
+                    } else {
+                        for n in notes {
+                            let ts = n["timestamp"].as_u64().unwrap_or(0);
+                            let msg = n["message"].as_str().unwrap_or("?");
+                            println!("[{}] {}", ts, msg);
+                        }
+                    }
+                }
+            })
+        }
         Command::Status => {
             rpc(port, "status", json!({})).await.map(|r| {
                 println!("node:   {}", r["node_id"].as_str().unwrap_or("?"));
@@ -322,7 +369,30 @@ async fn cmd_recover(name: &Option<String>) -> Result<()> {
     let (secret, master_address) = recovery::recover_master_keys(&phrase)?;
     let encrypted_secrets = recovery::encrypt_secrets(&secret, &enc_key)?;
 
-    // 3. Save wallet (billfold starts empty — synced from DHT)
+    // 3. Derive seed hash for DHT manifest lookup
+    let seed_hash = {
+        let mut h = blake3::Hasher::new();
+        h.update(b"vess-wallet-seed-v1");
+        h.update(&seed);
+        *h.finalize().as_bytes()
+    };
+
+    // 4. Try to recover from DHT manifest
+    let billfold = BillFold::new();
+    println!("Attempting DHT recovery...");
+    match rpc(9400, "recover_manifest", json!({"seed_hash": hex::encode(&seed_hash)})).await {
+        Ok(resp) => {
+            let found = resp["bills_found"].as_u64().unwrap_or(0);
+            println!("Found {} bills in local store.", found);
+        }
+        Err(_) => {
+            println!("Node not running — billfold starts empty.");
+            println!("Start the node with 'vess node --wallet {}' to sync from DHT.", 
+                name.clone().unwrap_or_else(|| "recovered".to_string()));
+        }
+    }
+
+    // 5. Save wallet
     let dir = wallets_dir();
     std::fs::create_dir_all(&dir)?;
     let wallet_name = name.clone().unwrap_or_else(|| "recovered".to_string());
@@ -331,7 +401,7 @@ async fn cmd_recover(name: &Option<String>) -> Result<()> {
     let wallet = WalletFile::new(
         master_address,
         encrypted_secrets,
-        BillFold::new(),
+        billfold,
         spend_seed,
         &enc_key,
     )?;
@@ -364,23 +434,23 @@ async fn cmd_dev_faucet(port: u16) -> Result<()> {
     io::stdin().read_line(&mut sk_hex)?;
     let dev_sk = hex::decode(sk_hex.trim()).context("invalid hex for dev SK")?;
 
-    // Generate a fresh owner keypair for this faucet
-    let (owner_vk, _owner_sk) = spend_auth::generate_spend_keypair();
+    // Generate fresh ephemeral keypair for this faucet Vess (unique per bill)
+    let (owner_vk, owner_sk) = spend_auth::generate_spend_keypair();
     let initial_pk = spend_auth::vk_hash(&owner_vk);
 
     // Create and submit
     let epoch = vess_foundry::clock::current_epoch();
-    let faucet = mine::create_faucet(&dev_sk, epoch, &owner_vk, &initial_pk)
+    let faucet = mint::create_faucet(&dev_sk, epoch, &owner_vk, &initial_pk)
         .map_err(|e| anyhow::anyhow!("faucet creation failed: {e}"))?;
 
     rpc(
         port,
         "faucet_submit",
-        json!({"vess": serde_json::to_value(&faucet)?}),
+        json!({"vess": serde_json::to_value(&faucet)?, "owner_sk": hex::encode(&owner_sk)}),
     )
     .await?;
     println!(
-        "Faucet submitted: epoch {}, {} Vess",
+        "Faucet submitted: epoch {}, {} Vess → wallet",
         epoch, faucet.amount
     );
     println!("vess_id: {}", hex::encode(faucet.compute_vess_id()));

@@ -141,7 +141,7 @@ pub struct WalletFile {
     /// Next bill_nonce for the VHALIX miner.  Persisted to prevent
     /// nonce reuse across restarts (which would allow double-claims).
     #[serde(default)]
-    pub mining_next_nonce: u64,
+    pub minting_next_nonce: u64,
 
     /// Password-encrypted copy of the encryption key for fast daily unlock.
     /// Set via `vess init --password` or `vess set-password`.
@@ -178,7 +178,7 @@ struct WalletPrivateMetadata {
     tag_registration: Option<StoredTagRegistration>,
     century_lock_ids: Vec<[u8; 32]>,
     #[serde(default)]
-    mining_next_nonce: u64,
+    minting_next_nonce: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -264,7 +264,7 @@ impl WalletFile {
             password_cache: None,
             integrity_hash: None,
             century_lock_ids: Vec::new(),
-            mining_next_nonce: 0,
+            minting_next_nonce: 0,
                     };
         wallet.refresh_encrypted_private_metadata(enc_key)?;
         Ok(wallet)
@@ -283,7 +283,7 @@ impl WalletFile {
             next_dht_index: self.next_dht_index,
             tag_registration: self.tag_registration.clone(),
             century_lock_ids: self.century_lock_ids.clone(),
-            mining_next_nonce: self.mining_next_nonce,
+            minting_next_nonce: self.minting_next_nonce,
                     }
     }
 
@@ -306,7 +306,7 @@ impl WalletFile {
         self.next_dht_index = metadata.next_dht_index;
         self.tag_registration = metadata.tag_registration;
         self.century_lock_ids = metadata.century_lock_ids;
-        self.mining_next_nonce = metadata.mining_next_nonce;
+        self.minting_next_nonce = metadata.minting_next_nonce;
                 Ok(())
     }
 

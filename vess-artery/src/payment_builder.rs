@@ -20,18 +20,17 @@ pub struct BuiltPayment {
     pub change_sk: Option<Vec<u8>>,
 }
 
-/// Build a payment: select inputs, create outputs with fresh ephemeral keypairs,
-/// sign the change commitment with the sender's input spend keys.
+/// Build a payment: select inputs we have credentials for, create outputs
+/// with fresh ephemeral keypairs, sign the change commitment.
 pub fn build_payment_ephemeral(
     state: &Arc<Mutex<ArteryState>>,
     amount: u64,
 ) -> Result<BuiltPayment, String> {
-    let (consumed_ids, total, input_sk, initial_pk) = {
+    let (consumed_ids, total, initial_pk) = {
         let s = state.lock().unwrap();
-        let sender_vk = s.wallet_vk.as_ref().ok_or("no wallet key")?;
-        let owner_hash = vess_foundry::spend_auth::vk_hash(sender_vk);
+        // Find bills we have spend credentials for (our wallet owns these)
         let mut mine: Vec<Vess> = s.store.iter()
-            .filter(|v| v.owner_vk_hash() == owner_hash)
+            .filter(|v| s.spend_credentials.contains_key(&v.compute_vess_id()))
             .cloned().collect();
         mine.sort_by_key(|v| std::cmp::Reverse(v.amount));
 
@@ -45,9 +44,7 @@ pub fn build_payment_ephemeral(
         if total < amount {
             return Err(format!("insufficient: {total} < {amount}"));
         }
-        // Get the SK for the first input (all inputs have same owner for now)
-        let sk = s.wallet_sk.clone().ok_or("no wallet secret")?;
-        (ids, total, sk, mine[0].initial_pk)
+        (ids, total, mine[0].initial_pk)
     };
 
     let change_amount = total.saturating_sub(amount);
@@ -83,7 +80,13 @@ pub fn build_payment_ephemeral(
         })
     });
 
-    // Sign the batch commitment with the sender's input SK
+    // Sign the batch commitment with one of the input spend keys
+    let input_sk = {
+        let s = state.lock().unwrap();
+        s.spend_credentials.get(&consumed_ids[0])
+            .map(|(_, sk)| sk.clone())
+            .ok_or("no spend credential for input")?
+    };
     let mut outputs = vec![payment.clone()];
     if let Some(ref c) = change { outputs.push(c.clone()); }
     let commitment = Vess::change_commitment(&consumed_ids, &outputs);

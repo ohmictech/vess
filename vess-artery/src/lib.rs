@@ -27,6 +27,7 @@ pub mod kademlia;
 pub mod limbo_buffer;
 pub mod local_discovery;
 pub mod mesh_contact;
+pub mod dht_query;
 pub mod dht_resolver;
 pub mod onion;
 pub mod payment_builder;

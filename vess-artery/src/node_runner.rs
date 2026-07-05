@@ -11,7 +11,7 @@ use crate::vess_store::VessStore;
 
 pub struct ArteryState {
     pub store: VessStore,
-    pub mining: Option<MiningState>,
+    pub minting: Option<MintingState>,
     pub wallet_vk: Option<Vec<u8>>,
     pub wallet_sk: Option<Vec<u8>>,
     pub node_id: [u8; 32],
@@ -36,9 +36,17 @@ pub struct ArteryState {
     pub add_peer_tx: Option<mpsc::UnboundedSender<String>>,
     /// Node's mesh contact for sharing with peers.
     pub mesh_contact: Option<vess_mesh::MeshCarrierContact>,
+    /// Spend credentials for bills we own (mint_id → (vk, sk)).
+    pub spend_credentials: HashMap<[u8; 32], (Vec<u8>, Vec<u8>)>,
+    /// Outbox channel for sending mesh messages (for onion forwarding, etc.).
+    pub mesh_outbox: Option<mpsc::UnboundedSender<(vess_mesh::MeshCarrierContact, vess_protocol::PulseMessage)>>,
+    /// Kademlia routing table for DHT operations (mailbox, tag, Vess sharding).
+    pub routing_table: crate::kademlia::RoutingTable,
+    /// Last epoch the wallet swept its mailbox (for catch-up after offline).
+    pub last_sweep_epoch: Option<u64>,
 }
 
-pub struct MiningState {
+pub struct MintingState {
     pub stop_tx: Option<tokio::sync::oneshot::Sender<()>>,
     pub amount: u64,
     pub started_at: u64,
@@ -64,7 +72,7 @@ impl ArteryState {
     pub fn new(node_id: [u8; 32], k_neighbors: usize) -> Self {
         Self {
             store: VessStore::default(),
-            mining: None, wallet_vk: None, wallet_sk: None, node_id,
+            minting: None, wallet_vk: None, wallet_sk: None, node_id,
             tag_dht: crate::tag_dht::TagDht::new(node_id, k_neighbors),
             limbo: crate::limbo_buffer::LimboBuffer::new(),
             peer_registry: crate::handshake::PeerRegistry::new(std::time::Duration::from_secs(30)),
@@ -79,6 +87,10 @@ impl ArteryState {
             banned_peers: HashSet::new(),
             add_peer_tx: None,
             mesh_contact: None,
+            spend_credentials: HashMap::new(),
+            mesh_outbox: None,
+            routing_table: crate::kademlia::RoutingTable::new(node_id),
+            last_sweep_epoch: None,
         }
     }
     pub fn notify(&mut self, msg: &str) {
@@ -86,6 +98,13 @@ impl ArteryState {
         if self.notifications.len() > 100 { self.notifications.pop_front(); }
     }
 
+    /// DHT replication factor: max(50, sqrt(known_peers)).
+    pub fn dht_replication(&self) -> usize {
+        crate::ownership_registry::dht_replication_factor(self.known_peers.len().max(1))
+    }
+
+    /// Push an already-encrypted wallet manifest to the DHT.
+    /// The caller handles encryption (wallet layer has the keys).
     /// Push an already-encrypted wallet manifest to the DHT.
     /// The caller handles encryption (wallet layer has the keys).
     pub fn push_wallet_manifest(&self, encrypted_blob: Vec<u8>) {
@@ -124,7 +143,7 @@ pub fn validate_vess(v: &Vess, store: &VessStore, _current_epoch: u64) -> Result
     let id = v.compute_vess_id();
     if store.is_consumed(&id) { return Err("already consumed".into()); }
     if let Some(ex) = store.get(&id) { if v.chain_depth <= ex.chain_depth { return Err("stale".into()); } }
-    if v.is_mined() { return Err("mining validation not yet wired for MintProof model".into()); }
+    if v.is_minted() { return Err("mining validation not yet wired for MintProof model".into()); }
     if v.is_changed() { return validate_changed(v, store); }
     Err("invalid".into())
 }
@@ -144,27 +163,39 @@ fn validate_changed(v: &Vess, store: &VessStore) -> Result<(), String> {
 
 pub fn spawn_miner(state: Arc<Mutex<ArteryState>>, amount: u64, initial_pk: [u8; 32], og_tx: mpsc::UnboundedSender<Vess>) {
     let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
-    let epoch = vess_foundry::clock::current_epoch();
+    let start_epoch = vess_foundry::clock::current_epoch();
     {
         let mut s = state.lock().unwrap();
-        s.mining = Some(MiningState { stop_tx: Some(stop_tx), amount, started_at: now_secs() });
+        s.minting = Some(MintingState { stop_tx: Some(stop_tx), amount, started_at: now_secs() });
     }
 
     let cs = state.clone();
     std::thread::spawn(move || {
         let mut nonce: u64 = 0;
+        let mut current_epoch = start_epoch;
+        let mut bills_minted: u64 = 0;
+
         loop {
+            // Check for stop signal
             if stop_rx.try_recv().is_ok() {
+                tracing::info!(bills_minted, "miner stopped");
                 break;
             }
 
-            // Try nonce
-            let hash = vess_foundry::mine::mine_argon2d(&initial_pk, epoch, nonce, amount);
-            let bits = vess_foundry::mine::leading_zero_bits(&hash);
+            // Check if epoch changed — reset nonce, continue with new epoch
+            let now_epoch = vess_foundry::clock::current_epoch();
+            if now_epoch != current_epoch {
+                current_epoch = now_epoch;
+                nonce = 0;
+                tracing::debug!(epoch = current_epoch, "miner advanced to new epoch");
+            }
 
-            let required_bits = vess_foundry::mine::amount_to_bits(amount);
+            // Try nonce
+            let hash = vess_foundry::mint::mint_argon2d(&initial_pk, current_epoch, nonce, amount);
+            let bits = vess_foundry::mint::leading_zero_bits(&hash);
+            let required_bits = vess_foundry::mint::amount_to_bits(amount);
+
             if bits >= required_bits {
-                // Found a valid proof!
                 let owner_vk = {
                     let s = cs.lock().unwrap();
                     s.wallet_vk.clone()
@@ -172,7 +203,7 @@ pub fn spawn_miner(state: Arc<Mutex<ArteryState>>, amount: u64, initial_pk: [u8;
                 if let Some(vk) = owner_vk {
                     let v = Vess {
                         amount,
-                        epoch,
+                        epoch: current_epoch,
                         nonce,
                         initial_pk,
                         owner_vk: vk,
@@ -187,17 +218,19 @@ pub fn spawn_miner(state: Arc<Mutex<ArteryState>>, amount: u64, initial_pk: [u8;
                         dht_index: 0,
                     };
                     let _ = og_tx.send(v);
-                    break;
+                    bills_minted += 1;
+                    // Reset nonce for next bill, same epoch
+                    nonce = 0;
+                    continue;
                 }
             }
 
             nonce = nonce.wrapping_add(1);
-            // Yield every 1000 attempts
             if nonce % 1000 == 0 {
                 std::thread::yield_now();
             }
         }
-        let _ = cs.lock().map(|mut s| s.mining = None);
+        let _ = cs.lock().map(|mut s| s.minting = None);
     });
 }
 
@@ -241,18 +274,22 @@ pub async fn run_node(config: NodeConfig) -> anyhow::Result<String> {
     let node_id = *mesh_node.id().as_bytes();
     tracing::info!(%bind_addr, node_id=%hex::encode(&node_id[..8]), "mesh bound");
 
+    // ── Mesh outbox: channel for forwarding onion hops and outgoing messages ──
+    let (mesh_tx, mut mesh_rx) = mpsc::unbounded_channel::<(vess_mesh::MeshCarrierContact, vess_protocol::PulseMessage)>();
+
     // Load persisted snapshot
     let storage = crate::persistence::NodeStorage::open(&config.state_dir)?;
     let snapshot = storage.load().unwrap_or_else(|_| crate::persistence::ArterySnapshot {
-        node_id, peer_list: vec![], known_peers: vec![], peer_endpoints: vec![], banned_peers: vec![],
+        node_id, peer_list: vec![], known_peers: vec![], peer_endpoints: vec![], banned_peers: vec![], last_sweep_epoch: None,
     });
 
     let state = Arc::new(Mutex::new(ArteryState::new(node_id, config.k_neighbors)));
 
-    // Store mesh contact for peer sharing
+    // Store mesh contact and outbox channel
     {
         let mut s = state.lock().unwrap();
         s.mesh_contact = Some(mesh_contact.clone());
+        s.mesh_outbox = Some(mesh_tx.clone());
     }
 
     // Restore persisted peers
@@ -268,6 +305,7 @@ pub async fn run_node(config: NodeConfig) -> anyhow::Result<String> {
             }
         }
         for &pid in &snapshot.banned_peers { s.banned_peers.insert(pid); }
+        s.last_sweep_epoch = snapshot.last_sweep_epoch;
     }
 
     let (og_tx, mut og_rx) = mpsc::unbounded_channel::<Vess>();
@@ -289,15 +327,27 @@ pub async fn run_node(config: NodeConfig) -> anyhow::Result<String> {
                         s.wallet_vk = Some(cred.spend_vk.clone());
                         s.wallet_sk = Some(cred.spend_sk.clone());
                     }
+                    // Backfill credentials for any existing bills with wallet VK
+                    let w_vk = s.wallet_vk.clone();
+                    let w_sk = s.wallet_sk.clone();
+                    if let (Some(vk), Some(sk)) = (w_vk, w_sk) {
+                        let owned: Vec<[u8; 32]> = s.store.iter()
+                            .filter(|v| v.owner_vk == vk)
+                            .map(|v| v.compute_vess_id())
+                            .collect();
+                        for id in owned {
+                            s.spend_credentials.insert(id, (vk.clone(), sk.clone()));
+                        }
+                    }
                     s.wallet_path = Some(wallet_path.clone());
-                    tracing::info!("wallet loaded");
+                    tracing::info!("wallet loaded with {} spendable bills", s.spend_credentials.len());
                 }
                 Err(e) => tracing::warn!(%e, "wallet load failed"),
             }
         }
     }
 
-    // Epoch ticker
+    // Epoch ticker (also prunes store + limbo)
     let cs = state.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
@@ -306,6 +356,10 @@ pub async fn run_node(config: NodeConfig) -> anyhow::Result<String> {
             let mut s = cs.lock().unwrap();
             let epoch = clock::current_epoch();
             s.store.prune_deep_buried(epoch);
+            let (evicted, _) = s.limbo.evict_expired(now_secs());
+            if evicted > 0 {
+                tracing::debug!(evicted, "limbo expired entries pruned");
+            }
             tracing::debug!(epoch, "epochly prune");
         }
     });
@@ -352,6 +406,7 @@ pub async fn run_node(config: NodeConfig) -> anyhow::Result<String> {
                 known_peers: s.known_peers.iter().copied().collect(),
                 peer_endpoints: s.peer_endpoints.values().cloned().collect(),
                 banned_peers: s.banned_peers.iter().copied().collect(),
+                last_sweep_epoch: s.last_sweep_epoch,
             };
             if let Ok(storage) = crate::persistence::NodeStorage::open(&persist_dir) {
                 if let Err(e) = storage.save(&snap) {
@@ -365,11 +420,23 @@ pub async fn run_node(config: NodeConfig) -> anyhow::Result<String> {
     let mesh_state = state.clone();
     let mesh_og = og_tx.clone();
     let mesh_self_contact = mesh_contact.clone();
+    let mesh_node_arc = std::sync::Arc::new(mesh_node);
+    let mesh_node_for_listener = mesh_node_arc.clone();
     tokio::spawn(async move {
-        if let Err(e) = mesh_node.listen_messages_with_response(move |peer, msg| {
+        if let Err(e) = mesh_node_for_listener.listen_messages_with_response(move |peer, msg| {
             handle_mesh_message(&mesh_state, &mesh_og, &peer, &msg, &mesh_self_contact)
         }).await {
             tracing::error!(%e, "mesh listener crashed");
+        }
+    });
+
+    // ── Mesh forwarder: reads from outbox, sends via mesh ──
+    let mesh_node_for_forward = mesh_node_arc.clone();
+    tokio::spawn(async move {
+        while let Some((contact, msg)) = mesh_rx.recv().await {
+            if let Err(e) = mesh_node_for_forward.send_message(&contact, &msg).await {
+                tracing::warn!(%e, "mesh forward failed");
+            }
         }
     });
 
@@ -393,6 +460,7 @@ pub async fn run_node(config: NodeConfig) -> anyhow::Result<String> {
                     known_peers: s.known_peers.iter().copied().collect(),
                     peer_endpoints: s.peer_endpoints.values().cloned().collect(),
                     banned_peers: s.banned_peers.iter().copied().collect(),
+                    last_sweep_epoch: s.last_sweep_epoch,
                 };
                 if let Ok(storage) = crate::persistence::NodeStorage::open(&config.state_dir) {
                     let _ = storage.save(&snap);
@@ -414,8 +482,30 @@ pub async fn run_node(config: NodeConfig) -> anyhow::Result<String> {
             }
             Some(v) = og_rx.recv() => {
                 let mut s = state.lock().unwrap();
+                let v_id = v.compute_vess_id();
                 if s.store.upsert(&v) {
-                    tracing::info!(id=%hex::encode(&v.compute_vess_id()[..8]), amount=v.amount, "Vess mined and stored");
+                    // Store credential if we have wallet keys
+                    if let (Some(ref vk), Some(ref sk)) = (s.wallet_vk.clone(), s.wallet_sk.clone()) {
+                        if v.owner_vk == *vk {
+                            s.spend_credentials.insert(v_id, (vk.clone(), sk.clone()));
+                        }
+                    }
+                    // XOR-shard Vess to K nearest DHT peers
+                    if let Some(ref tx) = s.mesh_outbox {
+                        let mut ranked: Vec<([u8; 32], String)> = s.peer_endpoints.iter()
+                            .map(|(id, ep)| (*id, ep.clone()))
+                            .collect();
+                        ranked.sort_by_key(|(id, _)| crate::gossip::xor_distance(id, &v_id));
+                        let msg = vess_protocol::PulseMessage::DhtStoreVess(v.clone());
+                        let repl = s.dht_replication();
+                        for (_, ep) in ranked.iter().take(repl) {
+                            if let Ok(contact) = vess_mesh::decode_mesh_contact_string(ep) {
+                                let _ = tx.send((contact, msg.clone()));
+                            }
+                        }
+                    }
+                    s.notify(&format!("minted {} Vess (epoch {})", v.amount, v.epoch));
+                    tracing::info!(id=%hex::encode(&v_id[..8]), amount=v.amount, epoch=v.epoch, "Vess minted");
                 }
             }
             else => break,
@@ -530,9 +620,20 @@ fn handle_mesh_message(
             };
             match crate::onion::process_onion_route(route, &relay_key) {
                 crate::onion::OnionAction::Forward(_inner) => {
-                    // Forward to next hop — would need to look up next peer
-                    tracing::debug!("onion: forwarding to next hop");
-                    // In production: send inner to next peer via mesh
+                    // Forward to all known peers (gossip-style onion relay)
+                    let s = state.lock().unwrap();
+                    let repl = s.dht_replication();
+                    if let Some(ref tx) = s.mesh_outbox {
+                        let msg = vess_protocol::PulseMessage::OnionRoute(
+                            vess_protocol::OnionRoute { outer: _inner.outer }
+                        );
+                        for ep_str in s.peer_endpoints.values().take(repl) {
+                            if let Ok(contact) = vess_mesh::decode_mesh_contact_string(ep_str) {
+                                let _ = tx.send((contact, msg.clone()));
+                            }
+                        }
+                    }
+                    tracing::debug!("onion: forwarded to peers");
                     None
                 }
                 crate::onion::OnionAction::Deliver { payment, shard_key: _ } => {
@@ -598,7 +699,78 @@ fn handle_mesh_message(
             ))
         }
 
-        // ── Gossip / tag relay / DHT — stubbed for now ──
+        // ── Tag gossip: receive and store tag registrations from peers ──
+        vess_protocol::PulseMessage::TagRegister(tag_reg) => {
+            let mut s = state.lock().unwrap();
+            let record = vess_tag::TagRecord {
+                tag_hash: tag_reg.tag_hash,
+                master_address: vess_stealth::MasterStealthAddress {
+                    scan_ek: tag_reg.scan_ek.clone(),
+                    spend_ek: tag_reg.spend_ek.clone(),
+                },
+                pow_nonce: tag_reg.pow_nonce,
+                pow_hash: tag_reg.pow_hash.clone(),
+                registered_at: tag_reg.timestamp,
+                registrant_vk: tag_reg.registrant_vk.clone(),
+                signature: tag_reg.signature.clone(),
+                hardened_at: None,
+                grace_until_epoch: None,
+            };
+            s.tag_dht.store(record);
+            tracing::debug!("received tag gossip");
+            None
+        }
+
+        // ── Vess DHT sharding: receive and store Vess from peers ──
+        vess_protocol::PulseMessage::DhtStoreVess(v) => {
+            let mut s = state.lock().unwrap();
+            if s.store.upsert(&v) {
+                tracing::debug!(id=%hex::encode(&v.compute_vess_id()[..8]), amount=v.amount, "received Vess from DHT shard");
+            }
+            None
+        }
+
+        // ── Manifest store: receive and cache wallet manifests ──
+        vess_protocol::PulseMessage::DhtStoreManifest(manifest) => {
+            tracing::debug!(dht_key=%hex::encode(&manifest.dht_key[..8]), "received wallet manifest from DHT shard");
+            // Store for recovery — in production this would write to a manifest cache
+            None
+        }
+
+        // ── DHT Query: respond with local data ──
+        vess_protocol::PulseMessage::DhtQuery(query) => {
+            let mut s = state.lock().unwrap();
+            let mut tags = vec![];
+            let mut payloads = vec![];
+            match query.query_kind {
+                vess_protocol::DhtQueryKind::TagLookup => {
+                    if let Some(record) = s.tag_dht.lookup_by_hash(&query.dht_key) {
+                        tags.push(serde_json::to_vec(record).unwrap_or_default());
+                    }
+                }
+                vess_protocol::DhtQueryKind::MailboxSweep => {
+                    payloads = s.limbo.sweep_by_mailbox_key(&query.dht_key, 64);
+                }
+                vess_protocol::DhtQueryKind::VessLookup => {
+                    if let Some(v) = s.store.get(&query.dht_key) {
+                        tags.push(serde_json::to_vec(v).unwrap_or_default());
+                    }
+                }
+                _ => {}
+            }
+            Some(vess_protocol::PulseMessage::DhtQueryResponse(
+                vess_protocol::DhtQueryResponse {
+                    nonce: query.nonce,
+                    query_kind: query.query_kind.clone(),
+                    tags,
+                    payloads,
+                    vess: vec![],
+                    manifests: vec![],
+                },
+            ))
+        }
+
+        // ── Gossip / other — stubbed for now ──
         _ => {
             tracing::trace!("unhandled mesh message: {:?}", std::mem::discriminant(msg));
             None

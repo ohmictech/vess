@@ -1,5 +1,5 @@
 //! **vess-foundry** — Core Vess primitives.
-pub mod mine;
+pub mod mint;
 pub mod spend_auth;
 pub mod vess;
 pub use vess::Vess;

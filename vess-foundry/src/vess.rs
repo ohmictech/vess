@@ -30,8 +30,8 @@ impl Vess {
             h.update(&self.amount.to_le_bytes());
             h.update(&self.epoch.to_be_bytes());
             // NOT including initial_pk or owner_vk — one bill per epoch
-        } else if self.is_mined() {
-            h.update(b"vess-mined-v1");
+        } else if self.is_minted() {
+            h.update(b"vess-minted-v1");
             h.update(&self.amount.to_le_bytes());
             h.update(&self.epoch.to_le_bytes());
             h.update(&self.nonce.to_le_bytes());
@@ -45,7 +45,7 @@ impl Vess {
         *h.finalize().as_bytes()
     }
 
-    pub fn is_mined(&self) -> bool { self.epoch > 0 && self.nonce > 0 && self.consumed.is_empty() }
+    pub fn is_minted(&self) -> bool { self.epoch > 0 && self.nonce > 0 && self.consumed.is_empty() }
     pub fn is_changed(&self) -> bool { !self.consumed.is_empty() && self.epoch == 0 && self.nonce == 0 }
     pub fn is_faucet(&self) -> bool { self.epoch > 0 && self.nonce == 0 && self.consumed.is_empty() }
 

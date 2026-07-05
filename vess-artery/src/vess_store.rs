@@ -77,7 +77,7 @@ impl VessStore {
             // Regular mined Vess: Argon2d verification
             for v in outputs {
                 if v.is_mined() {
-                    vess_foundry::mine::verify_mined_vess(v, clock::current_epoch())?;
+                    vess_foundry::mine::verify_minted_vess(v, clock::current_epoch())?;
                 }
                 self.upsert_one(v);
             }

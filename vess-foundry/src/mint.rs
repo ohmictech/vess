@@ -24,8 +24,8 @@ pub const ARGON2D_M_COST: u32 = 1024 * 1024; // 1 GiB in KiB
 pub const ARGON2D_T_COST: u32 = 1;
 pub const ARGON2D_P_COST: u32 = 1;
 pub const ARGON2D_HASH_LEN: usize = 32;
-const MINING_DOMAIN: &[u8] = b"vess-mine-v4";
-const MINING_SALT: &[u8] = b"vess-mine-salt-v4";
+const MINTING_DOMAIN: &[u8] = b"vess-mint-v4";
+const MINTING_SALT: &[u8] = b"vess-mint-salt-v4";
 pub const MAX_PROOF_EPOCH_AGE: u64 = 1;
 
 // ── Difficulty ──────────────────────────────────────────────────────
@@ -58,13 +58,13 @@ pub fn amount_to_bits(amount: u64) -> u32 {
 
 /// Run one Argon2d hash for mining.
 /// `password = initial_pk || epoch || nonce || amount`
-pub fn mine_argon2d(initial_pk: &[u8; 32], epoch: u64, nonce: u64, amount: u64) -> [u8; 32] {
-    let mut password = Vec::with_capacity(32 + 8 + 8 + 8 + MINING_DOMAIN.len());
+pub fn mint_argon2d(initial_pk: &[u8; 32], epoch: u64, nonce: u64, amount: u64) -> [u8; 32] {
+    let mut password = Vec::with_capacity(32 + 8 + 8 + 8 + MINTING_DOMAIN.len());
     password.extend_from_slice(initial_pk);
     password.extend_from_slice(&epoch.to_be_bytes());
     password.extend_from_slice(&nonce.to_be_bytes());
     password.extend_from_slice(&amount.to_be_bytes());
-    password.extend_from_slice(MINING_DOMAIN);
+    password.extend_from_slice(MINTING_DOMAIN);
 
     let mut output = [0u8; ARGON2D_HASH_LEN];
     let argon2 = Argon2::new(
@@ -73,7 +73,7 @@ pub fn mine_argon2d(initial_pk: &[u8; 32], epoch: u64, nonce: u64, amount: u64) 
         argon2::Params::new(ARGON2D_M_COST, ARGON2D_T_COST, ARGON2D_P_COST, Some(ARGON2D_HASH_LEN))
             .expect("valid argon2d params"),
     );
-    argon2.hash_password_into(&password, MINING_SALT, &mut output).expect("argon2d succeeds");
+    argon2.hash_password_into(&password, MINTING_SALT, &mut output).expect("argon2d succeeds");
     output
 }
 
@@ -94,28 +94,46 @@ pub fn leading_zero_bits(hash: &[u8; 32]) -> u32 {
 
 // ── Verification ────────────────────────────────────────────────────
 
-/// Verify a mined Vess: recompute Argon2d, check bit-level difficulty and epoch.
-pub fn verify_mined_vess(v: &Vess, current_epoch: u64) -> Result<(), String> {
-    if !v.is_mined() { return Err("not a mined Vess".into()); }
+/// Verify a minted (proof-of-work) Vess.
+pub fn verify_minted_vess(v: &Vess, current_epoch: u64) -> Result<(), String> {
+    if !v.is_minted() { return Err("not a minted Vess".into()); }
+    verify_epoch(v, current_epoch)?;
+    let output = mint_argon2d(&v.initial_pk, v.epoch, v.nonce, v.amount);
+    let bits = leading_zero_bits(&output);
+    let required = amount_to_bits(v.amount);
+    if bits < required {
+        return Err(format!("insufficient difficulty: {} zero bits, need {} for amount {}", bits, required, v.amount));
+    }
+    Ok(())
+}
 
+/// Verify a dev faucet Vess: check epoch and dev signature.
+pub fn verify_faucet_vess(v: &Vess, current_epoch: u64, dev_vk: &[u8]) -> Result<(), String> {
+    if !v.is_faucet() { return Err("not a faucet Vess".into()); }
+    verify_epoch(v, current_epoch)?;
+
+    let mut msg = blake3::Hasher::new();
+    msg.update(b"vess-faucet-v1");
+    msg.update(&v.epoch.to_be_bytes());
+    msg.update(&v.amount.to_be_bytes());
+    msg.update(&v.owner_vk);
+    let sig_msg = *msg.finalize().as_bytes();
+
+    if !crate::spend_auth::verify_spend(dev_vk, &sig_msg, &v.change_sig)
+        .unwrap_or(false)
+    {
+        return Err("invalid dev faucet signature".into());
+    }
+    Ok(())
+}
+
+fn verify_epoch(v: &Vess, current_epoch: u64) -> Result<(), String> {
     if current_epoch.saturating_sub(v.epoch) > MAX_PROOF_EPOCH_AGE {
-        return Err(format!("mining epoch {} expired (current {})", v.epoch, current_epoch));
+        return Err(format!("epoch {} expired (current {})", v.epoch, current_epoch));
     }
     if v.epoch > current_epoch {
         return Err(format!("epoch {} in the future", v.epoch));
     }
-
-    let output = mine_argon2d(&v.initial_pk, v.epoch, v.nonce, v.amount);
-    let bits = leading_zero_bits(&output);
-    let required = amount_to_bits(v.amount);
-
-    if bits < required {
-        return Err(format!(
-            "insufficient difficulty: {} zero bits, need {} for amount {}",
-            bits, required, v.amount
-        ));
-    }
-
     Ok(())
 }
 
@@ -155,15 +173,15 @@ mod tests {
 
     #[test]
     fn argon2d_produces_32_bytes() {
-        let out = mine_argon2d(&test_pk(), 0, 0, 1);
+        let out = mint_argon2d(&test_pk(), 0, 0, 1);
         assert_eq!(out.len(), 32);
     }
 
     #[test]
     fn different_params_different_output() {
         let pk = test_pk();
-        assert_ne!(mine_argon2d(&pk, 0, 0, 1), mine_argon2d(&pk, 0, 1, 1));
-        assert_ne!(mine_argon2d(&pk, 0, 0, 1), mine_argon2d(&pk, 0, 0, 2));
+        assert_ne!(mint_argon2d(&pk, 0, 0, 1), mint_argon2d(&pk, 0, 1, 1));
+        assert_ne!(mint_argon2d(&pk, 0, 0, 1), mint_argon2d(&pk, 0, 0, 2));
     }
 
     #[test]

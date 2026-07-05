@@ -86,6 +86,18 @@ pub enum PulseMessage {
     /// Response containing initial DHT shard data for a joining node.
     DhtSeedResponse(DhtSeedResponse),
 
+    /// Push a Vess to a DHT shard peer for replication.
+    DhtStoreVess(Vess),
+
+    /// Push an encrypted wallet manifest to a DHT shard peer.
+    DhtStoreManifest(ManifestStore),
+
+    /// Query a DHT peer for data (tag, Vess, mailbox, manifest).
+    DhtQuery(DhtQuery),
+
+    /// Response from a DHT peer to a query.
+    DhtQueryResponse(DhtQueryResponse),
+
     /// Handshake challenge: prove you are running an authorised protocol version.
     HandshakeChallenge(HandshakeChallenge),
 
@@ -794,6 +806,46 @@ pub struct FindNode {
 pub struct FindNodeResponse {
     /// Serialized mesh contacts of the K closest peers the responder knows.
     pub peers: Vec<Vec<u8>>,
+}
+
+/// Query to a DHT peer for specific data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DhtQuery {
+    /// What kind of data is being queried.
+    pub query_kind: DhtQueryKind,
+    /// The DHT key being queried (tag_hash, mailbox_key, vess_id, manifest_dht_key).
+    pub dht_key: [u8; 32],
+    /// Random nonce to match response to request.
+    pub nonce: [u8; 16],
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DhtQueryKind {
+    TagLookup,
+    MailboxSweep,
+    VessLookup,
+    ManifestLookup,
+}
+
+/// Response from a DHT peer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DhtQueryResponse {
+    /// Echoed nonce from the request.
+    pub nonce: [u8; 16],
+    /// The kind of data being returned.
+    pub query_kind: DhtQueryKind,
+    /// Found tag records (for TagLookup).
+    #[serde(default)]
+    pub tags: Vec<Vec<u8>>,
+    /// Found stealth payloads (for MailboxSweep).
+    #[serde(default)]
+    pub payloads: Vec<Vec<u8>>,
+    /// Found Vess bills (for VessLookup).
+    #[serde(default)]
+    pub vess: Vec<Vec<u8>>,
+    /// Found manifest blobs (for ManifestLookup).
+    #[serde(default)]
+    pub manifests: Vec<Vec<u8>>,
 }
 
 // ── Handshake ────────────────────────────────────────────────────────

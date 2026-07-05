@@ -18,9 +18,9 @@ use vess_protocol::Payment;
 /// Prevents unbounded memory growth from payment floods.
 const MAX_TOTAL_ENTRIES: usize = 10_000;
 
-/// Maximum age of a limbo entry (1 hour). Entries older than this
-/// are evicted — the sender can re-send if still desired.
-const MAX_ENTRY_AGE_SECS: u64 = 3600;
+/// Maximum age of a limbo entry (2 epochs = 48 hours).
+/// Recipients have two full days to come online and claim.
+const MAX_ENTRY_AGE_SECS: u64 = 2 * 86400; // 48 hours
 
 /// Maximum limbo entries a single relay peer can hold.
 /// Prevents a single malicious peer from flooding the buffer with
