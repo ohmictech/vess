@@ -7,5 +7,6 @@ members = [
     "vess-artery",
     "vess-sovereign",
     "vess-protocol",
+    "vess-cli",
 ]
 resolver = "2"

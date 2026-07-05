@@ -142,6 +142,35 @@ pub fn dht_response_signing_message(results: &[u8], proof_vess_id: &[u8; 32]) ->
     *h.finalize().as_bytes()
 }
 
+/// Resolve conflicting manifest recovery responses by highest Vess stake.
+/// Returns the encrypted blob from the responder with the most weight.
+pub fn resolve_manifest_responses(
+    responses: &[(SignedDhtResponse, Vec<u8>)],
+    store: &VessStore,
+) -> Option<Vec<u8>> {
+    let mut best: Option<(Vec<u8>, u64)> = None;
+
+    for (resp, blob) in responses {
+        let proof_vess = match store.get(&resp.proof_vess_id) {
+            Some(v) => v,
+            None => continue,
+        };
+        let sig_msg = dht_response_signing_message(&resp.results, &resp.proof_vess_id);
+        if !vess_foundry::spend_auth::verify_spend(
+            &proof_vess.owner_vk, &sig_msg, &resp.responder_sig,
+        ).unwrap_or(false) {
+            continue;
+        }
+        let weight = proof_vess.amount;
+        match &best {
+            None => best = Some((blob.clone(), weight)),
+            Some((_, w)) if weight > *w => best = Some((blob.clone(), weight)),
+            _ => {}
+        }
+    }
+    best.map(|(blob, _)| blob)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

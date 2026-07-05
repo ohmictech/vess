@@ -19,11 +19,14 @@ impl VessStore {
     // ── Dev faucet ────────────────────────────────────────────────
 
     /// Validate and store a dev faucet bill.
-    /// One per epoch, 20,000 Vess, signed by the dev key.
+    /// One per epoch, 30,000 Vess, signed by the dev key.
     /// Owner can be any address the dev chooses to receive to.
-    pub fn validate_faucet(&mut self, v: &Vess) -> Result<(), String> {
+    pub fn validate_faucet(&mut self, v: &Vess, current_epoch: u64) -> Result<(), String> {
         if v.amount != vess_protocol::DEV_FAUCET_AMOUNT {
             return Err(format!("faucet must be {} Vess", vess_protocol::DEV_FAUCET_AMOUNT));
+        }
+        if v.epoch != current_epoch {
+            return Err(format!("faucet must be for current epoch {} (got {})", current_epoch, v.epoch));
         }
         if self.faucet_epochs.contains(&v.epoch) {
             return Err(format!("faucet already claimed for epoch {}", v.epoch));
@@ -69,7 +72,7 @@ impl VessStore {
         if consumed_ids.is_empty() {
             // Faucet bills: special validation (dev key, epoch uniqueness)
             if outputs.len() == 1 && outputs[0].is_faucet() {
-                return self.validate_faucet(&outputs[0]).map(|_| ());
+                return self.validate_faucet(&outputs[0], clock::current_epoch()).map(|_| ());
             }
             // Regular mined Vess: Argon2d verification
             for v in outputs {

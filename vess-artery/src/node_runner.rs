@@ -20,6 +20,10 @@ pub struct ArteryState {
     pub duplicate_tracker: DuplicateTracker,
     pub notifications: std::collections::VecDeque<WalletNotification>,
     pub wallet_path: Option<std::path::PathBuf>,
+    /// Channel to push wallet manifests to the DHT.
+    pub manifest_tx: Option<mpsc::UnboundedSender<vess_protocol::ManifestStore>>,
+    /// Blake3 hash of the wallet's seed phrase (for DHT lookup).
+    pub wallet_seed_hash: Option<[u8; 32]>,
 }
 
 pub struct MiningState {
@@ -56,11 +60,42 @@ impl ArteryState {
             duplicate_tracker: DuplicateTracker::new(),
             notifications: std::collections::VecDeque::new(),
             wallet_path: None,
+            manifest_tx: None,
+            wallet_seed_hash: None,
         }
     }
     pub fn notify(&mut self, msg: &str) {
         self.notifications.push_back(WalletNotification { message: msg.to_string(), timestamp: now_secs() });
         if self.notifications.len() > 100 { self.notifications.pop_front(); }
+    }
+
+    /// Push an already-encrypted wallet manifest to the DHT.
+    /// The caller handles encryption (wallet layer has the keys).
+    pub fn push_wallet_manifest(&self, encrypted_blob: Vec<u8>) {
+        let seed_hash = match self.wallet_seed_hash {
+            Some(h) => h,
+            None => return,
+        };
+        let tx = match &self.manifest_tx {
+            Some(tx) => tx,
+            None => return,
+        };
+
+        let dht_key = {
+            let mut h = blake3::Hasher::new();
+            h.update(b"vess-wallet-manifest-v1");
+            h.update(&seed_hash);
+            *h.finalize().as_bytes()
+        };
+
+        let manifest = vess_protocol::ManifestStore {
+            dht_key,
+            encrypted_manifest: encrypted_blob,
+            hops_remaining: 0,
+        };
+
+        let _ = tx.send(manifest);
+        tracing::debug!("wallet manifest pushed to DHT");
     }
 }
 
