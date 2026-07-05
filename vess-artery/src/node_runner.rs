@@ -1,6 +1,7 @@
 //! Vess artery — full node with mesh networking, wallet, mining, RPC.
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use anyhow::Context;
 use tokio::sync::mpsc;
 use vess_foundry::Vess;
 use vess_foundry::clock;
@@ -33,6 +34,8 @@ pub struct ArteryState {
     pub banned_peers: HashSet<[u8; 32]>,
     /// Channel to dynamically add peers at runtime.
     pub add_peer_tx: Option<mpsc::UnboundedSender<String>>,
+    /// Node's mesh contact for sharing with peers.
+    pub mesh_contact: Option<vess_mesh::MeshCarrierContact>,
 }
 
 pub struct MiningState {
@@ -75,6 +78,7 @@ impl ArteryState {
             peer_endpoints: HashMap::new(),
             banned_peers: HashSet::new(),
             add_peer_tx: None,
+            mesh_contact: None,
         }
     }
     pub fn notify(&mut self, msg: &str) {
@@ -230,9 +234,12 @@ pub async fn run_node(config: NodeConfig) -> anyhow::Result<String> {
     let bind_addr = config.bind_addr.unwrap_or_else(||
         std::net::SocketAddr::V4(std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0)));
 
-    // Derive node ID from mesh seed
-    let (_, mesh_address) = vess_mesh::generate_mesh_keys_from_seed(&mesh_seed, 0);
-    let node_id = *mesh_address.node_id.as_bytes();
+    // ── Bind mesh UDP socket ──
+    let mesh_node = vess_mesh::MeshPulseNode::bind_from_seed(bind_addr, &mesh_seed, 0).await
+        .context("bind mesh UDP socket")?;
+    let mesh_contact = mesh_node.contact();
+    let node_id = *mesh_node.id().as_bytes();
+    tracing::info!(%bind_addr, node_id=%hex::encode(&node_id[..8]), "mesh bound");
 
     // Load persisted snapshot
     let storage = crate::persistence::NodeStorage::open(&config.state_dir)?;
@@ -241,6 +248,12 @@ pub async fn run_node(config: NodeConfig) -> anyhow::Result<String> {
     });
 
     let state = Arc::new(Mutex::new(ArteryState::new(node_id, config.k_neighbors)));
+
+    // Store mesh contact for peer sharing
+    {
+        let mut s = state.lock().unwrap();
+        s.mesh_contact = Some(mesh_contact.clone());
+    }
 
     // Restore persisted peers
     {
@@ -300,10 +313,10 @@ pub async fn run_node(config: NodeConfig) -> anyhow::Result<String> {
     // ── Local discovery (LAN broadcast + mDNS) ──
     let discovery_state = state.clone();
     let discovery_node_id = node_id;
-    let discovery_mesh_address = mesh_address.clone();
+    let discovery_contact = mesh_contact.clone();
     let discovery_bind = bind_addr;
     tokio::spawn(async move {
-        run_local_discovery(discovery_state, discovery_node_id, &discovery_mesh_address, discovery_bind).await;
+        run_local_discovery(discovery_state, discovery_node_id, &discovery_contact, discovery_bind).await;
     });
 
     // ── Process bootstrap peers ──
@@ -345,6 +358,18 @@ pub async fn run_node(config: NodeConfig) -> anyhow::Result<String> {
                     tracing::warn!(%e, "failed to persist snapshot");
                 }
             }
+        }
+    });
+
+    // ── Mesh message listener ──
+    let mesh_state = state.clone();
+    let mesh_og = og_tx.clone();
+    let mesh_self_contact = mesh_contact.clone();
+    tokio::spawn(async move {
+        if let Err(e) = mesh_node.listen_messages_with_response(move |peer, msg| {
+            handle_mesh_message(&mesh_state, &mesh_og, &peer, &msg, &mesh_self_contact)
+        }).await {
+            tracing::error!(%e, "mesh listener crashed");
         }
     });
 
@@ -404,14 +429,9 @@ pub async fn run_node(config: NodeConfig) -> anyhow::Result<String> {
 async fn run_local_discovery(
     state: Arc<Mutex<ArteryState>>,
     node_id: [u8; 32],
-    mesh_address: &vess_mesh::MeshAddress,
-    bind_addr: std::net::SocketAddr,
+    our_contact: &vess_mesh::MeshCarrierContact,
+    _bind_addr: std::net::SocketAddr,
 ) {
-    // Build our own contact for announcements
-    let our_contact = vess_mesh::MeshCarrierContact::UdpSocket {
-        addr: bind_addr.to_string(),
-        mesh_address: mesh_address.clone(),
-    };
 
     // Initial discovery sweep
     let discovered = crate::local_discovery::discover_lan_peer_contacts(
@@ -487,6 +507,101 @@ async fn run_local_discovery(
                     }
                 }
             }
+        }
+    }
+}
+
+// ── Mesh message handler ────────────────────────────────────────────
+
+/// Process an incoming PulseMessage from the mesh. Returns an optional response.
+fn handle_mesh_message(
+    state: &Arc<Mutex<ArteryState>>,
+    _og_tx: &mpsc::UnboundedSender<Vess>,
+    _peer: &vess_mesh::MeshPeer,
+    msg: &vess_protocol::PulseMessage,
+    _self_contact: &vess_mesh::MeshCarrierContact,
+) -> Option<vess_protocol::PulseMessage> {
+    match msg {
+        // ── Onion routing: try to decrypt and forward/deliver ──
+        vess_protocol::PulseMessage::OnionRoute(route) => {
+            let relay_key = {
+                let s = state.lock().unwrap();
+                blake3::hash(&s.node_id).into()
+            };
+            match crate::onion::process_onion_route(route, &relay_key) {
+                crate::onion::OnionAction::Forward(_inner) => {
+                    // Forward to next hop — would need to look up next peer
+                    tracing::debug!("onion: forwarding to next hop");
+                    // In production: send inner to next peer via mesh
+                    None
+                }
+                crate::onion::OnionAction::Deliver { payment, shard_key: _ } => {
+                    // Deliver to limbo with the shard key
+                    let self_node_id = state.lock().unwrap().node_id;
+                    let mut s = state.lock().unwrap();
+                    s.limbo.hold(
+                        payment.stealth_id,
+                        payment.clone(),
+                        vec![payment.payment_id],
+                        crate::node_runner::now_secs(),
+                        self_node_id,
+                        payment.mailbox_key,
+                    );
+                    tracing::info!("onion: delivered payment to limbo");
+                    None
+                }
+                crate::onion::OnionAction::Drop => {
+                    // Not for us — gossip to other peers
+                    None
+                }
+            }
+        }
+
+        // ── Direct payment: deliver to limbo ──
+        vess_protocol::PulseMessage::Payment(payment) => {
+            let self_node_id = state.lock().unwrap().node_id;
+            let mut s = state.lock().unwrap();
+            s.limbo.hold(
+                payment.stealth_id,
+                payment.clone(),
+                vec![payment.payment_id],
+                crate::node_runner::now_secs(),
+                self_node_id,
+                payment.mailbox_key,
+            );
+            tracing::debug!("received direct payment, held in limbo");
+            None
+        }
+
+        // ── Mailbox sweep: return buffered payloads ──
+        vess_protocol::PulseMessage::MailboxSweep(sweep) => {
+            let s = state.lock().unwrap();
+            let key = sweep.mailbox_key.unwrap_or([0u8; 32]);
+            let payloads = s.limbo.sweep_by_mailbox_key(&key, 64);
+            Some(vess_protocol::PulseMessage::MailboxSweepResponse(
+                vess_protocol::MailboxSweepResponse {
+                    nonce: sweep.nonce,
+                    payloads,
+                },
+            ))
+        }
+
+        // ── Mailbox collect: generic limbo sweep ──
+        vess_protocol::PulseMessage::MailboxCollect(_) => {
+            let s = state.lock().unwrap();
+            let payloads = s.limbo.sweep_payloads(64);
+            Some(vess_protocol::PulseMessage::MailboxCollectResponse(
+                vess_protocol::MailboxCollectResponse {
+                    stealth_id: [0u8; 32],
+                    payloads,
+                },
+            ))
+        }
+
+        // ── Gossip / tag relay / DHT — stubbed for now ──
+        _ => {
+            tracing::trace!("unhandled mesh message: {:?}", std::mem::discriminant(msg));
+            None
         }
     }
 }

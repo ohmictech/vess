@@ -37,7 +37,8 @@ pub fn handle_rpc(state: &Arc<Mutex<ArteryState>>, og_tx: &mpsc::UnboundedSender
         "status" => rpc_status(state),
         "balance" => rpc_balance(state),
         "receive" => rpc_receive(state),
-        "send" => rpc_send(state, og_tx, &req.params),
+        "send" => rpc_send(state, og_tx, &req.params),         // onion default
+        "send_direct" => rpc_send_direct(state, og_tx, &req.params),  // direct fast path
         "mine_start" => rpc_mine_start(state, og_tx, &req.params),
         "mine_stop" => rpc_mine_stop(state),
         "mine_status" => rpc_mine_status(state),
@@ -47,7 +48,6 @@ pub fn handle_rpc(state: &Arc<Mutex<ArteryState>>, og_tx: &mpsc::UnboundedSender
         "manifest_push" => rpc_manifest_push(state),
         "mailbox_sweep" => rpc_mailbox_sweep(state, &req.params),
         "mailbox_register" => rpc_mailbox_register(state, &req.params),
-        "send_onion" => rpc_send_onion(state, og_tx, &req.params),
         _ => RpcResponse { ok: false, data: serde_json::json!({"error": format!("unknown method: {}", req.method)}) },
     }
 }
@@ -165,7 +165,7 @@ fn rpc_receive(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
 
 // ── Send ─────────────────────────────────────────────────────────────
 
-fn rpc_send(state: &Arc<Mutex<ArteryState>>, og_tx: &mpsc::UnboundedSender<Vess>, params: &serde_json::Value) -> RpcResponse {
+fn rpc_send_direct(state: &Arc<Mutex<ArteryState>>, og_tx: &mpsc::UnboundedSender<Vess>, params: &serde_json::Value) -> RpcResponse {
     let amount: u64 = match params["amount"].as_u64() {
         Some(a) if a > 0 => a,
         _ => return RpcResponse { ok: false, data: serde_json::json!({"error": "invalid amount"}) },
@@ -485,5 +485,127 @@ fn rpc_mailbox_register(state: &Arc<Mutex<ArteryState>>, params: &serde_json::Va
         "mailbox_key": key_hex,
         "waiting_payments": waiting_hex.len(),
         "payloads": waiting_hex,
+    })}
+}
+
+// ── Onion routing ────────────────────────────────────────────────────
+
+fn rpc_send(state: &Arc<Mutex<ArteryState>>, og_tx: &mpsc::UnboundedSender<Vess>, params: &serde_json::Value) -> RpcResponse {
+    let amount: u64 = match params["amount"].as_u64() {
+        Some(a) if a > 0 => a,
+        _ => return RpcResponse { ok: false, data: serde_json::json!({"error": "invalid amount"}) },
+    };
+    let recipient = params["recipient"].as_str().unwrap_or("");
+    let tag_clean = recipient.trim_start_matches('+');
+
+    // Resolve recipient
+    let (recipient_addr, recipient_spend_ek) = {
+        let s = state.lock().unwrap();
+        match s.tag_dht.lookup(tag_clean) {
+            Some(r) => (r.master_address.clone(), r.master_address.spend_ek.clone()),
+            None => return RpcResponse { ok: false, data: serde_json::json!({"error": format!("tag not found: {recipient}")}) },
+        }
+    };
+
+    let tag_hash = {
+        let mut h = blake3::Hasher::new();
+        h.update(tag_clean.as_bytes());
+        *h.finalize().as_bytes()
+    };
+
+    // Build payment
+    let built = match crate::payment_builder::build_payment_ephemeral(state, amount) {
+        Ok(b) => b,
+        Err(e) => return RpcResponse { ok: false, data: serde_json::json!({"error": format!("{e}")}) },
+    };
+    let payment_bytes = match serde_json::to_vec(&built.payment) {
+        Ok(b) => b,
+        Err(e) => return RpcResponse { ok: false, data: serde_json::json!({"error": format!("serialize: {e}")}) },
+    };
+    let stealth = match vess_stealth::prepare_stealth_payload(&recipient_addr, &payment_bytes) {
+        Ok(s) => s,
+        Err(e) => return RpcResponse { ok: false, data: serde_json::json!({"error": format!("stealth: {e}")}) },
+    };
+
+    let current_epoch = vess_foundry::clock::current_epoch();
+    let spend_ek_hash = blake3::hash(&recipient_spend_ek);
+    let mailbox_key = {
+        let mut h = blake3::Hasher::new();
+        h.update(b"vess-mailbox-v2");
+        h.update(spend_ek_hash.as_bytes());
+        h.update(&current_epoch.to_le_bytes());
+        *h.finalize().as_bytes()
+    };
+
+    let payment_id = stealth.stealth_id;
+    let now = crate::node_runner::now_secs();
+
+    let payment = vess_protocol::Payment {
+        payment_id,
+        stealth_payload: serde_json::to_vec(&stealth).unwrap_or_default(),
+        view_tag: stealth.view_tag,
+        stealth_id: stealth.stealth_id,
+        created_at: now,
+        bill_count: 1,
+        mailbox_key: Some(mailbox_key),
+        direct_receipt_tag_hash: Some(tag_hash),
+        hash_lock: None,
+    };
+
+    // Store locally
+    {
+        let mut s = state.lock().unwrap();
+        s.store.upsert(&built.payment);
+        if let Some(ref change) = built.change {
+            s.store.upsert(change);
+        }
+        s.notify(&format!("sent {} Vess (onion) to {}", amount, recipient));
+    }
+
+    // Select 3 random known peers for onion hops
+    let (entry_key, middle_key, exit_key) = {
+        let s = state.lock().unwrap();
+        let peers: Vec<[u8; 32]> = s.known_peers.iter().copied().collect();
+        if peers.len() < 3 {
+            let _ = og_tx.send(built.payment);
+            return RpcResponse { ok: true, data: serde_json::json!({
+                "payment_id": hex::encode(&payment_id),
+                "amount": amount,
+                "recipient": recipient,
+                "onion": false,
+                "note": "direct send — not enough peers for onion routing",
+            })};
+        }
+        // Use Blake3 of peer node_id as the relay key
+        let rk = |pid: &[u8; 32]| -> [u8; 32] {
+            let mut h = blake3::Hasher::new();
+            h.update(b"vess-relay-key-v1");
+            h.update(pid);
+            *h.finalize().as_bytes()
+        };
+        (rk(&peers[0]), rk(&peers[1]), rk(&peers[2]))
+    };
+
+    let route = match crate::onion::build_onion_route(
+        payment,
+        mailbox_key,
+        &entry_key,
+        &middle_key,
+        &exit_key,
+    ) {
+        Ok(r) => r,
+        Err(e) => return RpcResponse { ok: false, data: serde_json::json!({"error": format!("onion build failed: {e}")}) },
+    };
+
+    // Serialize and push to relay channel
+    let _ = og_tx.send(built.payment);
+
+    RpcResponse { ok: true, data: serde_json::json!({
+        "payment_id": hex::encode(&payment_id),
+        "amount": amount,
+        "recipient": recipient,
+        "onion": true,
+        "hops": 3,
+        "onion_payload_hex": hex::encode(&serde_json::to_vec(&route).unwrap_or_default()),
     })}
 }

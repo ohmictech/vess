@@ -1,6 +1,6 @@
 # VESS #
 
-Stateless, stealth energy-value protocol. Vess flows around the most resilient, decentralized crypto mesh network ever conceived. Zero fees. Unlimited network throughput. Rapid settlement. Highly trustless.
+Stateless, stealth energy-value protocol. Vess flows around the most resilient, decentralized crypto mesh network ever conceived. Zero fees. Unlimited network throughput. Rapid settlement. Highly trustless. 100% post-quantum cryptography.
 
 NOT a speculative investment. NOT premined.
 
@@ -20,12 +20,16 @@ All data except the global epoch clock is distributed, rather than universally a
 
 ### PAYMENTS ###
 
-Payments are made to human readable *+VESSTAGS* rather than crypto addresses. The hash of these tags are mapped out to public stealth addresses, stored on the hash table. Tag queries are weighted by Vess ownership, which makes spoofing economically unviable.
+Payments are made to human readable *+VESSTAGS* rather than crypto addresses. The hashes of these tags are mapped out to public stealth addresses, stored on the hash table. Tag queries are weighted by Vess ownership, which makes spoofing economically unviable.
 
 Tags are alphanumeric, case insensitive strings claimed during wallet creation and reserved for 30 days to give users time to harden them by receiving or minting Vess.
 
 A payment in this network is not a public broadcast of state change. To send Vess to someone, you choose the Vess you'd like to change ownership of privately, sign the hand-off and change locally, and send the data encapsulated to the receiver's stealth address through the DHT. The receiver then has enough data to update the Vess states on the network, claiming the new Vess for themselves and consuming the old.
 
 If it is never claimed, it never changes ownership.
+
+### NETWORKING ###
+
+Custom PQ onion-routed UDP mesh layer. Highly surveillence resistant.
 
 

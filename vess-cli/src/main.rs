@@ -62,12 +62,15 @@ enum Command {
     #[command(alias = "recv")]
     Receive,
 
-    /// Send Vess to a tag.
+    /// Send Vess to a tag (onion-routed by default for privacy).
     Send {
         /// Amount in Vess.
         amount: u64,
         /// Recipient tag (e.g. +alice).
         recipient: String,
+        /// Skip onion routing, deliver directly (faster, less private).
+        #[arg(long)]
+        direct: bool,
     },
 
     /// Register or look up a VessTag.
@@ -145,10 +148,15 @@ async fn main() -> Result<()> {
                 .map(|r| println!("{} Vess", r["total"].as_u64().unwrap_or(0)))
         }
         Command::Receive => cmd_receive(port).await,
-        Command::Send { amount, recipient } => {
-            rpc(port, "send", json!({"amount": amount, "recipient": recipient}))
+        Command::Send { amount, recipient, direct } => {
+            let method = if *direct { "send_direct" } else { "send" };
+            rpc(port, method, json!({"amount": amount, "recipient": recipient}))
                 .await
-                .map(|r| println!("sent: {}", r["payment_id"].as_str().unwrap_or("?")))
+                .map(|r| {
+                    let onion = r["onion"].as_bool().unwrap_or(true);
+                    let label = if onion { "sent (onion)" } else { "sent (direct)" };
+                    println!("{}: {}", label, r["payment_id"].as_str().unwrap_or("?"));
+                })
         }
         Command::Tag(tag) => match tag {
             TagCmd::Register { tag } => {
