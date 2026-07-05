@@ -10,7 +10,7 @@ Actual thermodynamic money.
 
 Every Vess is born in a memory-hard Argon2d 1GB hashing session. Hit enough leading 0 bits derived from your *nonce | stealth address | epoch | amount* and you've successfully created new value, backed completely by energy and hardware. Unlike traditional PoW, the purpose of minting in this protocol is not to secure the network directly. There are no blocks nor block times, no global ledger agreement. Each individual Vess mined acts like its own UTXO whose ID is a hash of the very lottery preimage that created it, essentially baking in its energy proof as the root of the ownership chain that it contains.
 
-Argon2d was selected to level the playing field. All that matters in terms of minting power is effectively your core count and memory bandwith, which are much harder to scale industrially than pure hashing silicon. Consumer hardware is sufficient to be worth minting.
+Argon2d was selected to level the playing field. All that matters in terms of minting power is effectively your core count and memory bandwidth, which are much harder to scale industrially than pure hashing silicon. Consumer hardware is sufficient to be worth minting.
 
 ### HASH TABLE ###
 
@@ -28,8 +28,17 @@ A payment in this network is not a public broadcast of state change. To send Ves
 
 If it is never claimed, it never changes ownership.
 
-### NETWORKING ###
+### SOVEREIGNTY ###
 
-Custom PQ onion-routed UDP mesh layer. Highly surveillence resistant.
+Every payment is wrapped in four unlinkable cryptographic layers:
 
+0. Onion routing — 3-hop relay, no single node knows sender + recipient
+1. ML-KEM-768 mesh — ephemeral session keys per connection
+2. ML-KEM-768 stealth — unique stealth_id per payment, 48 KiB padded payloads
+3. ML-DSA-65 ephemeral — fresh owner key per bill, no address reuse
 
+No observer at any layer can correlate sender, amount, or recipient.
+
+## LICENSE ## 
+
+Apache 2.0 license
