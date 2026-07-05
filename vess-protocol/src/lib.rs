@@ -846,6 +846,9 @@ pub struct DhtQueryResponse {
     /// Found manifest blobs (for ManifestLookup).
     #[serde(default)]
     pub manifests: Vec<Vec<u8>>,
+    /// Proof of Vess ownership from the responder (for trust weighting).
+    #[serde(default)]
+    pub proof: Option<SignedDhtResponse>,
 }
 
 // ── Handshake ────────────────────────────────────────────────────────

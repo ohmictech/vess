@@ -2,8 +2,6 @@
 
 Stateless, stealth energy-value protocol. Vess flows around the most resilient, decentralized crypto mesh network ever conceived. Zero fees. Unlimited network throughput. Rapid settlement. Highly trustless. 100% post-quantum cryptography.
 
-NOT a speculative investment. NOT premined.
-
 Actual thermodynamic money.
 
 ### MINTING ###
@@ -12,7 +10,11 @@ Every Vess is born in a memory-hard Argon2d 1GB hashing session. Hit enough lead
 
 Argon2d was selected to level the playing field. All that matters in terms of minting power is effectively your core count and memory bandwidth, which are much harder to scale industrially than pure hashing silicon. Consumer hardware is sufficient to be worth minting.
 
-There is no supply limit or difficulty adjustment, because Vess was not created to be a speculative asset, it was created to represent tokenized energy. This is not problematic because unlike fiat currency, which is birthed into existence arbitrarily, every single Vess requires energy expenditure. Devaluation is not the result of a growing supply of Vess, because each unit has a baseline cost of production. The supply simply expands to match the electricity injected.
+### ECONOMICS ###
+
+There is no supply limit or difficulty adjustment, because Vess was not created to be a speculative asset, it was created to represent tokenized energy. This is not problematic because unlike fiat currency, which is birthed into existence arbitrarily, every single Vess requires energy expenditure. Devaluation is not the result of a growing supply of Vess, because each unit has a baseline cost of production. The supply simply expands to match the electricity injected rather than dilution.
+
+As there is no initial coin supply, tokenomics, fees, or allocations, development is funded by a hardcoded dev faucet subsidy. Limited to once per 24 hour epoch, a single payout of 30,000 vess is elligible to be claimed by the protocol. Other than this very modest emission, all Vess is created by equal effort.
 
 ### HASH TABLE ###
 

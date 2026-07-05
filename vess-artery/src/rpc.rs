@@ -20,14 +20,6 @@ pub struct QueueSenders {
     pub og_tx: mpsc::UnboundedSender<Vess>,
 }
 
-pub fn run_rpc_server(_state: Arc<Mutex<ArteryState>>, _senders: QueueSenders) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async { /* legacy stub */ })
-}
-
-pub fn wallet_tag_store(_state: &Arc<Mutex<ArteryState>>) {}
-
-pub fn fire_opportunistic_consolidations(_state: &Arc<Mutex<ArteryState>>) {}
-
 pub fn handle_rpc(state: &Arc<Mutex<ArteryState>>, og_tx: &mpsc::UnboundedSender<Vess>, req: RpcRequest) -> RpcResponse {
     match req.method.as_str() {
         "add_peer" => rpc_add_peer(state, &req.params),
@@ -423,18 +415,29 @@ fn rpc_tag_lookup(state: &Arc<Mutex<ArteryState>>, params: &serde_json::Value) -
         return RpcResponse { ok: false, data: serde_json::json!({"error": "missing tag"}) };
     }
     let tag_clean = tag_str.trim_start_matches('+');
+    let tag_hash = {
+        let mut h = blake3::Hasher::new();
+        h.update(tag_clean.as_bytes());
+        *h.finalize().as_bytes()
+    };
 
-    let s = state.lock().unwrap();
-    match s.tag_dht.lookup(tag_clean) {
-        Some(record) => RpcResponse { ok: true, data: serde_json::json!({
-            "tag": format!("+{}", tag_clean),
-            "tag_hash": hex::encode(&record.tag_hash[..8]),
-            "stealth_id": hex::encode(&record.master_address.spend_ek[..16]),
-            "hardened": record.is_hardened(),
-            "registered_at": record.registered_at,
-        })},
-        None => RpcResponse { ok: false, data: serde_json::json!({"error": "tag not found"}) },
+    // Query local + K nearest DHT peers
+    let responses = crate::dht_query::query_dht_peers(state, &tag_hash, vess_protocol::DhtQueryKind::TagLookup);
+
+    for resp in &responses {
+        for tag_bytes in &resp.tags {
+            if let Ok(record) = serde_json::from_slice::<vess_tag::TagRecord>(tag_bytes) {
+                return RpcResponse { ok: true, data: serde_json::json!({
+                    "tag": format!("+{}", tag_clean),
+                    "tag_hash": hex::encode(&record.tag_hash[..8]),
+                    "stealth_id": hex::encode(&record.master_address.spend_ek[..16]),
+                    "hardened": record.is_hardened(),
+                    "registered_at": record.registered_at,
+                })};
+            }
+        }
     }
+    RpcResponse { ok: false, data: serde_json::json!({"error": "tag not found"}) }
 }
 
 // ── Faucet ───────────────────────────────────────────────────────────

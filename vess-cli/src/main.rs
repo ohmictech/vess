@@ -97,6 +97,14 @@ enum Command {
         #[arg(long, value_delimiter = ',')]
         bootstrap: Vec<String>,
 
+        /// Rendezvous server for NAT hole punching (e.g. 1.2.3.4:9445).
+        #[arg(long)]
+        rendezvous: Option<String>,
+
+        /// Relay server for NAT fallback forwarding (e.g. 1.2.3.4:9446).
+        #[arg(long)]
+        relay: Option<String>,
+
         /// State directory.
         #[arg(long)]
         state_dir: Option<PathBuf>,
@@ -226,9 +234,11 @@ async fn main() -> Result<()> {
         Command::Node {
             bind,
             bootstrap,
+            rendezvous,
+            relay,
             state_dir,
             wallet,
-        } => cmd_node(port, bind, bootstrap, state_dir, wallet).await,
+        } => cmd_node(port, bind, bootstrap, rendezvous, relay, state_dir, wallet).await,
         Command::Claim => {
             rpc(port, "auto_claim", json!({}))
                 .await

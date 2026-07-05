@@ -76,8 +76,8 @@ impl VessStore {
             }
             // Regular mined Vess: Argon2d verification
             for v in outputs {
-                if v.is_mined() {
-                    vess_foundry::mine::verify_minted_vess(v, clock::current_epoch())?;
+                if v.is_minted() {
+                    vess_foundry::mint::verify_minted_vess(v, clock::current_epoch())?;
                 }
                 self.upsert_one(v);
             }
@@ -216,7 +216,7 @@ impl VessStore {
                             .max()
                             .unwrap_or(0);
                         let gap = max_successor_depth.saturating_sub(v.chain_depth);
-                        let epoch_old_enough = if v.is_mined() {
+                        let epoch_old_enough = if v.is_minted() {
                             current_epoch.saturating_sub(v.epoch) > 3
                         } else {
                             true

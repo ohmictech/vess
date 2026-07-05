@@ -40,6 +40,9 @@ pub mod tag_dht;
 pub mod vess_store;
 pub mod tag_resolver;
 
+/// Default number of peers to fan-out to for DHT push/query operations.
+pub const DHT_FANOUT: usize = 5;
+
 pub use banishment::BanishmentManager;
 pub use gossip::GossipConfig;
 pub use handshake::{compute_handshake_pow, verify_handshake_pow};

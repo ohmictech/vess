@@ -44,6 +44,20 @@ pub struct ArteryState {
     pub routing_table: crate::kademlia::RoutingTable,
     /// Last epoch the wallet swept its mailbox (for catch-up after offline).
     pub last_sweep_epoch: Option<u64>,
+    /// Pending DHT queries awaiting responses (query_id → response sender).
+    pub pending_queries: HashMap<[u8; 16], tokio::sync::mpsc::UnboundedSender<vess_protocol::DhtQueryResponse>>,
+    /// Encrypted wallet manifests cached from DHT replication (dht_key → manifest).
+    pub manifest_cache: HashMap<[u8; 32], vess_protocol::ManifestStore>,
+    /// Track which peers sent us which DHT stores to avoid echo loops.
+    pub dht_store_seen: HashSet<[u8; 32]>,
+    /// Per-peer NAT traversal hints (node_id → observed_addr etc.).
+    pub peer_hints: HashMap<[u8; 32], PeerHints>,
+    /// Mesh node handle for dial cascade (relay/rendezvous).
+    pub mesh_node: Option<Arc<vess_mesh::MeshPulseNode>>,
+    /// Configured relay server address for NAT fallback.
+    pub relay_addr: Option<std::net::SocketAddr>,
+    /// Configured rendezvous server address for hole punching.
+    pub rendezvous_addr: Option<std::net::SocketAddr>,
 }
 
 pub struct MintingState {
@@ -91,6 +105,13 @@ impl ArteryState {
             mesh_outbox: None,
             routing_table: crate::kademlia::RoutingTable::new(node_id),
             last_sweep_epoch: None,
+            pending_queries: HashMap::new(),
+            manifest_cache: HashMap::new(),
+            dht_store_seen: HashSet::new(),
+            peer_hints: HashMap::new(),
+            mesh_node: None,
+            relay_addr: None,
+            rendezvous_addr: None,
         }
     }
     pub fn notify(&mut self, msg: &str) {
@@ -139,11 +160,21 @@ pub fn now_secs() -> u64 { std::time::SystemTime::now().duration_since(std::time
 
 // ── Validation ──
 
-pub fn validate_vess(v: &Vess, store: &VessStore, _current_epoch: u64) -> Result<(), String> {
+pub fn validate_vess(v: &Vess, store: &VessStore, current_epoch: u64) -> Result<(), String> {
     let id = v.compute_vess_id();
     if store.is_consumed(&id) { return Err("already consumed".into()); }
     if let Some(ex) = store.get(&id) { if v.chain_depth <= ex.chain_depth { return Err("stale".into()); } }
-    if v.is_minted() { return Err("mining validation not yet wired for MintProof model".into()); }
+
+    // Validate minted Vess (Argon2d proof-of-work)
+    if v.is_minted() {
+        return vess_foundry::mint::verify_minted_vess(v, current_epoch);
+    }
+
+    // Validate faucet Vess (dev signature)
+    if v.is_faucet() {
+        return vess_foundry::mint::verify_faucet_vess(v, current_epoch, &vess_protocol::DEV_VK);
+    }
+
     if v.is_changed() { return validate_changed(v, store); }
     Err("invalid".into())
 }
@@ -247,6 +278,21 @@ pub struct NodeConfig {
     pub bootstrap: Vec<String>,
     pub enable_local_discovery: bool,
     pub test: bool,
+    /// Rendezvous server address for NAT hole punching (e.g. "1.2.3.4:9445").
+    pub rendezvous_addr: Option<std::net::SocketAddr>,
+    /// Relay server address for NAT fallback forwarding (e.g. "1.2.3.4:9446").
+    pub relay_addr: Option<std::net::SocketAddr>,
+}
+
+/// Per-peer hints for how to reach a node behind NAT.
+#[derive(Debug, Clone, Default)]
+pub struct PeerHints {
+    /// The peer's observed external address (from rendezvous/relay).
+    pub observed_addr: Option<std::net::SocketAddr>,
+    /// Whether this peer is registered with our rendezvous server.
+    pub rendezvous_registered: bool,
+    /// Whether this peer is registered with our relay server.
+    pub relay_registered: bool,
 }
 
 pub async fn run_node(config: NodeConfig) -> anyhow::Result<String> {
@@ -274,6 +320,36 @@ pub async fn run_node(config: NodeConfig) -> anyhow::Result<String> {
     let node_id = *mesh_node.id().as_bytes();
     tracing::info!(%bind_addr, node_id=%hex::encode(&node_id[..8]), "mesh bound");
 
+    // Wrap in Arc for shared access
+    let mesh_node = Arc::new(mesh_node);
+
+    // ── Auto-register with relay / rendezvous servers ──
+    let observed_relay = if let Some(relay_addr) = config.relay_addr {
+        match mesh_node.register_with_relay(relay_addr).await {
+            Ok(observed) => {
+                tracing::info!(%observed, %relay_addr, "registered with relay server, observed address");
+                Some(observed)
+            }
+            Err(e) => {
+                tracing::warn!(%e, %relay_addr, "failed to register with relay server");
+                None
+            }
+        }
+    } else { None };
+
+    let observed_rendezvous = if let Some(rendezvous_addr) = config.rendezvous_addr {
+        match mesh_node.register_with_rendezvous(rendezvous_addr).await {
+            Ok(observed) => {
+                tracing::info!(%observed, %rendezvous_addr, "registered with rendezvous server, observed address");
+                Some(observed)
+            }
+            Err(e) => {
+                tracing::warn!(%e, %rendezvous_addr, "failed to register with rendezvous server");
+                None
+            }
+        }
+    } else { None };
+
     // ── Mesh outbox: channel for forwarding onion hops and outgoing messages ──
     let (mesh_tx, mut mesh_rx) = mpsc::unbounded_channel::<(vess_mesh::MeshCarrierContact, vess_protocol::PulseMessage)>();
 
@@ -290,6 +366,9 @@ pub async fn run_node(config: NodeConfig) -> anyhow::Result<String> {
         let mut s = state.lock().unwrap();
         s.mesh_contact = Some(mesh_contact.clone());
         s.mesh_outbox = Some(mesh_tx.clone());
+        s.mesh_node = Some(mesh_node.clone());
+        s.relay_addr = config.relay_addr;
+        s.rendezvous_addr = config.rendezvous_addr;
     }
 
     // Restore persisted peers
@@ -420,8 +499,7 @@ pub async fn run_node(config: NodeConfig) -> anyhow::Result<String> {
     let mesh_state = state.clone();
     let mesh_og = og_tx.clone();
     let mesh_self_contact = mesh_contact.clone();
-    let mesh_node_arc = std::sync::Arc::new(mesh_node);
-    let mesh_node_for_listener = mesh_node_arc.clone();
+    let mesh_node_for_listener = mesh_node.clone();
     tokio::spawn(async move {
         if let Err(e) = mesh_node_for_listener.listen_messages_with_response(move |peer, msg| {
             handle_mesh_message(&mesh_state, &mesh_og, &peer, &msg, &mesh_self_contact)
@@ -430,11 +508,12 @@ pub async fn run_node(config: NodeConfig) -> anyhow::Result<String> {
         }
     });
 
-    // ── Mesh forwarder: reads from outbox, sends via mesh ──
-    let mesh_node_for_forward = mesh_node_arc.clone();
+    // ── Mesh forwarder: reads from outbox, sends via mesh with NAT cascade ──
+    let mesh_node_for_forward = mesh_node.clone();
+    let fwd_state = state.clone();
     tokio::spawn(async move {
         while let Some((contact, msg)) = mesh_rx.recv().await {
-            if let Err(e) = mesh_node_for_forward.send_message(&contact, &msg).await {
+            if let Err(e) = dial_and_send(&fwd_state, &mesh_node_for_forward, &contact, &msg).await {
                 tracing::warn!(%e, "mesh forward failed");
             }
         }
@@ -607,7 +686,7 @@ async fn run_local_discovery(
 fn handle_mesh_message(
     state: &Arc<Mutex<ArteryState>>,
     _og_tx: &mpsc::UnboundedSender<Vess>,
-    _peer: &vess_mesh::MeshPeer,
+    peer: &vess_mesh::MeshPeer,
     msg: &vess_protocol::PulseMessage,
     _self_contact: &vess_mesh::MeshCarrierContact,
 ) -> Option<vess_protocol::PulseMessage> {
@@ -733,16 +812,19 @@ fn handle_mesh_message(
         // ── Manifest store: receive and cache wallet manifests ──
         vess_protocol::PulseMessage::DhtStoreManifest(manifest) => {
             tracing::debug!(dht_key=%hex::encode(&manifest.dht_key[..8]), "received wallet manifest from DHT shard");
-            // Store for recovery — in production this would write to a manifest cache
+            let mut s = state.lock().unwrap();
+            s.manifest_cache.insert(manifest.dht_key, (*manifest).clone());
             None
         }
 
-        // ── DHT Query: respond with local data ──
+        // ── DHT Query: respond with local data + Vess ownership proof ──
         vess_protocol::PulseMessage::DhtQuery(query) => {
-            let mut s = state.lock().unwrap();
+            let s = state.lock().unwrap();
             let mut tags = vec![];
             let mut payloads = vec![];
-            match query.query_kind {
+            let mut vess = vec![];
+            let mut manifests = vec![];
+            match &query.query_kind {
                 vess_protocol::DhtQueryKind::TagLookup => {
                     if let Some(record) = s.tag_dht.lookup_by_hash(&query.dht_key) {
                         tags.push(serde_json::to_vec(record).unwrap_or_default());
@@ -753,20 +835,205 @@ fn handle_mesh_message(
                 }
                 vess_protocol::DhtQueryKind::VessLookup => {
                     if let Some(v) = s.store.get(&query.dht_key) {
-                        tags.push(serde_json::to_vec(v).unwrap_or_default());
+                        vess.push(serde_json::to_vec(v).unwrap_or_default());
                     }
                 }
-                _ => {}
+                vess_protocol::DhtQueryKind::ManifestLookup => {
+                    if let Some(manifest) = s.manifest_cache.get(&query.dht_key) {
+                        manifests.push(serde_json::to_vec(manifest).unwrap_or_default());
+                    }
+                }
             }
+
+            // Sign with Vess ownership proof
+            let proof = build_dht_proof(&s, &tags, &payloads, &vess, &manifests);
+
             Some(vess_protocol::PulseMessage::DhtQueryResponse(
                 vess_protocol::DhtQueryResponse {
                     nonce: query.nonce,
                     query_kind: query.query_kind.clone(),
-                    tags,
-                    payloads,
-                    vess: vec![],
-                    manifests: vec![],
+                    tags, payloads, vess, manifests,
+                    proof,
                 },
+            ))
+        }
+
+        // ── DHT Query Response: route back to waiting query ──
+        vess_protocol::PulseMessage::DhtQueryResponse(resp) => {
+            let s = state.lock().unwrap();
+            if let Some(tx) = s.pending_queries.get(&resp.nonce) {
+                let _ = tx.send(resp.clone());
+            }
+            None
+        }
+
+        // ── Peer Exchange: add discovered peers to routing table ──
+        vess_protocol::PulseMessage::PeerExchange(_ex) => {
+            let mut s = state.lock().unwrap();
+            // Add the sender to our routing table
+            if let Some(id) = peer.node_id().map(|n| *n.as_bytes()) {
+                if id != s.node_id && !s.banned_peers.contains(&id) {
+                    s.known_peers.insert(id);
+                    let contact_str = vess_mesh::encode_mesh_contact_string(&peer.contact).unwrap_or_default();
+                    s.peer_endpoints.insert(id, contact_str);
+                    let rp = crate::kademlia::RoutingPeer {
+                        id_hash: id, id_bytes: id.to_vec(),
+                        last_seen: now_secs(), first_seen: now_secs(),
+                    };
+                    s.routing_table.insert(rp);
+                }
+            }
+            None
+        }
+
+        // ── FindNode: respond with K closest peers to target ──
+        vess_protocol::PulseMessage::FindNode(fn_req) => {
+            let s = state.lock().unwrap();
+            let k = s.dht_replication();
+            let mut peers: Vec<([u8; 32], &String)> = s.peer_endpoints.iter()
+                .map(|(id, ep)| (*id, ep)).collect();
+            peers.sort_by_key(|(id, _)| crate::gossip::xor_distance(id, &fn_req.target));
+            let closest: Vec<Vec<u8>> = peers.iter().take(k)
+                .map(|(_, ep)| ep.as_bytes().to_vec()).collect();
+            Some(vess_protocol::PulseMessage::FindNodeResponse(
+                vess_protocol::FindNodeResponse { peers: closest }
+            ))
+        }
+
+        // ── FindNodeResponse: insert peers into routing table ──
+        vess_protocol::PulseMessage::FindNodeResponse(fnr) => {
+            let mut s = state.lock().unwrap();
+            for contact_bytes in &fnr.peers {
+                if let Ok(contact) = vess_mesh::decode_mesh_contact_string(
+                    &String::from_utf8_lossy(contact_bytes)
+                ) {
+                    if let Some(id) = contact.node_id().map(|n| *n.as_bytes()) {
+                        if id != s.node_id && !s.banned_peers.contains(&id) {
+                            let rp = crate::kademlia::RoutingPeer {
+                                id_hash: id, id_bytes: id.to_vec(),
+                                last_seen: now_secs(), first_seen: now_secs(),
+                            };
+                            s.routing_table.insert(rp);
+                        }
+                    }
+                }
+            }
+            None
+        }
+
+        // ── BanishmentProof: verify and banish ──
+        vess_protocol::PulseMessage::BanishmentProof(proof) => {
+            let mut s = state.lock().unwrap();
+            // TODO: full reporter signature verification
+            s.banned_peers.insert(proof.peer_id);
+            s.peer_endpoints.remove(&proof.peer_id);
+            s.known_peers.remove(&proof.peer_id);
+            s.routing_table.remove(&proof.peer_id);
+            tracing::warn!(peer=%hex::encode(&proof.peer_id[..8]), "peer banished via network proof");
+            None
+        }
+
+        // ── LimboHold: store payment in limbo for offline recipient ──
+        vess_protocol::PulseMessage::LimboHold(hold) => {
+            let mut s = state.lock().unwrap();
+            let peer_id_bytes = peer.node_id().map(|n| *n.as_bytes()).unwrap_or([0u8; 32]);
+            // Create a minimal Payment from the hold data for limbo storage
+            let payment = vess_protocol::Payment {
+                payment_id: [0u8; 32],
+                stealth_payload: vec![],
+                view_tag: 0,
+                stealth_id: hold.stealth_id,
+                created_at: hold.entered_at,
+                bill_count: hold.bill_ids.len() as u8,
+                mailbox_key: None,
+                direct_receipt_tag_hash: None,
+                hash_lock: None,
+            };
+            s.limbo.hold(hold.stealth_id, payment, hold.bill_ids.clone(), hold.entered_at, peer_id_bytes, None);
+            tracing::debug!(stealth=%hex::encode(&hold.stealth_id[..8]), "limbo hold stored");
+            None
+        }
+
+        // ── LimboNotify: peer announces limbo payments for a stealth_id ──
+        vess_protocol::PulseMessage::LimboNotify(notify) => {
+            let s = state.lock().unwrap();
+            let pending = !s.limbo.peek(&notify.stealth_id).is_empty();
+            drop(s);
+            if pending {
+                if let Some(ref tx) = state.lock().unwrap().mesh_outbox {
+                    let _ = tx.send((peer.contact.clone(), vess_protocol::PulseMessage::LimboNotify(notify.clone())));
+                }
+            }
+            None
+        }
+
+        // ── LimboDeliver: deliver buffered payment to recipient ──
+        vess_protocol::PulseMessage::LimboDeliver(deliver) => {
+            let s = state.lock().unwrap();
+            let payment = deliver.payment.clone();
+            // Store the delivered payment and notify via mailbox sweep response
+            if let Some(ref tx) = s.mesh_outbox {
+                let serialized = serde_json::to_vec(&payment).unwrap_or_default();
+                let resp = vess_protocol::PulseMessage::MailboxSweepResponse(
+                    vess_protocol::MailboxSweepResponse {
+                        nonce: [0u8; 16],
+                        payloads: vec![serialized],
+                    }
+                );
+                let _ = tx.send((peer.contact.clone(), resp));
+            }
+            None
+        }
+
+        // ── MailboxSweep: sweep limbo for recipient (duplicate handled above) ──
+
+        // ── ManifestRecover: return cached manifest if we have it ──
+        vess_protocol::PulseMessage::ManifestRecover(req) => {
+            let s = state.lock().unwrap();
+            if let Some(m) = s.manifest_cache.get(&req.dht_key) {
+                Some(vess_protocol::PulseMessage::ManifestRecoverResponse(
+                    vess_protocol::ManifestRecoverResponse {
+                        dht_key: req.dht_key,
+                        encrypted_manifest: m.encrypted_manifest.clone(),
+                        found: true,
+                    }
+                ))
+            } else {
+                Some(vess_protocol::PulseMessage::ManifestRecoverResponse(
+                    vess_protocol::ManifestRecoverResponse {
+                        dht_key: req.dht_key,
+                        encrypted_manifest: vec![],
+                        found: false,
+                    }
+                ))
+            }
+        }
+
+        // ── NetworkStats: respond with peer count and uptime ──
+        vess_protocol::PulseMessage::NetworkStats(req) => {
+            let s = state.lock().unwrap();
+            Some(vess_protocol::PulseMessage::NetworkStatsResponse(
+                vess_protocol::NetworkStatsResponse {
+                    nonce: req.nonce,
+                    peer_count: s.known_peers.len() as u64,
+                    verified_peer_count: s.peer_registry.count_in_state(crate::handshake::PeerState::Verified) as u64,
+                    estimated_network_size: s.routing_table.estimated_network_size() as u64,
+                    limbo_count: s.limbo.total_entries() as u64,
+                    median_payment_latency_ms: 0,
+                    p95_payment_latency_ms: 0,
+                    latency_sample_count: 0,
+                }
+            ))
+        }
+
+        // ── RegistryQuery: check if we have a Vess by mint_id ──
+        vess_protocol::PulseMessage::RegistryQuery(rq) => {
+            let s = state.lock().unwrap();
+            let active: Vec<bool> = rq.mint_ids.iter()
+                .map(|id| s.store.get(id).is_some())
+                .collect();
+            Some(vess_protocol::PulseMessage::RegistryQueryResponse(
+                vess_protocol::RegistryQueryResponse { active }
             ))
         }
 
@@ -776,6 +1043,102 @@ fn handle_mesh_message(
             None
         }
     }
+}
+
+/// Build a SignedDhtResponse proving Vess ownership for DHT response trust weighting.
+fn build_dht_proof(
+    s: &ArteryState,
+    tags: &[Vec<u8>],
+    payloads: &[Vec<u8>],
+    vess: &[Vec<u8>],
+    _manifests: &[Vec<u8>],
+) -> Option<vess_protocol::SignedDhtResponse> {
+    // Pick any Vess we have spend credentials for as proof of ownership
+    let (proof_vess_id, owner_sk) = s.spend_credentials.iter().next()
+        .map(|(id, (_, sk))| (*id, sk.clone()))?;
+
+    // Serialize results for signing
+    let results = serde_json::json!({
+        "tags": tags.iter().map(|t| hex::encode(t)).collect::<Vec<_>>(),
+        "payloads": payloads.len(),
+        "vess": vess.len(),
+    });
+    let results_bytes = serde_json::to_vec(&results).unwrap_or_default();
+
+    // Sign: Blake3("vess-dht-v1" || results || proof_vess_id)
+    let sig_msg = {
+        let mut h = blake3::Hasher::new();
+        h.update(b"vess-dht-v1");
+        h.update(&results_bytes);
+        h.update(&proof_vess_id);
+        *h.finalize().as_bytes()
+    };
+
+    let responder_sig = vess_foundry::spend_auth::sign_spend(&owner_sk, &sig_msg).ok()?;
+
+    Some(vess_protocol::SignedDhtResponse {
+        results: results_bytes,
+        proof_vess_id,
+        responder_sig,
+    })
+}
+
+// ── NAT traversal: dial cascade ──────────────────────────────────────
+
+/// Send a message to a peer, trying multiple paths in cascade:
+/// 1. Direct UDP (fastest, works with port forwarding / UPnP)
+/// 2. Rendezvous hole-punch (works for most home NATs)
+/// 3. Relay forwarding (works for symmetric NATs)
+async fn dial_and_send(
+    state: &Arc<Mutex<ArteryState>>,
+    mesh_node: &Arc<vess_mesh::MeshPulseNode>,
+    contact: &vess_mesh::MeshCarrierContact,
+    msg: &vess_protocol::PulseMessage,
+) -> anyhow::Result<()> {
+    // 1. Try direct
+    match mesh_node.send_message(contact, msg).await {
+        Ok(()) => return Ok(()),
+        Err(e) => tracing::debug!(%e, "direct send failed, trying cascade"),
+    }
+
+    // 2. Try rendezvous hole-punch
+    let rendezvous = {
+        let s = state.lock().unwrap();
+        s.rendezvous_addr
+    };
+    if let Some(rendezvous_addr) = rendezvous {
+        if let Some(target_id) = contact.node_id() {
+            match mesh_node.send_message_with_response_via_rendezvous(
+                rendezvous_addr, target_id, msg,
+            ).await {
+                Ok(_) => {
+                    tracing::debug!("hole-punch succeeded via rendezvous");
+                    return Ok(());
+                }
+                Err(e) => tracing::debug!(%e, "rendezvous hole-punch failed"),
+            }
+        }
+    }
+
+    // 3. Try relay fallback
+    let relay = {
+        let s = state.lock().unwrap();
+        s.relay_addr
+    };
+    if let Some(relay_addr) = relay {
+        match mesh_node.send_message_with_response_via_relay(
+            relay_addr, contact, msg,
+        ).await {
+            Ok(_) => {
+                tracing::debug!("relay forward succeeded");
+                return Ok(());
+            }
+            Err(e) => tracing::debug!(%e, "relay forward failed"),
+        }
+    }
+
+    // All paths failed
+    Err(anyhow::anyhow!("all dial paths exhausted for peer"))
 }
 
 fn load_or_create_mesh_seed(state_dir: &std::path::Path) -> anyhow::Result<[u8; 32]> {

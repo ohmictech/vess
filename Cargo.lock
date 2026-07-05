@@ -1877,6 +1877,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "vess-relay"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "vess-mesh",
+]
+
+[[package]]
+name = "vess-rendezvous"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "vess-mesh",
+]
+
+[[package]]
 name = "vess-sovereign"
 version = "0.1.0"
 dependencies = [

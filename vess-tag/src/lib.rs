@@ -506,6 +506,7 @@ mod tests {
             registrant_vk: Vec::new(),
             signature: Vec::new(),
             hardened_at: None,
+            grace_until_epoch: None,
         };
         let r2 = TagRecord {
             tag_hash,
@@ -516,6 +517,7 @@ mod tests {
             registrant_vk: Vec::new(),
             signature: Vec::new(),
             hardened_at: None,
+            grace_until_epoch: None,
         };
         assert_ne!(r1.digest(), r2.digest());
     }

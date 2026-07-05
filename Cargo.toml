@@ -8,5 +8,7 @@ members = [
     "vess-sovereign",
     "vess-protocol",
     "vess-cli",
+    "vess-relay",
+    "vess-rendezvous",
 ]
 resolver = "2"
