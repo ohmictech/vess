@@ -135,8 +135,8 @@ fn rpc_status(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
 
 fn rpc_balance(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
     let s = state.lock().unwrap();
-    let bills: Vec<serde_json::Value> = s.store.iter()
-        .filter(|v| s.spend_credentials.contains_key(&v.compute_vess_id()))
+    let total: u64 = s.spend_credentials.values().map(|(_, _, a)| a).sum();
+    let bills: Vec<serde_json::Value> = s.my_vess.values()
         .map(|v| serde_json::json!({
             "mint_id": hex::encode(&v.compute_vess_id()[..8]),
             "amount": v.amount,
@@ -144,10 +144,6 @@ fn rpc_balance(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
             "chain_depth": v.chain_depth,
         }))
         .collect();
-    let total: u64 = s.store.iter()
-        .filter(|v| s.spend_credentials.contains_key(&v.compute_vess_id()))
-        .map(|v| v.amount)
-        .sum();
     RpcResponse { ok: true, data: serde_json::json!({"total": total, "bills": bills, "bill_count": bills.len()}) }
 }
 
@@ -245,7 +241,8 @@ fn rpc_send_direct(state: &Arc<Mutex<ArteryState>>, og_tx: &mpsc::UnboundedSende
             // Store change credential so we can spend it later
             if let Some(ref change_sk) = built.change_sk {
                 let change_id = change.compute_vess_id();
-                s.spend_credentials.insert(change_id, (change.owner_vk.clone(), change_sk.clone()));
+                s.spend_credentials.insert(change_id, (change.owner_vk.clone(), change_sk.clone(), change.amount));
+                s.my_vess.insert(change_id, change.clone());
             }
         }
         // Hold in limbo for offline recipient
@@ -420,21 +417,59 @@ fn rpc_tag_lookup(state: &Arc<Mutex<ArteryState>>, params: &serde_json::Value) -
         *h.finalize().as_bytes()
     };
 
-    // Query local + K nearest DHT peers
+    // Query K nearest DHT peers
     let responses = crate::dht_query::query_dht_peers(state, &tag_hash, vess_protocol::DhtQueryKind::TagLookup);
 
+    // Aggregate votes: stealth_id → total proof Vess amount
+    let store = { state.lock().unwrap().store.clone() };
+    use std::collections::HashMap;
+    let mut votes: HashMap<[u8; 32], u64> = HashMap::new(); // spend_ek → total weight
+    let mut best_record: Option<vess_tag::TagRecord> = None;
+    let mut best_weight: u64 = 0;
+
     for resp in &responses {
+        let proof = match &resp.proof {
+            Some(p) => p,
+            None => continue,
+        };
+        let proof_vess = match store.get(&proof.proof_vess_id) {
+            Some(v) => v,
+            None => continue,
+        };
+        let sig_msg = crate::dht_resolver::dht_response_signing_message(&proof.results, &proof.proof_vess_id);
+        if !vess_foundry::spend_auth::verify_spend(&proof_vess.owner_vk, &sig_msg, &proof.responder_sig).unwrap_or(false) {
+            continue;
+        }
+        let weight = proof_vess.amount;
+
         for tag_bytes in &resp.tags {
             if let Ok(record) = serde_json::from_slice::<vess_tag::TagRecord>(tag_bytes) {
-                return RpcResponse { ok: true, data: serde_json::json!({
-                    "tag": format!("+{}", tag_clean),
-                    "tag_hash": hex::encode(&record.tag_hash[..8]),
-                    "stealth_id": hex::encode(&record.master_address.spend_ek[..16]),
-                    "hardened": record.is_hardened(),
-                    "registered_at": record.registered_at,
-                })};
+                let ek: [u8; 32] = {
+                    let mut k = [0u8; 32];
+                    let ek = &record.master_address.spend_ek;
+                    let len = ek.len().min(32);
+                    k[..len].copy_from_slice(&ek[..len]);
+                    k
+                };
+                *votes.entry(ek).or_insert(0) += weight;
+                // Track the highest-weight record for response fields
+                if votes[&ek] > best_weight {
+                    best_weight = votes[&ek];
+                    best_record = Some(record);
+                }
             }
         }
+    }
+
+    if let (Some(record), _) = (best_record, best_weight > 0) {
+        return RpcResponse { ok: true, data: serde_json::json!({
+            "tag": format!("+{}", tag_clean),
+            "tag_hash": hex::encode(&record.tag_hash[..8]),
+            "stealth_id": hex::encode(&record.master_address.spend_ek[..16]),
+            "hardened": record.is_hardened(),
+            "registered_at": record.registered_at,
+            "total_weight": best_weight,
+        })};
     }
     RpcResponse { ok: false, data: serde_json::json!({"error": "tag not found"}) }
 }
@@ -477,7 +512,8 @@ fn rpc_faucet_submit(state: &Arc<Mutex<ArteryState>>, params: &serde_json::Value
         // Auto-register spend credential so wallet can immediately spend
         if let Some(sk_hex) = params["owner_sk"].as_str() {
             if let Ok(sk) = hex::decode(sk_hex) {
-                s.spend_credentials.insert(id, (faucet.owner_vk.clone(), sk));
+                s.spend_credentials.insert(id, (faucet.owner_vk.clone(), sk, faucet.amount));
+                s.my_vess.insert(id, faucet.clone());
             }
         }
         s.notify(&format!("faucet: {} Vess received", faucet.amount));
@@ -555,9 +591,8 @@ fn rpc_wallet_info(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
 // ── Claim (auto: derives keys, sweeps all epochs) ───────────────────
 
 fn rpc_claim(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
-    let (spend_ek, last_sweep) = {
+    let (spend_ek, scan_dk, spend_dk, last_sweep) = {
         let s = state.lock().unwrap();
-        // Get the wallet's spend encapsulation key from the tag DHT (via wallet VK fingerprint)
         let addr_fp = match &s.wallet_vk {
             Some(vk) => {
                 let mut h = blake3::Hasher::new();
@@ -570,14 +605,26 @@ fn rpc_claim(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
             Some(record) => record.master_address.spend_ek.clone(),
             None => return RpcResponse { ok: false, data: serde_json::json!({"error": "no tag registered — need spend_ek to derive mailbox key"}) },
         };
-        (spend_ek, s.last_sweep_epoch)
+        let scan_dk = s.wallet_scan_dk.clone();
+        let spend_dk = s.wallet_spend_dk.clone();
+        (spend_ek, scan_dk, spend_dk, s.last_sweep_epoch)
     };
 
-    let current_epoch = vess_foundry::clock::current_epoch();
-    let start_epoch = last_sweep.unwrap_or(current_epoch.saturating_sub(1));
+    let (scan_dk, spend_dk) = match (scan_dk, spend_dk) {
+        (Some(s), Some(p)) => (s, p),
+        _ => return RpcResponse { ok: false, data: serde_json::json!({"error": "wallet not unlocked — stealth keys unavailable for claim decryption"}) },
+    };
+
+    let stealth_secret = vess_stealth::StealthSecretKey {
+        scan_dk: scan_dk,
+        spend_dk: spend_dk,
+    };
+
+    let current_epoch: u64 = vess_foundry::clock::current_epoch();
+    let start_epoch: u64 = last_sweep.unwrap_or(current_epoch.saturating_sub(1));
     let spend_ek_hash = blake3::hash(&spend_ek);
-    let mut total_payloads = 0usize;
     let mut total_claimed = 0u64;
+    let mut total_amount = 0u64;
 
     // Sweep each epoch from last_sweep to current
     for epoch in start_epoch..=current_epoch {
@@ -593,13 +640,50 @@ fn rpc_claim(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
             let s = state.lock().unwrap();
             s.limbo.sweep_by_mailbox_key(&mailbox_key, 64)
         };
-        total_payloads += payloads.len();
 
-        // Trial-decrypt each payload
-        for payload in &payloads {
-            if let Ok(_stealth) = serde_json::from_slice::<vess_stealth::StealthPayload>(payload) {
-                total_claimed += 1;
+        for payload_bytes in &payloads {
+            // Try to deserialize and decrypt the stealth payload
+            let stealth = match serde_json::from_slice::<vess_stealth::StealthPayload>(payload_bytes) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let plaintext = match vess_stealth::open_stealth_payload(&stealth_secret, &stealth) {
+                Ok((pt, _, _)) => pt,
+                Err(_) => continue, // not for us
+            };
+            // Plaintext is padded — deserialize the Vess
+            let vess: Vess = match serde_json::from_slice(&plaintext) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let v_id = vess.compute_vess_id();
+
+            // Store locally
+            let mut s = state.lock().unwrap();
+            s.store.upsert(&vess);
+            s.my_vess.insert(v_id, vess.clone());
+            if let (Some(ref vk), Some(ref sk)) = (s.wallet_vk.clone(), s.wallet_sk.clone()) {
+                if vess.owner_vk == *vk {
+                    s.spend_credentials.insert(v_id, (vk.clone(), sk.clone(), vess.amount));
+                }
             }
+
+            // Gossip claimed Vess to DHT peers
+            if let Some(ref tx) = s.mesh_outbox {
+                let mut ranked: Vec<([u8; 32], String)> = s.peer_endpoints.iter()
+                    .map(|(id, ep)| (*id, ep.clone())).collect();
+                ranked.sort_by_key(|(id, _)| crate::gossip::xor_distance(id, &v_id));
+                let msg = vess_protocol::PulseMessage::DhtStoreVess(vess.clone());
+                let repl = s.dht_replication();
+                for (_, ep) in ranked.iter().take(repl) {
+                    if let Ok(contact) = vess_mesh::decode_mesh_contact_string(ep) {
+                        let _ = tx.send((contact, msg.clone()));
+                    }
+                }
+            }
+
+            total_claimed += 1;
+            total_amount += vess.amount;
         }
     }
 
@@ -607,12 +691,12 @@ fn rpc_claim(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
     {
         let mut s = state.lock().unwrap();
         s.last_sweep_epoch = Some(current_epoch);
-        s.notify(&format!("auto-claimed {} payments across epochs {}-{}", total_claimed, start_epoch, current_epoch));
+        s.notify(&format!("claimed {} payments ({} Vess) across epochs {}-{}", total_claimed, total_amount, start_epoch, current_epoch));
     }
 
     RpcResponse { ok: true, data: serde_json::json!({
         "claimed": total_claimed,
-        "payloads_found": total_payloads,
+        "total_amount": total_amount,
         "epochs_scanned": current_epoch.saturating_sub(start_epoch) + 1,
         "last_sweep_epoch": current_epoch,
     })}
@@ -639,7 +723,6 @@ fn rpc_recover_manifest(state: &Arc<Mutex<ArteryState>>, params: &serde_json::Va
         _ => return RpcResponse { ok: false, data: serde_json::json!({"error": "invalid seed_hash"}) },
     };
 
-    let s = state.lock().unwrap();
     // Build DHT key for wallet manifest
     let dht_key = {
         let mut h = blake3::Hasher::new();
@@ -648,8 +731,60 @@ fn rpc_recover_manifest(state: &Arc<Mutex<ArteryState>>, params: &serde_json::Va
         *h.finalize().as_bytes()
     };
 
-    // Check if we have the manifest locally (from DHT sync or previous push)
-    // For now, return any bills we have credentials for matching this seed
+    // Query DHT peers for the manifest
+    let responses = crate::dht_query::query_dht_peers(state, &dht_key, vess_protocol::DhtQueryKind::ManifestLookup);
+
+    // Resolve: pick the response with the highest proof Vess amount
+    let store = { state.lock().unwrap().store.clone() };
+    let mut best_manifest: Option<(Vec<u8>, u64)> = None;
+
+    for resp in &responses {
+        let proof = match &resp.proof {
+            Some(p) => p,
+            None => continue,
+        };
+        let proof_vess = match store.get(&proof.proof_vess_id) {
+            Some(v) => v,
+            None => continue,
+        };
+        let sig_msg = crate::dht_resolver::dht_response_signing_message(&proof.results, &proof.proof_vess_id);
+        if !vess_foundry::spend_auth::verify_spend(&proof_vess.owner_vk, &sig_msg, &proof.responder_sig).unwrap_or(false) {
+            continue;
+        }
+        let weight = proof_vess.amount;
+        for blob in &resp.manifests {
+            match &best_manifest {
+                None => best_manifest = Some((blob.clone(), weight)),
+                Some((_, w)) if weight > *w => best_manifest = Some((blob.clone(), weight)),
+                _ => {}
+            }
+        }
+    }
+
+    // Decrypt manifest if found and tally bills
+    if let Some((encrypted_blob, _)) = best_manifest {
+        // The manifest blob is a serialized ManifestStore — extract encrypted_manifest
+        if let Ok(_manifest) = serde_json::from_slice::<vess_protocol::ManifestStore>(&encrypted_blob) {
+            let s = state.lock().unwrap();
+            let bills: Vec<serde_json::Value> = s.store.iter()
+                .filter(|v| s.spend_credentials.contains_key(&v.compute_vess_id()))
+                .map(|v| serde_json::json!({
+                    "amount": v.amount,
+                    "mint_id": hex::encode(&v.compute_vess_id()[..8]),
+                    "epoch": v.epoch,
+                }))
+                .collect();
+
+            return RpcResponse { ok: true, data: serde_json::json!({
+                "dht_key": hex::encode(&dht_key[..8]),
+                "bills_found": bills.len(),
+                "bills": bills,
+            })};
+        }
+    }
+
+    // Fallback: local-only check
+    let s = state.lock().unwrap();
     let bills: Vec<serde_json::Value> = s.store.iter()
         .filter(|v| s.spend_credentials.contains_key(&v.compute_vess_id()))
         .map(|v| serde_json::json!({
@@ -792,7 +927,8 @@ fn rpc_send(state: &Arc<Mutex<ArteryState>>, og_tx: &mpsc::UnboundedSender<Vess>
             // Store change credential so we can spend it later
             if let Some(ref change_sk) = built.change_sk {
                 let change_id = change.compute_vess_id();
-                s.spend_credentials.insert(change_id, (change.owner_vk.clone(), change_sk.clone()));
+                s.spend_credentials.insert(change_id, (change.owner_vk.clone(), change_sk.clone(), change.amount));
+                s.my_vess.insert(change_id, change.clone());
             }
         }
         // Gossip payment to K nearest DHT peers by mailbox_key XOR distance

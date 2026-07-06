@@ -14,6 +14,10 @@ pub struct ArteryState {
     pub minting: Option<MintingState>,
     pub wallet_vk: Option<Vec<u8>>,
     pub wallet_sk: Option<Vec<u8>>,
+    /// ML-KEM scan decryption key (for opening stealth payloads on claim).
+    pub wallet_scan_dk: Option<Vec<u8>>,
+    /// ML-KEM spend decryption key.
+    pub wallet_spend_dk: Option<Vec<u8>>,
     pub node_id: [u8; 32],
     pub tag_dht: crate::tag_dht::TagDht,
     pub limbo: crate::limbo_buffer::LimboBuffer,
@@ -36,8 +40,10 @@ pub struct ArteryState {
     pub add_peer_tx: Option<mpsc::UnboundedSender<String>>,
     /// Node's mesh contact for sharing with peers.
     pub mesh_contact: Option<vess_mesh::MeshCarrierContact>,
-    /// Spend credentials for bills we own (mint_id → (vk, sk)).
-    pub spend_credentials: HashMap<[u8; 32], (Vec<u8>, Vec<u8>)>,
+    /// Spend credentials for bills we own (mint_id → (vk, sk, amount)).
+    pub spend_credentials: HashMap<[u8; 32], (Vec<u8>, Vec<u8>, u64)>,
+    /// Full Vess objects we own (mint_id → Vess).
+    pub my_vess: HashMap<[u8; 32], Vess>,
     /// Outbox channel for sending mesh messages (for onion forwarding, etc.).
     pub mesh_outbox: Option<mpsc::UnboundedSender<(vess_mesh::MeshCarrierContact, vess_protocol::PulseMessage)>>,
     /// Kademlia routing table for DHT operations (mailbox, tag, Vess sharding).
@@ -67,15 +73,43 @@ pub struct MintingState {
 }
 
 pub struct DuplicateTracker {
-    seen: std::collections::HashSet<[u8; 32]>,
+    /// Message hash → occurrence count (within 1-hour window).
+    counts: std::collections::HashMap<[u8; 32], u32>,
+    /// Eviction queue: (hash, timestamp).
     times: std::collections::VecDeque<([u8; 32], u64)>,
+    /// Max occurrences before a message is considered duplicate (default: 2).
+    max_occurrences: u32,
 }
 
 impl DuplicateTracker {
-    pub fn new() -> Self { Self { seen: std::collections::HashSet::new(), times: std::collections::VecDeque::new() } }
+    pub fn new() -> Self {
+        Self {
+            counts: std::collections::HashMap::new(),
+            times: std::collections::VecDeque::new(),
+            max_occurrences: 2,
+        }
+    }
+
+    /// Returns `true` if this message has been seen too many times in the window.
+    /// Allows up to `max_occurrences` (2) before flagging as duplicate.
     pub fn is_duplicate(&mut self, id: &[u8; 32], now: u64) -> bool {
-        while self.times.front().map_or(false, |(_, t)| now.saturating_sub(*t) > 3600) { if let Some((id, _)) = self.times.pop_front() { self.seen.remove(&id); } }
-        !self.seen.insert(*id) || { self.times.push_back((*id, now)); false }
+        // Evict entries older than 1 hour
+        while self.times.front().map_or(false, |(_, t)| now.saturating_sub(*t) > 3600) {
+            if let Some((id, _)) = self.times.pop_front() {
+                self.counts.remove(&id);
+            }
+        }
+
+        let count = self.counts.entry(*id).or_insert(0);
+        if *count < self.max_occurrences {
+            *count += 1;
+            if *count == 1 {
+                self.times.push_back((*id, now));
+            }
+            false // not a duplicate yet
+        } else {
+            true // exceeded the limit
+        }
     }
 }
 
@@ -86,7 +120,8 @@ impl ArteryState {
     pub fn new(node_id: [u8; 32], k_neighbors: usize) -> Self {
         Self {
             store: VessStore::default(),
-            minting: None, wallet_vk: None, wallet_sk: None, node_id,
+            minting: None, wallet_vk: None, wallet_sk: None,
+            wallet_scan_dk: None, wallet_spend_dk: None, node_id,
             tag_dht: crate::tag_dht::TagDht::new(node_id, k_neighbors),
             limbo: crate::limbo_buffer::LimboBuffer::new(),
             peer_registry: crate::handshake::PeerRegistry::new(std::time::Duration::from_secs(30)),
@@ -102,6 +137,7 @@ impl ArteryState {
             add_peer_tx: None,
             mesh_contact: None,
             spend_credentials: HashMap::new(),
+            my_vess: HashMap::new(),
             mesh_outbox: None,
             routing_table: crate::kademlia::RoutingTable::new(node_id),
             last_sweep_epoch: None,
@@ -419,6 +455,13 @@ pub async fn run_node(config: NodeConfig) -> anyhow::Result<String> {
                                     }
                                 }
                             }
+                            // Decrypt stealth keys for claim flow
+                            if let Ok(secret) = vess_sovereign::recovery::decrypt_secrets(&wallet.encrypted_secrets, &enc_key) {
+                                let mut s = state.lock().unwrap();
+                                s.wallet_scan_dk = Some(secret.scan_dk.clone());
+                                s.wallet_spend_dk = Some(secret.spend_dk.clone());
+                                tracing::info!("wallet stealth keys loaded for claim decryption");
+                            }
                         } else {
                             tracing::warn!("wallet password incorrect — wallet loaded as watch-only");
                         }
@@ -438,7 +481,11 @@ pub async fn run_node(config: NodeConfig) -> anyhow::Result<String> {
                             .map(|v| v.compute_vess_id())
                             .collect();
                         for id in owned {
-                            s.spend_credentials.insert(id, (vk.clone(), sk.clone()));
+                            let amount = s.store.get(&id).map(|v| v.amount).unwrap_or(0);
+                            s.spend_credentials.insert(id, (vk.clone(), sk.clone(), amount));
+                            if let Some(v) = s.store.get(&id).cloned() {
+                                s.my_vess.insert(id, v);
+                            }
                         }
                     }
                     s.wallet_path = Some(wallet_path.clone());
@@ -518,14 +565,15 @@ pub async fn run_node(config: NodeConfig) -> anyhow::Result<String> {
         }
     });
 
-    // ── Mesh message listener ──
+    // ── Mesh message listener (with spam/bad-data gating) ──
     let mesh_state = state.clone();
     let mesh_og = og_tx.clone();
     let mesh_self_contact = mesh_contact.clone();
     let mesh_node_for_listener = mesh_node.clone();
     tokio::spawn(async move {
         if let Err(e) = mesh_node_for_listener.listen_messages_with_response(move |peer, msg| {
-            handle_mesh_message(&mesh_state, &mesh_og, &peer, &msg, &mesh_self_contact)
+            gate_inbound_message(&mesh_state, &peer, msg)
+                .and_then(|msg| handle_mesh_message(&mesh_state, &mesh_og, &peer, &msg, &mesh_self_contact))
         }).await {
             tracing::error!(%e, "mesh listener crashed");
         }
@@ -589,7 +637,8 @@ pub async fn run_node(config: NodeConfig) -> anyhow::Result<String> {
                     // Store credential if we have wallet keys
                     if let (Some(ref vk), Some(ref sk)) = (s.wallet_vk.clone(), s.wallet_sk.clone()) {
                         if v.owner_vk == *vk {
-                            s.spend_credentials.insert(v_id, (vk.clone(), sk.clone()));
+                            s.spend_credentials.insert(v_id, (vk.clone(), sk.clone(), v.amount));
+                            s.my_vess.insert(v_id, v.clone());
                         }
                     }
                     // XOR-shard Vess to K nearest DHT peers
@@ -701,6 +750,55 @@ async fn run_local_discovery(
             }
         }
     }
+}
+
+// ── Inbound message gating ──────────────────────────────────────────
+
+/// Gate every inbound mesh message: ban check, rate limit, dedup.
+/// Returns `Some(msg)` if the message passes all checks, `None` to drop.
+fn gate_inbound_message(
+    state: &Arc<Mutex<ArteryState>>,
+    peer: &vess_mesh::MeshPeer,
+    msg: vess_protocol::PulseMessage,
+) -> Option<vess_protocol::PulseMessage> {
+    let peer_id = match peer.node_id().map(|n| *n.as_bytes()) {
+        Some(id) => id,
+        None => return Some(msg), // can't identify peer, let it through
+    };
+
+    let mut s = state.lock().unwrap();
+
+    // 1. Banishment check — silently drop banned peers
+    if s.banned_peers.contains(&peer_id) {
+        return None;
+    }
+
+    // 2. Rate limit check — per-peer quota (200 msg / 10s window, 3-strike banishment)
+    if !s.rate_limiter.allow(&peer_id) {
+        if s.rate_limiter.should_banish(&peer_id) {
+            s.banned_peers.insert(peer_id);
+            s.peer_registry.mark_banished(peer_id);
+            s.routing_table.remove(&peer_id);
+            s.known_peers.remove(&peer_id);
+            s.peer_endpoints.remove(&peer_id);
+            tracing::warn!(peer=%hex::encode(&peer_id[..8]), "peer banished for repeated rate-limiting");
+        }
+        return None;
+    }
+
+    // 3. Duplicate check — same message content within the last hour
+    let msg_key = {
+        let mut h = blake3::Hasher::new();
+        h.update(&serde_json::to_vec(&msg).unwrap_or_default());
+        *h.finalize().as_bytes()
+    };
+    if s.duplicate_tracker.is_duplicate(&msg_key, now_secs()) {
+        tracing::debug!(peer=%hex::encode(&peer_id[..8]), "duplicate message dropped");
+        return None;
+    }
+
+    drop(s);
+    Some(msg)
 }
 
 // ── Mesh message handler ────────────────────────────────────────────
@@ -1066,9 +1164,10 @@ fn build_dht_proof(
     vess: &[Vec<u8>],
     _manifests: &[Vec<u8>],
 ) -> Option<vess_protocol::SignedDhtResponse> {
-    // Pick any Vess we have spend credentials for as proof of ownership
-    let (proof_vess_id, owner_sk) = s.spend_credentials.iter().next()
-        .map(|(id, (_, sk))| (*id, sk.clone()))?;
+    // Pick the largest Vess we own as proof of ownership — maximizes trust weight
+    let (proof_vess_id, owner_sk) = s.spend_credentials.iter()
+        .max_by_key(|(_, (_, _, amount))| *amount)
+        .map(|(id, (_, sk, _))| (*id, sk.clone()))?;
 
     // Serialize results for signing
     let results = serde_json::json!({

@@ -84,7 +84,7 @@ pub fn build_payment_ephemeral(
     let input_sk = {
         let s = state.lock().unwrap();
         s.spend_credentials.get(&consumed_ids[0])
-            .map(|(_, sk)| sk.clone())
+            .map(|(_, sk, _)| sk.clone())
             .ok_or("no spend credential for input")?
     };
     let mut outputs = vec![payment.clone()];

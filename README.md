@@ -14,7 +14,7 @@ Argon2d was selected to level the playing field. All that matters in terms of mi
 
 There is no supply limit or difficulty adjustment, because Vess was not created to be a speculative asset, it was created to represent tokenized energy. This is not problematic because unlike fiat currency, which is birthed into existence arbitrarily, every single Vess requires energy expenditure. Devaluation is not the result of a growing supply of Vess, because each unit has a baseline cost of production. The supply simply expands to match the electricity injected rather than dilution.
 
-As there is no initial coin supply, tokenomics, fees, or allocations, development is funded by a hardcoded dev faucet subsidy. Limited to once per 24 hour epoch, a single payout of 30,000 vess is elligible to be claimed by the protocol. Other than this very modest emission, all Vess is created by equal effort.
+As there is no initial coin supply, tokenomics, fees, or allocations, development is funded by a hardcoded dev faucet subsidy. Limited to once per 24 hour epoch, a single payout of 30,000 vess is elligible to be claimed by the protocol. Other than this modest emission, all Vess is created by equal effort.
 
 ### HASH TABLE ###
 
@@ -43,6 +43,164 @@ Every payment is wrapped in four unlinkable cryptographic layers:
 
 No observer at any layer can correlate sender, amount, or recipient.
 
+### USAGE ###
+
+Build from source (Rust 1.80+):
+
+```bash
+git clone https://github.com/vess/vess
+cd vess
+cargo build --release
+```
+
+Binaries produced: `vess` (CLI wallet + node), `vess-relay`, `vess-rendezvous`.
+
+### ARCHITECTURE ###
+
+```
+vess-cli/          CLI wallet (init, send, mint, claim, node, etc.)
+vess-artery/       Full node — mesh networking, DHT, mining, RPC server
+vess-mesh/         P2P transport — UDP/TCP carriers, handshake, relay, rendezvous
+vess-foundry/      Core types — Vess bill, minting, spend auth, clock
+vess-protocol/     Wire format — PulseMessage enum, DHT query/response, payment
+vess-stealth/      ML-KEM-768 stealth addressing — per-payment unlinkability
+vess-tag/          VessTag — human-readable recipient identifiers
+vess-sovereign/    Wallet file — BIP39 recovery, encrypted persistence
+vess-relay/        Standalone relay server binary (NAT fallback)
+vess-rendezvous/   Standalone rendezvous server binary (hole punching)
+```
+
+Third-party integration path:
+```
+Your wallet (any language) ← TCP JSON-line :9821 → vess node ← mesh → DHT
+```
+
+#### Wallet
+
+```bash
+# Create a new wallet (BIP39 recovery phrase + password)
+vess init --name mywallet
+
+# Recover a wallet from phrase
+vess recover --name mywallet
+
+# Check balance
+vess balance
+
+# Show your receiving vesstag (for others to send to you)
+vess receive
+```
+
+#### Sending
+
+```bash
+# Send via onion routing (default, 3-hop private)
+vess send --amount 100 --recipient +alice
+
+# Send direct (faster, less private)
+vess send --amount 100 --recipient +alice --direct
+```
+
+#### Tags
+
+```bash
+# Register a human-readable tag (alphanumeric, case-insensitive)
+vess tag register alice
+```
+
+#### Minting
+
+```bash
+# Start mining (continuous, epoch-aware, 1 GB Argon2d)
+vess mint start --amount 1
+
+# Check mining status
+vess mint status
+
+# Stop mining
+vess mint stop
+```
+
+#### Dev Faucet
+
+```bash
+# Claim dev subsidy (30,000 Vess per epoch, requires wallet)
+vess dev-faucet
+```
+
+#### Claims & Recovery
+
+```bash
+# Claim all buffered payments since last sweep (auto-derives mailbox keys)
+vess claim
+
+# Push encrypted wallet manifest to DHT for disaster recovery
+vess manifest
+
+# Show wallet notifications
+vess notifications
+```
+
+#### Node
+
+```bash
+# Start the artery node (mesh networking + DHT + RPC)
+vess node --wallet mywallet
+
+# With NAT traversal (deploy relay/rendezvous servers on public IPs first)
+vess node --wallet mywallet --rendezvous 1.2.3.4:9445 --relay 1.2.3.4:9446
+
+# With bootstrap peers and custom bind
+vess node --wallet mywallet --bind 0.0.0.0:18348 --bootstrap peer1:port,peer2:port
+
+# Non-interactive password
+vess node --wallet mywallet --password "mypass"
+
+# Show node status
+vess status
+```
+
+#### Peers
+
+```bash
+# Add a peer while the node is running
+vess peer add "192.168.1.5:18348"
+
+# List known peers
+vess peer list
+
+# Remove a peer by node ID prefix
+vess peer remove abc12345
+```
+
+#### Infrastructure
+
+Vess chooses to stay neutral and censorship resistant at the base layer, not providing any central relay servers or bootstrap nodes. Third party implementations must provide their own bootstrap node paths and relay servers. Out of band node discovery is recommended for maximum decentralization.
+
+```bash
+# Run a relay server (transparent forwarding for symmetric NATs)
+vess-relay --bind 0.0.0.0:9446
+
+# Run a rendezvous server (UDP hole-punch coordinator)
+vess-rendezvous --bind 0.0.0.0:9445
+```
+
+#### RPC
+
+Third-party wallets integrate via TCP JSON-line on port 9821:
+
+```bash
+# Example: check balance via curl
+echo '{"method":"balance","params":{}}' | nc localhost 9821
+```
+
+Full RPC API: `balance`, `send`, `send_direct`, `receive`, `tag_register`, `tag_lookup`,
+`mint_start`, `mint_stop`, `mint_status`, `faucet_submit`, `manifest_push`,
+`recover_manifest`, `claim`, `notifications`, `status`, `wallet_info`,
+`add_peer`, `list_peers`, `remove_peer`, `ban_peer`.
+
+
+
 ## LICENSE ## 
 
-Apache 2.0 license
+Apache 2.0 License

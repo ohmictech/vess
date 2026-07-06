@@ -126,6 +126,20 @@ enum Command {
 
     /// Show node status.
     Status,
+
+    /// Manage known peers.
+    #[command(subcommand)]
+    Peer(PeerCmd),
+}
+
+#[derive(Subcommand)]
+enum PeerCmd {
+    /// Add a peer by contact string (e.g. "192.168.1.5:18348").
+    Add { contact: String },
+    /// List all known peers.
+    List,
+    /// Remove a peer by node ID prefix.
+    Remove { node_id: String },
 }
 
 #[derive(Subcommand)]
@@ -268,6 +282,32 @@ async fn main() -> Result<()> {
                 println!("epoch:  {}", r["epoch"].as_u64().unwrap_or(0));
             })
         }
+        Command::Peer(cmd) => match cmd {
+            PeerCmd::Add { contact } => {
+                rpc(port, "add_peer", json!({"contact": contact}))
+                    .await
+                    .map(|r| println!("added peer: {}", r["peer_id"].as_str().unwrap_or("?")))
+            }
+            PeerCmd::List => {
+                rpc(port, "list_peers", json!({})).await.map(|r| {
+                    if let Some(peers) = r["peers"].as_array() {
+                        if peers.is_empty() {
+                            println!("No known peers.");
+                        } else {
+                            println!("{} peers:", peers.len());
+                            for p in peers {
+                                println!("  {}  {}", p["node_id"].as_str().unwrap_or("?"), p["contact"].as_str().unwrap_or("?"));
+                            }
+                        }
+                    }
+                })
+            }
+            PeerCmd::Remove { node_id } => {
+                rpc(port, "remove_peer", json!({"node_id": node_id}))
+                    .await
+                    .map(|r| println!("removed: {}", r["removed"].as_bool().unwrap_or(false)))
+            }
+        },
     }
 }
 
