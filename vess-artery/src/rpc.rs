@@ -305,9 +305,9 @@ fn rpc_mint_start(state: &Arc<Mutex<ArteryState>>, og_tx: &mpsc::UnboundedSender
 
 fn rpc_mint_stop(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
     let mut s = state.lock().unwrap();
-    if let Some(ref mut minting) = s.minting {
-        if let Some(tx) = minting.stop_tx.take() {
-            let _ = tx.send(());
+    if let Some(ref minting) = s.minting {
+        if let Some(ref flag) = minting.stop_flag {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
         }
     }
     s.minting = None;
@@ -318,7 +318,12 @@ fn rpc_mint_status(state: &Arc<Mutex<ArteryState>>) -> RpcResponse {
     let s = state.lock().unwrap();
     if let Some(ref minting) = s.minting {
         let elapsed = crate::node_runner::now_secs().saturating_sub(minting.started_at);
-        RpcResponse { ok: true, data: serde_json::json!({"active": true, "amount": minting.amount, "seconds": elapsed}) }
+        RpcResponse { ok: true, data: serde_json::json!({
+            "active": true,
+            "amount": minting.amount,
+            "seconds": elapsed,
+            "threads": minting.num_threads,
+        })}
     } else {
         RpcResponse { ok: true, data: serde_json::json!({"active": false}) }
     }

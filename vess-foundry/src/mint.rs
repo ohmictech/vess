@@ -20,7 +20,8 @@ use crate::Vess;
 
 // ── Mining params ───────────────────────────────────────────────────
 
-pub const ARGON2D_M_COST: u32 = 1024 * 1024; // 1 GiB in KiB
+pub const ARGON2D_M_COST_MAINNET: u32 = 1024 * 1024; // 1 GiB in KiB
+pub const ARGON2D_M_COST_TESTNET: u32 = 64;           // 64 KiB (fast testing)
 pub const ARGON2D_T_COST: u32 = 1;
 pub const ARGON2D_P_COST: u32 = 1;
 pub const ARGON2D_HASH_LEN: usize = 32;
@@ -30,25 +31,37 @@ pub const MAX_PROOF_EPOCH_AGE: u64 = 1;
 
 // ── Difficulty ──────────────────────────────────────────────────────
 
-/// Minimum leading zero bits to claim any Vess.
-pub const BASE_BITS: u32 = 16;
+/// Minimum leading zero bits to claim any Vess (mainnet).
+pub const BASE_BITS_MAINNET: u32 = 16;
+/// Minimum leading zero bits (testnet).
+pub const BASE_BITS_TESTNET: u32 = 4;
+
+pub fn base_bits(testnet: bool) -> u32 {
+    if testnet { BASE_BITS_TESTNET } else { BASE_BITS_MAINNET }
+}
+
+pub fn argon2d_m_cost(testnet: bool) -> u32 {
+    if testnet { ARGON2D_M_COST_TESTNET } else { ARGON2D_M_COST_MAINNET }
+}
 
 /// Maximum Vess claimable at a given leading-zero-bit count.
 /// Super-linear: `base + 10% bonus per extra bit` to reward consolidation.
-pub fn bits_to_max_amount(bits: u32) -> u64 {
-    if bits < BASE_BITS { return 0; }
-    let shift = bits - BASE_BITS;
+pub fn bits_to_max_amount(bits: u32, testnet: bool) -> u64 {
+    let base = base_bits(testnet);
+    if bits < base { return 0; }
+    let shift = bits - base;
     if shift >= 64 { return u64::MAX; }
-    let base = 1u64 << shift;
-    let bonus = base.saturating_mul(shift as u64) / 10; // +10% per extra bit
-    base.saturating_add(bonus)
+    let amount = 1u64 << shift;
+    let bonus = amount.saturating_mul(shift as u64) / 10;
+    amount.saturating_add(bonus)
 }
 
 /// Minimum leading zero bits required to claim `amount` Vess.
-pub fn amount_to_bits(amount: u64) -> u32 {
-    if amount <= 1 { return BASE_BITS; }
-    let mut bits = BASE_BITS;
-    while bits < BASE_BITS + 64 && bits_to_max_amount(bits) < amount {
+pub fn amount_to_bits(amount: u64, testnet: bool) -> u32 {
+    let base = base_bits(testnet);
+    if amount <= 1 { return base; }
+    let mut bits = base;
+    while bits < base + 64 && bits_to_max_amount(bits, testnet) < amount {
         bits += 1;
     }
     bits
@@ -58,7 +71,7 @@ pub fn amount_to_bits(amount: u64) -> u32 {
 
 /// Run one Argon2d hash for mining.
 /// `password = initial_pk || epoch || nonce || amount`
-pub fn mint_argon2d(initial_pk: &[u8; 32], epoch: u64, nonce: u64, amount: u64) -> [u8; 32] {
+pub fn mint_argon2d(initial_pk: &[u8; 32], epoch: u64, nonce: u64, amount: u64, testnet: bool) -> [u8; 32] {
     let mut password = Vec::with_capacity(32 + 8 + 8 + 8 + MINTING_DOMAIN.len());
     password.extend_from_slice(initial_pk);
     password.extend_from_slice(&epoch.to_be_bytes());
@@ -67,10 +80,11 @@ pub fn mint_argon2d(initial_pk: &[u8; 32], epoch: u64, nonce: u64, amount: u64) 
     password.extend_from_slice(MINTING_DOMAIN);
 
     let mut output = [0u8; ARGON2D_HASH_LEN];
+    let m_cost = argon2d_m_cost(testnet);
     let argon2 = Argon2::new(
         argon2::Algorithm::Argon2d,
         argon2::Version::V0x13,
-        argon2::Params::new(ARGON2D_M_COST, ARGON2D_T_COST, ARGON2D_P_COST, Some(ARGON2D_HASH_LEN))
+        argon2::Params::new(m_cost, ARGON2D_T_COST, ARGON2D_P_COST, Some(ARGON2D_HASH_LEN))
             .expect("valid argon2d params"),
     );
     argon2.hash_password_into(&password, MINTING_SALT, &mut output).expect("argon2d succeeds");
@@ -95,12 +109,12 @@ pub fn leading_zero_bits(hash: &[u8; 32]) -> u32 {
 // ── Verification ────────────────────────────────────────────────────
 
 /// Verify a minted (proof-of-work) Vess.
-pub fn verify_minted_vess(v: &Vess, current_epoch: u64) -> Result<(), String> {
+pub fn verify_minted_vess(v: &Vess, current_epoch: u64, testnet: bool) -> Result<(), String> {
     if !v.is_minted() { return Err("not a minted Vess".into()); }
     verify_epoch(v, current_epoch)?;
-    let output = mint_argon2d(&v.initial_pk, v.epoch, v.nonce, v.amount);
+    let output = mint_argon2d(&v.initial_pk, v.epoch, v.nonce, v.amount, testnet);
     let bits = leading_zero_bits(&output);
-    let required = amount_to_bits(v.amount);
+    let required = amount_to_bits(v.amount, testnet);
     if bits < required {
         return Err(format!("insufficient difficulty: {} zero bits, need {} for amount {}", bits, required, v.amount));
     }
@@ -173,14 +187,14 @@ mod tests {
 
     #[test]
     fn argon2d_produces_32_bytes() {
-        let out = mint_argon2d(&test_pk(), 0, 0, 1);
+        let out = mint_argon2d(&test_pk(), 0, 0, 1, false);
         assert_eq!(out.len(), 32);
     }
 
     #[test]
     fn different_params_different_output() {
         let pk = test_pk();
-        assert_ne!(mint_argon2d(&pk, 0, 0, 1), mint_argon2d(&pk, 0, 1, 1));
+        assert_ne!(mint_argon2d(&pk, 0, 0, 1, false), mint_argon2d(&pk, 0, 1, 1, false));
         assert_ne!(mint_argon2d(&pk, 0, 0, 1), mint_argon2d(&pk, 0, 0, 2));
     }
 

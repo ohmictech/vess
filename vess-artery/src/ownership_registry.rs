@@ -43,15 +43,13 @@ pub struct ConsumedRecord {
 
 #[derive(Debug, Clone)]
 pub struct OwnershipRegistry {
-    #[allow(dead_code)]
-    node_id: [u8; 32],
     records: HashMap<[u8; 32], OwnershipRecord>,
     consumed: HashMap<[u8; 32], ConsumedRecord>,
 }
 
 impl OwnershipRegistry {
-    pub fn new(node_id: [u8; 32]) -> Self {
-        Self { node_id, records: HashMap::new(), consumed: HashMap::new() }
+    pub fn new() -> Self {
+        Self { records: HashMap::new(), consumed: HashMap::new() }
     }
     pub fn get(&self, mint_id: &[u8; 32]) -> Option<&OwnershipRecord> {
         self.records.get(mint_id)

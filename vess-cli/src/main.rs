@@ -77,7 +77,7 @@ enum Command {
     #[command(subcommand)]
     Tag(TagCmd),
 
-    /// Submit the dev faucet for the current epoch.
+    /// Submit the dev faucet for the current epoch (production — rate-limited to once per epoch).
     DevFaucet,
 
     /// Start/stop/status minting.
@@ -116,6 +116,10 @@ enum Command {
         /// Wallet name to load.
         #[arg(long)]
         wallet: Option<String>,
+
+        /// Run in testnet mode (easier mining: 4-bit base, 64 KiB Argon2d).
+        #[arg(long)]
+        testnet: bool,
     },
 
     /// Claim buffered payments from mailbox (auto-derives key, sweeps all epochs).
@@ -227,8 +231,9 @@ async fn main() -> Result<()> {
                 rpc(port, "mint_status", json!({})).await.map(|r| {
                     if r["active"].as_bool().unwrap_or(false) {
                         println!(
-                            "minting: {} Vess target, {}s elapsed",
+                            "minting: {} Vess target, {} threads, {}s elapsed",
                             r["amount"].as_u64().unwrap_or(0),
+                            r["threads"].as_u64().unwrap_or(1),
                             r["seconds"].as_u64().unwrap_or(0)
                         );
                     } else {
@@ -250,7 +255,8 @@ async fn main() -> Result<()> {
             password,
             state_dir,
             wallet,
-        } => cmd_node(port, bind, bootstrap, rendezvous, relay, password, state_dir, wallet).await,
+            testnet,
+        } => cmd_node(port, bind, bootstrap, rendezvous, relay, password, state_dir, wallet, testnet).await,
         Command::Claim => {
             rpc(port, "claim", json!({}))
                 .await
@@ -540,6 +546,7 @@ async fn cmd_node(
     password: &Option<String>,
     state_dir: &Option<PathBuf>,
     wallet_name: &Option<String>,
+    testnet: &bool,
 ) -> Result<()> {
     let bind_addr: Option<std::net::SocketAddr> = bind.as_ref().and_then(|b| b.parse().ok());
     let rendezvous_addr: Option<std::net::SocketAddr> = rendezvous.as_ref().and_then(|b| b.parse().ok());
@@ -571,7 +578,7 @@ async fn cmd_node(
         max_hops: 6,
         bootstrap: bootstrap.to_vec(),
         enable_local_discovery: true,
-        test: false,
+        test: *testnet,
         rendezvous_addr,
         relay_addr,
     };

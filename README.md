@@ -121,13 +121,6 @@ vess mint status
 vess mint stop
 ```
 
-#### Dev Faucet
-
-```bash
-# Claim dev subsidy (30,000 Vess per epoch, requires wallet)
-vess dev-faucet
-```
-
 #### Claims & Recovery
 
 ```bash

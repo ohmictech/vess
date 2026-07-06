@@ -24,8 +24,9 @@ pub const DEV_FAUCET_AMOUNT: u64 = 30_000;
 
 /// Canonical dev ML-DSA-65 verification key (hardcoded, public).
 /// Every node verifies faucet signatures against this key.
+/// Zero-key placeholder — replace with real dev key before distributing binaries.
 pub const DEV_VK: [u8; 1953] = [
-    0x00; 1953 // PLACEHOLDER — replace with actual dev VK before launch
+    0x00; 1953
 ];
 
 // ── DHT trust ───────────────────────────────────────────────────────
@@ -455,7 +456,7 @@ pub struct TagLookup {
     pub nonce: [u8; 16],
     /// Optional proof that the requester owns a Vess bill (from burn or
     /// transfer). Nodes require this to prevent Sybil-based tag enumeration.
-    /// Absent in testnet mode.
+    /// Omitted for backward compatibility; required for Sybil-resistant deployments.
     #[serde(default)]
     pub burn_proof: Option<ProofOfVessOwnership>,
 }
@@ -678,7 +679,8 @@ pub struct DhtSeedRequest {
     #[serde(default)]
     pub max_consumed_records: u16,
     /// Proof that the requester owns a Vess bill (prevents Sybil-based
-    /// DHT shard collection during bootstrap). Absent in testnet mode.
+    /// DHT shard collection during bootstrap). Omitted for backward
+    /// compatibility; required for Sybil-resistant production deployments.
     #[serde(default)]
     pub burn_proof: Option<ProofOfVessOwnership>,
 }

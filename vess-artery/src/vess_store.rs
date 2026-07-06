@@ -61,7 +61,7 @@ impl VessStore {
     /// - Previous owner (of inputs) must sign the batch commitment
     /// - Chain tips must advance for each output
     /// - Inputs are consumed atomically only if all outputs validate
-    pub fn validate_and_upsert_batch(&mut self, outputs: &[Vess]) -> Result<(), String> {
+    pub fn validate_and_upsert_batch(&mut self, outputs: &[Vess], testnet: bool) -> Result<(), String> {
         if outputs.is_empty() {
             return Ok(());
         }
@@ -77,7 +77,7 @@ impl VessStore {
             // Regular mined Vess: Argon2d verification
             for v in outputs {
                 if v.is_minted() {
-                    vess_foundry::mint::verify_minted_vess(v, clock::current_epoch())?;
+                    vess_foundry::mint::verify_minted_vess(v, clock::current_epoch(), testnet)?;
                 }
                 self.upsert_one(v);
             }
@@ -155,8 +155,8 @@ impl VessStore {
     // ── Single upsert ──────────────────────────────────────────────
 
     /// Store a single Vess (for single-output spends).
-    pub fn validate_and_upsert(&mut self, v: &Vess) -> Result<(), String> {
-        self.validate_and_upsert_batch(&[v.clone()])
+    pub fn validate_and_upsert(&mut self, v: &Vess, testnet: bool) -> Result<(), String> {
+        self.validate_and_upsert_batch(&[v.clone()], testnet)
     }
 
     /// Store without validation (for locally-created bills).
@@ -188,7 +188,7 @@ impl VessStore {
         true
     }
 
-    /// Legacy alias.
+    /// Store a single Vess (canonical entry point).
     pub fn upsert(&mut self, v: &Vess) -> bool {
         self.upsert_one(v)
     }

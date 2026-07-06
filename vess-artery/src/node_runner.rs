@@ -64,12 +64,15 @@ pub struct ArteryState {
     pub relay_addr: Option<std::net::SocketAddr>,
     /// Configured rendezvous server address for hole punching.
     pub rendezvous_addr: Option<std::net::SocketAddr>,
+    /// Whether this node is running in testnet mode (easier mining).
+    pub testnet: bool,
 }
 
 pub struct MintingState {
-    pub stop_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    pub stop_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
     pub amount: u64,
     pub started_at: u64,
+    pub num_threads: usize,
 }
 
 pub struct DuplicateTracker {
@@ -148,6 +151,7 @@ impl ArteryState {
             mesh_node: None,
             relay_addr: None,
             rendezvous_addr: None,
+            testnet: false,
         }
     }
     pub fn notify(&mut self, msg: &str) {
@@ -196,14 +200,14 @@ pub fn now_secs() -> u64 { std::time::SystemTime::now().duration_since(std::time
 
 // ── Validation ──
 
-pub fn validate_vess(v: &Vess, store: &VessStore, current_epoch: u64) -> Result<(), String> {
+pub fn validate_vess(v: &Vess, store: &VessStore, current_epoch: u64, testnet: bool) -> Result<(), String> {
     let id = v.compute_vess_id();
     if store.is_consumed(&id) { return Err("already consumed".into()); }
     if let Some(ex) = store.get(&id) { if v.chain_depth <= ex.chain_depth { return Err("stale".into()); } }
 
     // Validate minted Vess (Argon2d proof-of-work)
     if v.is_minted() {
-        return vess_foundry::mint::verify_minted_vess(v, current_epoch);
+        return vess_foundry::mint::verify_minted_vess(v, current_epoch, testnet);
     }
 
     // Validate faucet Vess (dev signature)
@@ -229,76 +233,94 @@ fn validate_changed(v: &Vess, store: &VessStore) -> Result<(), String> {
 // ── Mining ──
 
 pub fn spawn_miner(state: Arc<Mutex<ArteryState>>, amount: u64, initial_pk: [u8; 32], og_tx: mpsc::UnboundedSender<Vess>) {
-    let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let num_cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .max(1);
+
+    let stop_flag = Arc::new(AtomicBool::new(false));
     let start_epoch = vess_foundry::clock::current_epoch();
+    let started_at = now_secs();
+
+    // Store minting state for status/stop
     {
         let mut s = state.lock().unwrap();
-        s.minting = Some(MintingState { stop_tx: Some(stop_tx), amount, started_at: now_secs() });
+        s.minting = Some(MintingState {
+            stop_flag: Some(stop_flag.clone()),
+            amount,
+            started_at,
+            num_threads: num_cores,
+        });
     }
 
-    let cs = state.clone();
-    std::thread::spawn(move || {
-        let mut nonce: u64 = 0;
-        let mut current_epoch = start_epoch;
-        let mut bills_minted: u64 = 0;
+    tracing::info!(cores = num_cores, amount, "miner started with {} threads", num_cores);
 
-        loop {
-            // Check for stop signal
-            if stop_rx.try_recv().is_ok() {
-                tracing::info!(bills_minted, "miner stopped");
-                break;
-            }
+    // Spawn one thread per CPU core
+    for _ in 0..num_cores {
+        let cs = state.clone();
+        let tx = og_tx.clone();
+        let stop = stop_flag.clone();
+        let testnet = { state.lock().unwrap().testnet };
 
-            // Check if epoch changed — reset nonce, continue with new epoch
-            let now_epoch = vess_foundry::clock::current_epoch();
-            if now_epoch != current_epoch {
-                current_epoch = now_epoch;
-                nonce = 0;
-                tracing::debug!(epoch = current_epoch, "miner advanced to new epoch");
-            }
+        std::thread::spawn(move || {
+            let mut nonce: u64 = 0;
+            let mut current_epoch = start_epoch;
+            let mut found: u64 = 0;
 
-            // Try nonce
-            let hash = vess_foundry::mint::mint_argon2d(&initial_pk, current_epoch, nonce, amount);
-            let bits = vess_foundry::mint::leading_zero_bits(&hash);
-            let required_bits = vess_foundry::mint::amount_to_bits(amount);
+            loop {
+                // Check stop signal
+                if stop.load(Ordering::Relaxed) {
+                    tracing::debug!(found, "miner thread stopped");
+                    break;
+                }
 
-            if bits >= required_bits {
-                let owner_vk = {
-                    let s = cs.lock().unwrap();
-                    s.wallet_vk.clone()
-                };
-                if let Some(vk) = owner_vk {
-                    let v = Vess {
-                        amount,
-                        epoch: current_epoch,
-                        nonce,
-                        initial_pk,
-                        owner_vk: vk,
-                        prev_sig: Vec::new(),
-                        chain_depth: 0,
-                        consumed: Vec::new(),
-                        change_sig: Vec::new(),
-                        chain_tip: [0u8; 32],
-                        digest: hash,
-                        created_at: now_secs(),
-                        stealth_id: [0u8; 32],
-                        dht_index: 0,
-                    };
-                    let _ = og_tx.send(v);
-                    bills_minted += 1;
-                    // Reset nonce for next bill, same epoch
+                // Epoch rollover: reset nonce, continue with new epoch
+                let now_epoch = vess_foundry::clock::current_epoch();
+                if now_epoch != current_epoch {
+                    current_epoch = now_epoch;
                     nonce = 0;
-                    continue;
+                }
+
+                // Try nonce
+                let hash = vess_foundry::mint::mint_argon2d(&initial_pk, current_epoch, nonce, amount, testnet);
+                let bits = vess_foundry::mint::leading_zero_bits(&hash);
+                let required_bits = vess_foundry::mint::amount_to_bits(amount, testnet);
+
+                if bits >= required_bits {
+                    let owner_vk = { cs.lock().unwrap().wallet_vk.clone() };
+                    if let Some(vk) = owner_vk {
+                        let v = Vess {
+                            amount,
+                            epoch: current_epoch,
+                            nonce,
+                            initial_pk,
+                            owner_vk: vk,
+                            prev_sig: Vec::new(),
+                            chain_depth: 0,
+                            consumed: Vec::new(),
+                            change_sig: Vec::new(),
+                            chain_tip: [0u8; 32],
+                            digest: hash,
+                            created_at: now_secs(),
+                            stealth_id: [0u8; 32],
+                            dht_index: 0,
+                        };
+                        let _ = tx.send(v);
+                        found += 1;
+                        nonce = 0;
+                        continue;
+                    }
+                }
+
+                nonce = nonce.wrapping_add(1);
+                if nonce % 10_000 == 0 {
+                    std::thread::yield_now();
                 }
             }
-
-            nonce = nonce.wrapping_add(1);
-            if nonce % 1000 == 0 {
-                std::thread::yield_now();
-            }
-        }
-        let _ = cs.lock().map(|mut s| s.minting = None);
-    });
+        });
+    }
 }
 
 // ── Node entry point ──
@@ -405,6 +427,7 @@ pub async fn run_node(config: NodeConfig) -> anyhow::Result<String> {
         s.mesh_node = Some(mesh_node.clone());
         s.relay_addr = config.relay_addr;
         s.rendezvous_addr = config.rendezvous_addr;
+        s.testnet = config.test;
     }
 
     // Restore persisted peers
@@ -560,6 +583,27 @@ pub async fn run_node(config: NodeConfig) -> anyhow::Result<String> {
             if let Ok(storage) = crate::persistence::NodeStorage::open(&persist_dir) {
                 if let Err(e) = storage.save(&snap) {
                     tracing::warn!(%e, "failed to persist snapshot");
+                }
+            }
+        }
+    });
+
+    // ── Periodic peer exchange gossip ──
+    let gossip_state = state.clone();
+    let gossip_node = mesh_node.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+        loop {
+            interval.tick().await;
+            let contacts = {
+                let s = gossip_state.lock().unwrap();
+                s.peer_endpoints.values().take(5).cloned().collect::<Vec<_>>()
+            };
+            for ep_str in &contacts {
+                if let Ok(contact) = vess_mesh::decode_mesh_contact_string(ep_str) {
+                    let _ = gossip_node.send_message(&contact, &vess_protocol::PulseMessage::PeerExchange(
+                        vess_protocol::PeerExchange { sender_id: gossip_node.id().as_bytes().to_vec() }
+                    )).await;
                 }
             }
         }
@@ -923,6 +967,12 @@ fn handle_mesh_message(
 
         // ── Vess DHT sharding: receive and store Vess from peers ──
         vess_protocol::PulseMessage::DhtStoreVess(v) => {
+            let current_epoch = vess_foundry::clock::current_epoch();
+            let testnet = state.lock().unwrap().testnet;
+            if let Err(e) = validate_vess(&v, &state.lock().unwrap().store, current_epoch, testnet) {
+                tracing::debug!(%e, "rejected invalid Vess from DHT shard");
+                return None;
+            }
             let mut s = state.lock().unwrap();
             if s.store.upsert(&v) {
                 tracing::debug!(id=%hex::encode(&v.compute_vess_id()[..8]), amount=v.amount, "received Vess from DHT shard");
@@ -1148,7 +1198,7 @@ fn handle_mesh_message(
             ))
         }
 
-        // ── Gossip / other — stubbed for now ──
+        // ── Unhandled message types ──
         _ => {
             tracing::trace!("unhandled mesh message: {:?}", std::mem::discriminant(msg));
             None
