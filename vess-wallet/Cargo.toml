@@ -1,0 +1,21 @@
+[package]
+name = "vess-wallet"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["lib", "cdylib"]
+
+[[bin]]
+name = "vess-wallet-cli"
+path = "src/main.rs"
+
+[dependencies]
+vess-crypto = { path = "../vess-crypto" }
+vess-network = { path = "../vess-network" }
+hex = "0.4"
+pqcrypto-dilithium = "0.5"
+pqcrypto-kyber = "0.8"
+pqcrypto-traits = "0.3"
+rand = "0.8"
+heed = "0.20"

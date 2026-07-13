@@ -1,14 +1,13 @@
 [workspace]
 members = [
-    "vess-mesh",
-    "vess-foundry",
-    "vess-stealth",
-    "vess-tag",
-    "vess-artery",
-    "vess-sovereign",
-    "vess-protocol",
-    "vess-cli",
-    "vess-relay",
-    "vess-rendezvous",
+    "vess-crypto",
+    "vess-network",
+    "vess-wallet",
+    "vess-node",
 ]
 resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"

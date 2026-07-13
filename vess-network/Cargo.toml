@@ -1,0 +1,10 @@
+[package]
+name = "vess-network"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+vess-crypto = { path = "../vess-crypto" }
+pqcrypto-dilithium = "0.5"
+pqcrypto-kyber = "0.8"
+pqcrypto-traits = "0.3"

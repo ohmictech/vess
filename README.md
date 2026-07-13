@@ -1,199 +1,172 @@
-# VESS #
+# Vess
 
-Stateless, stealth energy-value protocol. Vess flows around the most resilient, decentralized crypto mesh network ever conceived. Zero fees. Unlimited network throughput. Rapid settlement. Highly trustless. 100% post-quantum cryptography.
+**Vess is a post-quantum, feeless, energy-backed, decentralized crypto payment protocol.**
 
-Actual thermodynamic money.
+What this network achieves:
 
-### MINTING ###
+- Quantum resistant from the ground up
+- ~1 second block time
+- Good surveillance resistance
+- Bandwidth limited throughput
+- Zero transaction fees
+- Low state bloat and hardware requirements
+- Payment transport agnosticism (OOB)
+- Node discovery agnosticism (OOB)
+- Memory hard, highly ASIC resistant mining
+- No pre-mine or VC
+- No artificial scarcity
+- Mnimalist codebase
 
-Every Vess is born in a memory-hard Argon2d 1GB hashing session. Hit enough leading 0 bits derived from your *nonce | stealth address | epoch | amount* and you've successfully created new value, backed completely by energy and hardware. Unlike traditional PoW, the purpose of minting in this protocol is not to secure the network directly. There are no blocks nor block times, no global ledger agreement. Each individual Vess mined acts like its own UTXO whose ID is a hash of the very lottery preimage that created it, essentially baking in its energy proof as the root of the ownership chain that it contains.
+---
 
-Argon2d was selected to level the playing field. All that matters in terms of minting power is effectively your core count and memory bandwidth, which are much harder to scale industrially than pure hashing silicon. Consumer hardware is sufficient to be worth minting.
+The reason for its existence overlaps precisely zero with almost the entirety of DeFi. If you're interested in making a quick buck, move along.
 
-### ECONOMICS ###
+Vess is backed 1:1 by energy. It is intended as a thermodynamic currency, rather than a speculative asset to hold and sell for more later on. There are no arbitrary tokenomics or programmatic deflation schedules. Mine it, spend it, move it around. Create velocity rather than stagnation, using it as an actual payment method.
 
-There is no supply limit or difficulty adjustment, because Vess was not created to be a speculative asset, it was created to represent tokenized energy. This is not problematic because unlike fiat currency, which is birthed into existence arbitrarily, every single Vess requires energy expenditure. Devaluation is not the result of a growing supply of Vess, because each unit has a baseline cost of production. The supply simply expands to match the electricity injected rather than dilution.
+---
 
-As there is no initial coin supply, tokenomics, fees, or allocations, development is funded by a hardcoded dev faucet subsidy. Limited to once per 24 hour epoch, a single payout of 30,000 vess is elligible to be claimed by the protocol. Other than this modest emission, all Vess is created by equal effort.
+It allows feelessness because unlike traditional consensus, it does not passively and politely reorder malicious data. Millions of lines of code have been written in the past two decades to solidify distributed ledgers that agree on which version of a spend is the correct one. Blocks, PoW, PoS, DAGs. Their entire architectural purpose outside of agreement on a set of data is to respectfully resolve conflicts.
 
-### HASH TABLE ###
+Unfortunately, historical cryptocurrency offloads the cost of malice onto honest node operators. You pay for adversarial resistance with fees, state bloat, thoughput blockages, all in the name of protection. Vess understands a double spend for what it actually is: a willful, malicious attempt to extract value and sabotage a network.
 
-Vess is stored on the network's distributed hash table, keyed by its ID. Conflicting Vess is resolved deterministically, with the longest chain depth winning out, and ties broken by lowest hash. This renders double spends impossible as long as there is at least a single honest node responding to a DHT request.
+So, a conflict in Vess is resolved with appropriate force: a total vaporization of all associated UTXOs. If a node sees a conflicting set of payments, it simply deletes all associated inputs. The penalty for dishonesty in Vess rests completely on the attackers.
 
-All data except the global epoch clock is distributed, rather than universally agreed upon, allowing any modest device to run a full node.
+---
 
-### PAYMENTS ###
+## Everything is out-of-band
 
-Payments are made to human readable *+VESSTAGS* rather than crypto addresses. The hashes of these tags are mapped out to public stealth addresses, stored on the hash table. Tag queries are weighted by Vess ownership, which makes spoofing economically unviable.
+Vess payments never travel from payer to payee through the node network. A `vess://` invoice and the signed `VessPayment` blob are exchanged through whatever channel the two parties choose: a messaging app, a QR code, an email, a USB drive, a printed piece of paper, a forum post, an NFC tap, a Bluetooth transfer. The network only sees the blob when the receiver decides to submit it.
 
-Tags are alphanumeric, case insensitive strings claimed during wallet creation and reserved for 30 days to give users time to harden them by receiving or minting Vess.
+This is a structural defense.
 
-A payment in this network is not a public broadcast of state change. To send Vess to someone, you choose the Vess you'd like to change ownership of privately, sign the hand-off and change locally, and send the data encapsulated to the receiver's stealth address through the DHT. The receiver then has enough data to update the Vess states on the network, claiming the new Vess for themselves and consuming the old.
+**Massively increased attack surface for surveillance.** To trace who paid whom, an adversary can no longer just monitor the P2P network. They must also compromise every possible channel in use. Signal, WhatsApp, Gmail, iMessage, physical mail, in-person meetings, whatever. The payment graph scatters across carriers the network has no visibility into. A blockchain analyst who reconstructs the full on-chain history still doesn't know whether the blob traveled through a ProtonMail attachment or a sticker on a coffee shop counter. Every channel added to the ecosystem multiplies the adversary's required coverage.
 
-If it is never claimed, it never changes ownership.
+**Network-level attacks become irrelevant.** You can't eclipse-attack a payment that doesn't touch the mesh. You can't DDoS a transaction out of the mempool when the mempool isn't involved until the receiver is ready. Payer and receiver can complete the entire exchange while both are fully offline from the Vess network. The payment blob is inert bytes until submitted — it has no expiration, no nonce dependency on network state, no sequence number that expires.
 
-### SOVEREIGNTY ###
+**Third-party flexibility with no protocol lock-in.** Any app can generate a `vess://` invoice. Any wallet implementation can sign a `VessPayment`. Any node can accept the submission. The format is just bytes, and there is no handshake between wallet and node, no API key, no registration. Every medium can operate at the level of "produce this blob, accept that blob." Nobody needs permission to participate.
 
-Every payment is wrapped in four unlinkable cryptographic layers:
+---
 
-0. Onion routing — 3-hop relay, no single node knows sender + recipient
-1. ML-KEM-768 mesh — ephemeral session keys per connection
-2. ML-KEM-768 stealth — unique stealth_id per payment, 48 KiB padded payloads
-3. ML-DSA-65 ephemeral — fresh owner key per bill, no address reuse
+## Why should you care?
 
-No observer at any layer can correlate sender, amount, or recipient.
+| | Bitcoin | Ethereum | Nano | **Vess** |
+|---|---|---|---|---|
+| Post-quantum | No | No | No | **Yes** |
+| Fees | Yes | Yes | No | **No** |
+| Mine on laptop | No | No | N/A | **Yes** |
+| ASIC-resistant PoW | No | No | N/A | **Yes** |
+| Privacy | Pseudononymous | Almost none | Almost none | Good |
+| Value anchor | Speculation | Speculation | Speculation | **Energy (PoW)** |
+| Codebase size | 500K+ LoC | 2M+ LoC | 200K+ LoC | **~3K LoC** |
 
-### USAGE ###
+## How it works (60 seconds)
 
-Build from source (Rust 1.80+):
+1. **Mining:** Find a 42-cycle in a Cuckatoo32 graph (~1.3GB RAM, single-threaded). Submit the block. Nodes verify the proof in microseconds and reward the miner with freshly minted coins. Difficulty auto-adjusts toward a ~1-second block time.
+2. **Consensus:** Every node maintains a UTXO set in LMDB — just opaque `VessId` hashes with no amounts or owner data. When a payment arrives, nodes verify signatures, check that inputs are unspent, and apply the state change. If two payments spend the same coin (a double-spend), Vess doesn't reorder — it **vaporizes** all inputs from both payments. The penalty for malice falls entirely on the attacker.
+3. **Spending (always OOB):** There are no on-chain addresses. Every payment begins with a `vess://` invoice shared however you want (QR code, messaging app, email, NFC, wallet). The payer's wallet builds and signs a `VessPayment` blob, then hands it back to the receiver out-of-band. The receiver submits it to any node. Each output uses a one-time ML-DSA-65 keypair, so there's nothing to reuse, link, or track.
+4. **Dev subsidy:** 1% of each block reward (minimum 1 Vess) goes to a hardcoded dev key. No premine, no ICO, no special minting privilege.
+
+### No seed phrases — you own the files
+
+Vess has no 12-word recovery phrase. There is no BIP39, no HD derivation, no master seed. Each UTXO contains its own independent ML-DSA-65 keypair, stored directly in your encrypted wallet file (`wallet.vess`). Owning Vess literally means possessing the files that contain those private keys.
+
+This means:
+
+- **No phrase to leak.** There's no 12- or 24-word string that, if screenshot or spoken, drains everything. Your coins are individual keys in an encrypted blob.
+- **No BIP39 footgun.** Nobody loses funds because they stored a seed phrase in a password manager, cloud note, or under their keyboard. If you don't have the wallet file, you don't have the coins — period.
+- **Natural partitioning.** Cold storage is as simple as copying `wallet.vess` to a USB drive and deleting it from the online machine. Spend a few coins by moving just those keypairs into a hot wallet file. No derivation paths, no gap limits, no change-chain scanning.
+- **Backup is copy.** Wallet file on two drives? That's your backup. Lose all copies? Those coins are gone — there's no registrar to appeal to. This is a feature, not a bug.
+- **Nothing to subpoena.** If a custodian or exchange claims to hold Vess, they must produce the actual signed blobs. There is no "wallet import format" that lets them sweep from a 12-word phrase extracted from a database. Either they have the keys, or they don't.
+
+In short: your wallet file *is* your money. Treat it accordingly.
+
+## Running a node
 
 ```bash
-git clone https://github.com/vess/vess
-cd vess
+# Build everything
 cargo build --release
+
+# Start a node (listens on 0.0.0.0:9876 by default)
+cargo run --release -p vess-node
+
+# Start with mining enabled
+cargo run --release -p vess-node -- --mine
+
+# Listen on a specific port
+cargo run --release -p vess-node -- --listen 0.0.0.0:9877
+
+# Bootstrap from an existing peer
+cargo run --release -p vess-node -- --bootstrap 127.0.0.1:9876
+
+# All flags combined
+cargo run --release -p vess-node -- --listen 0.0.0.0:9877 --mine --bootstrap 127.0.0.1:9876
 ```
 
-Binaries produced: `vess` (CLI wallet + node), `vess-relay`, `vess-rendezvous`.
+| Flag | Description |
+|---|---|
+| `--listen <addr>` | Bind address (default: `0.0.0.0:9876`) |
+| `--mine` | Enable mining |
+| `--bootstrap <addr>` | Connect to an existing peer on startup (repeatable) |
 
-### ARCHITECTURE ###
-
-```
-vess-cli/          CLI wallet (init, send, mint, claim, node, etc.)
-vess-artery/       Full node — mesh networking, DHT, mining, RPC server
-vess-mesh/         P2P transport — UDP/TCP carriers, handshake, relay, rendezvous
-vess-foundry/      Core types — Vess bill, minting, spend auth, clock
-vess-protocol/     Wire format — PulseMessage enum, DHT query/response, payment
-vess-stealth/      ML-KEM-768 stealth addressing — per-payment unlinkability
-vess-tag/          VessTag — human-readable recipient identifiers
-vess-sovereign/    Wallet file — BIP39 recovery, encrypted persistence
-vess-relay/        Standalone relay server binary (NAT fallback)
-vess-rendezvous/   Standalone rendezvous server binary (hole punching)
-```
-
-Third-party integration path:
-```
-Your wallet (any language) ← TCP JSON-line :9821 → vess node ← mesh → DHT
-```
-
-#### Wallet
+## Running the wallet
 
 ```bash
-# Create a new wallet (BIP39 recovery phrase + password)
-vess init --name mywallet
+# Build
+cargo build --release
 
-# Recover a wallet from phrase
-vess recover --name mywallet
+# Import coinbase outputs from a node's LMDB (run while node is live)
+cargo run --release -p vess-wallet -- --import vess-db
 
 # Check balance
-vess balance
+cargo run --release -p vess-wallet -- --balance
 
-# Show your receiving vesstag (for others to send to you)
-vess receive
+# Consolidate all UTXOs into fewer outputs (reduces future tx sizes)
+cargo run --release -p vess-wallet -- --consolidate
+
+# Generate an invoice (receiver)
+cargo run --release -p vess-wallet -- --invoice 100
+
+# Pay an invoice — export signed blob for OOB delivery (payer)
+cargo run --release -p vess-wallet -- --pay "vess://abc123...?amount=100" --out payment.vess
+
+# Claim a payment blob received OOB (receiver)
+cargo run --release -p vess-wallet -- --submit payment.vess
+
+# Connect to a specific node (default: 127.0.0.1:9876)
+cargo run --release -p vess-wallet -- --connect 127.0.0.1:9877 --balance
+
+# Use a custom wallet file and password
+cargo run --release -p vess-wallet -- --wallet my-wallet.vess --password hunter2 --balance
 ```
 
-#### Sending
+| Flag | Description |
+|---|---|
+| `--import <db-path>` | Import unspent coinbase outputs from a node's LMDB |
+| `--balance` | Print balance and exit |
+| `--consolidate` | Merge up to 5 UTXOs at a time into single outputs |
+| `--invoice <amount>` | Print a `vess://` invoice URL for the given amount |
+| `--pay <url>` | Build and sign a payment for a `vess://` invoice (requires `--out`) |
+| `--out <file>` | File path for exported payment blob |
+| `--submit <file>` | Submit a `VessPayment` blob received OOB to the network |
+| `--connect <addr>` | Node address for RPC (default: `127.0.0.1:9876`) |
+| `--wallet <path>` | Wallet file path (default: `wallet.vess`) |
+| `--password <pw>` | Wallet encryption password (default: empty) |
+
+### Interactive mode
+
+Run without flags for a REPL:
 
 ```bash
-# Send via onion routing (default, 3-hop private)
-vess send --amount 100 --recipient +alice
-
-# Send direct (faster, less private)
-vess send --amount 100 --recipient +alice --direct
+cargo run --release -p vess-wallet
+> connect 127.0.0.1:9876
+> balance
+> invoice 50
+> pay vess://...
+> submit payment.vess
+> consolidate
+> help
 ```
 
-#### Tags
+## License
 
-```bash
-# Register a human-readable tag (alphanumeric, case-insensitive)
-vess tag register alice
-```
-
-#### Minting
-
-```bash
-# Start mining (continuous, epoch-aware, 1 GB Argon2d)
-vess mint start --amount 1
-
-# Check mining status
-vess mint status
-
-# Stop mining
-vess mint stop
-```
-
-#### Claims & Recovery
-
-```bash
-# Claim all buffered payments since last sweep (auto-derives mailbox keys)
-vess claim
-
-# Push encrypted wallet manifest to DHT for disaster recovery
-vess manifest
-
-# Show wallet notifications
-vess notifications
-```
-
-#### Node
-
-```bash
-# Start the artery node (mesh networking + DHT + RPC)
-vess node --wallet mywallet
-
-# With NAT traversal (deploy relay/rendezvous servers on public IPs first)
-vess node --wallet mywallet --rendezvous 1.2.3.4:9445 --relay 1.2.3.4:9446
-
-# With bootstrap peers and custom bind
-vess node --wallet mywallet --bind 0.0.0.0:18348 --bootstrap peer1:port,peer2:port
-
-# Non-interactive password
-vess node --wallet mywallet --password "mypass"
-
-# Show node status
-vess status
-```
-
-#### Peers
-
-```bash
-# Add a peer while the node is running
-vess peer add "192.168.1.5:18348"
-
-# List known peers
-vess peer list
-
-# Remove a peer by node ID prefix
-vess peer remove abc12345
-```
-
-#### Infrastructure
-
-Vess chooses to stay neutral and censorship resistant at the base layer, not providing any central relay servers or bootstrap nodes. Third party implementations must provide their own bootstrap node paths and relay servers. Out of band node discovery is recommended for maximum decentralization.
-
-```bash
-# Run a relay server (transparent forwarding for symmetric NATs)
-vess-relay --bind 0.0.0.0:9446
-
-# Run a rendezvous server (UDP hole-punch coordinator)
-vess-rendezvous --bind 0.0.0.0:9445
-```
-
-#### RPC
-
-Third-party wallets integrate via TCP JSON-line on port 9821:
-
-```bash
-# Example: check balance via curl
-echo '{"method":"balance","params":{}}' | nc localhost 9821
-```
-
-Full RPC API: `balance`, `send`, `send_direct`, `receive`, `tag_register`, `tag_lookup`,
-`mint_start`, `mint_stop`, `mint_status`, `faucet_submit`, `manifest_push`,
-`recover_manifest`, `claim`, `notifications`, `status`, `wallet_info`,
-`add_peer`, `list_peers`, `remove_peer`, `ban_peer`.
-
-
-
-## LICENSE ## 
-
-Apache 2.0 License
+Apache 2.0
