@@ -1,6 +1,7 @@
 /target/
 **/target/
 *.vess
+*.ps1
 vess-db/
 node1-db/
 node2-db/
