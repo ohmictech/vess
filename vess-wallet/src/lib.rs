@@ -236,17 +236,18 @@ impl Wallet {
 
         // Outputs: timestamp=0 for transfers (not mints)
         let mut out_vess: Vec<Vess> = outputs.iter().map(|(oh, amt)| {
-            Vess { variant: VessVariant::Output, amount: *amt, owner_hash: *oh, timestamp: 0, nonce: 0, salt: random_bytes(), pubkey: Vec::new(), spend_key: Vec::new(), proof: vec![] }
+            Vess { variant: VessVariant::Output, amount: *amt, owner_hash: *oh, timestamp: 0, nonce: 0, salt: random_bytes(), pubkey: Vec::new(), spend_key: Vec::new(), proof: vec![], spend_condition: None }
         }).collect();
 
         if change > 0 {
             let (pk, sk) = dsa_generate();
             let oh = dsa_pubkey_hash(&pk);
             self.keypairs.insert(oh, Keypair { dsa_pk: pk, dsa_sk: sk });
-            out_vess.push(Vess { variant: VessVariant::Output, amount: change, owner_hash: oh, timestamp: 0, nonce: 0, salt: random_bytes(), pubkey: Vec::new(), spend_key: Vec::new(), proof: vec![] });
+            out_vess.push(Vess { variant: VessVariant::Output, amount: change, owner_hash: oh, timestamp: 0, nonce: 0, salt: random_bytes(), pubkey: Vec::new(), spend_key: Vec::new(), proof: vec![], spend_condition: None });
         }
 
-        let mut payment = VessPayment { payment_id: [0u8; 32], inputs: selected, outputs: out_vess, timestamp: 0, sigs: Vec::new() };
+        let preimage_count = selected.len();
+        let mut payment = VessPayment { payment_id: [0u8; 32], inputs: selected, outputs: out_vess, timestamp: 0, sigs: Vec::new(), preimages: vec![None; preimage_count] };
         payment.compute();
 
         for v in &payment.inputs {
@@ -374,7 +375,7 @@ impl Wallet {
     /// Import coinbase Vess objects from a node's treasure chest (LMDB "keys" database).
     /// Adds to vbank_claimed (they're confirmed on-chain). Skips duplicates.
     pub fn import_treasure(&mut self, db_path: &str) -> usize {
-        let env = match unsafe { heed::EnvOpenOptions::new().map_size(1_073_741_824).max_dbs(4).open(db_path) } {
+        let env = match unsafe { heed::EnvOpenOptions::new().map_size(1_073_741_824).max_dbs(5).open(db_path) } {
             Ok(e) => e, Err(_) => return 0,
         };
         let t = match env.read_txn() { Ok(t) => t, Err(_) => return 0 };

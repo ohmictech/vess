@@ -21,6 +21,8 @@ pub const RPC_CHECK: u8 = 0x10;
 pub const RPC_CHECK_RESP: u8 = 0x11;
 pub const RPC_SUBMIT: u8 = 0x14;
 pub const RPC_SUBMIT_RESP: u8 = 0x15;
+pub const RPC_CONNECT_PEER: u8 = 0x1A;
+pub const RPC_CONNECT_PEER_RESP: u8 = 0x1B;
 pub const RPC_GET_PEERS: u8 = 0x18;
 pub const RPC_GET_PEERS_RESP: u8 = 0x19;
 
@@ -55,6 +57,7 @@ pub enum RpcRequest {
     Check(VessId),
     Submit(VessPayment),
     GetPeers,
+    ConnectPeer(std::net::SocketAddr),
 }
 
 #[derive(Debug)]
@@ -62,6 +65,7 @@ pub enum RpcResponse {
     Check(bool),
     Submit(bool),
     GetPeers(Vec<(NodeId, SocketAddr)>),
+    ConnectPeer(bool),
 }
 
 pub fn frame(tag: u8, payload: &[u8]) -> Vec<u8> {
@@ -202,6 +206,12 @@ impl RpcRequest {
             RpcRequest::Check(id) => frame(RPC_CHECK, id),
             RpcRequest::Submit(p) => frame(RPC_SUBMIT, &p.encode()),
             RpcRequest::GetPeers => frame(RPC_GET_PEERS, &[]),
+            RpcRequest::ConnectPeer(addr) => {
+                let mut p = Vec::new();
+                write_u16(&mut p, addr.port());
+                write_bytes(&mut p, addr.ip().to_string().as_bytes());
+                frame(RPC_CONNECT_PEER, &p)
+            }
         }
     }
 
@@ -211,6 +221,14 @@ impl RpcRequest {
             RPC_CHECK => Some(RpcRequest::Check(read_fixed(payload, &mut pos)?)),
             RPC_SUBMIT => VessPayment::decode(payload, &mut pos).map(RpcRequest::Submit),
             RPC_GET_PEERS => Some(RpcRequest::GetPeers),
+            RPC_CONNECT_PEER => {
+                let port = u16::from_le_bytes(payload.get(..2)?.try_into().ok()?);
+                pos = 2;
+                let ip_bytes = read_bytes(payload, &mut pos)?;
+                let ip_str = std::str::from_utf8(&ip_bytes).ok()?;
+                let addr = format!("{}:{}", ip_str, port).parse().ok()?;
+                Some(RpcRequest::ConnectPeer(addr))
+            }
             _ => None,
         }
     }
@@ -221,6 +239,7 @@ impl RpcResponse {
         match self {
             RpcResponse::Check(b) => frame(RPC_CHECK_RESP, &[*b as u8]),
             RpcResponse::Submit(b) => frame(RPC_SUBMIT_RESP, &[*b as u8]),
+            RpcResponse::ConnectPeer(b) => frame(RPC_CONNECT_PEER_RESP, &[*b as u8]),
             RpcResponse::GetPeers(peers) => {
                 let mut p = Vec::new();
                 write_u32(&mut p, peers.len() as u32);
@@ -250,6 +269,9 @@ impl RpcResponse {
                     peers.push((id, addr));
                 }
                 Some(RpcResponse::GetPeers(peers))
+            }
+            RPC_CONNECT_PEER_RESP => {
+                Some(RpcResponse::ConnectPeer(payload.first().copied().unwrap_or(0) != 0))
             }
             _ => None,
         }

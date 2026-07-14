@@ -42,6 +42,16 @@ fn main() -> std::io::Result<()> {
             }
         }
     }
+
+    // Reconnect to known peers from previous sessions
+    let reconnects = node.reconnect_peers();
+    if !reconnects.is_empty() {
+        eprintln!("reconnecting to {} known peers...", reconnects.len());
+        for (addr, init) in reconnects {
+            let _ = socket.send_to(&init, addr);
+        }
+    }
+
     eprintln!("node ready — listening on {}", addr);
 
     let mut buf = [0u8; 65536];

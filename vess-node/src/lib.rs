@@ -10,6 +10,7 @@ const DANDELION_FLUFF_PROB: f64 = 0.10; // 10% chance per hop to switch to fluff
 const DANDELION_EMBARGO_TICKS: u64 = 40; // ~200ms embargo before fluff broadcast
 const HOLE_PUNCH_MAX_RETRIES: u8 = 3;
 const STEM_RELAY_MAX_PER_TICK: usize = 2;
+const MAX_FRAME_SIZE: usize = 20 * 1024 * 1024;  // 20 MB max UDP datagram (block + overhead)
 
 /// NAT reachability classification.
 #[derive(PartialEq, Clone, Copy, Debug)]
@@ -41,6 +42,7 @@ pub struct Node {
     ban_list: heed::Database<heed::types::Bytes, heed::types::Unit>,
     meta: heed::Database<heed::types::Str, heed::types::Bytes>,
     mined_keys: heed::Database<heed::types::Bytes, heed::types::Bytes>, // owner_hash → pubkey||spend_key
+    peers_db: heed::Database<heed::types::Bytes, heed::types::Unit>,   // persisted peer addresses
     limbo: HashMap<PaymentId, (VessPayment, u64)>,       // payment → (data, entry_tick)
     limbo_inputs: HashMap<VessId, Vec<PaymentId>>,       // which limbo payments claim each input
     contested: HashSet<PaymentId>,                        // payments with conflicting inputs (burn on block inclusion)
@@ -68,6 +70,7 @@ pub struct Node {
     sync_offset: u64,                             // how many UTXO IDs received so far
     sync_target_root: Option<MerkleRoot>,         // target merkle root we're aiming for
     sync_chunk_size: u32,                         // IDs per SyncReq chunk
+    auto_sync_until: u64,                         // keep driving sync until this tick
     test_mode: bool,
 }
 
@@ -79,16 +82,17 @@ impl Node {
 
     fn new_inner(addr: SocketAddr, db_path: &str, test_mode: bool) -> Self {
         let _ = std::fs::create_dir(db_path);
-        let env = unsafe { heed::EnvOpenOptions::new().map_size(1_073_741_824).max_dbs(4).open(db_path) }.unwrap();
+        let env = unsafe { heed::EnvOpenOptions::new().map_size(1_073_741_824).max_dbs(5).open(db_path) }.unwrap();
         let mut wtxn = env.write_txn().unwrap();
         let db: heed::Database<heed::types::Bytes, heed::types::Unit> = env.create_database(&mut wtxn, Some("vess")).unwrap();
         let ban_list: heed::Database<heed::types::Bytes, heed::types::Unit> = env.create_database(&mut wtxn, Some("bans")).unwrap();
         let meta: heed::Database<heed::types::Str, heed::types::Bytes> = env.create_database(&mut wtxn, Some("meta")).unwrap();
         let mined_keys: heed::Database<heed::types::Bytes, heed::types::Bytes> = env.create_database(&mut wtxn, Some("keys")).unwrap();
+        let peers_db: heed::Database<heed::types::Bytes, heed::types::Unit> = env.create_database(&mut wtxn, Some("peers")).unwrap();
         wtxn.commit().unwrap();
 
         let (saved_ticks, saved_diff) = Self::load_meta(&env, &meta);
-        let mut node = Self { addr, network: Network::new(), peers: HashMap::new(), max_peers: 32, needs_sync: true, env, vess_index: db, ban_list, meta, mined_keys,
+        let mut node = Self { addr, network: Network::new(), peers: HashMap::new(), max_peers: 32, needs_sync: true, env, vess_index: db, ban_list, meta, mined_keys, peers_db,
             limbo: HashMap::new(), limbo_inputs: HashMap::new(), contested: HashSet::new(),
             outbox: Vec::new(), ticks: saved_ticks, fails: HashMap::new(),
             peer_msg_count: HashMap::new(), msg_window_start: 0, peer_merkle: HashMap::new(),
@@ -104,6 +108,7 @@ impl Node {
             sync_offset: 0,
             sync_target_root: None,
             sync_chunk_size: 10000,
+            auto_sync_until: 0,
             test_mode };
         // Load persisted bans
         if let Ok(t) = node.env.read_txn() {
@@ -113,6 +118,26 @@ impl Node {
                         if key.len() >= 6 {
                             let addr = SocketAddr::from(([0,0,0,0], u16::from_le_bytes([key[4], key[5]])));
                             node.fails.insert(addr, 100); // Already banned
+                        }
+                    }
+                }
+            }
+            // Load persisted peers
+            if let Ok(iter) = node.peers_db.iter(&t) {
+                for entry in iter {
+                    if let Ok((key, _)) = entry {
+                        if key.len() >= 6 {
+                            let port = u16::from_le_bytes([key[0], key[1]]);
+                            let ip = &key[2..];
+                            if ip.len() >= 4 {
+                                let ip_addr = std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                                    ip[0], ip[1], ip[2], ip[3]));
+                                let addr = SocketAddr::new(ip_addr, port);
+                                // Don't add our own address
+                                if addr != node.addr {
+                                    node.peers.insert(addr, [0u8; 32]);
+                                }
+                            }
                         }
                     }
                 }
@@ -147,8 +172,9 @@ impl Node {
     pub fn limbo_len(&self) -> usize { self.limbo.len() }
     /// Number of UTXOs in the LMDB state index.
     pub fn utxo_count(&self) -> usize {
-        let t = self.env.read_txn().unwrap();
-        self.vess_index.len(&t).unwrap_or(0) as usize
+        self.env.read_txn().ok()
+            .and_then(|t| self.vess_index.len(&t).ok())
+            .unwrap_or(0) as usize
     }
     pub fn has_session_for(&self, addr: &SocketAddr) -> bool { self.network.session_by_addr(addr).is_some() }
 
@@ -249,6 +275,46 @@ impl Node {
         for n in &proof.1 { payload_with_pow.extend_from_slice(&n.to_le_bytes()); }
         frame(tag, &payload_with_pow)
     }
+
+    /// Persist a peer address so we can reconnect on restart.
+    fn persist_peer(&self, addr: SocketAddr) {
+        let mut key = addr.port().to_le_bytes().to_vec();
+        match addr.ip() {
+            std::net::IpAddr::V4(ip) => key.extend_from_slice(&ip.octets()),
+            std::net::IpAddr::V6(ip) => key.extend_from_slice(&ip.octets()),
+        }
+        if let Ok(mut w) = self.env.write_txn() {
+            let _ = self.peers_db.put(&mut w, &key, &());
+            let _ = w.commit();
+        }
+    }
+
+    /// Trigger auto-sync for the next ~5 seconds (1000 ticks).
+    fn trigger_auto_sync(&mut self) {
+        self.auto_sync_until = self.ticks.saturating_add(1000);
+    }
+
+    /// Attempt to reconnect to all known-but-unconnected peers.
+    /// Returns list of (addr, handshake_init_bytes) to be sent via socket.
+    pub fn reconnect_peers(&mut self) -> Vec<(std::net::SocketAddr, Vec<u8>)> {
+        let unconnected: Vec<std::net::SocketAddr> = self.peers.iter()
+            .filter(|(a, id)| {
+                **id == [0u8; 32] &&               // not yet handshaked
+                *a != &self.addr &&                 // not ourselves
+                !self.has_session_for(a)            // no active session
+            })
+            .map(|(a, _)| *a)
+            .collect();
+        let mut out = Vec::new();
+        for addr in unconnected {
+            if self.peer_count() >= self.max_peers { break; }
+            let init = self.add_peer(addr);
+            if !init.is_empty() {
+                out.push((addr, init));
+            }
+        }
+        out
+    }
     pub fn check_direct(&self, id: &VessId) -> bool {
         self.env.read_txn().ok()
             .and_then(|t| self.vess_index.get(&t, id).ok().flatten())
@@ -322,6 +388,7 @@ impl Node {
         }
         self.limbo.insert(p.payment_id, (p.clone(), self.ticks));
         self.relay(&p);
+        self.trigger_auto_sync();
         true
     }
 
@@ -357,7 +424,7 @@ impl Node {
     /// Compute what the state merkle WILL be after applying a set of payments.
     fn compute_state_merkle(&self, all_payments: &[VessPayment]) -> MerkleRoot {
         let conflicted = Self::find_conflicts(all_payments);
-        let rt = self.env.read_txn().unwrap();
+        let rt = match self.env.read_txn() { Ok(t) => t, Err(_) => return [0u8; 32] };
         let mut ids: Vec<VessId> = self.vess_index.iter(&rt).unwrap()
             .filter_map(|r| r.ok())
             .map(|(k, _)| { let mut a = [0u8;32]; a.copy_from_slice(&k); a })
@@ -383,10 +450,10 @@ impl Node {
         let mut coinbase_outputs = Vec::new();
         if reward > 0 {
             coinbase_outputs.push(Vess { variant: VessVariant::Mint, amount: reward, owner_hash,
-                timestamp: 0, nonce: 0, salt: random_bytes(), pubkey, spend_key, proof: vec![] });
+                timestamp: 0, nonce: 0, salt: random_bytes(), pubkey, spend_key, proof: vec![], spend_condition: None });
         }
         coinbase_outputs.push(Vess { variant: VessVariant::Mint, amount: dev_reward(reward), owner_hash: DEV_PUBKEY_HASH,
-            timestamp: 0, nonce: 0, salt: random_bytes(), pubkey: vec![], spend_key: vec![], proof: vec![] });
+            timestamp: 0, nonce: 0, salt: random_bytes(), pubkey: vec![], spend_key: vec![], proof: vec![], spend_condition: None });
         // Persist coinbase to treasure chest (mined_keys) for wallet import
         for v in &coinbase_outputs {
             if let Ok(mut w) = self.env.write_txn() {
@@ -394,7 +461,7 @@ impl Node {
                 let _ = w.commit();
             }
         }
-        let mut coinbase = VessPayment { payment_id: [0u8;32], inputs: vec![], outputs: coinbase_outputs.clone(), timestamp: 0, sigs: vec![] };
+        let mut coinbase = VessPayment { payment_id: [0u8;32], inputs: vec![], outputs: coinbase_outputs.clone(), timestamp: 0, sigs: vec![], preimages: vec![] };
         coinbase.compute();
 
         // Collect clean payments from limbo
@@ -443,11 +510,11 @@ impl Node {
         let mut coinbase_outputs = Vec::new();
         if reward > 0 {
             coinbase_outputs.push(Vess { variant: VessVariant::Mint, amount: reward, owner_hash: miner_oh,
-                timestamp: 0, nonce: 0, salt: random_bytes(), pubkey: pk.as_bytes().to_vec(), spend_key: sk.as_bytes().to_vec(), proof: vec![] });
+                timestamp: 0, nonce: 0, salt: random_bytes(), pubkey: pk.as_bytes().to_vec(), spend_key: sk.as_bytes().to_vec(), proof: vec![], spend_condition: None });
         }
         let dev_share = dev_reward(reward);
         coinbase_outputs.push(Vess { variant: VessVariant::Mint, amount: dev_share, owner_hash: DEV_PUBKEY_HASH,
-            timestamp: 0, nonce: 0, salt: random_bytes(), pubkey: vec![], spend_key: vec![], proof: vec![] });
+            timestamp: 0, nonce: 0, salt: random_bytes(), pubkey: vec![], spend_key: vec![], proof: vec![], spend_condition: None });
         // Persist coinbase Vess objects to treasure chest
         for v in &coinbase_outputs {
             if let Ok(mut w) = self.env.write_txn() {
@@ -455,7 +522,7 @@ impl Node {
                 let _ = w.commit();
             }
         }
-        let mut coinbase = VessPayment { payment_id: [0u8;32], inputs: vec![], outputs: coinbase_outputs, timestamp: 0, sigs: vec![] };
+        let mut coinbase = VessPayment { payment_id: [0u8;32], inputs: vec![], outputs: coinbase_outputs, timestamp: 0, sigs: vec![], preimages: vec![] };
         coinbase.compute();
 
         // Build the full payment set that will be applied, then compute state merkle
@@ -747,7 +814,7 @@ impl Node {
         if self.ticks % 100 == 0 { self.peer_announce(); } // ~0.5s
         if self.ticks % 60 == 0 { self.ping_all(); }       // ~0.3s
         if self.ticks % 30 == 0 { self.reap(); }
-        if self.needs_sync && self.ticks % 50 == 0 { self.drive_sync(); }
+        if (self.needs_sync && self.ticks % 50 == 0) || (self.auto_sync_until > self.ticks && self.ticks % 50 == 0) { self.drive_sync(); }
         std::mem::take(&mut self.outbox)
     }
 
@@ -800,15 +867,32 @@ impl Node {
             if let Ok(pk) = dilithium3::PublicKey::from_bytes(&v.pubkey) {
                 if !dsa_verify(&pk, &p.payment_id, &p.sigs[i]) { return false; }
             } else { return false; }
+
+            // Spend condition: preimage always wins, owner after timelock
+            if let Some(ref cond) = v.spend_condition {
+                if cond.is_active() {
+                    let preimage_ok = i < p.preimages.len()
+                        && p.preimages[i].is_some()
+                        && blake3_hash(&p.preimages[i].unwrap()) == cond.hashlock;
+                    let refund_ok = cond.timelock_after > 0
+                        && std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs() >= cond.timelock_after)
+                            .unwrap_or(false);
+                    if !preimage_ok && !refund_ok { return false; }
+                }
+            }
         }
         true
     }
 
     pub fn merkle(&self) -> MerkleRoot {
-        let t = self.env.read_txn().unwrap();
-        let mut ids: Vec<VessId> = self.vess_index.iter(&t).unwrap().filter_map(|r| r.ok().map(|(k,_)| { let mut a=[0u8;32]; a.copy_from_slice(&k); a })).collect();
-        ids.sort();
-        merkle_root(&ids)
+        let t = match self.env.read_txn() { Ok(t) => t, Err(_) => return [0u8; 32] };
+        let iter = self.vess_index.iter(&t).unwrap().filter_map(|r| r.ok().map(|(k,_)| {
+            let mut a = [0u8; 32]; a.copy_from_slice(&k); a
+        }));
+        // LMDB B-tree iterates in byte order → streaming merkle, O(log N) RAM
+        merkle_root_stream(iter)
     }
 
     /// Returns (ticks, merkle_root) that a quorum of peers agree on.
@@ -839,6 +923,9 @@ impl Node {
     pub fn process(&mut self, addr: SocketAddr, data: &[u8]) -> Option<Vec<u8>> {
         // Reject banned peers immediately
         if self.fails.get(&addr).copied().unwrap_or(0) > 5 { return None; }
+        // Reject oversize frames (DoS protection)
+        if data.len() > MAX_FRAME_SIZE { self.strike(addr); return None; }
+        if data.len() < 5 { return None; }  // minimum: tag(1) + len(4)
         let (tag, mut payload) = match unframe(data) { Some(v) => v, None => { self.strike(addr); return None; } };
         if tag == HANDSHAKE_INIT || tag == HANDSHAKE_RESP {
             // Verify PoW handshake puzzle on INIT
@@ -860,7 +947,10 @@ impl Node {
             }
             let resp = self.network.handle_handshake(addr, tag, payload);
             if let Some(s) = self.network.session_by_addr(&addr) {
-                if s.node_id.is_some() { self.peers.insert(addr, s.node_id.unwrap()); }
+                if s.node_id.is_some() {
+                    self.peers.insert(addr, s.node_id.unwrap());
+                    self.persist_peer(addr);
+                }
             }
             return resp;
         }
@@ -1000,6 +1090,14 @@ impl Node {
             RpcRequest::Check(id) => RpcResponse::Check(self.check(&id)),
             RpcRequest::Submit(p) => RpcResponse::Submit(self.submit(p)),
             RpcRequest::GetPeers => RpcResponse::GetPeers(self.get_peers()),
+            RpcRequest::ConnectPeer(addr) => {
+                let init = self.add_peer(addr);
+                let ok = !init.is_empty();
+                if ok {
+                    self.outbox.push((addr, init));
+                }
+                RpcResponse::ConnectPeer(ok)
+            }
         }.encode())
     }
 
@@ -1015,10 +1113,15 @@ impl Node {
             self.stems.remove(&p.payment_id);
             self.fluff_embargo.insert(p.payment_id, (p.clone(), self.ticks));
         } else {
-            // Stay in stem: forward to one random peer
+            // Stay in stem: forward to two random peers for redundancy
             self.stems.insert(p.payment_id, h + 1);
-            let i = rand::thread_rng().gen_range(0..peers.len());
-            self.send(peers[i], &GossipMessage::Payment(p.clone()));
+            let i1 = rand::thread_rng().gen_range(0..peers.len());
+            self.send(peers[i1], &GossipMessage::Payment(p.clone()));
+            if peers.len() >= 2 {
+                let mut i2 = rand::thread_rng().gen_range(0..peers.len());
+                if i2 == i1 { i2 = (i1 + 1) % peers.len(); }
+                self.send(peers[i2], &GossipMessage::Payment(p.clone()));
+            }
         }
     }
 
@@ -1051,7 +1154,7 @@ impl Node {
 
     fn sync_chunk(&mut self, addr: SocketAddr, start: u64, count: u32) {
         let ids: Vec<VessId> = {
-            let t = self.env.read_txn().unwrap();
+            let t = match self.env.read_txn() { Ok(t) => t, Err(_) => return };
             self.vess_index.iter(&t).unwrap().filter_map(|r| r.ok().map(|(k,_)| { let mut a=[0u8;32]; a.copy_from_slice(&k); a })).skip(start as usize).take(count as usize).collect()
         };
         self.send(addr, &GossipMessage::StateSyncChunk(start, ids));

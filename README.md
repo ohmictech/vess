@@ -12,7 +12,7 @@ What this network achieves:
 - Low state bloat and hardware requirements
 - Payment transport agnosticism (OOB)
 - Node discovery agnosticism (OOB)
-- Memory hard, highly ASIC resistant mining
+- Memory hard, ASIC resistant mining
 - No pre-mine or VC
 - No artificial scarcity
 - Mnimalist codebase
@@ -53,17 +53,17 @@ This is a structural defense.
 |---|---|---|---|---|
 | Post-quantum | No | No | No | **Yes** |
 | Fees | Yes | Yes | No | **No** |
-| Speed | 7 tps | 20
+| TPS | 7 | 25 | 100+ | **300+** |
 | Security | PoW | PoS | Validators | **PoW** |
-| ASIC resistant | No | No | N/A | **Yes** |
+| ASIC resistant | No | N/A | N/A | **Yes** |
 | Privacy | Medium | Low | Low | **Good** |
-| Value anchor | Speculation | Speculation | Speculation | **Energy (PoW)** |
+| Value anchor | Speculation | Speculation | Speculation | **Energy-tethered** |
 | Codebase size | 500K+ LoC | 2M+ LoC | 200K+ LoC | **~3K LoC** |
 
 ## How it works (60 seconds)
 
-1. **Mining:** Find a 42-cycle in a Cuckatoo32 graph (~1.3GB RAM, single-threaded). Submit the block. Nodes verify the proof in microseconds and reward the miner with freshly minted coins. Difficulty auto-adjusts toward a ~1-second block time.
-2. **Consensus:** Every node maintains a UTXO set in LMDB — just opaque `VessId` hashes with no amounts or owner data. When a payment arrives, nodes verify signatures, check that inputs are unspent, and apply the state change. If two payments spend the same coin (a double-spend), Vess doesn't reorder — it **vaporizes** all inputs from both payments. The penalty for malice falls entirely on the attacker.
+1. **Mining:** Find a 42-cycle in a Cuckatoo27 graph (~1.3GB RAM, single-threaded). Submit the block. Nodes verify the proof in microseconds and reward the miner with freshly minted Vess. Difficulty auto-adjusts toward a ~1-second block time.
+2. **Consensus:** Every node maintains a UTXO set in LMDB which is just opaque `VessId` hashes with no amounts or owner data. When a payment arrives, nodes verify signatures, check that inputs are unspent, and apply the state change. If two payments spend the same coin (a double-spend), Vess doesn't reorder, it **vaporizes** all inputs from both payments. The penalty for malice falls entirely on the attacker.
 3. **Spending (always OOB):** There are no on-chain addresses. Every payment begins with a `vess://` invoice shared however you want (QR code, messaging app, email, NFC, wallet). The payer's wallet builds and signs a `VessPayment` blob, then hands it back to the receiver out-of-band. The receiver submits it to any node. Each output uses a one-time ML-DSA-65 keypair, so there's nothing to reuse, link, or track.
 4. **Dev subsidy:** 1% of each block reward (minimum 1 Vess) goes to a hardcoded dev key. No premine, no ICO, no special minting privilege.
 
@@ -152,21 +152,6 @@ cargo run --release -p vess-wallet -- --wallet my-wallet.vess --password hunter2
 | `--connect <addr>` | Node address for RPC (default: `127.0.0.1:9876`) |
 | `--wallet <path>` | Wallet file path (default: `wallet.vess`) |
 | `--password <pw>` | Wallet encryption password (default: empty) |
-
-### Interactive mode
-
-Run without flags for a REPL:
-
-```bash
-cargo run --release -p vess-wallet
-> connect 127.0.0.1:9876
-> balance
-> invoice 50
-> pay vess://...
-> submit payment.vess
-> consolidate
-> help
-```
 
 ## License
 

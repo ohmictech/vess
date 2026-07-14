@@ -150,6 +150,35 @@ pub fn kem_decapsulate(ct: &[u8], sk: &kyber512::SecretKey) -> Option<Vec<u8>> {
         .ok()
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct SpendCondition {
+    pub hashlock: [u8; 32],         // blake3(preimage) must match; [0;32] = no hashlock
+    pub timelock_after: u64,        // UNIX seconds; 0 = no timelock
+}
+
+impl SpendCondition {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&self.hashlock);
+        buf.extend_from_slice(&self.timelock_after.to_le_bytes());
+        buf
+    }
+
+    pub fn decode(bytes: &[u8], pos: &mut usize) -> Option<Self> {
+        if *pos + 40 > bytes.len() { return None; }
+        let hashlock: [u8; 32] = bytes[*pos..*pos+32].try_into().ok()?;
+        *pos += 32;
+        let timelock_after = u64::from_le_bytes(bytes[*pos..*pos+8].try_into().ok()?);
+        *pos += 8;
+        Some(SpendCondition { hashlock, timelock_after })
+    }
+
+    /// Returns true if the hashlock is set (non-zero).
+    pub fn is_active(&self) -> bool {
+        self.hashlock != [0u8; 32]
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Vess {
     pub variant: VessVariant,
@@ -161,6 +190,7 @@ pub struct Vess {
     pub pubkey: Vec<u8>,
     pub spend_key: Vec<u8>,
     pub proof: Vec<u32>,        // cuckatoo proof: 42 sorted nonces for Mint, empty for Output
+    pub spend_condition: Option<SpendCondition>,  // optional hashlock + timelock
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -198,7 +228,12 @@ impl Vess {
             }
             VessVariant::Output => {
                 let ah = Self::amount_hash(self.amount, &self.salt);
-                Self::output_vess_id(&ah, &self.owner_hash)
+                // Include spend condition in the output ID if present
+                if let Some(ref sc) = self.spend_condition {
+                    blake3_hash_multi(&[VESS_ID_V1, &ah, &self.owner_hash, &sc.encode()])
+                } else {
+                    Self::output_vess_id(&ah, &self.owner_hash)
+                }
             }
         }
     }
@@ -211,6 +246,7 @@ pub struct VessPayment {
     pub outputs: Vec<Vess>,
     pub timestamp: u64,         // Unix timestamp for mint TTL; 0 for transfers
     pub sigs: Vec<Signature>,
+    pub preimages: Vec<Option<[u8; 32]>>,  // hashlock preimage per input; None if no hashlock
 }
 
 impl VessPayment {
@@ -379,6 +415,13 @@ impl Vess {
         write_bytes(&mut buf, &self.spend_key);
         write_u32(&mut buf, self.proof.len() as u32);
         for &n in &self.proof { write_u32(&mut buf, n); }
+        // Spend condition: 1 byte discriminant + optional 40 bytes
+        if let Some(ref sc) = self.spend_condition {
+            write_u8(&mut buf, 1);
+            buf.extend_from_slice(&sc.encode());
+        } else {
+            write_u8(&mut buf, 0);
+        }
         buf
     }
 
@@ -394,7 +437,11 @@ impl Vess {
         let proof_len = read_u32(bytes, pos)? as usize;
         let mut proof = Vec::with_capacity(proof_len);
         for _ in 0..proof_len { proof.push(read_u32(bytes, pos)?); }
-        Some(Vess { variant, amount, owner_hash, timestamp, nonce, salt, pubkey, spend_key, proof })
+        let spend_condition = match read_u8(bytes, pos)? {
+            1 => SpendCondition::decode(bytes, pos),
+            _ => None,
+        };
+        Some(Vess { variant, amount, owner_hash, timestamp, nonce, salt, pubkey, spend_key, proof, spend_condition })
     }
 }
 
@@ -409,6 +456,15 @@ impl VessPayment {
         for v in &self.outputs { buf.extend_from_slice(&v.encode()); }
         write_u32(&mut buf, self.sigs.len() as u32);
         for s in &self.sigs { write_bytes(&mut buf, s); }
+        // Preimages: 1 byte per input (0=none, 1=present) + 32 bytes if present
+        for pi in &self.preimages {
+            if let Some(preimage) = pi {
+                write_u8(&mut buf, 1);
+                buf.extend_from_slice(preimage);
+            } else {
+                write_u8(&mut buf, 0);
+            }
+        }
         buf
     }
 
@@ -424,26 +480,51 @@ impl VessPayment {
         let sig_len = read_u32(bytes, pos)? as usize;
         let mut sigs = Vec::with_capacity(sig_len);
         for _ in 0..sig_len { sigs.push(read_bytes(bytes, pos)?); }
-        Some(VessPayment { payment_id, inputs, outputs, timestamp, sigs })
+        // Preimages: one per input
+        let mut preimages = Vec::with_capacity(inputs.len());
+        for _ in 0..inputs.len() {
+            preimages.push(match read_u8(bytes, pos)? {
+                1 => {
+                    if *pos + 32 > bytes.len() { return None; }
+                    let pi: [u8; 32] = bytes[*pos..*pos+32].try_into().ok()?;
+                    *pos += 32;
+                    Some(pi)
+                }
+                _ => None,
+            });
+        }
+        Some(VessPayment { payment_id, inputs, outputs, timestamp, sigs, preimages })
     }
 }
 
 pub fn merkle_root(items: &[[u8; 32]]) -> [u8; 32] {
     if items.is_empty() { return [0u8; 32]; }
-    let mut layer: Vec<[u8; 32]> = items.to_vec();
-    while layer.len() > 1 {
-        let mut next = Vec::with_capacity((layer.len() + 1) / 2);
-        for pair in layer.chunks(2) {
-            let h = if pair.len() == 2 {
-                blake3_hash_multi(&[&pair[0], &pair[1]])
-            } else {
-                blake3_hash_multi(&[&pair[0], &pair[0]])
-            };
-            next.push(h);
+    merkle_root_stream(items.iter().copied())
+}
+
+/// Streaming Merkle root — O(log N) memory, processes items in order.
+pub fn merkle_root_stream<I: IntoIterator<Item = [u8; 32]>>(items: I) -> [u8; 32] {
+    let mut stack: Vec<([u8; 32], u32)> = Vec::new(); // (hash, height)
+    let mut count = 0u64;
+    for item in items {
+        let mut current = item;
+        let mut height = 0u32;
+        while let Some(&(top, h)) = stack.last() {
+            if h != height { break; }
+            stack.pop();
+            current = blake3_hash_multi(&[&top, &current]);
+            height += 1;
         }
-        layer = next;
+        stack.push((current, height));
+        count += 1;
     }
-    layer[0]
+    if count == 0 { return [0u8; 32]; }
+    while stack.len() > 1 {
+        let (right, _) = stack.pop().unwrap();
+        let (left, _) = stack.pop().unwrap();
+        stack.push((blake3_hash_multi(&[&left, &right]), 0));
+    }
+    stack[0].0
 }
 
 pub fn node_id(pk: &dilithium3::PublicKey) -> NodeId {

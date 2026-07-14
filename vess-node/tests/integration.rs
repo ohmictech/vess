@@ -111,8 +111,8 @@ mod integration {
         let (pk2, sk2) = dsa_generate();
         let oh2 = dsa_pubkey_hash(&pk2);
         let out_v = Vess { variant: VessVariant::Output, amount: v.amount, owner_hash: oh2, timestamp: 0,
-            nonce: 0, salt: random_bytes(), pubkey: pk2.as_bytes().to_vec(), spend_key: sk2.as_bytes().to_vec(), proof: vec![] };
-        let mut spend = VessPayment { payment_id: [0u8;32], inputs: vec![v], outputs: vec![out_v], timestamp: 0, sigs: vec![] };
+            nonce: 0, salt: random_bytes(), pubkey: pk2.as_bytes().to_vec(), spend_key: sk2.as_bytes().to_vec(), proof: vec![], spend_condition: None };
+        let mut spend = VessPayment { payment_id: [0u8;32], inputs: vec![v], outputs: vec![out_v], timestamp: 0, sigs: vec![], preimages: vec![] };
         spend.compute(); spend.sigs = vec![dsa_sign(&sk, &spend.payment_id)];
         assert!(n1.submit(spend.clone()), "first submit succeeds");
         assert!(!n1.submit(spend.clone()), "dup submit fails");
@@ -126,8 +126,8 @@ mod integration {
         mine_coins(&mut n1, oh, pk.as_bytes(), sk.as_bytes());
         // Async mint rejected
         let fake = Vess { variant: VessVariant::Mint, amount: 1, owner_hash: DEV_PUBKEY_HASH, timestamp: 0,
-            nonce: 0, salt: [0u8;32], pubkey: vec![], spend_key: vec![], proof: vec![] };
-        let mut fp = VessPayment { payment_id: [0u8;32], inputs: vec![], outputs: vec![fake], timestamp: 0, sigs: vec![] };
+            nonce: 0, salt: [0u8;32], pubkey: vec![], spend_key: vec![], proof: vec![], spend_condition: None };
+        let mut fp = VessPayment { payment_id: [0u8;32], inputs: vec![], outputs: vec![fake], timestamp: 0, sigs: vec![], preimages: vec![] };
         fp.compute();
         assert!(!n1.submit(fp), "async mint rejected");
     }
@@ -142,8 +142,8 @@ mod integration {
         let (pk2, sk2) = dsa_generate();
         let oh2 = dsa_pubkey_hash(&pk2);
         let out_v = Vess { variant: VessVariant::Output, amount: v.amount, owner_hash: oh2, timestamp: 0,
-            nonce: 0, salt: random_bytes(), pubkey: pk2.as_bytes().to_vec(), spend_key: sk2.as_bytes().to_vec(), proof: vec![] };
-        let mut spend = VessPayment { payment_id: [0u8;32], inputs: vec![v], outputs: vec![out_v], timestamp: 0, sigs: vec![] };
+            nonce: 0, salt: random_bytes(), pubkey: pk2.as_bytes().to_vec(), spend_key: sk2.as_bytes().to_vec(), proof: vec![], spend_condition: None };
+        let mut spend = VessPayment { payment_id: [0u8;32], inputs: vec![v], outputs: vec![out_v], timestamp: 0, sigs: vec![], preimages: vec![] };
         spend.compute(); spend.sigs = vec![dsa_sign(&sk, &spend.payment_id)];
         assert!(n1.submit(spend.clone()), "spend succeeds");
         n1.flush_limbo();
@@ -263,13 +263,13 @@ mod integration {
         let oh2 = dsa_pubkey_hash(&pk2);
         let out1 = Vess { variant: VessVariant::Output, amount: v.amount, owner_hash: oh2,
             timestamp: 0, nonce: 0, salt: random_bytes(),
-            pubkey: pk2.as_bytes().to_vec(), spend_key: sk2.as_bytes().to_vec(), proof: vec![] };
+            pubkey: pk2.as_bytes().to_vec(), spend_key: sk2.as_bytes().to_vec(), proof: vec![], spend_condition: None };
         let out2 = Vess { variant: VessVariant::Output, amount: v.amount, owner_hash: oh2,
             timestamp: 0, nonce: 0, salt: random_bytes(),
-            pubkey: pk2.as_bytes().to_vec(), spend_key: sk2.as_bytes().to_vec(), proof: vec![] };
-        let mut p1 = VessPayment { payment_id: [0u8;32], inputs: vec![v.clone()], outputs: vec![out1], timestamp: 0, sigs: vec![] };
+            pubkey: pk2.as_bytes().to_vec(), spend_key: sk2.as_bytes().to_vec(), proof: vec![], spend_condition: None };
+        let mut p1 = VessPayment { payment_id: [0u8;32], inputs: vec![v.clone()], outputs: vec![out1], timestamp: 0, sigs: vec![], preimages: vec![] };
         p1.compute(); p1.sigs = vec![dsa_sign(&sk, &p1.payment_id)];
-        let mut p2 = VessPayment { payment_id: [0u8;32], inputs: vec![v.clone()], outputs: vec![out2], timestamp: 0, sigs: vec![] };
+        let mut p2 = VessPayment { payment_id: [0u8;32], inputs: vec![v.clone()], outputs: vec![out2], timestamp: 0, sigs: vec![], preimages: vec![] };
         p2.compute(); p2.sigs = vec![dsa_sign(&sk, &p2.payment_id)];
 
         // Build a block manually with both conflicting payments (bypass limbo)
@@ -278,8 +278,8 @@ mod integration {
         let oh3 = dsa_pubkey_hash(&pk3);
         let coinbase_out = Vess { variant: VessVariant::Mint, amount: 1, owner_hash: oh3,
             timestamp: 0, nonce: 0, salt: random_bytes(), pubkey: pk3.as_bytes().to_vec(),
-            spend_key: sk3.as_bytes().to_vec(), proof: vec![] };
-        let mut cb = VessPayment { payment_id: [0u8;32], inputs: vec![], outputs: vec![coinbase_out], timestamp: 0, sigs: vec![] };
+            spend_key: sk3.as_bytes().to_vec(), proof: vec![], spend_condition: None };
+        let mut cb = VessPayment { payment_id: [0u8;32], inputs: vec![], outputs: vec![coinbase_out], timestamp: 0, sigs: vec![], preimages: vec![] };
         cb.compute();
         let cb_id = cb.outputs[0].vess_id();
         // Verify the IDs match before moving p1/p2
@@ -317,8 +317,8 @@ mod integration {
         let oh2 = dsa_pubkey_hash(&pk2);
         let out_v = Vess { variant: VessVariant::Output, amount: v.amount, owner_hash: oh2,
             timestamp: 0, nonce: 0, salt: random_bytes(),
-            pubkey: pk2.as_bytes().to_vec(), spend_key: vec![], proof: vec![] };
-        let mut spend = VessPayment { payment_id: [0u8;32], inputs: vec![v.clone()], outputs: vec![out_v.clone()], timestamp: 0, sigs: vec![] };
+            pubkey: pk2.as_bytes().to_vec(), spend_key: vec![], proof: vec![], spend_condition: None };
+        let mut spend = VessPayment { payment_id: [0u8;32], inputs: vec![v.clone()], outputs: vec![out_v.clone()], timestamp: 0, sigs: vec![], preimages: vec![] };
         spend.compute(); spend.sigs = vec![dsa_sign(&sk, &spend.payment_id)];
 
         // Build a block with deliberately wrong state_merkle
@@ -326,8 +326,8 @@ mod integration {
         let oh3 = dsa_pubkey_hash(&pk3);
         let coinbase_out = Vess { variant: VessVariant::Mint, amount: 1, owner_hash: oh3,
             timestamp: 0, nonce: 0, salt: random_bytes(), pubkey: pk3.as_bytes().to_vec(),
-            spend_key: sk3.as_bytes().to_vec(), proof: vec![] };
-        let mut cb = VessPayment { payment_id: [0u8;32], inputs: vec![], outputs: vec![coinbase_out], timestamp: 0, sigs: vec![] };
+            spend_key: sk3.as_bytes().to_vec(), proof: vec![], spend_condition: None };
+        let mut cb = VessPayment { payment_id: [0u8;32], inputs: vec![], outputs: vec![coinbase_out], timestamp: 0, sigs: vec![], preimages: vec![] };
         cb.compute();
         let fake_block = VessBlock {
             version: 1, parents: node.tip_hashes.clone(), timestamp: 0, difficulty_bits: 9, nonce: 0,
@@ -361,8 +361,8 @@ mod integration {
         let oh_b = dsa_pubkey_hash(&pk_b);
         let cb1_out = Vess { variant: VessVariant::Mint, amount: 2, owner_hash: oh_b,
             timestamp: 0, nonce: 0, salt: random_bytes(), pubkey: pk_b.as_bytes().to_vec(),
-            spend_key: sk_b.as_bytes().to_vec(), proof: vec![] };
-        let mut cb1 = VessPayment { payment_id: [0u8;32], inputs: vec![], outputs: vec![cb1_out.clone()], timestamp: 0, sigs: vec![] };
+            spend_key: sk_b.as_bytes().to_vec(), proof: vec![], spend_condition: None };
+        let mut cb1 = VessPayment { payment_id: [0u8;32], inputs: vec![], outputs: vec![cb1_out.clone()], timestamp: 0, sigs: vec![], preimages: vec![] };
         cb1.compute();
         let block1 = VessBlock { version: 1, parents: vec![], timestamp: 1000, difficulty_bits: 10, nonce: 0,
             payment_merkle: merkle_root(&[cb1.payment_id]), state_merkle: [0u8; 32],
@@ -371,8 +371,8 @@ mod integration {
 
         let cb2_out = Vess { variant: VessVariant::Mint, amount: 2, owner_hash: oh_b,
             timestamp: 0, nonce: 0, salt: random_bytes(), pubkey: pk_b.as_bytes().to_vec(),
-            spend_key: sk_b.as_bytes().to_vec(), proof: vec![] };
-        let mut cb2 = VessPayment { payment_id: [0u8;32], inputs: vec![], outputs: vec![cb2_out], timestamp: 0, sigs: vec![] };
+            spend_key: sk_b.as_bytes().to_vec(), proof: vec![], spend_condition: None };
+        let mut cb2 = VessPayment { payment_id: [0u8;32], inputs: vec![], outputs: vec![cb2_out], timestamp: 0, sigs: vec![], preimages: vec![] };
         cb2.compute();
         let block2 = VessBlock { version: 1, parents: vec![block1.header_hash()], timestamp: 2000, difficulty_bits: 10, nonce: 0,
             payment_merkle: merkle_root(&[cb2.payment_id]), state_merkle: [0u8; 32],
@@ -434,8 +434,8 @@ mod integration {
         let oh2 = dsa_pubkey_hash(&pk2);
         let out_v = Vess { variant: VessVariant::Output, amount: v.amount, owner_hash: oh2,
             timestamp: 0, nonce: 0, salt: random_bytes(), pubkey: pk2.as_bytes().to_vec(),
-            spend_key: vec![], proof: vec![] };
-        let mut spend = VessPayment { payment_id: [0u8;32], inputs: vec![v], outputs: vec![out_v], timestamp: 0, sigs: vec![] };
+            spend_key: vec![], proof: vec![], spend_condition: None };
+        let mut spend = VessPayment { payment_id: [0u8;32], inputs: vec![v], outputs: vec![out_v], timestamp: 0, sigs: vec![], preimages: vec![] };
         spend.compute(); spend.sigs = vec![dsa_sign(&sk, &spend.payment_id)];
 
         // Submit — payment enters limbo
@@ -459,6 +459,194 @@ mod integration {
             // The payment should have left embargo
             assert!(!n1.fluff_embargo.contains_key(&spend.payment_id), "embargo drained");
         }
+    }
+
+    #[test]
+    fn test_spend_condition_hashlock() {
+        // Verify: correct preimage passes, wrong preimage fails on hashlocked output.
+        let (mut node, _s) = start_node_at("127.0.0.1:19940", "vess-db-spendcond");
+        let (pk, sk) = dsa_generate();
+        let oh = dsa_pubkey_hash(&pk);
+
+        let preimage = blake3_hash(b"secret");
+        let hashlock = blake3_hash(&preimage);
+
+        let v = mine_coins(&mut node, oh, pk.as_bytes(), sk.as_bytes());
+
+        // Lock coins into a hashlocked output
+        let (pk2, sk2) = dsa_generate();
+        let oh2 = dsa_pubkey_hash(&pk2);
+        let out_v = Vess {
+            variant: VessVariant::Output, amount: v.amount, owner_hash: oh2,
+            timestamp: 0, nonce: 0, salt: random_bytes(),
+            pubkey: Vec::new(), spend_key: Vec::new(), proof: vec![],
+            spend_condition: Some(SpendCondition { hashlock, timelock_after: 0 }),
+        };
+        let mut lock = VessPayment {
+            payment_id: [0u8;32], inputs: vec![v.clone()], outputs: vec![out_v.clone()],
+            timestamp: 0, sigs: vec![], preimages: vec![None],
+        };
+        lock.compute();
+        lock.sigs.push(dsa_sign(&sk, &lock.payment_id));
+        assert!(node.submit(lock), "lock with hashlock output must succeed");
+
+        // Mine to confirm the locked output
+        let _ = mine_coins(&mut node, oh, pk.as_bytes(), sk.as_bytes());
+
+        // Now try to SPEND the hashlocked output with correct preimage
+        let mut out_spendable = out_v.clone();
+        out_spendable.pubkey = pk2.as_bytes().to_vec();
+        out_spendable.spend_key = sk2.as_bytes().to_vec();
+        let mut good = VessPayment {
+            payment_id: [0u8;32],
+            inputs: vec![out_spendable.clone()],
+            outputs: vec![Vess {
+                variant: VessVariant::Output, amount: v.amount, owner_hash: oh,
+                timestamp: 0, nonce: 0, salt: random_bytes(),
+                pubkey: Vec::new(), spend_key: Vec::new(), proof: vec![],
+                spend_condition: None,
+            }],
+            timestamp: 0, sigs: vec![],
+            preimages: vec![Some(preimage)],
+        };
+        good.compute();
+        good.sigs.push(dsa_sign(&sk2, &good.payment_id));
+        assert!(node.submit(good), "correct preimage must pass");
+
+        // Wrong preimage must fail (different payment)
+        let wrong_hash = blake3_hash(b"wrong");
+        let out_v2 = Vess {
+            variant: VessVariant::Output, amount: v.amount, owner_hash: oh2,
+            timestamp: 0, nonce: 0, salt: random_bytes(),
+            pubkey: Vec::new(), spend_key: Vec::new(), proof: vec![],
+            spend_condition: Some(SpendCondition { hashlock, timelock_after: 0 }),
+        };
+        let mut lock2 = VessPayment {
+            payment_id: [0u8;32], inputs: vec![v.clone()], outputs: vec![out_v2.clone()],
+            timestamp: 0, sigs: vec![], preimages: vec![None],
+        };
+        lock2.compute();
+        lock2.sigs.push(dsa_sign(&sk, &lock2.payment_id));
+        assert!(node.submit(lock2), "second lock must succeed");
+        let _ = mine_coins(&mut node, oh, pk.as_bytes(), sk.as_bytes());
+
+        let mut bad_out = out_v2.clone();
+        bad_out.pubkey = pk2.as_bytes().to_vec();
+        bad_out.spend_key = sk2.as_bytes().to_vec();
+        let mut bad = VessPayment {
+            payment_id: [0u8;32],
+            inputs: vec![bad_out],
+            outputs: vec![Vess {
+                variant: VessVariant::Output, amount: v.amount, owner_hash: oh,
+                timestamp: 0, nonce: 0, salt: random_bytes(),
+                pubkey: Vec::new(), spend_key: Vec::new(), proof: vec![],
+                spend_condition: None,
+            }],
+            timestamp: 0, sigs: vec![],
+            preimages: vec![Some(wrong_hash)],
+        };
+        bad.compute();
+        bad.sigs.push(dsa_sign(&sk2, &bad.payment_id));
+        assert!(!node.submit(bad), "wrong preimage must be rejected");
+    }
+
+    #[test]
+    fn test_spend_condition_timelock_refund() {
+        // Verify: expired timelock allows refund without preimage, future timelock does not.
+        let (mut node, _s) = start_node_at("127.0.0.1:19941", "vess-db-timelock");
+        let (pk, sk) = dsa_generate();
+        let oh = dsa_pubkey_hash(&pk);
+        let v = mine_coins(&mut node, oh, pk.as_bytes(), sk.as_bytes());
+
+        let preimage = blake3_hash(b"some-secret");
+        let hashlock = blake3_hash(&preimage);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+
+        // ── Test 1: Expired timelock — refund succeeds ──
+        let (pk2, sk2) = dsa_generate();
+        let oh2 = dsa_pubkey_hash(&pk2);
+        let expired = now.saturating_sub(3600); // 1 hour ago
+        let out_exp = Vess {
+            variant: VessVariant::Output, amount: v.amount, owner_hash: oh2,
+            timestamp: 0, nonce: 0, salt: random_bytes(),
+            pubkey: Vec::new(), spend_key: Vec::new(), proof: vec![],
+            spend_condition: Some(SpendCondition { hashlock, timelock_after: expired }),
+        };
+        let mut lock_exp = VessPayment {
+            payment_id: [0u8;32], inputs: vec![v.clone()], outputs: vec![out_exp.clone()],
+            timestamp: 0, sigs: vec![], preimages: vec![None],
+        };
+        lock_exp.compute();
+        lock_exp.sigs.push(dsa_sign(&sk, &lock_exp.payment_id));
+        assert!(node.submit(lock_exp), "expired lock must submit");
+        let _ = mine_coins(&mut node, oh, pk.as_bytes(), sk.as_bytes());
+
+        // Refund without preimage — timelock expired, owner sig alone should pass
+        let mut refund_input = out_exp.clone();
+        refund_input.pubkey = pk2.as_bytes().to_vec();
+        refund_input.spend_key = sk2.as_bytes().to_vec();
+        let mut refund = VessPayment {
+            payment_id: [0u8;32],
+            inputs: vec![refund_input],
+            outputs: vec![Vess {
+                variant: VessVariant::Output, amount: v.amount, owner_hash: oh,
+                timestamp: 0, nonce: 0, salt: random_bytes(),
+                pubkey: Vec::new(), spend_key: Vec::new(), proof: vec![],
+                spend_condition: None,
+            }],
+            timestamp: 0, sigs: vec![],
+            preimages: vec![None],
+        };
+        refund.compute();
+        refund.sigs.push(dsa_sign(&sk2, &refund.payment_id));
+        assert!(node.submit(refund), "refund after timelock expiry must pass");
+
+        // ── Test 2: Future timelock — refund fails without preimage ──
+        let v2 = mine_coins(&mut node, oh, pk.as_bytes(), sk.as_bytes());
+        let future = now.saturating_add(86400);
+        let out_fut = Vess {
+            variant: VessVariant::Output, amount: v2.amount, owner_hash: oh2,
+            timestamp: 0, nonce: 0, salt: random_bytes(),
+            pubkey: Vec::new(), spend_key: Vec::new(), proof: vec![],
+            spend_condition: Some(SpendCondition { hashlock, timelock_after: future }),
+        };
+        let mut lock_fut = VessPayment {
+            payment_id: [0u8;32], inputs: vec![v2.clone()], outputs: vec![out_fut.clone()],
+            timestamp: 0, sigs: vec![], preimages: vec![None],
+        };
+        lock_fut.compute();
+        lock_fut.sigs.push(dsa_sign(&sk, &lock_fut.payment_id));
+        assert!(node.submit(lock_fut), "future lock must submit");
+        let _ = mine_coins(&mut node, oh, pk.as_bytes(), sk.as_bytes());
+
+        // Early refund without preimage must fail
+        let mut early_input = out_fut.clone();
+        early_input.pubkey = pk2.as_bytes().to_vec();
+        early_input.spend_key = sk2.as_bytes().to_vec();
+        let mut early = VessPayment {
+            payment_id: [0u8;32],
+            inputs: vec![early_input],
+            outputs: vec![Vess {
+                variant: VessVariant::Output, amount: v2.amount, owner_hash: oh,
+                timestamp: 0, nonce: 0, salt: random_bytes(),
+                pubkey: Vec::new(), spend_key: Vec::new(), proof: vec![],
+                spend_condition: None,
+            }],
+            timestamp: 0, sigs: vec![],
+            preimages: vec![None],
+        };
+        early.compute();
+        early.sigs.push(dsa_sign(&sk2, &early.payment_id));
+        assert!(!node.submit(early.clone()), "early refund must fail");
+
+        // But with correct preimage it should pass
+        let mut with_preimage = early;
+        with_preimage.preimages = vec![Some(preimage)];
+        with_preimage.compute();
+        with_preimage.sigs.clear();
+        with_preimage.sigs.push(dsa_sign(&sk2, &with_preimage.payment_id));
+        assert!(node.submit(with_preimage), "correct preimage must pass even before timelock");
     }
 
 }
