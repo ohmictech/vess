@@ -461,26 +461,4 @@ mod integration {
         }
     }
 
-    #[test]
-    fn test_nullifier_pruning() {
-        // Mint nullifiers older than 24h should be pruned.
-        let (mut node, _s) = start_node_at("127.0.0.1:19932", "vess-db-nullprune");
-
-        // Fresh nullifier: timestamp = now in seconds (will survive)
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-        let fresh_id = blake3_hash(b"fresh");
-        node.mint_nullifiers.insert(fresh_id, now);
-
-        // Expired nullifier: timestamp = 25 hours ago (will be pruned)
-        let old_id = blake3_hash(b"old");
-        node.mint_nullifiers.insert(old_id, now.saturating_sub(90000)); // 25h ago
-
-        assert!(node.mint_nullifiers.contains_key(&fresh_id), "fresh exists");
-        assert!(node.mint_nullifiers.contains_key(&old_id), "old exists");
-
-        node.prune_nullifiers();
-
-        assert!(node.mint_nullifiers.contains_key(&fresh_id), "fresh survived");
-        assert!(!node.mint_nullifiers.contains_key(&old_id), "old pruned");
-    }
 }

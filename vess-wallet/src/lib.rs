@@ -43,6 +43,37 @@ impl Wallet {
         }
     }
 
+    /// Returns true if we have a completed handshake session with the node.
+    pub fn connected(&self) -> bool {
+        self.node_addr
+            .and_then(|a| self.network.session_by_addr(&a))
+            .map(|s| s.session_key != [0u8; 32])
+            .unwrap_or(false)
+    }
+
+    /// Returns the node address we're connected to, if any.
+    pub fn node(&self) -> Option<SocketAddr> {
+        self.node_addr
+    }
+
+    /// Number of keypairs stored in the wallet.
+    pub fn keypair_count(&self) -> usize {
+        self.keypairs.len()
+    }
+
+    /// Payment history counts: (built, received).
+    pub fn history_counts(&self) -> (usize, usize) {
+        (self.pbank_built.len(), self.pbank_received.len())
+    }
+
+    /// Get peer count from the connected node via RPC.
+    pub fn peer_count(&mut self) -> Option<usize> {
+        match self.call_rpc(RpcRequest::GetPeers)? {
+            RpcResponse::GetPeers(peers) => Some(peers.len()),
+            _ => None,
+        }
+    }
+
     pub fn bind(&mut self) -> std::io::Result<()> {
         let sock = UdpSocket::bind("0.0.0.0:0")?;
         // Windows: prevent ICMP port-unreachable from killing the socket.
@@ -242,8 +273,11 @@ impl Wallet {
             self.vbank_unclaimed.retain(|x| x.vess_id() != id);
         }
         for v in &payment.outputs {
-            if self.keypairs.contains_key(&v.owner_hash) {
-                self.vbank_unclaimed.push(v.clone());
+            if let Some(kp) = self.keypairs.get(&v.owner_hash) {
+                let mut owned = v.clone();
+                owned.pubkey = kp.dsa_pk.as_bytes().to_vec();
+                owned.spend_key = kp.dsa_sk.as_bytes().to_vec();
+                self.vbank_unclaimed.push(owned);
             }
         }
         true
@@ -254,8 +288,11 @@ impl Wallet {
     pub fn claim_payment(&mut self, payment: &VessPayment) -> bool {
         if !self.submit_payment(payment).unwrap_or(false) { return false; }
         for v in &payment.outputs {
-            if self.keypairs.contains_key(&v.owner_hash) {
-                self.vbank_unclaimed.push(v.clone());
+            if let Some(kp) = self.keypairs.get(&v.owner_hash) {
+                let mut owned = v.clone();
+                owned.pubkey = kp.dsa_pk.as_bytes().to_vec();
+                owned.spend_key = kp.dsa_sk.as_bytes().to_vec();
+                self.vbank_unclaimed.push(owned);
             }
         }
         self.pbank_received.push(payment.clone());
@@ -294,11 +331,44 @@ impl Wallet {
 
     pub fn receive(&mut self, payment: VessPayment) {
         for v in &payment.outputs {
-            if self.keypairs.contains_key(&v.owner_hash) {
-                self.vbank_unclaimed.push(v.clone());
+            if let Some(kp) = self.keypairs.get(&v.owner_hash) {
+                let mut owned = v.clone();
+                owned.pubkey = kp.dsa_pk.as_bytes().to_vec();
+                owned.spend_key = kp.dsa_sk.as_bytes().to_vec();
+                self.vbank_unclaimed.push(owned);
             }
         }
         self.pbank_received.push(payment);
+    }
+
+    /// Import a payment blob from raw bytes (OOB receive path — no node needed).
+    /// Returns Some(output_count) on success, None if the blob is invalid.
+    pub fn receive_blob(&mut self, data: &[u8]) -> Option<usize> {
+        let mut pos = 0;
+        let payment = VessPayment::decode(data, &mut pos)?;
+        let count = payment.outputs.iter()
+            .filter(|v| self.keypairs.contains_key(&v.owner_hash))
+            .count();
+        self.receive(payment);
+        Some(count)
+    }
+
+    /// Sync unclaimed outputs against the node: check each via RPC and move
+    /// confirmed ones to vbank_claimed. Returns (moved, remaining).
+    pub fn sync(&mut self) -> (usize, usize) {
+        let ids: Vec<VessId> = self.vbank_unclaimed.iter().map(|v| v.vess_id()).collect();
+        let mut moved = 0usize;
+        for id in &ids {
+            if self.check(id).unwrap_or(false) {
+                // Confirmed on-chain — move from unclaimed to claimed
+                if let Some(pos) = self.vbank_unclaimed.iter().position(|v| &v.vess_id() == id) {
+                    let v = self.vbank_unclaimed.remove(pos);
+                    self.vbank_claimed.push(v);
+                    moved += 1;
+                }
+            }
+        }
+        (moved, self.vbank_unclaimed.len())
     }
 
     /// Import coinbase Vess objects from a node's treasure chest (LMDB "keys" database).
@@ -361,6 +431,19 @@ impl Wallet {
             write_bytes(&mut plain, kp.dsa_pk.as_bytes());
             write_bytes(&mut plain, kp.dsa_sk.as_bytes());
         }
+        // Persist payment history: built + received
+        write_u32(&mut plain, self.pbank_built.len() as u32);
+        for p in &self.pbank_built {
+            let encoded = p.encode();
+            write_u32(&mut plain, encoded.len() as u32);
+            plain.extend_from_slice(&encoded);
+        }
+        write_u32(&mut plain, self.pbank_received.len() as u32);
+        for p in &self.pbank_received {
+            let encoded = p.encode();
+            write_u32(&mut plain, encoded.len() as u32);
+            plain.extend_from_slice(&encoded);
+        }
         write_fixed(&mut plain, &self.salt);
         let nonce = random_bytes::<12>();
         let ct = chacha_encrypt(&self.password_hash, &nonce, &plain);
@@ -397,12 +480,35 @@ impl Wallet {
                 keypairs.insert(oh, Keypair { dsa_pk, dsa_sk });
             }
         }
+        // Load payment history
+        let built_len = read_u32(&plain, &mut pos)? as usize;
+        let mut pbank_built = Vec::with_capacity(built_len);
+        for _ in 0..built_len {
+            let blob_len = read_u32(&plain, &mut pos)? as usize;
+            if pos + blob_len > plain.len() { break; }
+            if let Some(p) = VessPayment::decode(&plain, &mut pos) {
+                pbank_built.push(p);
+            } else {
+                pos = pos.saturating_sub(blob_len).saturating_add(blob_len);
+            }
+        }
+        let recv_len = read_u32(&plain, &mut pos)? as usize;
+        let mut pbank_received = Vec::with_capacity(recv_len);
+        for _ in 0..recv_len {
+            let blob_len = read_u32(&plain, &mut pos)? as usize;
+            if pos + blob_len > plain.len() { break; }
+            if let Some(p) = VessPayment::decode(&plain, &mut pos) {
+                pbank_received.push(p);
+            } else {
+                pos = pos.saturating_sub(blob_len).saturating_add(blob_len);
+            }
+        }
         Some(Self {
             vbank_claimed,
             vbank_unclaimed,
             pbank_minting: Vec::new(),
-            pbank_built: Vec::new(),
-            pbank_received: Vec::new(),
+            pbank_built,
+            pbank_received,
             keypairs,
             password_hash: key,
             salt,

@@ -61,6 +61,9 @@ fn run_flags(args: &[String]) {
             "--pay" => { action = Some("pay".into()); i += 1; if i < args.len() { action_arg = Some(args[i].clone()); } }
             "--out" => { i += 1; if i < args.len() { out_file = Some(args[i].clone()); } }
             "--submit" => { action = Some("submit".into()); i += 1; if i < args.len() { action_arg = Some(args[i].clone()); } }
+            "--receive" => { action = Some("receive".into()); i += 1; if i < args.len() { action_arg = Some(args[i].clone()); } }
+            "--export" => { action = Some("export".into()); i += 1; if i < args.len() { action_arg = Some(args[i].clone()); } }
+            "--sync" => { action = Some("sync".into()); }
             _ => { eprintln!("unknown flag: {}", args[i]); return; }
         }
         i += 1;
@@ -135,8 +138,44 @@ fn run_flags(args: &[String]) {
                 Err(_) => println!("cannot read file: {}", path),
             }
         }
+        Some("receive") => {
+            let path = action_arg.as_deref().unwrap_or("received.vess");
+            match std::fs::read(path) {
+                Ok(data) => {
+                    match w.receive_blob(&data) {
+                        Some(count) => println!("received {} outputs, balance now: {} VESS", count, w.balance()),
+                        None => println!("failed to decode payment blob"),
+                    }
+                }
+                Err(_) => println!("cannot read file: {}", path),
+            }
+        }
+        Some("export") => {
+            let url = action_arg.as_deref().unwrap_or("");
+            let path = out_file.as_deref().unwrap_or("payment.vess");
+            match parse_invoice(url) {
+                Some((oh, amount)) => {
+                    match w.export_payment(&[(oh, amount)]) {
+                        Some(blob) => {
+                            if std::fs::write(path, &blob).is_ok() {
+                                println!("payment exported to {} ({} VESS → {:?}…, {} bytes)",
+                                    path, amount, &oh[..4], blob.len());
+                            } else {
+                                println!("failed to write {}", path);
+                            }
+                        }
+                        None => println!("insufficient funds"),
+                    }
+                }
+                None => println!("invalid invoice URL"),
+            }
+        }
+        Some("sync") => {
+            let (moved, remaining) = w.sync();
+            println!("sync: {} confirmed, {} still unclaimed ({} total balance)", moved, remaining, w.balance());
+        }
         _ => {
-            println!("usage: vess-wallet-cli --import <db> | --balance | --consolidate | --invoice <n> | --pay <url> [--out <file>] | --submit <file>");
+            println!("usage: vess-wallet-cli --import <db> | --balance | --consolidate | --invoice <n> | --pay <url> [--out <file>] | --export <url> [--out <file>] | --submit <file> | --receive <file> | --sync");
         }
     }
 
@@ -176,20 +215,19 @@ fn run_interactive() {
 
         match parts[0] {
             "help" | "h" => {
-                println!("commands: connect, balance, invoice, pay, consolidate, import, peers, save, exit");
+                println!("commands: connect, balance, invoice, pay, export, receive, submit, sync, status, consolidate, import, save, exit");
             }
             "connect" | "c" => {
                 let addr = parts.get(1).map_or("127.0.0.1:9876", |s| *s);
                 match addr.parse::<SocketAddr>() {
                     Ok(sa) => {
-                        if let Err(e) = w.bind() {
-                            println!("bind failed: {}", e);
-                            continue;
+                        print!("connecting to {}... ", sa);
+                        io::stdout().flush().unwrap();
+                        match w.connect_full(sa) {
+                            true => println!("connected ✓"),
+                            false => println!("failed — is the node running?"),
                         }
-                        let init = w.connect(sa);
-                        // Send handshake init via UDP — the node responds, we complete
-                        // For now, just store the addr; actual UDP exchange needs the socket
-                        println!("connecting to {}... (handshake bytes: {} bytes)", sa, init.len());
+                        let _ = std::fs::write(WALLET_FILE, &w.save());
                     }
                     Err(e) => println!("bad address: {}", e),
                 }
@@ -207,27 +245,133 @@ fn run_interactive() {
             "pay" | "p" => {
                 let url = parts.get(1).unwrap_or(&"");
                 if url.is_empty() {
-                    println!("usage: pay <vess://...>");
+                    println!("usage: pay <vess://...> [--out <file>] [--send]");
                     continue;
                 }
-                // Parse vess:// URL: vess://<owner_hash_hex>?amount=N&memo=M
+                let out_file = parts.iter().position(|&s| s == "--out")
+                    .and_then(|i| parts.get(i + 1).copied())
+                    .unwrap_or("payment.vess");
+                let do_send = parts.contains(&"--send");
+
                 match parse_invoice(url) {
                     Some((oh, amount)) => {
                         match w.build_payment(&[(oh, amount)]) {
                             Some(payment) => {
                                 let data = payment.encode();
-                                // Submit via RPC would need the UDP socket; for now just display
-                                println!("payment built: {} bytes, id={:?}",
-                                    data.len(), &payment.payment_id[..8]);
-                                match w.send(&payment) {
-                                    true => println!("sent!"),
-                                    false => println!("send failed — connect to node first"),
+                                let hex4: String = payment.payment_id[..4].iter().map(|b| format!("{:02x}", b)).collect();
+                                println!("payment built: {} bytes, id={}", data.len(), hex4);
+
+                                let _ = std::fs::write(out_file, &data);
+                                println!("exported to {} (hand this to the receiver)", out_file);
+
+                                if do_send {
+                                    match w.send(&payment) {
+                                        true => println!("submitted to network ✓"),
+                                        false => println!("submit failed — connect to node first"),
+                                    }
+                                } else {
+                                    println!("not submitted — receiver runs 'submit {}' to claim", out_file);
+                                }
+                                let _ = std::fs::write(WALLET_FILE, &w.save());
+                            }
+                            None => println!("insufficient funds"),
+                        }
+                    }
+                    None => println!("invalid invoice URL"),
+                }
+            }
+            "export" | "exp" | "e" => {
+                let url = parts.get(1).unwrap_or(&"");
+                if url.is_empty() {
+                    println!("usage: export <vess://...> [--out <file>]");
+                    continue;
+                }
+                let out_file = parts.iter().position(|&s| s == "--out")
+                    .and_then(|i| parts.get(i + 1).copied())
+                    .unwrap_or("payment.vess");
+                let url_only = if parts.len() > 2 && parts[2] == "--out" { parts[1] } else { url };
+
+                match parse_invoice(url_only) {
+                    Some((oh, amount)) => {
+                        match w.export_payment(&[(oh, amount)]) {
+                            Some(blob) => {
+                                if std::fs::write(out_file, &blob).is_ok() {
+                                    println!("payment exported to {} ({} VESS → {:?}…, {} bytes)",
+                                        out_file, amount, &oh[..4], blob.len());
+                                    println!("give this file to the receiver — they run 'receive {}' or 'submit {}'", out_file, out_file);
+                                } else {
+                                    println!("failed to write {}", out_file);
                                 }
                             }
                             None => println!("insufficient funds"),
                         }
                     }
                     None => println!("invalid invoice URL"),
+                }
+            }
+            "sync" | "syn" => {
+                match w.sync() {
+                    (moved, remaining) => {
+                        println!("sync: {} confirmed, {} still unclaimed ({} total balance)",
+                            moved, remaining, w.balance());
+                        if moved > 0 {
+                            let _ = std::fs::write(WALLET_FILE, &w.save());
+                        }
+                    }
+                }
+            }            "status" | "stat" => {
+                println!("connected:  {}", if w.connected() { "yes" } else { "no" });
+                if let Some(addr) = w.node() {
+                    println!("node:       {}", addr);
+                    if w.connected() {
+                        if let Some(n) = w.peer_count() {
+                            println!("peer count: {}", n);
+                        }
+                    }
+                }
+                println!("balance:    {} VESS", w.balance());
+                println!("claimed:    {} UTXOs", w.vbank_claimed.len());
+                println!("unclaimed:  {} UTXOs", w.vbank_unclaimed.len());
+                println!("keypairs:   {}", w.keypair_count());
+                let (built, received) = w.history_counts();
+                println!("history:    {} built, {} received", built, received);
+            }            "receive" | "recv" | "r" => {
+                let path = parts.get(1).unwrap_or(&"received.vess");
+                match std::fs::read(path) {
+                    Ok(data) => {
+                        match w.receive_blob(&data) {
+                            Some(count) => {
+                                println!("received {} outputs ({} VESS total balance now)",
+                                    count, w.balance());
+                                let _ = std::fs::write(WALLET_FILE, &w.save());
+                            }
+                            None => println!("failed to decode payment blob — invalid file"),
+                        }
+                    }
+                    Err(_) => println!("cannot read file: {}", path),
+                }
+            }
+            "submit" | "sub" => {
+                let path = parts.get(1).unwrap_or(&"received.vess");
+                match std::fs::read(path) {
+                    Ok(data) => {
+                        let mut pos = 0;
+                        match VessPayment::decode(&data, &mut pos) {
+                            Some(payment) => {
+                                if w.claim_payment(&payment) {
+                                    println!("payment submitted to network: {} VESS, id={:?}…",
+                                        payment.output_sum(), &payment.payment_id[..8]);
+                                    println!("balance: {} VESS ({} claimed, {} unclaimed)",
+                                        w.balance(), w.vbank_claimed.len(), w.vbank_unclaimed.len());
+                                    let _ = std::fs::write(WALLET_FILE, &w.save());
+                                } else {
+                                    println!("submit failed — connect to node first or node rejected");
+                                }
+                            }
+                            None => println!("failed to decode payment from {}", path),
+                        }
+                    }
+                    Err(_) => println!("cannot read file: {}", path),
                 }
             }
             "consolidate" | "cons" => {

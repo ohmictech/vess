@@ -35,7 +35,7 @@ So, a conflict in Vess is resolved with appropriate force: a total vaporization 
 
 ## Everything is out-of-band
 
-Vess payments never travel from payer to payee through the node network. A `vess://` invoice and the signed `VessPayment` blob are exchanged through whatever channel the two parties choose: a messaging app, a QR code, an email, a USB drive, a printed piece of paper, a forum post, an NFC tap, a Bluetooth transfer. The network only sees the blob when the receiver decides to submit it.
+Vess payments never travel from payer to payee through the node network. A `vess://` invoice and the signed `VessPayment` blob are exchanged through whatever channel the two parties choose: a messaging app, a QR code, an email, a USB drive, a printed piece of paper, a forum post, an NFC tap, a Bluetooth transfer. The network only sees the blob when the receiver decides to submit it: payments are fundamentally receiver-claimed. Unless a payment blob is claimed and submitted to the network to transfer ownership, nothing changes.
 
 This is a structural defense.
 
@@ -53,9 +53,10 @@ This is a structural defense.
 |---|---|---|---|---|
 | Post-quantum | No | No | No | **Yes** |
 | Fees | Yes | Yes | No | **No** |
-| Mine on laptop | No | No | N/A | **Yes** |
-| ASIC-resistant PoW | No | No | N/A | **Yes** |
-| Privacy | Pseudononymous | Almost none | Almost none | Good |
+| Speed | 7 tps | 20
+| Security | PoW | PoS | Validators | **PoW** |
+| ASIC resistant | No | No | N/A | **Yes** |
+| Privacy | Medium | Low | Low | **Good** |
 | Value anchor | Speculation | Speculation | Speculation | **Energy (PoW)** |
 | Codebase size | 500K+ LoC | 2M+ LoC | 200K+ LoC | **~3K LoC** |
 

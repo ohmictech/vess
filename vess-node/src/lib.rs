@@ -44,7 +44,6 @@ pub struct Node {
     limbo: HashMap<PaymentId, (VessPayment, u64)>,       // payment → (data, entry_tick)
     limbo_inputs: HashMap<VessId, Vec<PaymentId>>,       // which limbo payments claim each input
     contested: HashSet<PaymentId>,                        // payments with conflicting inputs (burn on block inclusion)
-    pub mint_nullifiers: HashMap<VessId, u64>,
     outbox: Vec<(SocketAddr, Vec<u8>)>,
     pub stems: HashMap<PaymentId, u8>,
     pub fluff_embargo: HashMap<PaymentId, (VessPayment, u64)>, // delayed fluff: payment → (data, queued_tick)
@@ -64,6 +63,11 @@ pub struct Node {
     pub introducer: Option<SocketAddr>,         // public peer helping us punch through
     pub introduced_peers: HashMap<NodeId, IntroducedPeer>, // peers we're hole-punching toward
     relay_queue: Vec<(NodeId, Vec<u8>)>,        // StemRelay fallback queue (target_id, gossip_bytes)
+    // State sync
+    sync_peer: Option<SocketAddr>,               // peer we're syncing UTXOs from
+    sync_offset: u64,                             // how many UTXO IDs received so far
+    sync_target_root: Option<MerkleRoot>,         // target merkle root we're aiming for
+    sync_chunk_size: u32,                         // IDs per SyncReq chunk
     test_mode: bool,
 }
 
@@ -83,10 +87,9 @@ impl Node {
         let mined_keys: heed::Database<heed::types::Bytes, heed::types::Bytes> = env.create_database(&mut wtxn, Some("keys")).unwrap();
         wtxn.commit().unwrap();
 
-        let (saved_ticks, saved_nulls, saved_diff) = Self::load_meta(&env, &meta);
+        let (saved_ticks, saved_diff) = Self::load_meta(&env, &meta);
         let mut node = Self { addr, network: Network::new(), peers: HashMap::new(), max_peers: 32, needs_sync: true, env, vess_index: db, ban_list, meta, mined_keys,
             limbo: HashMap::new(), limbo_inputs: HashMap::new(), contested: HashSet::new(),
-            mint_nullifiers: saved_nulls,
             outbox: Vec::new(), ticks: saved_ticks, fails: HashMap::new(),
             peer_msg_count: HashMap::new(), msg_window_start: 0, peer_merkle: HashMap::new(),
             stems: HashMap::new(), fluff_embargo: HashMap::new(),
@@ -97,6 +100,10 @@ impl Node {
             introducer: None,
             introduced_peers: HashMap::new(),
             relay_queue: Vec::new(),
+            sync_peer: None,
+            sync_offset: 0,
+            sync_target_root: None,
+            sync_chunk_size: 10000,
             test_mode };
         // Load persisted bans
         if let Ok(t) = node.env.read_txn() {
@@ -114,38 +121,17 @@ impl Node {
         node
     }
 
-    fn load_meta(env: &heed::Env, meta: &heed::Database<heed::types::Str, heed::types::Bytes>) -> (u64, HashMap<VessId, u64>, u32) {
-        let t = match env.read_txn() { Ok(t) => t, Err(_) => return (0, HashMap::new(), DIFFICULTY_BASE_BITS) };
+    fn load_meta(env: &heed::Env, meta: &heed::Database<heed::types::Str, heed::types::Bytes>) -> (u64, u32) {
+        let t = match env.read_txn() { Ok(t) => t, Err(_) => return (0, DIFFICULTY_BASE_BITS) };
         let ticks = meta.get(&t, "ticks").ok().flatten().and_then(|b| if b.len()>=8 { Some(u64::from_le_bytes(b[..8].try_into().unwrap())) } else { None }).unwrap_or(0);
-        let nulls = meta.get(&t, "nulls").ok().flatten().map(|b| {
-            let mut m = HashMap::new();
-            if b.len() >= 4 {
-                let count = u32::from_le_bytes(b[..4].try_into().unwrap()) as usize;
-                let mut pos = 4;
-                for _ in 0..count {
-                    if pos + 40 > b.len() { break; }
-                    let mut id = [0u8; 32]; id.copy_from_slice(&b[pos..pos+32]); pos += 32;
-                    let ts = u64::from_le_bytes(b[pos..pos+8].try_into().unwrap()); pos += 8;
-                    m.insert(id, ts);
-                }
-            }
-            m
-        }).unwrap_or_default();
         let diff = meta.get(&t, "diff").ok().flatten().and_then(|b| if b.len()>=4 { Some(u32::from_le_bytes(b[..4].try_into().unwrap())) } else { None }).unwrap_or(DIFFICULTY_BASE_BITS);
-        (ticks, nulls, diff)
+        (ticks, diff)
     }
 
     fn save_meta(&self) {
         if let Ok(mut w) = self.env.write_txn() {
             let _ = self.meta.put(&mut w, "ticks", &self.ticks.to_le_bytes());
             let _ = self.meta.put(&mut w, "diff", &self.current_difficulty.to_le_bytes());
-            let mut null_buf = Vec::with_capacity(4 + self.mint_nullifiers.len() * 40);
-            null_buf.extend_from_slice(&(self.mint_nullifiers.len() as u32).to_le_bytes());
-            for (id, ts) in &self.mint_nullifiers {
-                null_buf.extend_from_slice(id);
-                null_buf.extend_from_slice(&ts.to_le_bytes());
-            }
-            let _ = self.meta.put(&mut w, "nulls", &null_buf);
             w.commit().expect("save_meta commit failed");
         }
     }
@@ -310,17 +296,7 @@ impl Node {
         // Don't accept payments while catching up; isolated nodes are always "synced"
         if self.needs_sync && self.peer_count() > 0 { return false; }
         if self.limbo.contains_key(&p.payment_id) { return false; }
-        // Mint TTL: timestamp + 24h must not have passed
-        if p.is_mint() {
-            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-            if p.timestamp > 0 && p.timestamp + 86400 < now { return false; }
-        }
         if !self.verify(&p) { return false; }
-        if p.is_mint() {
-            let vid = p.outputs[0].vess_id();
-            if self.mint_nullifiers.contains_key(&vid) { return false; }
-            self.mint_nullifiers.insert(vid, p.timestamp);
-        }
 
         // Check for conflicts: any input already claimed by another limbo payment?
         let mut conflicting: HashSet<PaymentId> = HashSet::new();
@@ -370,11 +346,6 @@ impl Node {
             let _ = w.commit();
         }
         self.save_meta();
-    }
-
-    pub fn prune_nullifiers(&mut self) {
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-        self.mint_nullifiers.retain(|_, &mut ts| ts == 0 || ts + 86400 > now);
     }
 
     // ---- block mining ----
@@ -753,7 +724,6 @@ impl Node {
             }
         }
 
-        if self.ticks % 2000 == 0 { self.prune_nullifiers(); }
         // Broadcast any pending blocks (self-mined or received) to peers
         let pending: Vec<VessBlock> = self.pending_blocks.drain(..).collect();
         for block in pending {
@@ -766,6 +736,7 @@ impl Node {
         if self.ticks % 100 == 0 { self.peer_announce(); } // ~0.5s
         if self.ticks % 60 == 0 { self.ping_all(); }       // ~0.3s
         if self.ticks % 30 == 0 { self.reap(); }
+        if self.needs_sync && self.ticks % 50 == 0 { self.drive_sync(); }
         std::mem::take(&mut self.outbox)
     }
 
@@ -959,25 +930,7 @@ impl Node {
             GossipMessage::Ping(n) => { self.send(addr, &GossipMessage::Pong(*n)); }
             GossipMessage::StateSyncReq(s, c) => { self.sync_chunk(addr, *s, *c); }
             GossipMessage::StateSyncChunk(start, ids) => {
-                if !ids.is_empty() {
-                    if let Ok(mut w) = self.env.write_txn() {
-                        for id in ids {
-                            let _ = self.vess_index.put(&mut w, id, &());
-                        }
-                        let _ = w.commit();
-                    }
-                    let new_ticks = start.saturating_add(ids.len() as u64);
-                    if new_ticks > self.ticks { self.ticks = new_ticks; }
-                    self.save_meta();
-                }
-                if (ids.len() as u32) < 1000 {
-                    if let Some(&(_, expected_root)) = self.peer_merkle.get(&addr) {
-                        let our_root = self.merkle();
-                        if our_root != expected_root {
-                            self.send(addr, &GossipMessage::StateSyncReq(self.ticks, 1000));
-                        }
-                    }
-                }
+                self.handle_sync_chunk(addr, *start, ids);
             }
             // ---- NAT traversal messages ----
             GossipMessage::IntroduceRequest(target_id) => {
@@ -1091,6 +1044,104 @@ impl Node {
             self.vess_index.iter(&t).unwrap().filter_map(|r| r.ok().map(|(k,_)| { let mut a=[0u8;32]; a.copy_from_slice(&k); a })).skip(start as usize).take(count as usize).collect()
         };
         self.send(addr, &GossipMessage::StateSyncChunk(start, ids));
+    }
+
+    /// Periodically drive state sync when needs_sync is true.
+    fn drive_sync(&mut self) {
+        // If no sync peer yet, pick the one with the highest ticks from peer_merkle
+        if self.sync_peer.is_none() {
+            let best = self.peer_merkle.iter()
+                .filter(|(addr, _)| self.has_session_for(addr))
+                .max_by_key(|(_, (ticks, _))| *ticks)
+                .map(|(addr, (_, root))| (*addr, *root));
+            if let Some((addr, root)) = best {
+                self.sync_peer = Some(addr);
+                self.sync_target_root = Some(root);
+                self.sync_offset = 0;
+                self.send(addr, &GossipMessage::StateSyncReq(0, self.sync_chunk_size));
+            }
+            return;
+        }
+
+        let peer = match self.sync_peer {
+            Some(p) => p,
+            None => return,
+        };
+
+        // If we've matched target merkle, we're done
+        if let Some(target) = self.sync_target_root {
+            if self.merkle() == target {
+                self.needs_sync = false;
+                self.sync_peer = None;
+                self.sync_target_root = None;
+                self.sync_offset = 0;
+                return;
+            }
+        }
+
+        // If peer disconnected, reset and pick a new one next cycle
+        if !self.has_session_for(&peer) {
+            self.sync_peer = None;
+            self.sync_target_root = None;
+            self.sync_offset = 0;
+            return;
+        }
+
+        // Request the next chunk (progress is tracked by handle_sync_chunk)
+        self.send(peer, &GossipMessage::StateSyncReq(self.sync_offset, self.sync_chunk_size));
+    }
+
+    /// Process an incoming StateSyncChunk from a peer.
+    fn handle_sync_chunk(&mut self, addr: SocketAddr, start: u64, ids: &[VessId]) {
+        let is_from_sync_peer = self.sync_peer == Some(addr);
+
+        if !ids.is_empty() {
+            // Insert only UTXO IDs we don't already have (idempotent)
+            if let Ok(mut w) = self.env.write_txn() {
+                let rt = self.env.read_txn().unwrap();
+                for id in ids {
+                    if self.vess_index.get(&rt, id).unwrap().is_none() {
+                        let _ = self.vess_index.put(&mut w, id, &());
+                    }
+                }
+                drop(rt);
+                let _ = w.commit();
+            }
+
+            if is_from_sync_peer {
+                self.sync_offset = start.saturating_add(ids.len() as u64);
+            }
+
+            self.save_meta();
+        }
+
+        // If chunk is smaller than requested, we've reached the end of the peer's UTXO set
+        if (ids.len() as u32) < self.sync_chunk_size {
+            if is_from_sync_peer {
+                // Check if our merkle now matches target
+                if let Some(target) = self.sync_target_root {
+                    if self.merkle() == target {
+                        self.needs_sync = false;
+                        self.sync_peer = None;
+                        self.sync_target_root = None;
+                        self.sync_offset = 0;
+                        return;
+                    }
+                }
+                // Didn't match — restart sync from beginning (peer may have new state)
+                self.sync_offset = 0;
+            } else {
+                // Unsolicited chunk from non-sync peer: if it was a response to a
+                // block-triggered request, check if we're caught up now.
+                if let Some(&(_, expected_root)) = self.peer_merkle.get(&addr) {
+                    if self.merkle() != expected_root {
+                        // Still behind — request more from this peer
+                        let next_start = start.saturating_add(ids.len() as u64);
+                        self.send(addr, &GossipMessage::StateSyncReq(next_start, self.sync_chunk_size));
+                    }
+                }
+            }
+        }
     }
 
     fn peer_announce(&mut self) {
