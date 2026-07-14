@@ -13,7 +13,7 @@ pub const TEST_EDGE_BITS: u32 = 12;         // 2^12=4096 nodes → instant tests
 pub const TEST_CYCLE_LENGTH: usize = 6;
 pub const MAX_EDGES_TEST: usize = 1 << 15;  // 32K edges — covers test + handshake
 pub const MAX_SOLVE_ATTEMPTS: usize = 50;
-pub const HANDSHAKE_EDGE_BITS: u32 = 12;    // fast: 2^12 nodes → millisecond solve
+pub const HANDSHAKE_EDGE_BITS: u32 = 16;    // 2^16 nodes, 32K edges → ~50-200ms solve
 pub const HANDSHAKE_CYCLE_LENGTH: usize = 6;   // matches test cycle length
 
 pub type Proof = [u32; CYCLE_LENGTH];

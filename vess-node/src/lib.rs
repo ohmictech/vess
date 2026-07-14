@@ -250,12 +250,16 @@ impl Node {
         frame(tag, &payload_with_pow)
     }
     pub fn check_direct(&self, id: &VessId) -> bool {
-        self.vess_index.get(&self.env.read_txn().unwrap(), id).unwrap().is_some()
+        self.env.read_txn().ok()
+            .and_then(|t| self.vess_index.get(&t, id).ok().flatten())
+            .is_some()
     }
 
     pub fn check(&self, id: &VessId) -> bool {
         // Check LMDB first, then limbo outputs (pending, not yet in LMDB)
-        self.vess_index.get(&self.env.read_txn().unwrap(), id).unwrap().is_some()
+        self.env.read_txn().ok()
+            .and_then(|t| self.vess_index.get(&t, id).ok().flatten())
+            .is_some()
             || self.limbo.values().any(|(p, _)| p.outputs.iter().any(|v| &v.vess_id() == id))
     }
 
@@ -383,6 +387,13 @@ impl Node {
         }
         coinbase_outputs.push(Vess { variant: VessVariant::Mint, amount: dev_reward(reward), owner_hash: DEV_PUBKEY_HASH,
             timestamp: 0, nonce: 0, salt: random_bytes(), pubkey: vec![], spend_key: vec![], proof: vec![] });
+        // Persist coinbase to treasure chest (mined_keys) for wallet import
+        for v in &coinbase_outputs {
+            if let Ok(mut w) = self.env.write_txn() {
+                let _ = self.mined_keys.put(&mut w, &v.vess_id(), &v.encode());
+                let _ = w.commit();
+            }
+        }
         let mut coinbase = VessPayment { payment_id: [0u8;32], inputs: vec![], outputs: coinbase_outputs.clone(), timestamp: 0, sigs: vec![] };
         coinbase.compute();
 

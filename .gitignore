@@ -3,6 +3,9 @@
 *.vess
 *.ps1
 vess-db/
+**/vess-db*/
 node1-db/
 node2-db/
 node3-db/
+**/*.mdb
+**/fullflow_3node.rs
