@@ -64,7 +64,6 @@ fn run_flags(args: &[String]) {
             "--out" => { i += 1; if i < args.len() { out_file = Some(args[i].clone()); } }
             "--submit" => { action = Some("submit".into()); i += 1; if i < args.len() { action_arg = Some(args[i].clone()); } }
             "--receive" => { action = Some("receive".into()); i += 1; if i < args.len() { action_arg = Some(args[i].clone()); } }
-            "--export" => { action = Some("export".into()); i += 1; if i < args.len() { action_arg = Some(args[i].clone()); } }
             "--sync" => { action = Some("sync".into()); }
             _ => { eprintln!("unknown flag: {}", args[i]); return; }
         }
@@ -160,32 +159,12 @@ fn run_flags(args: &[String]) {
                 Err(_) => println!("cannot read file: {}", path),
             }
         }
-        Some("export") => {
-            let url = action_arg.as_deref().unwrap_or("");
-            let path = out_file.as_deref().unwrap_or("payment.vess");
-            match parse_invoice(url) {
-                Some((oh, amount, sc)) => {
-                    match w.export_payment(&[(oh, amount, sc)]) {
-                        Some(blob) => {
-                            if std::fs::write(path, &blob).is_ok() {
-                                println!("payment exported to {} ({} VESS → {:?}…, {} bytes)",
-                                    path, amount, &oh[..4], blob.len());
-                            } else {
-                                println!("failed to write {}", path);
-                            }
-                        }
-                        None => println!("insufficient funds"),
-                    }
-                }
-                None => println!("invalid invoice URL"),
-            }
-        }
         Some("sync") => {
             let (moved, remaining) = w.sync();
             println!("sync: {} confirmed, {} still unclaimed ({} total balance)", moved, remaining, w.balance());
         }
         _ => {
-            println!("usage: vess-wallet-cli --import <db> | --balance | --consolidate | --invoice <n> | --pay <url> [--out <file>] | --export <url> [--out <file>] | --submit <file> | --receive <file> | --sync");
+            println!("usage: vess-wallet --import <db> | --import-key <pub> <sec> | --balance | --consolidate | --invoice <n> | --pay <url> --out <file> | --submit <file> | --receive <file> | --sync");
         }
     }
 
@@ -301,35 +280,6 @@ fn run_interactive() {
                                     println!("not submitted — receiver runs 'submit {}' to claim", out_file);
                                 }
                                 let _ = std::fs::write(WALLET_FILE, &w.save());
-                            }
-                            None => println!("insufficient funds"),
-                        }
-                    }
-                    None => println!("invalid invoice URL"),
-                }
-            }
-            "export" | "exp" | "e" => {
-                let url = parts.get(1).unwrap_or(&"");
-                if url.is_empty() {
-                    println!("usage: export <vess://...> [--out <file>]");
-                    continue;
-                }
-                let out_file = parts.iter().position(|&s| s == "--out")
-                    .and_then(|i| parts.get(i + 1).copied())
-                    .unwrap_or("payment.vess");
-                let url_only = if parts.len() > 2 && parts[2] == "--out" { parts[1] } else { url };
-
-                match parse_invoice(url_only) {
-                    Some((oh, amount, sc)) => {
-                        match w.export_payment(&[(oh, amount, sc)]) {
-                            Some(blob) => {
-                                if std::fs::write(out_file, &blob).is_ok() {
-                                    println!("payment exported to {} ({} VESS → {:?}…, {} bytes)",
-                                        out_file, amount, &oh[..4], blob.len());
-                                    println!("give this file to the receiver — they run 'receive {}' or 'submit {}'", out_file, out_file);
-                                } else {
-                                    println!("failed to write {}", out_file);
-                                }
                             }
                             None => println!("insufficient funds"),
                         }

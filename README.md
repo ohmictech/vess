@@ -11,11 +11,10 @@ What this network achieves:
 - Zero transaction fees
 - Low state bloat and hardware requirements
 - Payment transport agnosticism (OOB)
-- Node discovery agnosticism (OOB)
 - Memory hard, ASIC resistant mining
 - No pre-mine or VC
-- No artificial scarcity
-- Mnimalist codebase
+- Commodity rather than artificial scarcity
+- Tiny codebase
 
 ---
 
@@ -90,20 +89,17 @@ vess-node --bootstrap peers.txt     # file with one peer per line
 vess-node --bootstrap https://example.com/peers.txt  # fetch from URL
 ```
 
-| Flag | Description |
-|---|---|
-| `--listen` | Bind address (default `0.0.0.0:9876`) |
-| `--mine` | Enable Cuckatoo27 mining |
-| `--bootstrap` | Peer address, file, or URL of peer list (repeatable) |
-
 ### Running the wallet
 
 ```
 vess-wallet --import vess-db       # import coinbase UTXOs
+vess-wallet --import-key pub sec   # import a raw keypair
 vess-wallet --balance              # check balance
+vess-wallet --sync                 # confirm unclaimed UTXOs against node
 vess-wallet --invoice 100          # generate vess:// invoice
 vess-wallet --pay "vess://..." --out payment.vess
 vess-wallet --submit payment.vess  # claim received blob
+vess-wallet --receive payment.vess # import blob into wallet
 vess-wallet --consolidate          # merge small UTXOs
 ```
 
