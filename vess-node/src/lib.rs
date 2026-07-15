@@ -495,11 +495,11 @@ impl Node {
             .map(|(_, (p, _))| p.clone())
             .filter(|p| self.verify(p))
             .collect();
-        if self.peer_count() == 0 { return None; }
 
         let has_work = !clean.is_empty() || !self.contested.is_empty();
         let periodic = self.ticks % 4000 == 0;
-        if !has_work && !periodic { return None; }
+        let genesis = self.blocks.is_empty(); // always mine the first block immediately
+        if !has_work && !periodic && !genesis { return None; }
 
         let diff = self.current_difficulty;
         let reward = block_reward(diff);
@@ -566,11 +566,12 @@ impl Node {
     /// Run the Cuckatoo27 PoW on a block candidate (slow — meant for background thread).
     /// `start_nonce` and `step` partition the nonce space across threads.
     /// Returns None if cancelled before finding a solution.
-    pub fn mine_pow(block: &VessBlock, start_nonce: u64, step: u64, cancel: &std::sync::atomic::AtomicBool) -> Option<(u64, Vec<u32>)> {
+    pub fn mine_pow(block: &VessBlock, start_nonce: u64, step: u64, cancel: &std::sync::atomic::AtomicBool, counter: &std::sync::atomic::AtomicU64) -> Option<(u64, Vec<u32>)> {
         let diff = block.difficulty_bits;
         let mut nonce = start_nonce;
         loop {
             if cancel.load(std::sync::atomic::Ordering::Relaxed) { return None; }
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let mut bh = block.clone(); bh.nonce = nonce;
             let header_hash = bh.header_hash();
             if let Some(proof) = cuckoo::solve(&header_hash, cuckoo::CYCLE_LENGTH, cuckoo::EDGE_BITS) {

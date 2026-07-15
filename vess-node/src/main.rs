@@ -81,6 +81,16 @@ fn main() -> std::io::Result<()> {
         }
     }
 
+    // Block counter — increments on every processed block (mined or received).
+    // The mining pool uses this to detect stale candidates.
+    let block_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let block_count_miner = block_count.clone();
+    let block_count_main = block_count.clone();
+
+    // Hash counter — total nonces tried across all mining threads (for display).
+    let hash_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let hash_count_status = hash_count.clone();
+
     // Mining pool — spawns N threads per candidate, partitioned nonce space
     let miner_node = node.clone();
     let (block_tx, block_rx) = mpsc::channel::<(VessBlock, u64, Vec<u32>)>();
@@ -101,6 +111,8 @@ fn main() -> std::io::Result<()> {
                 None => { std::thread::sleep(Duration::from_millis(200)); continue; }
             }
         };
+        let started_at = block_count_miner.load(std::sync::atomic::Ordering::Relaxed);
+        hash_count.store(0, std::sync::atomic::Ordering::Relaxed);
         // Run N solver threads; first to find a solution cancels the rest
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (result_tx, result_rx) = mpsc::channel();
@@ -109,17 +121,42 @@ fn main() -> std::io::Result<()> {
             let b = candidate.clone();
             let tx = result_tx.clone();
             let c = cancel.clone();
+            let hc = hash_count.clone();
             std::thread::spawn(move || {
-                if let Some((nonce, proof)) = Node::mine_pow(&b, t, cores_u64, c.as_ref()) {
+                if let Some((nonce, proof)) = Node::mine_pow(&b, t, cores_u64, c.as_ref(), hc.as_ref()) {
                     let _ = tx.send((nonce, proof));
                 }
             });
         }
-        drop(result_tx); // so recv doesn't block forever if all threads cancel
-        if let Ok((nonce, proof)) = result_rx.recv() {
-            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-            let _ = block_tx.send((candidate, nonce, proof));
+        drop(result_tx);
+        // Wait for solution, but check periodically for stale work / stop
+        loop {
+            match result_rx.recv_timeout(Duration::from_millis(500)) {
+                Ok((nonce, proof)) => {
+                    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                    // Discard if a block arrived while we were mining
+                    if block_count_miner.load(std::sync::atomic::Ordering::Relaxed) == started_at {
+                        let _ = block_tx.send((candidate, nonce, proof));
+                    }
+                    break;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    // Check if mining was stopped or a new block arrived
+                    let n = miner_node.lock().unwrap();
+                    if n.mining_cores == 0 {
+                        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                        break;
+                    }
+                    if block_count_miner.load(std::sync::atomic::Ordering::Relaxed) != started_at {
+                        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                        break;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
         }
+        // Brief pause between rounds so the main loop gets the lock
+        std::thread::sleep(Duration::from_millis(100));
     });
 
     // Stdin thread for runtime commands
@@ -175,6 +212,7 @@ fn main() -> std::io::Result<()> {
         // Apply mined blocks from background thread
         while let Ok((block, nonce, proof)) = block_rx.try_recv() {
             node.lock().unwrap().apply_mined_block(block, nonce, proof);
+            block_count_main.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             // Broadcast the new block
             if let Ok(n) = node.lock() {
                 if let Some(last) = n.pending_blocks.last() {
@@ -204,6 +242,7 @@ fn main() -> std::io::Result<()> {
                 if let Some(resp) = node.lock().unwrap().process(src, &buf[..len]) {
                     let _ = socket.send_to(&resp, src);
                 }
+                block_count_main.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(ref e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
@@ -212,22 +251,29 @@ fn main() -> std::io::Result<()> {
         let outbound = {
             let mut n = node.lock().unwrap();
             let ob = n.cycle();
+            // Status — do it here while we hold the lock, no second acquisition
+            if n.ticks.saturating_sub(last_status) >= 2000 {
+                last_status = n.ticks;
+                let m = n.merkle();
+                let h = hash_count_status.load(std::sync::atomic::Ordering::Relaxed);
+                let hps = h / 2;
+                if n.mining_cores > 0 {
+                    eprintln!("[{}:{}] peers={} limbo={} utxos={} diff={} mine={}c {}h/s merkle={}",
+                        n.ticks, addr.port(), n.peer_count(), n.limbo_len(),
+                        n.utxo_count(), n.current_difficulty, n.mining_cores,
+                        hps, fmt8(&m[..8]));
+                } else {
+                    eprintln!("[{}:{}] peers={} limbo={} utxos={} diff={} merkle={}",
+                        n.ticks, addr.port(), n.peer_count(), n.limbo_len(),
+                        n.utxo_count(), n.current_difficulty, fmt8(&m[..8]));
+                }
+            }
             ob
         };
         for (dest, data) in outbound {
             let _ = socket.send_to(&data, dest);
         }
 
-        {
-            let n = node.lock().unwrap();
-            if n.ticks.saturating_sub(last_status) >= 2000 {
-                last_status = n.ticks;
-                let m = n.merkle();
-                eprintln!("[{}:{}] peers={} limbo={} utxos={} diff={} merkle={}",
-                    n.ticks, addr.port(), n.peer_count(), n.limbo_len(),
-                    n.utxo_count(), n.current_difficulty, fmt8(&m[..8]));
-            }
-        }
         std::thread::sleep(Duration::from_millis(1));
     }
 }
