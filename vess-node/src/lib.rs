@@ -57,7 +57,7 @@ pub struct Node {
     blocks: HashMap<BlockHash, VessBlock>,    // recent blocks by hash
     pub tip_hashes: Vec<BlockHash>,               // DAG tips for parent selection
     current_tip: Option<BlockHash>,           // tip our LMDB state corresponds to
-    pub mining: bool,                          // auto-mine blocks from limbo payments
+    pub mining_cores: u32,                     // 0 = off, 1+ = mining with that many threads
     pub current_difficulty: u32,               // adjusts via DAA every DIFFICULTY_WINDOW blocks
     pub pending_blocks: Vec<VessBlock>,            // blocks waiting for gossip broadcast
     // NAT traversal
@@ -97,7 +97,7 @@ impl Node {
             outbox: Vec::new(), ticks: saved_ticks, fails: HashMap::new(),
             peer_msg_count: HashMap::new(), msg_window_start: 0, peer_merkle: HashMap::new(),
             stems: HashMap::new(), fluff_embargo: HashMap::new(),
-            blocks: HashMap::new(), tip_hashes: Vec::new(), current_tip: None, mining: false,
+            blocks: HashMap::new(), tip_hashes: Vec::new(), current_tip: None, mining_cores: 0,
             current_difficulty: saved_diff,
             pending_blocks: Vec::new(),
             nat_type: NatType::Unknown,
@@ -488,20 +488,17 @@ impl Node {
         coinbase_outputs
     }
 
-    /// Try to mine a block. Production only (test_mode uses test_mine).
-    pub fn try_mine(&mut self) -> Option<VessBlock> {
+    /// Prepare a block candidate (fast — reads state, no PoW). Returns None if no work.
+    pub fn prepare_block(&mut self) -> Option<VessBlock> {
         let clean: Vec<VessPayment> = self.limbo.iter()
             .filter(|(pid, _)| !self.contested.contains(*pid))
             .map(|(_, (p, _))| p.clone())
             .filter(|p| self.verify(p))
             .collect();
-        // Don't mine until we're connected to at least one peer — blocks
-        // can't propagate otherwise, so mining in isolation is wasted work.
         if self.peer_count() == 0 { return None; }
 
-        // Mine when limbo has payments, or periodically for coinbase-only blocks
         let has_work = !clean.is_empty() || !self.contested.is_empty();
-        let periodic = self.ticks % 4000 == 0; // ~20s between empty-block attempts
+        let periodic = self.ticks % 4000 == 0;
         if !has_work && !periodic { return None; }
 
         let diff = self.current_difficulty;
@@ -518,12 +515,10 @@ impl Node {
             coinbase_outputs.push(Vess { variant: VessVariant::Mint, amount: dev_share, owner_hash: DEV_PUBKEY_HASH,
             timestamp: 0, nonce: 0, salt: random_bytes(), pubkey: vec![], spend_key: vec![], proof: vec![], spend_condition: None });
         }
-        // Always include at least one output to carry the Cuckatoo proof
         if coinbase_outputs.is_empty() {
             coinbase_outputs.push(Vess { variant: VessVariant::Mint, amount: 0, owner_hash: DEV_PUBKEY_HASH,
             timestamp: 0, nonce: 0, salt: random_bytes(), pubkey: vec![], spend_key: vec![], proof: vec![], spend_condition: None });
         }
-        // Persist coinbase Vess objects to treasure chest
         for v in &coinbase_outputs {
             if let Ok(mut w) = self.env.write_txn() {
                 let _ = self.mined_keys.put(&mut w, &v.vess_id(), &v.encode());
@@ -533,52 +528,59 @@ impl Node {
         let mut coinbase = VessPayment { payment_id: [0u8;32], inputs: vec![], outputs: coinbase_outputs, timestamp: 0, sigs: vec![], preimages: vec![] };
         coinbase.compute();
 
-        // Build the full payment set that will be applied, then compute state merkle
-        let mut all_payments: Vec<VessPayment> = vec![coinbase.clone()];
-        for p in &clean { all_payments.push(p.clone()); }
-        let state_merkle = self.compute_state_merkle(&all_payments);
-
         let mut all_ids: Vec<VessId> = vec![coinbase.payment_id];
         for p in &clean { all_ids.push(p.payment_id); }
         for pid in &self.contested { if let Some((p, _)) = self.limbo.get(pid) { all_ids.push(p.payment_id); } }
         all_ids.sort(); all_ids.dedup();
 
-        let block = VessBlock {
+        Some(VessBlock {
             version: 1, parents: self.tip_hashes.clone(),
             timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64,
             difficulty_bits: diff, nonce: 0,
-            payment_merkle: merkle_root(&all_ids), state_merkle,
+            payment_merkle: merkle_root(&all_ids), state_merkle: [0u8; 32],
             coinbase, payments: clean,
-        };
+        })
+    }
 
-        // Cuckatoo27 mine: header hash → solve 42-cycle → hash proof → check difficulty
-        let mut b = block;
-        // Cuckatoo27 PoW always required (rewards may or may not emit)
-        let (target_nonce, cuckoo_proof) = {
-            let mut nonce = 0u64;
-            loop {
-                let mut bh = b.clone(); bh.nonce = nonce;
-                let header_hash = bh.header_hash();
-                if let Some(proof) = cuckoo::solve(&header_hash, cuckoo::CYCLE_LENGTH, cuckoo::EDGE_BITS) {
-                    let pow_hash = cuckoo::proof_to_id(&proof);
-                    if check_difficulty(&pow_hash, diff) {
-                        break (nonce, proof);
-                    }
-                }
-                nonce = nonce.wrapping_add(1);
-            }
-        };
-        b.nonce = target_nonce;
-        if let Some(miner_out) = b.coinbase.outputs.get_mut(0) {
-            miner_out.proof = cuckoo_proof;
+    /// Apply a mined block (fast — called from main loop when mining thread finishes).
+    pub fn apply_mined_block(&mut self, mut block: VessBlock, nonce: u64, proof: Vec<u32>) {
+        block.nonce = nonce;
+        if let Some(miner_out) = block.coinbase.outputs.get_mut(0) {
+            miner_out.proof = proof;
         }
-        self.pending_blocks.push(b.clone());
-        self.process_block(&b);
+        // Recompute state_merkle with the finalized block
+        let mut all_payments: Vec<VessPayment> = vec![block.coinbase.clone()];
+        for p in &block.payments { all_payments.push(p.clone()); }
+        block.state_merkle = self.compute_state_merkle(&all_payments);
 
-        let block_hash = b.header_hash();
+        let reward = block_reward(block.difficulty_bits);
+        let dev_share = dev_reward(reward);
+        self.pending_blocks.push(block.clone());
+        self.process_block(&block);
+
+        let block_hash = block.header_hash();
         let hex4: String = block_hash[..4].iter().map(|b| format!("{:02x}", b)).collect();
-        eprintln!("BLOCK mined id={} reward={}+{}dev diff={}", hex4, reward, dev_share, diff);
-        Some(b)
+        eprintln!("BLOCK mined id={} reward={}+{}dev diff={}", hex4, reward, dev_share, block.difficulty_bits);
+    }
+
+    /// Run the Cuckatoo27 PoW on a block candidate (slow — meant for background thread).
+    /// `start_nonce` and `step` partition the nonce space across threads.
+    /// Returns None if cancelled before finding a solution.
+    pub fn mine_pow(block: &VessBlock, start_nonce: u64, step: u64, cancel: &std::sync::atomic::AtomicBool) -> Option<(u64, Vec<u32>)> {
+        let diff = block.difficulty_bits;
+        let mut nonce = start_nonce;
+        loop {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) { return None; }
+            let mut bh = block.clone(); bh.nonce = nonce;
+            let header_hash = bh.header_hash();
+            if let Some(proof) = cuckoo::solve(&header_hash, cuckoo::CYCLE_LENGTH, cuckoo::EDGE_BITS) {
+                let pow_hash = cuckoo::proof_to_id(&proof);
+                if check_difficulty(&pow_hash, diff) {
+                    return Some((nonce, proof));
+                }
+            }
+            nonce = nonce.wrapping_add(step);
+        }
     }
 
     /// Find conflicting payment indices in a set of payments (direct + daisy-chain).
@@ -843,8 +845,7 @@ impl Node {
             let addrs: Vec<SocketAddr> = self.peers.iter().filter(|(_,id)| **id != [0u8;32]).map(|(a,_)| *a).collect();
             for a in addrs { self.send(a, &m); }
         }
-        // Try to mine a block if there are payments in limbo
-        if self.mining && self.ticks % 20 == 0 { let _ = self.try_mine(); }
+        // Mining is handled by the background mining thread in main.rs
         if self.ticks % 100 == 0 { self.peer_announce(); } // ~0.5s
         if self.ticks % 60 == 0 { self.ping_all(); }       // ~0.3s
         if self.ticks % 30 == 0 { self.reap(); }

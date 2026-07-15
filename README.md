@@ -82,11 +82,19 @@ Both constraints can be combined on a single output. The payer sets the conditio
 
 ```
 vess-node                           # default: 0.0.0.0:9876
-vess-node --mine                    # with mining
 vess-node --listen 0.0.0.0:9877     # custom port
 vess-node --bootstrap peer:9876     # join existing network
 vess-node --bootstrap peers.txt     # file with one peer per line
 vess-node --bootstrap https://example.com/peers.txt  # fetch from URL
+```
+
+Mining is toggled at runtime from the node's terminal:
+```
+mine         # start mining (1 core)
+mine 4       # start mining with 4 cores
+mine stop    # stop mining
+peer 1.2.3.4:9876  # connect to a peer
+status       # show peers, UTXOs, difficulty, mining state
 ```
 
 ### Running the wallet
