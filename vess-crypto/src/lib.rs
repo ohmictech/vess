@@ -10,11 +10,12 @@ pub mod cuckoo;
 pub const VESS_ID_V1: &[u8] = b"vess-id-v1";
 pub const VESS_AMOUNT_V1: &[u8] = b"vess-amount-v1";
 pub const VESS_PAYMENT_V1: &[u8] = b"vess-payment-v1";
-pub const DIFFICULTY_BASE_BITS: u32 = 0;  // 1 Vess at diff=0, doubling each bit: 1→2→4→8...
+pub const DIFFICULTY_BASE_BITS: u32 = 0;  // start at 0; DAA adjusts upward
+pub const MINING_DIFFICULTY: u32 = 10;     // no coinbase rewards below this threshold
 pub const DIFFICULTY_WINDOW: usize = 10; // adjust every 10 blocks (~10s at 1s target)
 pub const MAX_INPUTS: usize = 5;
 pub const MAX_OUTPUTS: usize = 5;
-pub const DEV_PUBKEY_HASH: OwnerHash = [0u8; 32]; // TODO: replace with real dev pubkey hash
+pub const DEV_PUBKEY_HASH: OwnerHash = [110, 21, 195, 148, 223, 13, 67, 230, 129, 206, 239, 20, 52, 239, 139, 196, 34, 240, 125, 188, 221, 191, 106, 2, 128, 22, 222, 125, 240, 39, 140, 248]; // TODO: replace with real dev pubkey hash
 
 /// Dev subsidy: 1% of block reward, minimum 1 Vess.
 pub fn dev_reward(miner_reward: Amount) -> Amount {
@@ -88,9 +89,10 @@ pub fn required_difficulty(amount: Amount) -> u32 {
     DIFFICULTY_BASE_BITS + amount.ilog2()
 }
 
-/// Block reward: 1 Vess at diff=0, doubles each bit: 0→1, 1→2, 2→4, 3→8...
+/// Block reward: 1 Vess below MINING_DIFFICULTY, doubles each bit beyond.
 pub fn block_reward(difficulty_bits: u32) -> Amount {
-    1u64 << difficulty_bits as u32
+    if difficulty_bits < MINING_DIFFICULTY { return 1; }
+    1u64 << (difficulty_bits - MINING_DIFFICULTY) as u32
 }
 
 /// Adjust difficulty to target a given block time. Returns new bits.
@@ -98,9 +100,14 @@ pub fn block_reward(difficulty_bits: u32) -> Amount {
 pub fn adjust_difficulty(current_bits: u32, recent_times: &[u64], target_ms: u64) -> u32 {
     if recent_times.is_empty() { return current_bits; }
     let avg: f64 = recent_times.iter().sum::<u64>() as f64 / recent_times.len() as f64;
-    if avg < target_ms as f64 * 0.75 { return current_bits + 1; }  // too fast
-    if avg > target_ms as f64 * 1.5  { return current_bits.saturating_sub(1); } // too slow
-    current_bits
+    let next = if avg < target_ms as f64 * 0.75 {
+        current_bits + 1  // too fast
+    } else if avg > target_ms as f64 * 1.5 {
+        current_bits.saturating_sub(1) // too slow
+    } else {
+        current_bits
+    };
+    next.min(60)  // cap at 60 to prevent shift overflow in cumulative work
 }
 
 /// Deterministic VessId for a dev subsidy mint (no PoW proof needed).
@@ -173,9 +180,9 @@ impl SpendCondition {
         Some(SpendCondition { hashlock, timelock_after })
     }
 
-    /// Returns true if the hashlock is set (non-zero).
+    /// Returns true if the condition imposes any restriction (hashlock or timelock).
     pub fn is_active(&self) -> bool {
-        self.hashlock != [0u8; 32]
+        self.hashlock != [0u8; 32] || self.timelock_after != 0
     }
 }
 
@@ -265,11 +272,11 @@ impl VessPayment {
     }
 
     pub fn input_sum(&self) -> Amount {
-        self.inputs.iter().map(|v| v.amount).sum()
+        self.inputs.iter().fold(0u64, |acc, v| acc.saturating_add(v.amount))
     }
 
     pub fn output_sum(&self) -> Amount {
-        self.outputs.iter().map(|v| v.amount).sum()
+        self.outputs.iter().fold(0u64, |acc, v| acc.saturating_add(v.amount))
     }
 
     pub fn is_mint(&self) -> bool {

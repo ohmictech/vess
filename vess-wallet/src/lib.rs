@@ -209,7 +209,7 @@ impl Wallet {
             + self.vbank_unclaimed.iter().map(|v| v.amount).sum::<u64>()
     }
 
-    pub fn build_invoice(&mut self, amount: Option<Amount>, memo: Option<&str>) -> String {
+    pub fn build_invoice(&mut self, amount: Option<Amount>, memo: Option<&str>, hashlock: Option<&[u8; 32]>, timelock_after: Option<u64>) -> String {
         let (pk, sk) = dsa_generate();
         let owner_hash = dsa_pubkey_hash(&pk);
         self.keypairs.insert(owner_hash, Keypair { dsa_pk: pk, dsa_sk: sk });
@@ -217,12 +217,14 @@ impl Wallet {
         let mut params = Vec::new();
         if let Some(a) = amount { params.push(format!("amount={}", a)); }
         if let Some(m) = memo { params.push(format!("memo={}", m)); }
+        if let Some(hl) = hashlock { params.push(format!("hashlock={}", hex::encode(hl))); }
+        if let Some(ts) = timelock_after { params.push(format!("timelock={}", ts)); }
         if !params.is_empty() { url.push('?'); url.push_str(&params.join("&")); }
         url
     }
 
-    pub fn build_payment(&mut self, outputs: &[(OwnerHash, Amount)]) -> Option<VessPayment> {
-        let total_needed: Amount = outputs.iter().map(|(_, a)| a).sum();
+    pub fn build_payment(&mut self, outputs: &[(OwnerHash, Amount, Option<SpendCondition>)]) -> Option<VessPayment> {
+        let total_needed: Amount = outputs.iter().map(|(_, a, _)| a).sum();
         let mut selected = Vec::new();
         let mut selected_sum = 0;
         let pool: Vec<&Vess> = self.vbank_claimed.iter().collect();
@@ -235,8 +237,11 @@ impl Wallet {
         let change = selected_sum - total_needed;
 
         // Outputs: timestamp=0 for transfers (not mints)
-        let mut out_vess: Vec<Vess> = outputs.iter().map(|(oh, amt)| {
-            Vess { variant: VessVariant::Output, amount: *amt, owner_hash: *oh, timestamp: 0, nonce: 0, salt: random_bytes(), pubkey: Vec::new(), spend_key: Vec::new(), proof: vec![], spend_condition: None }
+        let mut out_vess: Vec<Vess> = outputs.iter().map(|(oh, amt, sc)| {
+            Vess { variant: VessVariant::Output, amount: *amt, owner_hash: *oh,
+                timestamp: 0, nonce: 0, salt: random_bytes(),
+                pubkey: Vec::new(), spend_key: Vec::new(), proof: vec![],
+                spend_condition: sc.clone() }
         }).collect();
 
         if change > 0 {
@@ -261,7 +266,7 @@ impl Wallet {
 
     /// Build and encode a payment for OOB delivery — returns the raw bytes to hand off.
     /// Does NOT submit to the network. The receiver calls `claim_payment` to submit.
-    pub fn export_payment(&mut self, outputs: &[(OwnerHash, Amount)]) -> Option<Vec<u8>> {
+    pub fn export_payment(&mut self, outputs: &[(OwnerHash, Amount, Option<SpendCondition>)]) -> Option<Vec<u8>> {
         let payment = self.build_payment(outputs)?;
         Some(payment.encode())
     }
@@ -313,7 +318,7 @@ impl Wallet {
             let chunk: Vec<Vess> = self.vbank_claimed.iter().take(MAX_INPUTS).cloned().collect();
             if chunk.len() < 2 { break; }
             let total: u64 = chunk.iter().map(|v| v.amount).sum();
-            let payment = match self.build_payment(&[(oh, total)]) {
+            let payment = match self.build_payment(&[(oh, total, None)]) {
                 Some(p) => p,
                 None => break,
             };
@@ -372,6 +377,22 @@ impl Wallet {
         (moved, self.vbank_unclaimed.len())
     }
 
+    /// Import a keypair from raw bytes. Returns the owner_hash for UTXO lookup.
+    pub fn import_keypair(&mut self, pubkey_bytes: &[u8], seckey_bytes: &[u8]) -> Option<OwnerHash> {
+        let pk = dilithium3::PublicKey::from_bytes(pubkey_bytes).ok()?;
+        let sk = dilithium3::SecretKey::from_bytes(seckey_bytes).ok()?;
+        let oh = dsa_pubkey_hash(&pk);
+        self.keypairs.insert(oh, Keypair { dsa_pk: pk, dsa_sk: sk });
+        Some(oh)
+    }
+
+    /// Import a keypair from files. Returns the owner_hash.
+    pub fn import_keypair_files(&mut self, pub_path: &str, sec_path: &str) -> Option<OwnerHash> {
+        let pk_bytes = std::fs::read(pub_path).ok()?;
+        let sk_bytes = std::fs::read(sec_path).ok()?;
+        self.import_keypair(&pk_bytes, &sk_bytes)
+    }
+
     /// Import coinbase Vess objects from a node's treasure chest (LMDB "keys" database).
     /// Adds to vbank_claimed (they're confirmed on-chain). Skips duplicates.
     pub fn import_treasure(&mut self, db_path: &str) -> usize {
@@ -396,21 +417,26 @@ impl Wallet {
             for entry in iter {
                 if let Ok((_key, bytes)) = entry {
                     if let Some(v) = Vess::decode(&bytes, &mut 0) {
-                        if v.variant == VessVariant::Mint && v.owner_hash != DEV_PUBKEY_HASH {
+                        if v.variant == VessVariant::Mint {
                             if !known.contains(&v.vess_id()) {
                                 // Must be unspent in the UTXO set
                                 if vess_db.get(&t, &v.vess_id()).ok().flatten().is_none() {
                                     continue; // already spent, skip
                                 }
-                                // Extract keypair from the Vess so we can sign spends
-                                if let (Ok(pk), Ok(sk)) = (
-                                    dilithium3::PublicKey::from_bytes(&v.pubkey),
-                                    dilithium3::SecretKey::from_bytes(&v.spend_key)
-                                ) {
-                                    self.keypairs.entry(v.owner_hash).or_insert(Keypair { dsa_pk: pk, dsa_sk: sk });
+                                // Extract keypair from Vess or use stored keypair (for dev outputs)
+                                if !v.pubkey.is_empty() {
+                                    if let (Ok(pk), Ok(sk)) = (
+                                        dilithium3::PublicKey::from_bytes(&v.pubkey),
+                                        dilithium3::SecretKey::from_bytes(&v.spend_key)
+                                    ) {
+                                        self.keypairs.entry(v.owner_hash).or_insert(Keypair { dsa_pk: pk, dsa_sk: sk });
+                                    }
                                 }
-                                self.vbank_claimed.push(v);
-                                count += 1;
+                                // Accept if we have the keypair (from import-key or embedded in Vess)
+                                if self.keypairs.contains_key(&v.owner_hash) {
+                                    self.vbank_claimed.push(v);
+                                    count += 1;
+                                }
                             }
                         }
                     }

@@ -1,7 +1,7 @@
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::net::SocketAddr;
-use vess_crypto::{VessPayment, OwnerHash};
+use vess_crypto::{VessPayment, OwnerHash, SpendCondition};
 use crate::Wallet;
 
 pub const VESS_OK: i32 = 0;
@@ -73,7 +73,7 @@ pub extern "C" fn vess_wallet_build_invoice(wallet: *mut Wallet, amount: u64, me
     let w = unsafe { &mut *wallet };
     let m = if memo.is_null() { None } else { Some(unsafe { CStr::from_ptr(memo) }.to_str().unwrap_or("")) };
     let amt = if amount == 0 { None } else { Some(amount) };
-    let url = w.build_invoice(amt, m);
+    let url = w.build_invoice(amt, m, None, None);
     unsafe { *out_len = url.len() as u32; }
     CString::new(url).unwrap().into_raw()
 }
@@ -84,7 +84,7 @@ pub extern "C" fn vess_wallet_build_payment(wallet: *mut Wallet, hashes: *const 
     let n = count as usize;
     let oh: &[OwnerHash] = unsafe { std::slice::from_raw_parts(hashes as *const OwnerHash, n) };
     let amt: &[u64] = unsafe { std::slice::from_raw_parts(amounts, n) };
-    let outputs: Vec<(OwnerHash, u64)> = oh.iter().zip(amt.iter()).map(|(h, a)| (*h, *a)).collect();
+    let outputs: Vec<(OwnerHash, u64, Option<SpendCondition>)> = oh.iter().zip(amt.iter()).map(|(h, a)| (*h, *a, None)).collect();
     if let Some(p) = w.build_payment(&outputs) {
         let data = p.encode();
         unsafe { *out_len = data.len() as u32; }

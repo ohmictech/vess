@@ -157,7 +157,8 @@ impl Node {
         if let Ok(mut w) = self.env.write_txn() {
             let _ = self.meta.put(&mut w, "ticks", &self.ticks.to_le_bytes());
             let _ = self.meta.put(&mut w, "diff", &self.current_difficulty.to_le_bytes());
-            w.commit().expect("save_meta commit failed");
+            // Best-effort commit; meta loss is recoverable
+            let _ = w.commit();
         }
     }
 
@@ -445,7 +446,7 @@ impl Node {
 
     /// Test helper: mine a block with coinbase to the given owner. Returns coinbase outputs.
     pub fn test_mine(&mut self, owner_hash: OwnerHash, pubkey: Vec<u8>, spend_key: Vec<u8>) -> Vec<Vess> {
-        let diff = 0; // reward = 1 Vess at diff=0
+        let diff = MINING_DIFFICULTY; // reward = 1 Vess at threshold
         let reward = block_reward(diff);
         let mut coinbase_outputs = Vec::new();
         if reward > 0 {
@@ -504,17 +505,24 @@ impl Node {
         if !has_work && !periodic { return None; }
 
         let diff = self.current_difficulty;
+        let reward = block_reward(diff);
         let (pk, sk) = dsa_generate();
         let miner_oh = dsa_pubkey_hash(&pk);
-        let reward = block_reward(diff);
         let mut coinbase_outputs = Vec::new();
         if reward > 0 {
             coinbase_outputs.push(Vess { variant: VessVariant::Mint, amount: reward, owner_hash: miner_oh,
                 timestamp: 0, nonce: 0, salt: random_bytes(), pubkey: pk.as_bytes().to_vec(), spend_key: sk.as_bytes().to_vec(), proof: vec![], spend_condition: None });
         }
         let dev_share = dev_reward(reward);
-        coinbase_outputs.push(Vess { variant: VessVariant::Mint, amount: dev_share, owner_hash: DEV_PUBKEY_HASH,
+        if dev_share > 0 {
+            coinbase_outputs.push(Vess { variant: VessVariant::Mint, amount: dev_share, owner_hash: DEV_PUBKEY_HASH,
             timestamp: 0, nonce: 0, salt: random_bytes(), pubkey: vec![], spend_key: vec![], proof: vec![], spend_condition: None });
+        }
+        // Always include at least one output to carry the Cuckatoo proof
+        if coinbase_outputs.is_empty() {
+            coinbase_outputs.push(Vess { variant: VessVariant::Mint, amount: 0, owner_hash: DEV_PUBKEY_HASH,
+            timestamp: 0, nonce: 0, salt: random_bytes(), pubkey: vec![], spend_key: vec![], proof: vec![], spend_condition: None });
+        }
         // Persist coinbase Vess objects to treasure chest
         for v in &coinbase_outputs {
             if let Ok(mut w) = self.env.write_txn() {
@@ -543,21 +551,27 @@ impl Node {
             coinbase, payments: clean,
         };
 
-        // Cuckatoo mine
+        // Cuckatoo27 mine: header hash → solve 42-cycle → hash proof → check difficulty
         let mut b = block;
-        let target_nonce = {
+        // Cuckatoo27 PoW always required (rewards may or may not emit)
+        let (target_nonce, cuckoo_proof) = {
             let mut nonce = 0u64;
             loop {
                 let mut bh = b.clone(); bh.nonce = nonce;
-                if check_difficulty(&bh.header_hash(), diff) {
-                    if cuckoo::solve(&bh.header_hash(), cuckoo::HANDSHAKE_CYCLE_LENGTH, cuckoo::HANDSHAKE_EDGE_BITS).is_some() {
-                        break nonce;
+                let header_hash = bh.header_hash();
+                if let Some(proof) = cuckoo::solve(&header_hash, cuckoo::CYCLE_LENGTH, cuckoo::EDGE_BITS) {
+                    let pow_hash = cuckoo::proof_to_id(&proof);
+                    if check_difficulty(&pow_hash, diff) {
+                        break (nonce, proof);
                     }
                 }
                 nonce = nonce.wrapping_add(1);
             }
         };
         b.nonce = target_nonce;
+        if let Some(miner_out) = b.coinbase.outputs.get_mut(0) {
+            miner_out.proof = cuckoo_proof;
+        }
         self.pending_blocks.push(b.clone());
         self.process_block(&b);
 
@@ -603,9 +617,24 @@ impl Node {
     /// Process a mined/received block. Returns false if our state merkle
     /// didn't match the block's claim (we're missing UTXO entries — sync needed).
     pub fn process_block(&mut self, block: &VessBlock) -> bool {
-        // Verify PoW (skip in test mode — test_mine sets nonce=0)
-        let hash = block.header_hash();
-        if !self.test_mode && !check_difficulty(&hash, block.difficulty_bits) { return false; }
+        // Verify Cuckatoo27 PoW (skip in test mode)
+        if !self.test_mode {
+            let proof = block.coinbase.outputs.first()
+                .map(|v| &v.proof)
+                .filter(|p| !p.is_empty());
+            if let Some(p) = proof {
+                let header_hash = block.header_hash();
+                if !cuckoo::verify(&header_hash, p, cuckoo::CYCLE_LENGTH, cuckoo::EDGE_BITS) {
+                    return false;
+                }
+                let pow_hash = cuckoo::proof_to_id(p);
+                if !check_difficulty(&pow_hash, block.difficulty_bits) {
+                    return false;
+                }
+            } else {
+                return false; // No Cuckatoo proof in coinbase
+            }
+        }
 
         // Collect all payments (coinbase + block payments), verify each
         let mut all_payments: Vec<VessPayment> = vec![block.coinbase.clone()];
@@ -629,7 +658,12 @@ impl Node {
                     for out in &p.outputs { let _ = self.vess_index.put(&mut w, &out.vess_id(), &()); }
                 }
             }
-            w.commit().expect("LMDB commit failed in process_block");
+            if w.commit().is_err() {
+                // LMDB commit failed (disk full, etc.) — leave limbo intact, retry later
+                return false;
+            }
+        } else {
+            return false;
         }
 
         // Remove all processed payments from limbo
@@ -864,22 +898,28 @@ impl Node {
         if p.sigs.len() != p.inputs.len() { return false; }
         for (i, v) in p.inputs.iter().enumerate() {
             if !self.check(&v.vess_id()) { return false; }
+
+            // Signature is always required
             if let Ok(pk) = dilithium3::PublicKey::from_bytes(&v.pubkey) {
                 if !dsa_verify(&pk, &p.payment_id, &p.sigs[i]) { return false; }
             } else { return false; }
 
-            // Spend condition: preimage always wins, owner after timelock
+            // Spend condition: additional gates on top of signature
             if let Some(ref cond) = v.spend_condition {
-                if cond.is_active() {
+                // Hashlock: must provide correct preimage (if set)
+                if cond.hashlock != [0u8; 32] {
                     let preimage_ok = i < p.preimages.len()
                         && p.preimages[i].is_some()
                         && blake3_hash(&p.preimages[i].unwrap()) == cond.hashlock;
-                    let refund_ok = cond.timelock_after > 0
-                        && std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs() >= cond.timelock_after)
-                            .unwrap_or(false);
-                    if !preimage_ok && !refund_ok { return false; }
+                    if !preimage_ok { return false; }
+                }
+                // Timelock: output expires, can't spend after (if set)
+                if cond.timelock_after > 0 {
+                    let expired = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() >= cond.timelock_after)
+                        .unwrap_or(false);
+                    if expired { return false; }
                 }
             }
         }
@@ -896,11 +936,10 @@ impl Node {
     }
 
     /// Returns (ticks, merkle_root) that a quorum of peers agree on.
-    /// 1 peer → trust it. 2+ peers → require ≥2 to agree on the same root.
+    /// Requires ≥2 peers to agree — never trusts a single peer.
     fn consensus_merkle(&self) -> Option<(u64, MerkleRoot)> {
         let roots: Vec<(u64, MerkleRoot)> = self.peer_merkle.values().copied().collect();
-        if roots.is_empty() { return None; }
-        if roots.len() == 1 { return Some(roots[0]); }
+        if roots.len() < 2 { return None; }
         // Count votes for each (ticks, root) pair; need ≥2 matching
         let mut counts: HashMap<(u64, MerkleRoot), usize> = HashMap::new();
         for &r in &roots { *counts.entry(r).or_insert(0) += 1; }

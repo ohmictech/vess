@@ -17,7 +17,7 @@
 
 use std::io::{self, Write, BufRead};
 use std::net::SocketAddr;
-use vess_crypto::{OwnerHash, VessPayment};
+use vess_crypto::{OwnerHash, VessPayment, SpendCondition};
 use vess_wallet::Wallet;
 
 const WALLET_FILE: &str = "wallet.vess";
@@ -46,6 +46,7 @@ fn run_flags(args: &[String]) {
     let mut node_addr: SocketAddr = "127.0.0.1:9876".parse().unwrap();
     let mut action: Option<String> = None;
     let mut action_arg: Option<String> = None;
+    let mut action_arg2: Option<String> = None;
     let mut out_file: Option<String> = None;
 
     let mut i = 1;
@@ -55,6 +56,7 @@ fn run_flags(args: &[String]) {
             "--password" => { i += 1; if i < args.len() { password = args[i].as_bytes().to_vec(); } }
             "--connect" => { i += 1; if i < args.len() { node_addr = args[i].parse().unwrap_or(node_addr); } }
             "--import" => { action = Some("import".into()); i += 1; if i < args.len() { action_arg = Some(args[i].clone()); } }
+            "--import-key" => { action = Some("import-key".into()); i += 1; if i < args.len() { action_arg = Some(args[i].clone()); i += 1; if i < args.len() { action_arg2 = Some(args[i].clone()); } } }
             "--balance" => { action = Some("balance".into()); }
             "--consolidate" => { action = Some("consolidate".into()); }
             "--invoice" => { action = Some("invoice".into()); i += 1; if i < args.len() { action_arg = Some(args[i].clone()); } }
@@ -82,6 +84,14 @@ fn run_flags(args: &[String]) {
             println!("balance: {} VESS ({} claimed, {} unclaimed)",
                 w.balance(), w.vbank_claimed.len(), w.vbank_unclaimed.len());
         }
+        Some("import-key") => {
+            let pub_path = action_arg.as_deref().unwrap_or("dev-pub.key");
+            let sec_path = action_arg2.as_deref().unwrap_or("dev-sec.key");
+            match w.import_keypair_files(pub_path, sec_path) {
+                Some(oh) => println!("imported keypair: owner_hash={}", hex::encode(oh)),
+                None => println!("failed to read keypair from {} / {}", pub_path, sec_path),
+            }
+        }
         Some("balance") => {
             println!("{}", w.balance());
         }
@@ -93,7 +103,7 @@ fn run_flags(args: &[String]) {
         }
         Some("invoice") => {
             let amount: u64 = action_arg.as_deref().and_then(|s| s.parse().ok()).unwrap_or(1);
-            println!("{}", w.build_invoice(Some(amount), None));
+            println!("{}", w.build_invoice(Some(amount), None, None, None));
         }
         Some("pay") => {
             let path = match &out_file {
@@ -102,8 +112,8 @@ fn run_flags(args: &[String]) {
             };
             let url = action_arg.as_deref().unwrap_or("");
             match parse_invoice(url) {
-                Some((oh, amount)) => {
-                    match w.export_payment(&[(oh, amount)]) {
+                Some((oh, amount, sc)) => {
+                    match w.export_payment(&[(oh, amount, sc)]) {
                         Some(blob) => {
                             if std::fs::write(path, &blob).is_ok() {
                                 println!("payment exported to {} ({} VESS → {:?}…, {} bytes)",
@@ -154,8 +164,8 @@ fn run_flags(args: &[String]) {
             let url = action_arg.as_deref().unwrap_or("");
             let path = out_file.as_deref().unwrap_or("payment.vess");
             match parse_invoice(url) {
-                Some((oh, amount)) => {
-                    match w.export_payment(&[(oh, amount)]) {
+                Some((oh, amount, sc)) => {
+                    match w.export_payment(&[(oh, amount, sc)]) {
                         Some(blob) => {
                             if std::fs::write(path, &blob).is_ok() {
                                 println!("payment exported to {} ({} VESS → {:?}…, {} bytes)",
@@ -215,7 +225,7 @@ fn run_interactive() {
 
         match parts[0] {
             "help" | "h" => {
-                println!("commands: connect, balance, invoice, pay, export, receive, submit, sync, status, consolidate, import, save, exit");
+                println!("commands: connect, balance, invoice, pay, export, receive, submit, sync, status, consolidate, import, import-key, save, exit");
             }
             "connect" | "c" => {
                 let addr = parts.get(1).map_or("127.0.0.1:9876", |s| *s);
@@ -238,8 +248,26 @@ fn run_interactive() {
             }
             "invoice" | "inv" => {
                 let amount: u64 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(1);
-                let memo = parts.get(2).map_or("", |s| *s);
-                let url = w.build_invoice(Some(amount), Some(memo));
+                let memo = parts.get(2).filter(|s| !s.starts_with("--")).map_or("", |s| s);
+                let hashlock = parts.iter().position(|&s| s == "--hashlock")
+                    .and_then(|i| parts.get(i + 1))
+                    .and_then(|s| {
+                        let mut hl = [0u8; 32];
+                        hex::decode_to_slice(s, &mut hl).ok()?;
+                        Some(hl)
+                    });
+                let timelock = parts.iter().position(|&s| s == "--timelock")
+                    .and_then(|i| parts.get(i + 1))
+                    .and_then(|s| s.parse::<u64>().ok());
+                let sc = if hashlock.is_some() || timelock.is_some() {
+                    Some(SpendCondition {
+                        hashlock: hashlock.unwrap_or([0u8; 32]),
+                        timelock_after: timelock.unwrap_or(0),
+                    })
+                } else {
+                    None
+                };
+                let url = w.build_invoice(Some(amount), Some(memo), hashlock.as_ref(), timelock);
                 println!("{}", url);
             }
             "pay" | "p" => {
@@ -254,8 +282,8 @@ fn run_interactive() {
                 let do_send = parts.contains(&"--send");
 
                 match parse_invoice(url) {
-                    Some((oh, amount)) => {
-                        match w.build_payment(&[(oh, amount)]) {
+                    Some((oh, amount, sc)) => {
+                        match w.build_payment(&[(oh, amount, sc)]) {
                             Some(payment) => {
                                 let data = payment.encode();
                                 let hex4: String = payment.payment_id[..4].iter().map(|b| format!("{:02x}", b)).collect();
@@ -292,8 +320,8 @@ fn run_interactive() {
                 let url_only = if parts.len() > 2 && parts[2] == "--out" { parts[1] } else { url };
 
                 match parse_invoice(url_only) {
-                    Some((oh, amount)) => {
-                        match w.export_payment(&[(oh, amount)]) {
+                    Some((oh, amount, sc)) => {
+                        match w.export_payment(&[(oh, amount, sc)]) {
                             Some(blob) => {
                                 if std::fs::write(out_file, &blob).is_ok() {
                                     println!("payment exported to {} ({} VESS → {:?}…, {} bytes)",
@@ -388,6 +416,18 @@ fn run_interactive() {
                 let count = w.import_treasure(path);
                 println!("imported {} coinbase outputs from {}", count, path);
             }
+            "import-key" | "impk" => {
+                let pub_path = parts.get(1).unwrap_or(&"dev-pub.key");
+                let sec_path = parts.get(2).unwrap_or(&"dev-sec.key");
+                match w.import_keypair_files(pub_path, sec_path) {
+                    Some(oh) => {
+                        println!("imported keypair: owner_hash={}", hex::encode(oh));
+                        println!("run 'import <db>' or sync to find matching UTXOs");
+                        let _ = std::fs::write(WALLET_FILE, &w.save());
+                    }
+                    None => println!("failed to read keypair from {} / {}", pub_path, sec_path),
+                }
+            }
             "peers" => {
                 // Would need RPC GetPeers call through the UDP socket
                 println!("peers: use 'connect' to connect to a node");
@@ -415,9 +455,9 @@ fn read_line() -> String {
     line.trim().to_string()
 }
 
-/// Parse a vess:// URL into (owner_hash, amount).
-/// Format: vess://<64-hex-chars>?amount=N&memo=...
-fn parse_invoice(url: &str) -> Option<(OwnerHash, u64)> {
+/// Parse a vess:// URL into (owner_hash, amount, spend_condition).
+/// Format: vess://<64-hex-chars>?amount=N&hashlock=<hex>&timelock=<unix>
+fn parse_invoice(url: &str) -> Option<(OwnerHash, u64, Option<SpendCondition>)> {
     let body = url.strip_prefix("vess://")?;
     let (hex, query) = body.split_once('?').unwrap_or((body, ""));
     if hex.len() != 64 { return None; }
@@ -428,5 +468,25 @@ fn parse_invoice(url: &str) -> Option<(OwnerHash, u64)> {
         .and_then(|p| p.strip_prefix("amount="))
         .and_then(|s| s.parse().ok())
         .unwrap_or(1);
-    Some((oh, amount))
+    let hashlock: Option<[u8; 32]> = query.split('&')
+        .find(|p| p.starts_with("hashlock="))
+        .and_then(|p| p.strip_prefix("hashlock="))
+        .and_then(|s| {
+            let mut hl = [0u8; 32];
+            hex::decode_to_slice(s, &mut hl).ok()?;
+            Some(hl)
+        });
+    let timelock: Option<u64> = query.split('&')
+        .find(|p| p.starts_with("timelock="))
+        .and_then(|p| p.strip_prefix("timelock="))
+        .and_then(|s| s.parse().ok());
+    let sc = if hashlock.is_some() || timelock.is_some() {
+        Some(SpendCondition {
+            hashlock: hashlock.unwrap_or([0u8; 32]),
+            timelock_after: timelock.unwrap_or(0),
+        })
+    } else {
+        None
+    };
+    Some((oh, amount, sc))
 }

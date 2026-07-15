@@ -9,7 +9,7 @@ mod persistence {
         let mut w = Wallet::new(password);
 
         // Generate a keypair and add some bills
-        let invoice = w.build_invoice(Some(500), Some("test"));
+        let invoice = w.build_invoice(Some(500), Some("test"), None, None);
         assert!(!invoice.is_empty(), "invoice must be non-empty");
 
         // Save the wallet

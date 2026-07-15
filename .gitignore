@@ -8,4 +8,5 @@ node1-db/
 node2-db/
 node3-db/
 **/*.mdb
+*.key
 **/fullflow_3node.rs

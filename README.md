@@ -58,7 +58,7 @@ This is a structural defense.
 | ASIC resistant | No | N/A | N/A | **Yes** |
 | Privacy | Medium | Low | Low | **Good** |
 | Value anchor | Speculation | Speculation | Speculation | **Energy-tethered** |
-| Codebase size | 500K+ LoC | 2M+ LoC | 200K+ LoC | **~3K LoC** |
+| Codebase size | 500K+ LoC | 2M+ LoC | 200K+ LoC | **~5K LoC** |
 
 ## How it works (60 seconds)
 

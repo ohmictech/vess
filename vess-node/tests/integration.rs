@@ -551,8 +551,8 @@ mod integration {
     }
 
     #[test]
-    fn test_spend_condition_timelock_refund() {
-        // Verify: expired timelock allows refund without preimage, future timelock does not.
+    fn test_spend_condition_timelock_expiry() {
+        // Verify: after timelock expires, the output is dead — even correct preimage fails.
         let (mut node, _s) = start_node_at("127.0.0.1:19941", "vess-db-timelock");
         let (pk, sk) = dsa_generate();
         let oh = dsa_pubkey_hash(&pk);
@@ -563,32 +563,30 @@ mod integration {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
 
-        // ── Test 1: Expired timelock — refund succeeds ──
         let (pk2, sk2) = dsa_generate();
         let oh2 = dsa_pubkey_hash(&pk2);
-        let expired = now.saturating_sub(3600); // 1 hour ago
-        let out_exp = Vess {
+
+        // ── Test 1: Active timelock — preimage works ──
+        let future = now.saturating_add(86400);
+        let out_active = Vess {
             variant: VessVariant::Output, amount: v.amount, owner_hash: oh2,
             timestamp: 0, nonce: 0, salt: random_bytes(),
             pubkey: Vec::new(), spend_key: Vec::new(), proof: vec![],
-            spend_condition: Some(SpendCondition { hashlock, timelock_after: expired }),
+            spend_condition: Some(SpendCondition { hashlock, timelock_after: future }),
         };
-        let mut lock_exp = VessPayment {
-            payment_id: [0u8;32], inputs: vec![v.clone()], outputs: vec![out_exp.clone()],
+        let mut lock = VessPayment {
+            payment_id: [0u8;32], inputs: vec![v.clone()], outputs: vec![out_active.clone()],
             timestamp: 0, sigs: vec![], preimages: vec![None],
         };
-        lock_exp.compute();
-        lock_exp.sigs.push(dsa_sign(&sk, &lock_exp.payment_id));
-        assert!(node.submit(lock_exp), "expired lock must submit");
+        lock.compute();
+        lock.sigs.push(dsa_sign(&sk, &lock.payment_id));
+        assert!(node.submit(lock), "active timelock must submit");
         let _ = mine_coins(&mut node, oh, pk.as_bytes(), sk.as_bytes());
 
-        // Refund without preimage — timelock expired, owner sig alone should pass
-        let mut refund_input = out_exp.clone();
-        refund_input.pubkey = pk2.as_bytes().to_vec();
-        refund_input.spend_key = sk2.as_bytes().to_vec();
-        let mut refund = VessPayment {
+        // Preimage works before expiry
+        let mut ok_spend = VessPayment {
             payment_id: [0u8;32],
-            inputs: vec![refund_input],
+            inputs: vec![{ let mut o = out_active.clone(); o.pubkey = pk2.as_bytes().to_vec(); o.spend_key = sk2.as_bytes().to_vec(); o }],
             outputs: vec![Vess {
                 variant: VessVariant::Output, amount: v.amount, owner_hash: oh,
                 timestamp: 0, nonce: 0, salt: random_bytes(),
@@ -596,37 +594,34 @@ mod integration {
                 spend_condition: None,
             }],
             timestamp: 0, sigs: vec![],
-            preimages: vec![None],
+            preimages: vec![Some(preimage)],
         };
-        refund.compute();
-        refund.sigs.push(dsa_sign(&sk2, &refund.payment_id));
-        assert!(node.submit(refund), "refund after timelock expiry must pass");
+        ok_spend.compute();
+        ok_spend.sigs.push(dsa_sign(&sk2, &ok_spend.payment_id));
+        assert!(node.submit(ok_spend), "preimage must work before expiry");
 
-        // ── Test 2: Future timelock — refund fails without preimage ──
+        // ── Test 2: Expired timelock — preimage fails ──
+        let expired = now.saturating_sub(3600);
         let v2 = mine_coins(&mut node, oh, pk.as_bytes(), sk.as_bytes());
-        let future = now.saturating_add(86400);
-        let out_fut = Vess {
+        let out_exp = Vess {
             variant: VessVariant::Output, amount: v2.amount, owner_hash: oh2,
             timestamp: 0, nonce: 0, salt: random_bytes(),
             pubkey: Vec::new(), spend_key: Vec::new(), proof: vec![],
-            spend_condition: Some(SpendCondition { hashlock, timelock_after: future }),
+            spend_condition: Some(SpendCondition { hashlock, timelock_after: expired }),
         };
-        let mut lock_fut = VessPayment {
-            payment_id: [0u8;32], inputs: vec![v2.clone()], outputs: vec![out_fut.clone()],
+        let mut lock_exp = VessPayment {
+            payment_id: [0u8;32], inputs: vec![v2.clone()], outputs: vec![out_exp.clone()],
             timestamp: 0, sigs: vec![], preimages: vec![None],
         };
-        lock_fut.compute();
-        lock_fut.sigs.push(dsa_sign(&sk, &lock_fut.payment_id));
-        assert!(node.submit(lock_fut), "future lock must submit");
+        lock_exp.compute();
+        lock_exp.sigs.push(dsa_sign(&sk, &lock_exp.payment_id));
+        assert!(node.submit(lock_exp), "expired lock must submit");
         let _ = mine_coins(&mut node, oh, pk.as_bytes(), sk.as_bytes());
 
-        // Early refund without preimage must fail
-        let mut early_input = out_fut.clone();
-        early_input.pubkey = pk2.as_bytes().to_vec();
-        early_input.spend_key = sk2.as_bytes().to_vec();
-        let mut early = VessPayment {
+        // Try spending with correct preimage after expiry — must fail
+        let mut dead = VessPayment {
             payment_id: [0u8;32],
-            inputs: vec![early_input],
+            inputs: vec![{ let mut o = out_exp.clone(); o.pubkey = pk2.as_bytes().to_vec(); o.spend_key = sk2.as_bytes().to_vec(); o }],
             outputs: vec![Vess {
                 variant: VessVariant::Output, amount: v2.amount, owner_hash: oh,
                 timestamp: 0, nonce: 0, salt: random_bytes(),
@@ -634,19 +629,11 @@ mod integration {
                 spend_condition: None,
             }],
             timestamp: 0, sigs: vec![],
-            preimages: vec![None],
+            preimages: vec![Some(preimage)],
         };
-        early.compute();
-        early.sigs.push(dsa_sign(&sk2, &early.payment_id));
-        assert!(!node.submit(early.clone()), "early refund must fail");
-
-        // But with correct preimage it should pass
-        let mut with_preimage = early;
-        with_preimage.preimages = vec![Some(preimage)];
-        with_preimage.compute();
-        with_preimage.sigs.clear();
-        with_preimage.sigs.push(dsa_sign(&sk2, &with_preimage.payment_id));
-        assert!(node.submit(with_preimage), "correct preimage must pass even before timelock");
+        dead.compute();
+        dead.sigs.push(dsa_sign(&sk2, &dead.payment_id));
+        assert!(!node.submit(dead), "expired timelock must reject even with preimage");
     }
 
 }
