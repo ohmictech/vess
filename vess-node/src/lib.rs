@@ -913,11 +913,11 @@ impl Node {
                         && blake3_hash(&p.preimages[i].unwrap()) == cond.hashlock;
                     if !preimage_ok { return false; }
                 }
-                // Timelock: output expires, can't spend after (if set)
-                if cond.timelock_after > 0 {
+                // Expiry: output expires, can't spend after (if set)
+                if cond.expires_at > 0 {
                     let expired = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs() >= cond.timelock_after)
+                        .map(|d| d.as_secs() >= cond.expires_at)
                         .unwrap_or(false);
                     if expired { return false; }
                 }

@@ -31,15 +31,46 @@ fn main() -> std::io::Result<()> {
 
     eprintln!("vess-node {} mine={} peers={}", addr, mining, bootstrap.len());
 
-    // Bootstrap connections
+    // Bootstrap connections — args can be SocketAddr, file path, or http(s) URL
+    let mut resolved: Vec<std::net::SocketAddr> = Vec::new();
     for bp in &bootstrap {
-        if let Ok(bs) = bp.parse::<std::net::SocketAddr>() {
-            eprintln!("bootstrapping to {} (solving handshake PoW)...", bs);
-            let init = node.add_peer(bs);
-            if !init.is_empty() {
-                let _ = socket.send_to(&init, bs);
-                eprintln!("  handshake init sent ({} bytes)", init.len());
+        if let Ok(addr) = bp.parse::<std::net::SocketAddr>() {
+            resolved.push(addr);
+        } else {
+            let lines: Vec<String> = if bp.starts_with("http://") || bp.starts_with("https://") {
+                eprintln!("fetching peer list from {}", bp);
+                match ureq::get(bp).call() {
+                    Ok(r) => r.into_string().unwrap_or_default()
+                        .lines().map(|l| l.trim().to_string()).collect(),
+                    Err(e) => { eprintln!("  fetch failed: {}", e); continue; }
+                }
+            } else {
+                eprintln!("reading peer list from {}", bp);
+                match std::fs::read_to_string(bp) {
+                    Ok(s) => s.lines().map(|l| l.trim().to_string()).collect(),
+                    Err(e) => { eprintln!("  read failed: {}", e); continue; }
+                }
+            };
+            for line in &lines {
+                if line.is_empty() || line.starts_with('#') { continue; }
+                // Strip port if present in host:port format; keep as-is for SocketAddr parse
+                if let Ok(addr) = line.parse::<std::net::SocketAddr>() {
+                    resolved.push(addr);
+                } else {
+                    // Try appending default port
+                    if let Ok(addr) = format!("{}:9876", line).parse::<std::net::SocketAddr>() {
+                        resolved.push(addr);
+                    }
+                }
             }
+        }
+    }
+    for bs in &resolved {
+        eprintln!("bootstrapping to {} (solving handshake PoW)...", bs);
+        let init = node.add_peer(*bs);
+        if !init.is_empty() {
+            let _ = socket.send_to(&init, *bs);
+            eprintln!("  handshake init sent ({} bytes)", init.len());
         }
     }
 

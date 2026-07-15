@@ -480,7 +480,7 @@ mod integration {
             variant: VessVariant::Output, amount: v.amount, owner_hash: oh2,
             timestamp: 0, nonce: 0, salt: random_bytes(),
             pubkey: Vec::new(), spend_key: Vec::new(), proof: vec![],
-            spend_condition: Some(SpendCondition { hashlock, timelock_after: 0 }),
+            spend_condition: Some(SpendCondition { hashlock, expires_at: 0 }),
         };
         let mut lock = VessPayment {
             payment_id: [0u8;32], inputs: vec![v.clone()], outputs: vec![out_v.clone()],
@@ -519,7 +519,7 @@ mod integration {
             variant: VessVariant::Output, amount: v.amount, owner_hash: oh2,
             timestamp: 0, nonce: 0, salt: random_bytes(),
             pubkey: Vec::new(), spend_key: Vec::new(), proof: vec![],
-            spend_condition: Some(SpendCondition { hashlock, timelock_after: 0 }),
+            spend_condition: Some(SpendCondition { hashlock, expires_at: 0 }),
         };
         let mut lock2 = VessPayment {
             payment_id: [0u8;32], inputs: vec![v.clone()], outputs: vec![out_v2.clone()],
@@ -551,9 +551,9 @@ mod integration {
     }
 
     #[test]
-    fn test_spend_condition_timelock_expiry() {
-        // Verify: after timelock expires, the output is dead — even correct preimage fails.
-        let (mut node, _s) = start_node_at("127.0.0.1:19941", "vess-db-timelock");
+    fn test_spend_condition_expiry() {
+        // Verify: after expiry, the output is dead — even correct preimage fails.
+        let (mut node, _s) = start_node_at("127.0.0.1:19941", "vess-db-expiry");
         let (pk, sk) = dsa_generate();
         let oh = dsa_pubkey_hash(&pk);
         let v = mine_coins(&mut node, oh, pk.as_bytes(), sk.as_bytes());
@@ -566,13 +566,13 @@ mod integration {
         let (pk2, sk2) = dsa_generate();
         let oh2 = dsa_pubkey_hash(&pk2);
 
-        // ── Test 1: Active timelock — preimage works ──
+        // ── Test 1: Not yet expired — preimage works ──
         let future = now.saturating_add(86400);
         let out_active = Vess {
             variant: VessVariant::Output, amount: v.amount, owner_hash: oh2,
             timestamp: 0, nonce: 0, salt: random_bytes(),
             pubkey: Vec::new(), spend_key: Vec::new(), proof: vec![],
-            spend_condition: Some(SpendCondition { hashlock, timelock_after: future }),
+            spend_condition: Some(SpendCondition { hashlock, expires_at: future }),
         };
         let mut lock = VessPayment {
             payment_id: [0u8;32], inputs: vec![v.clone()], outputs: vec![out_active.clone()],
@@ -580,7 +580,7 @@ mod integration {
         };
         lock.compute();
         lock.sigs.push(dsa_sign(&sk, &lock.payment_id));
-        assert!(node.submit(lock), "active timelock must submit");
+        assert!(node.submit(lock), "not-yet-expired must submit");
         let _ = mine_coins(&mut node, oh, pk.as_bytes(), sk.as_bytes());
 
         // Preimage works before expiry
@@ -600,14 +600,14 @@ mod integration {
         ok_spend.sigs.push(dsa_sign(&sk2, &ok_spend.payment_id));
         assert!(node.submit(ok_spend), "preimage must work before expiry");
 
-        // ── Test 2: Expired timelock — preimage fails ──
+        // ── Test 2: Expired — preimage fails ──
         let expired = now.saturating_sub(3600);
         let v2 = mine_coins(&mut node, oh, pk.as_bytes(), sk.as_bytes());
         let out_exp = Vess {
             variant: VessVariant::Output, amount: v2.amount, owner_hash: oh2,
             timestamp: 0, nonce: 0, salt: random_bytes(),
             pubkey: Vec::new(), spend_key: Vec::new(), proof: vec![],
-            spend_condition: Some(SpendCondition { hashlock, timelock_after: expired }),
+            spend_condition: Some(SpendCondition { hashlock, expires_at: expired }),
         };
         let mut lock_exp = VessPayment {
             payment_id: [0u8;32], inputs: vec![v2.clone()], outputs: vec![out_exp.clone()],
@@ -633,7 +633,7 @@ mod integration {
         };
         dead.compute();
         dead.sigs.push(dsa_sign(&sk2, &dead.payment_id));
-        assert!(!node.submit(dead), "expired timelock must reject even with preimage");
+        assert!(!node.submit(dead), "expired must reject even with preimage");
     }
 
 }

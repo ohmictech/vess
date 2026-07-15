@@ -209,7 +209,7 @@ impl Wallet {
             + self.vbank_unclaimed.iter().map(|v| v.amount).sum::<u64>()
     }
 
-    pub fn build_invoice(&mut self, amount: Option<Amount>, memo: Option<&str>, hashlock: Option<&[u8; 32]>, timelock_after: Option<u64>) -> String {
+    pub fn build_invoice(&mut self, amount: Option<Amount>, memo: Option<&str>, hashlock: Option<&[u8; 32]>, expires_at: Option<u64>) -> String {
         let (pk, sk) = dsa_generate();
         let owner_hash = dsa_pubkey_hash(&pk);
         self.keypairs.insert(owner_hash, Keypair { dsa_pk: pk, dsa_sk: sk });
@@ -218,7 +218,7 @@ impl Wallet {
         if let Some(a) = amount { params.push(format!("amount={}", a)); }
         if let Some(m) = memo { params.push(format!("memo={}", m)); }
         if let Some(hl) = hashlock { params.push(format!("hashlock={}", hex::encode(hl))); }
-        if let Some(ts) = timelock_after { params.push(format!("timelock={}", ts)); }
+        if let Some(ts) = expires_at { params.push(format!("expires={}", ts)); }
         if !params.is_empty() { url.push('?'); url.push_str(&params.join("&")); }
         url
     }

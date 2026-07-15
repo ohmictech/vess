@@ -11,7 +11,7 @@ pub const VESS_ID_V1: &[u8] = b"vess-id-v1";
 pub const VESS_AMOUNT_V1: &[u8] = b"vess-amount-v1";
 pub const VESS_PAYMENT_V1: &[u8] = b"vess-payment-v1";
 pub const DIFFICULTY_BASE_BITS: u32 = 0;  // start at 0; DAA adjusts upward
-pub const MINING_DIFFICULTY: u32 = 10;     // no coinbase rewards below this threshold
+pub const MINING_DIFFICULTY: u32 = 10;    
 pub const DIFFICULTY_WINDOW: usize = 10; // adjust every 10 blocks (~10s at 1s target)
 pub const MAX_INPUTS: usize = 5;
 pub const MAX_OUTPUTS: usize = 5;
@@ -160,14 +160,14 @@ pub fn kem_decapsulate(ct: &[u8], sk: &kyber512::SecretKey) -> Option<Vec<u8>> {
 #[derive(Clone, Debug, PartialEq)]
 pub struct SpendCondition {
     pub hashlock: [u8; 32],         // blake3(preimage) must match; [0;32] = no hashlock
-    pub timelock_after: u64,        // UNIX seconds; 0 = no timelock
+    pub expires_at: u64,            // UNIX seconds; output expires, can't spend after; 0 = no expiry
 }
 
 impl SpendCondition {
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         buf.extend_from_slice(&self.hashlock);
-        buf.extend_from_slice(&self.timelock_after.to_le_bytes());
+        buf.extend_from_slice(&self.expires_at.to_le_bytes());
         buf
     }
 
@@ -175,14 +175,14 @@ impl SpendCondition {
         if *pos + 40 > bytes.len() { return None; }
         let hashlock: [u8; 32] = bytes[*pos..*pos+32].try_into().ok()?;
         *pos += 32;
-        let timelock_after = u64::from_le_bytes(bytes[*pos..*pos+8].try_into().ok()?);
+        let expires_at = u64::from_le_bytes(bytes[*pos..*pos+8].try_into().ok()?);
         *pos += 8;
-        Some(SpendCondition { hashlock, timelock_after })
+        Some(SpendCondition { hashlock, expires_at })
     }
 
-    /// Returns true if the condition imposes any restriction (hashlock or timelock).
+    /// Returns true if the condition imposes any restriction (hashlock or expiry).
     pub fn is_active(&self) -> bool {
-        self.hashlock != [0u8; 32] || self.timelock_after != 0
+        self.hashlock != [0u8; 32] || self.expires_at != 0
     }
 }
 
@@ -197,7 +197,7 @@ pub struct Vess {
     pub pubkey: Vec<u8>,
     pub spend_key: Vec<u8>,
     pub proof: Vec<u32>,        // cuckatoo proof: 42 sorted nonces for Mint, empty for Output
-    pub spend_condition: Option<SpendCondition>,  // optional hashlock + timelock
+    pub spend_condition: Option<SpendCondition>,  // optional hashlock + expiry
 }
 
 #[derive(Clone, PartialEq, Debug)]

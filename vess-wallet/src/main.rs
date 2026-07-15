@@ -256,18 +256,18 @@ fn run_interactive() {
                         hex::decode_to_slice(s, &mut hl).ok()?;
                         Some(hl)
                     });
-                let timelock = parts.iter().position(|&s| s == "--timelock")
+                let expires = parts.iter().position(|&s| s == "--expires")
                     .and_then(|i| parts.get(i + 1))
                     .and_then(|s| s.parse::<u64>().ok());
-                let sc = if hashlock.is_some() || timelock.is_some() {
+                let sc = if hashlock.is_some() || expires.is_some() {
                     Some(SpendCondition {
                         hashlock: hashlock.unwrap_or([0u8; 32]),
-                        timelock_after: timelock.unwrap_or(0),
+                        expires_at: expires.unwrap_or(0),
                     })
                 } else {
                     None
                 };
-                let url = w.build_invoice(Some(amount), Some(memo), hashlock.as_ref(), timelock);
+                let url = w.build_invoice(Some(amount), Some(memo), hashlock.as_ref(), expires);
                 println!("{}", url);
             }
             "pay" | "p" => {
@@ -456,7 +456,7 @@ fn read_line() -> String {
 }
 
 /// Parse a vess:// URL into (owner_hash, amount, spend_condition).
-/// Format: vess://<64-hex-chars>?amount=N&hashlock=<hex>&timelock=<unix>
+/// Format: vess://<64-hex-chars>?amount=N&hashlock=<hex>&expires=<unix>
 fn parse_invoice(url: &str) -> Option<(OwnerHash, u64, Option<SpendCondition>)> {
     let body = url.strip_prefix("vess://")?;
     let (hex, query) = body.split_once('?').unwrap_or((body, ""));
@@ -476,14 +476,14 @@ fn parse_invoice(url: &str) -> Option<(OwnerHash, u64, Option<SpendCondition>)> 
             hex::decode_to_slice(s, &mut hl).ok()?;
             Some(hl)
         });
-    let timelock: Option<u64> = query.split('&')
-        .find(|p| p.starts_with("timelock="))
-        .and_then(|p| p.strip_prefix("timelock="))
+    let expires: Option<u64> = query.split('&')
+        .find(|p| p.starts_with("expires="))
+        .and_then(|p| p.strip_prefix("expires="))
         .and_then(|s| s.parse().ok());
-    let sc = if hashlock.is_some() || timelock.is_some() {
+    let sc = if hashlock.is_some() || expires.is_some() {
         Some(SpendCondition {
             hashlock: hashlock.unwrap_or([0u8; 32]),
-            timelock_after: timelock.unwrap_or(0),
+            expires_at: expires.unwrap_or(0),
         })
     } else {
         None
