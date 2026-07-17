@@ -1,8 +1,7 @@
 use std::net::SocketAddr;
-use pqcrypto_dilithium::dilithium3;
-use pqcrypto_kyber::kyber512;
-use pqcrypto_traits::kem::PublicKey as _;
 use vess_crypto::*;
+
+pub mod data_packets;
 
 pub const TAG_PAYMENT: u8 = 0x01;
 pub const TAG_ROOT: u8 = 0x02;
@@ -16,6 +15,7 @@ pub const TAG_BLOCK: u8 = 0x0B;
 pub const TAG_INTRODUCE: u8 = 0x0C;
 pub const TAG_HOLE_PUNCH: u8 = 0x0D;
 pub const TAG_STEM_RELAY: u8 = 0x0E;
+pub const TAG_DATA_ACK: u8 = 0x0F;
 
 pub const RPC_CHECK: u8 = 0x10;
 pub const RPC_CHECK_RESP: u8 = 0x11;
@@ -30,7 +30,7 @@ pub const HANDSHAKE_INIT: u8 = 0x80;
 pub const HANDSHAKE_RESP: u8 = 0x81;
 pub const ENCRYPTED_DATA: u8 = 0x00;
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Debug, Clone)]
 pub enum GossipMessage {
@@ -50,6 +50,8 @@ pub enum GossipMessage {
     HolePunch(u32),
     /// Fallback relay through introducer: target_node_id, raw_gossip_bytes
     StemRelay(NodeId, Vec<u8>),
+    /// Authenticated completion acknowledgement for an application data packet.
+    DataAck(data_packets::MessageId),
 }
 
 #[derive(Debug)]
@@ -139,6 +141,7 @@ impl GossipMessage {
                 p.extend_from_slice(data);
                 frame(TAG_STEM_RELAY, &p)
             }
+            GossipMessage::DataAck(id) => frame(TAG_DATA_ACK, id),
         }
     }
 
@@ -195,6 +198,7 @@ impl GossipMessage {
                 let data = payload[pos..pos+len].to_vec();
                 Some(GossipMessage::StemRelay(target_id, data))
             }
+            TAG_DATA_ACK => Some(GossipMessage::DataAck(read_fixed(payload, &mut pos)?)),
             _ => None,
         }
     }
@@ -321,10 +325,10 @@ impl Session {
 
 pub struct Network {
     pub sessions: Vec<Session>,
-    pub dsa_sk: dilithium3::SecretKey,
-    pub dsa_pk: dilithium3::PublicKey,
-    pub kem_sk: kyber512::SecretKey,
-    pub kem_pk: kyber512::PublicKey,
+    pub dsa_sk: Vec<u8>,   // 32-byte ML-DSA-65 seed
+    pub dsa_pk: Vec<u8>,   // 1952-byte ML-DSA-65 verifying key
+    pub kem_sk: Vec<u8>,   // 64-byte ML-KEM-512 decapsulation seed
+    pub kem_pk: Vec<u8>,   // 800-byte ML-KEM-512 encapsulation key
 }
 
 impl Network {
@@ -348,7 +352,7 @@ impl Network {
         let mut p = Vec::new();
         p.extend_from_slice(&self.my_node_id());
         p.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
-        p.extend_from_slice(self.kem_pk.as_bytes());
+        p.extend_from_slice(&self.kem_pk);
         self.sessions.push(Session { addr, node_id: None, session_key: [0u8; 32], peer_version: 0, reported_addr: None, nonce_ctr: 0 });
         frame(HANDSHAKE_INIT, &p)
     }
@@ -359,10 +363,10 @@ impl Network {
                 if payload.len() <= 36 { return None; }
                 let peer_id: NodeId = payload[..32].try_into().ok()?;
                 let peer_ver = u32::from_le_bytes(payload[32..36].try_into().ok()?);
+                if peer_ver != PROTOCOL_VERSION { return None; }
                 let ekem_raw = &payload[36..];
-                let ekem_pk = kyber512::PublicKey::from_bytes(ekem_raw).ok()?;
-                let (ct_bytes, ss_bytes) = kem_encapsulate(&ekem_pk);
-                let sig = dsa_sign(&self.dsa_sk, &payload[..32]);
+                let (ct_bytes, ss_bytes) = kem_encapsulate(ekem_raw)?;
+                let sig = dsa_sign(&self.dsa_sk, &payload[..32])?;
                 // Canonical ordering: both sides derive the same key
                 let (a, b) = if peer_id < self.my_node_id() { (peer_id, self.my_node_id()) } else { (self.my_node_id(), peer_id) };
                 let session_key = blake3_hash_multi(&[&ss_bytes, &a, &b]);
@@ -378,6 +382,7 @@ impl Network {
                 if payload.len() < 36 { return None; }
                 let peer_id: NodeId = payload[..32].try_into().ok()?;
                 let peer_ver = u32::from_le_bytes(payload[32..36].try_into().ok()?);
+                if peer_ver != PROTOCOL_VERSION { return None; }
                 let mut pos = 36;
                 let _sig = read_bytes(payload, &mut pos)?;
                 let ct_bytes = read_bytes(payload, &mut pos)?;

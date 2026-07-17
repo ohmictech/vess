@@ -3,11 +3,16 @@ use std::net::{SocketAddr, UdpSocket};
 use pqcrypto_dilithium::dilithium3;
 use pqcrypto_traits::sign::{PublicKey as _, SecretKey as _};
 use vess_crypto::*;
-use vess_network::{unframe, Network, RpcRequest, RpcResponse, HANDSHAKE_RESP, HANDSHAKE_INIT, frame, ENCRYPTED_DATA};
+use vess_network::{unframe, GossipMessage, Network, RpcRequest, RpcResponse, HANDSHAKE_RESP, HANDSHAKE_INIT, frame, ENCRYPTED_DATA};
+use vess_network::data_packets::{self, MessageId, PacketReassembler};
 
 mod ffi;
 
 const RPC_TIMEOUT_MS: u64 = 5000;
+const WALLET_MAGIC: &[u8; 8] = b"VESSWLT\0";
+const WALLET_FORMAT_VERSION: u8 = 1;
+const WALLET_HEADER_LEN: usize = WALLET_MAGIC.len() + 1 + 12 + 32;
+const MAX_WALLET_ITEMS: usize = 1_000_000;
 
 struct Keypair {
     dsa_pk: dilithium3::PublicKey,
@@ -17,6 +22,8 @@ struct Keypair {
 pub struct Wallet {
     pub vbank_claimed: Vec<Vess>,
     pub vbank_unclaimed: Vec<Vess>,
+    pub vbank_pending: Vec<Vess>,          // spent in an exported payment, awaiting confirmation
+    preimages: HashMap<VessId, [u8; 32]>,  // hashlock preimages for inputs we can spend
     #[allow(dead_code)]
     pbank_minting: Vec<VessPayment>,
     pbank_built: Vec<VessPayment>,
@@ -27,6 +34,8 @@ pub struct Wallet {
     network: Network,
     node_addr: Option<SocketAddr>,
     socket: Option<UdpSocket>,
+    packet_reassembly: PacketReassembler,
+    transport_tick: u64,
 }
 
 impl Wallet {
@@ -34,12 +43,31 @@ impl Wallet {
         let salt = random_bytes::<32>();
         let key = argon2id_key(password, &salt);
         Self {
-            vbank_claimed: Vec::new(), vbank_unclaimed: Vec::new(),
+            vbank_claimed: Vec::new(), vbank_unclaimed: Vec::new(), vbank_pending: Vec::new(),
+            preimages: HashMap::new(),
             pbank_minting: Vec::new(), pbank_built: Vec::new(), pbank_received: Vec::new(),
             keypairs: HashMap::new(),
             password_hash: key, salt,
             network: Network::new(),
-            node_addr: None, socket: None,
+            node_addr: None, socket: None, packet_reassembly: PacketReassembler::new(), transport_tick: 0,
+        }
+    }
+
+    fn reassemble_packet(&mut self, bytes: &[u8]) -> Option<Option<(Option<MessageId>, Vec<u8>)>> {
+        self.transport_tick = self.transport_tick.wrapping_add(1);
+        if !data_packets::is_fragment(bytes) { return Some(Some((None, bytes.to_vec()))); }
+        self.packet_reassembly.push(bytes, self.transport_tick).ok()
+            .map(|result| result.map(|(id, message)| (Some(id), message)))
+    }
+
+    fn acknowledge_packet(&mut self, id: MessageId) {
+        let Some(addr) = self.node_addr else { return; };
+        let Some(socket) = self.socket.as_ref().and_then(|s| s.try_clone().ok()) else { return; };
+        let Some(session) = self.network.session_by_addr_mut(&addr) else { return; };
+        let plain = GossipMessage::DataAck(id).encode();
+        let packet = frame(ENCRYPTED_DATA, &session.encrypt(&plain));
+        if let Some(fragments) = data_packets::fragment_message(&packet) {
+            for fragment in fragments { let _ = socket.send_to(&fragment, addr); }
         }
     }
 
@@ -142,29 +170,46 @@ impl Wallet {
         for n in &proof.1 { payload_with_pow.extend_from_slice(&n.to_le_bytes()); }
         let init_with_pow = frame(tag, &payload_with_pow);
 
-        let socket = match &self.socket { Some(s) => s, None => return false };
-        if socket.send_to(&init_with_pow, addr).is_err() { return false; }
+        let socket = match &self.socket { Some(s) => match s.try_clone() { Ok(s) => s, Err(_) => return false }, None => return false };
+        let Some(fragments) = data_packets::fragment_message(&init_with_pow) else { return false; };
+        for fragment in fragments {
+            if socket.send_to(&fragment, addr).is_err() { return false; }
+        }
         socket.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok();
         let mut buf = [0u8; 65536];
-        match socket.recv_from(&mut buf) {
-            Ok((len, _src)) => self.handshake_complete(&buf[..len]),
-            Err(_) => false,
+        loop {
+            match socket.recv_from(&mut buf) {
+                Ok((len, _src)) => match self.reassemble_packet(&buf[..len]) {
+                    Some(Some((id, packet))) => {
+                        let connected = self.handshake_complete(&packet);
+                        if connected { if let Some(id) = id { self.acknowledge_packet(id); } }
+                        return connected;
+                    }
+                    Some(None) => continue,
+                    None => return false,
+                },
+                Err(_) => return false,
+            }
         }
     }
 
     fn call_rpc(&mut self, req: RpcRequest) -> Option<RpcResponse> {
         let addr = self.node_addr?;
-        let socket = self.socket.as_ref()?;
-        let session = self.network.session_by_addr_mut(&addr)?;
+        let socket = self.socket.as_ref()?.try_clone().ok()?;
         let plain = req.encode();
-        let encrypted = session.encrypt(&plain);
+        let encrypted = self.network.session_by_addr_mut(&addr)?.encrypt(&plain);
         let framed = frame(ENCRYPTED_DATA, &encrypted);
-        if socket.send_to(&framed, addr).is_err() { return None; }
+        let fragments = data_packets::fragment_message(&framed)?;
+        for fragment in &fragments {
+            if socket.send_to(fragment, addr).is_err() { return None; }
+        }
         // Switch to non-blocking to drain gossip quickly
         socket.set_nonblocking(true).ok()?;
         let mut buf = [0u8; 65536];
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(RPC_TIMEOUT_MS);
-        let len = loop {
+        let mut next_retry = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let mut retries = 0u8;
+        let packet = loop {
             if std::time::Instant::now() >= deadline {
                 let _ = socket.set_nonblocking(false);
                 return None;
@@ -172,20 +217,31 @@ impl Wallet {
             let (len, _) = match socket.recv_from(&mut buf) {
                 Ok(v) => v,
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= next_retry && retries < 3 {
+                        for fragment in &fragments { let _ = socket.send_to(fragment, addr); }
+                        retries += 1;
+                        next_retry += std::time::Duration::from_secs(1);
+                    }
                     std::thread::sleep(std::time::Duration::from_millis(1));
                     continue;
                 }
                 Err(_) => { let _ = socket.set_nonblocking(false); return None; },
             };
-            // Skip gossip (framed ENCRYPTED_DATA) from the node
-            if len >= 5 && buf[0] == ENCRYPTED_DATA {
-                let frame_len = u32::from_le_bytes(buf[1..5].try_into().unwrap()) as usize;
-                if len == 5 + frame_len { continue; }
+            let (packet_id, packet) = match self.reassemble_packet(&buf[..len]) {
+                Some(Some(packet)) => packet,
+                Some(None) => continue,
+                None => { let _ = socket.set_nonblocking(false); return None; },
+            };
+            if let Some(id) = packet_id { self.acknowledge_packet(id); }
+            // Gossip is outer-framed; RPC responses are raw encrypted bytes.
+            if packet.len() >= 5 && packet[0] == ENCRYPTED_DATA {
+                let frame_len = u32::from_le_bytes(packet[1..5].try_into().ok()?) as usize;
+                if packet.len() == 5 + frame_len { continue; }
             }
-            break len;
+            break packet;
         };
         let _ = socket.set_nonblocking(false);
-        let plain = session.decrypt(&buf[..len])?;
+        let plain = self.network.session_by_addr_mut(&addr)?.decrypt(&packet)?;
         let (inner_tag, inner_payload) = unframe(&plain)?;
         RpcResponse::decode(inner_tag, inner_payload)
     }
@@ -209,6 +265,16 @@ impl Wallet {
             + self.vbank_unclaimed.iter().map(|v| v.amount).sum::<u64>()
     }
 
+    /// Balance that is currently spendable (excludes pending).
+    pub fn spendable_balance(&self) -> Amount {
+        self.vbank_claimed.iter().map(|v| v.amount).sum::<u64>()
+    }
+
+    /// Balance locked in pending (exported but unconfirmed).
+    pub fn pending_balance(&self) -> Amount {
+        self.vbank_pending.iter().map(|v| v.amount).sum::<u64>()
+    }
+
     pub fn build_invoice(&mut self, amount: Option<Amount>, memo: Option<&str>, hashlock: Option<&[u8; 32]>, expires_at: Option<u64>) -> String {
         let (pk, sk) = dsa_generate();
         let owner_hash = dsa_pubkey_hash(&pk);
@@ -227,6 +293,7 @@ impl Wallet {
         let total_needed: Amount = outputs.iter().map(|(_, a, _)| a).sum();
         let mut selected = Vec::new();
         let mut selected_sum = 0;
+        // Only select from claimed (never pending or unclaimed)
         let pool: Vec<&Vess> = self.vbank_claimed.iter().collect();
         for v in &pool {
             if selected_sum >= total_needed { break; }
@@ -251,8 +318,11 @@ impl Wallet {
             out_vess.push(Vess { variant: VessVariant::Output, amount: change, owner_hash: oh, timestamp: 0, nonce: 0, salt: random_bytes(), pubkey: Vec::new(), spend_key: Vec::new(), proof: vec![], spend_condition: None });
         }
 
-        let preimage_count = selected.len();
-        let mut payment = VessPayment { payment_id: [0u8; 32], inputs: selected, outputs: out_vess, timestamp: 0, sigs: Vec::new(), preimages: vec![None; preimage_count] };
+        // Populate preimages for hashlocked inputs
+        let preimages: Vec<Option<[u8; 32]>> = selected.iter().map(|v| {
+            self.preimages.get(&v.vess_id()).copied()
+        }).collect();
+        let mut payment = VessPayment { payment_id: [0u8; 32], inputs: selected, outputs: out_vess, timestamp: 0, sigs: Vec::new(), preimages };
         payment.compute();
 
         for v in &payment.inputs {
@@ -264,10 +334,18 @@ impl Wallet {
         Some(payment)
     }
 
-    /// Build and encode a payment for OOB delivery — returns the raw bytes to hand off.
-    /// Does NOT submit to the network. The receiver calls `claim_payment` to submit.
+    /// Build and encode a payment for OOB delivery. Moves used inputs to pending.
+    /// The receiver calls `claim_payment` to submit; until then these coins are locked.
     pub fn export_payment(&mut self, outputs: &[(OwnerHash, Amount, Option<SpendCondition>)]) -> Option<Vec<u8>> {
         let payment = self.build_payment(outputs)?;
+        // Move spent inputs to pending — don't delete until confirmed gone by sync
+        for v in &payment.inputs {
+            let id = v.vess_id();
+            if let Some(pos) = self.vbank_claimed.iter().position(|x| x.vess_id() == id) {
+                self.vbank_pending.push(self.vbank_claimed.remove(pos));
+            }
+        }
+        self.pbank_built.push(payment.clone());
         Some(payment.encode())
     }
 
@@ -359,6 +437,11 @@ impl Wallet {
         Some(count)
     }
 
+    /// Store a hashlock preimage for a UTXO we own. Required to spend hashlocked inputs.
+    pub fn import_preimage(&mut self, vess_id: &VessId, preimage: &[u8; 32]) {
+        self.preimages.insert(*vess_id, *preimage);
+    }
+
     /// Sync unclaimed outputs against the node: check each via RPC and move
     /// confirmed ones to vbank_claimed. Returns (moved, remaining).
     pub fn sync(&mut self) -> (usize, usize) {
@@ -366,12 +449,19 @@ impl Wallet {
         let mut moved = 0usize;
         for id in &ids {
             if self.check(id).unwrap_or(false) {
-                // Confirmed on-chain — move from unclaimed to claimed
                 if let Some(pos) = self.vbank_unclaimed.iter().position(|v| &v.vess_id() == id) {
                     let v = self.vbank_unclaimed.remove(pos);
                     self.vbank_claimed.push(v);
                     moved += 1;
                 }
+            }
+        }
+        // Clean up pending: UTXOs gone from network → payment confirmed, drop them
+        let pending_ids: Vec<VessId> = self.vbank_pending.iter().map(|v| v.vess_id()).collect();
+        for id in &pending_ids {
+            if !self.check(id).unwrap_or(true) {
+                // No longer on network — receiver submitted and it got mined
+                self.vbank_pending.retain(|v| &v.vess_id() != id);
             }
         }
         (moved, self.vbank_unclaimed.len())
@@ -452,6 +542,13 @@ impl Wallet {
         for v in &self.vbank_claimed { plain.extend(&v.encode()); }
         write_u32(&mut plain, self.vbank_unclaimed.len() as u32);
         for v in &self.vbank_unclaimed { plain.extend(&v.encode()); }
+        write_u32(&mut plain, self.vbank_pending.len() as u32);
+        for v in &self.vbank_pending { plain.extend(&v.encode()); }
+        write_u32(&mut plain, self.preimages.len() as u32);
+        for (id, pre) in &self.preimages {
+            write_fixed(&mut plain, id);
+            write_fixed(&mut plain, pre);
+        }
         write_u32(&mut plain, self.keypairs.len() as u32);
         for (oh, kp) in &self.keypairs {
             write_fixed(&mut plain, oh);
@@ -474,27 +571,77 @@ impl Wallet {
         write_fixed(&mut plain, &self.salt);
         let nonce = random_bytes::<12>();
         let ct = chacha_encrypt(&self.password_hash, &nonce, &plain);
-        // Format: nonce(12) || salt(32) || ciphertext
-        let mut out = nonce.to_vec();
+        plain.fill(0);
+        // Format: magic(8) || version(1) || nonce(12) || salt(32) || ciphertext
+        let mut out = Vec::with_capacity(WALLET_HEADER_LEN + ct.len());
+        out.extend_from_slice(WALLET_MAGIC);
+        out.push(WALLET_FORMAT_VERSION);
+        out.extend_from_slice(&nonce);
         out.extend_from_slice(&self.salt);
         out.extend_from_slice(&ct);
         out
     }
 
+    /// Persist only ciphertext. The plaintext serialization buffer exists only
+    /// inside `save()` and is wiped before this method writes anything to disk.
+    pub fn save_to_path(&self, path: impl AsRef<std::path::Path>) -> std::io::Result<()> {
+        let path = path.as_ref();
+        let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("wallet.vess");
+        let temp = parent.join(format!(".{name}.tmp"));
+        let data = self.save();
+        let mut file = std::fs::File::create(&temp)?;
+        use std::io::Write as _;
+        file.write_all(&data)?;
+        file.sync_all()?;
+        drop(file);
+        #[cfg(windows)]
+        if path.exists() { std::fs::remove_file(path)?; }
+        std::fs::rename(temp, path)
+    }
+
     pub fn load(data: &[u8], password: &[u8]) -> Option<Self> {
-        if data.len() < 44 { return None; }
-        let nonce: [u8; 12] = data[..12].try_into().ok()?;
-        let salt: [u8; 32] = data[12..44].try_into().ok()?;
+        let (nonce_offset, salt_offset, cipher_offset) = if data.starts_with(WALLET_MAGIC) {
+            if data.len() < WALLET_HEADER_LEN || data[WALLET_MAGIC.len()] != WALLET_FORMAT_VERSION { return None; }
+            (WALLET_MAGIC.len() + 1, WALLET_MAGIC.len() + 1 + 12, WALLET_HEADER_LEN)
+        } else {
+            // Legacy format: nonce(12) || salt(32) || ciphertext.
+            if data.len() < 44 { return None; }
+            (0, 12, 44)
+        };
+        let nonce: [u8; 12] = data[nonce_offset..nonce_offset + 12].try_into().ok()?;
+        let salt: [u8; 32] = data[salt_offset..salt_offset + 32].try_into().ok()?;
         let key = argon2id_key(password, &salt);
-        let plain = chacha_decrypt(&key, &nonce, &data[44..])?;
+        let mut plain = chacha_decrypt(&key, &nonce, &data[cipher_offset..])?;
+        let result = Self::load_plain(&plain, key, salt);
+        plain.fill(0);
+        result
+    }
+
+    fn load_plain(plain: &[u8], key: [u8; 32], salt: [u8; 32]) -> Option<Self> {
         let mut pos = 0;
         let claimed_len = read_u32(&plain, &mut pos)? as usize;
+        if claimed_len > MAX_WALLET_ITEMS { return None; }
         let mut vbank_claimed = Vec::with_capacity(claimed_len);
         for _ in 0..claimed_len { vbank_claimed.push(Vess::decode(&plain, &mut pos)?); }
         let unclaimed_len = read_u32(&plain, &mut pos)? as usize;
+        if unclaimed_len > MAX_WALLET_ITEMS { return None; }
         let mut vbank_unclaimed = Vec::with_capacity(unclaimed_len);
         for _ in 0..unclaimed_len { vbank_unclaimed.push(Vess::decode(&plain, &mut pos)?); }
+        let pending_len = read_u32(&plain, &mut pos)? as usize;
+        if pending_len > MAX_WALLET_ITEMS { return None; }
+        let mut vbank_pending = Vec::with_capacity(pending_len);
+        for _ in 0..pending_len { vbank_pending.push(Vess::decode(&plain, &mut pos)?); }
+        let pre_len = read_u32(&plain, &mut pos)? as usize;
+        if pre_len > MAX_WALLET_ITEMS { return None; }
+        let mut preimages = HashMap::new();
+        for _ in 0..pre_len {
+            let id = read_fixed(&plain, &mut pos)?;
+            let pre = read_fixed(&plain, &mut pos)?;
+            preimages.insert(id, pre);
+        }
         let kp_len = read_u32(&plain, &mut pos)? as usize;
+        if kp_len > MAX_WALLET_ITEMS { return None; }
         let mut keypairs = HashMap::new();
         for _ in 0..kp_len {
             let oh = read_fixed(&plain, &mut pos)?;
@@ -509,6 +656,7 @@ impl Wallet {
         }
         // Load payment history
         let built_len = read_u32(&plain, &mut pos)? as usize;
+        if built_len > MAX_WALLET_ITEMS { return None; }
         let mut pbank_built = Vec::with_capacity(built_len);
         for _ in 0..built_len {
             let blob_len = read_u32(&plain, &mut pos)? as usize;
@@ -520,6 +668,7 @@ impl Wallet {
             }
         }
         let recv_len = read_u32(&plain, &mut pos)? as usize;
+        if recv_len > MAX_WALLET_ITEMS { return None; }
         let mut pbank_received = Vec::with_capacity(recv_len);
         for _ in 0..recv_len {
             let blob_len = read_u32(&plain, &mut pos)? as usize;
@@ -533,6 +682,8 @@ impl Wallet {
         Some(Self {
             vbank_claimed,
             vbank_unclaimed,
+            vbank_pending,
+            preimages,
             pbank_minting: Vec::new(),
             pbank_built,
             pbank_received,
@@ -542,6 +693,8 @@ impl Wallet {
             network: Network::new(),
             node_addr: None,
             socket: None,
+            packet_reassembly: PacketReassembler::new(),
+            transport_tick: 0,
         })
     }
 }

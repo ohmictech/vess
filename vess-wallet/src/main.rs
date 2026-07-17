@@ -17,18 +17,40 @@
 
 use std::io::{self, Write, BufRead};
 use std::net::SocketAddr;
-use vess_crypto::{OwnerHash, VessPayment, SpendCondition};
+use vess_crypto::{OwnerHash, SpendCondition, VessPayment};
 use vess_wallet::Wallet;
 
 const WALLET_FILE: &str = "wallet.vess";
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.len() == 3 && args[1] == "--wallet" {
+        run_interactive(&args[2]);
+        return;
+    }
+    if args.len() == 2 && args[1] == "--list-wallets" {
+        list_wallets();
+        return;
+    }
     if args.len() > 1 {
         run_flags(&args);
         return;
     }
-    run_interactive();
+    run_interactive(WALLET_FILE);
+}
+
+fn list_wallets() {
+    let mut wallets: Vec<String> = std::fs::read_dir(".").ok().into_iter().flatten()
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let path = entry.path();
+            (path.extension().and_then(|ext| ext.to_str()) == Some("vess"))
+                .then(|| path.display().to_string())
+        })
+        .collect();
+    wallets.sort();
+    if wallets.is_empty() { println!("no wallet files found"); }
+    for path in wallets { println!("{}", path); }
 }
 
 fn load_or_create(wallet_path: &str, password: &[u8]) -> Wallet {
@@ -62,7 +84,6 @@ fn run_flags(args: &[String]) {
             "--invoice" => { action = Some("invoice".into()); i += 1; if i < args.len() { action_arg = Some(args[i].clone()); } }
             "--pay" => { action = Some("pay".into()); i += 1; if i < args.len() { action_arg = Some(args[i].clone()); } }
             "--out" => { i += 1; if i < args.len() { out_file = Some(args[i].clone()); } }
-            "--submit" => { action = Some("submit".into()); i += 1; if i < args.len() { action_arg = Some(args[i].clone()); } }
             "--receive" => { action = Some("receive".into()); i += 1; if i < args.len() { action_arg = Some(args[i].clone()); } }
             "--sync" => { action = Some("sync".into()); }
             _ => { eprintln!("unknown flag: {}", args[i]); return; }
@@ -80,8 +101,9 @@ fn run_flags(args: &[String]) {
             let path = action_arg.as_deref().unwrap_or("../vess-db");
             let count = w.import_treasure(path);
             println!("imported {} coinbase outputs from {}", count, path);
-            println!("balance: {} VESS ({} claimed, {} unclaimed)",
-                w.balance(), w.vbank_claimed.len(), w.vbank_unclaimed.len());
+            println!("balance: {} VESS ({} claimed, {} unclaimed{})",
+                w.balance(), w.vbank_claimed.len(), w.vbank_unclaimed.len(),
+                if w.pending_balance() > 0 { format!(", {} pending", w.pending_balance()) } else { String::new() });
         }
         Some("import-key") => {
             let pub_path = action_arg.as_deref().unwrap_or("dev-pub.key");
@@ -92,7 +114,12 @@ fn run_flags(args: &[String]) {
             }
         }
         Some("balance") => {
-            println!("{}", w.balance());
+            let pending = w.pending_balance();
+            if pending > 0 {
+                println!("{} ({} pending)", w.balance(), pending);
+            } else {
+                println!("{}", w.balance());
+            }
         }
         Some("consolidate") => {
             let before = w.vbank_claimed.len();
@@ -127,8 +154,8 @@ fn run_flags(args: &[String]) {
                 None => println!("invalid invoice URL"),
             }
         }
-        Some("submit") => {
-            let path = action_arg.as_deref().unwrap_or("");
+        Some("receive") => {
+            let path = action_arg.as_deref().unwrap_or("received.vess");
             match std::fs::read(path) {
                 Ok(data) => {
                     let mut pos = 0;
@@ -138,22 +165,10 @@ fn run_flags(args: &[String]) {
                                 println!("payment claimed: {} VESS, id={:?}…",
                                     payment.output_sum(), &payment.payment_id[..8]);
                             } else {
-                                println!("submit failed — node rejected the payment");
+                                println!("claim failed — connect to node first or node rejected");
                             }
                         }
                         None => println!("failed to decode payment from {}", path),
-                    }
-                }
-                Err(_) => println!("cannot read file: {}", path),
-            }
-        }
-        Some("receive") => {
-            let path = action_arg.as_deref().unwrap_or("received.vess");
-            match std::fs::read(path) {
-                Ok(data) => {
-                    match w.receive_blob(&data) {
-                        Some(count) => println!("received {} outputs, balance now: {} VESS", count, w.balance()),
-                        None => println!("failed to decode payment blob"),
                     }
                 }
                 Err(_) => println!("cannot read file: {}", path),
@@ -164,21 +179,23 @@ fn run_flags(args: &[String]) {
             println!("sync: {} confirmed, {} still unclaimed ({} total balance)", moved, remaining, w.balance());
         }
         _ => {
-            println!("usage: vess-wallet --import <db> | --import-key <pub> <sec> | --balance | --consolidate | --invoice <n> | --pay <url> --out <file> | --submit <file> | --receive <file> | --sync");
+            println!("usage: vess-wallet --import <db> | --import-key <pub> <sec> | --balance | --consolidate | --invoice <n> | --pay <url> --out <file> | --receive <file> | --sync");
         }
     }
 
-    let _ = std::fs::write(&wallet_path, &w.save());
+    if let Err(error) = w.save_to_path(&wallet_path) {
+        eprintln!("failed to save wallet: {}", error);
+    }
 }
 
-fn run_interactive() {
+fn run_interactive(wallet_path: &str) {
     let mut wallet: Option<Wallet> = None;
 
-    if std::path::Path::new(WALLET_FILE).exists() {
-        print!("wallet password: ");
+    if std::path::Path::new(wallet_path).exists() {
+        print!("wallet password for {}: ", wallet_path);
         io::stdout().flush().unwrap();
         let pw = read_line();
-        if let Ok(data) = std::fs::read(WALLET_FILE) {
+        if let Ok(data) = std::fs::read(wallet_path) {
             wallet = Wallet::load(&data, pw.as_bytes());
             if wallet.is_some() {
                 println!("wallet loaded ({} VESS balance)", wallet.as_ref().unwrap().balance());
@@ -189,8 +206,17 @@ fn run_interactive() {
     }
 
     if wallet.is_none() {
-        wallet = Some(Wallet::new(b"default"));
-        println!("empty wallet created — use 'connect <addr>' and 'import <db>' to get started");
+        print!("set wallet password (or enter for none): ");
+        io::stdout().flush().unwrap();
+        let pw = read_line();
+        let pass = pw.as_bytes();
+        wallet = Some(Wallet::new(pass));
+        if pw.is_empty() {
+            println!("empty wallet created (no password set)");
+        } else {
+            println!("empty wallet created (password protected)");
+        }
+        println!("  use 'connect <addr>' and 'import <db>' to get started");
     }
 
     let w = wallet.as_mut().unwrap();
@@ -204,7 +230,7 @@ fn run_interactive() {
 
         match parts[0] {
             "help" | "h" => {
-                println!("commands: connect, balance, invoice, pay, export, receive, submit, sync, status, consolidate, import, import-key, save, exit");
+                println!("commands: connect, balance, invoice, pay, receive, sync, status, consolidate, import, import-key, save, exit");
             }
             "connect" | "c" => {
                 let addr = parts.get(1).map_or("127.0.0.1:9876", |s| *s);
@@ -216,7 +242,7 @@ fn run_interactive() {
                             true => println!("connected ✓"),
                             false => println!("failed — is the node running?"),
                         }
-                        let _ = std::fs::write(WALLET_FILE, &w.save());
+                        let _ = w.save_to_path(wallet_path);
                     }
                     Err(e) => println!("bad address: {}", e),
                 }
@@ -238,14 +264,6 @@ fn run_interactive() {
                 let expires = parts.iter().position(|&s| s == "--expires")
                     .and_then(|i| parts.get(i + 1))
                     .and_then(|s| s.parse::<u64>().ok());
-                let sc = if hashlock.is_some() || expires.is_some() {
-                    Some(SpendCondition {
-                        hashlock: hashlock.unwrap_or([0u8; 32]),
-                        expires_at: expires.unwrap_or(0),
-                    })
-                } else {
-                    None
-                };
                 let url = w.build_invoice(Some(amount), Some(memo), hashlock.as_ref(), expires);
                 println!("{}", url);
             }
@@ -279,7 +297,7 @@ fn run_interactive() {
                                 } else {
                                     println!("not submitted — receiver runs 'submit {}' to claim", out_file);
                                 }
-                                let _ = std::fs::write(WALLET_FILE, &w.save());
+                                let _ = w.save_to_path(wallet_path);
                             }
                             None => println!("insufficient funds"),
                         }
@@ -293,7 +311,7 @@ fn run_interactive() {
                         println!("sync: {} confirmed, {} still unclaimed ({} total balance)",
                             moved, remaining, w.balance());
                         if moved > 0 {
-                            let _ = std::fs::write(WALLET_FILE, &w.save());
+                            let _ = w.save_to_path(wallet_path);
                         }
                     }
                 }
@@ -308,7 +326,9 @@ fn run_interactive() {
                     }
                 }
                 println!("balance:    {} VESS", w.balance());
-                println!("claimed:    {} UTXOs", w.vbank_claimed.len());
+                let pending = w.pending_balance();
+                println!("claimed:    {} UTXOs{}", w.vbank_claimed.len(),
+                    if pending > 0 { format!(" ({} VESS pending)", pending) } else { String::new() });
                 println!("unclaimed:  {} UTXOs", w.vbank_unclaimed.len());
                 println!("keypairs:   {}", w.keypair_count());
                 let (built, received) = w.history_counts();
@@ -317,33 +337,17 @@ fn run_interactive() {
                 let path = parts.get(1).unwrap_or(&"received.vess");
                 match std::fs::read(path) {
                     Ok(data) => {
-                        match w.receive_blob(&data) {
-                            Some(count) => {
-                                println!("received {} outputs ({} VESS total balance now)",
-                                    count, w.balance());
-                                let _ = std::fs::write(WALLET_FILE, &w.save());
-                            }
-                            None => println!("failed to decode payment blob — invalid file"),
-                        }
-                    }
-                    Err(_) => println!("cannot read file: {}", path),
-                }
-            }
-            "submit" | "sub" => {
-                let path = parts.get(1).unwrap_or(&"received.vess");
-                match std::fs::read(path) {
-                    Ok(data) => {
                         let mut pos = 0;
                         match VessPayment::decode(&data, &mut pos) {
                             Some(payment) => {
                                 if w.claim_payment(&payment) {
-                                    println!("payment submitted to network: {} VESS, id={:?}…",
+                                    println!("payment claimed: {} VESS, id={:?}…",
                                         payment.output_sum(), &payment.payment_id[..8]);
                                     println!("balance: {} VESS ({} claimed, {} unclaimed)",
                                         w.balance(), w.vbank_claimed.len(), w.vbank_unclaimed.len());
-                                    let _ = std::fs::write(WALLET_FILE, &w.save());
+                                    let _ = w.save_to_path(wallet_path);
                                 } else {
-                                    println!("submit failed — connect to node first or node rejected");
+                                    println!("claim failed — connect to node first or node rejected");
                                 }
                             }
                             None => println!("failed to decode payment from {}", path),
@@ -373,7 +377,7 @@ fn run_interactive() {
                     Some(oh) => {
                         println!("imported keypair: owner_hash={}", hex::encode(oh));
                         println!("run 'import <db>' or sync to find matching UTXOs");
-                        let _ = std::fs::write(WALLET_FILE, &w.save());
+                        let _ = w.save_to_path(wallet_path);
                     }
                     None => println!("failed to read keypair from {} / {}", pub_path, sec_path),
                 }
@@ -383,13 +387,13 @@ fn run_interactive() {
                 println!("peers: use 'connect' to connect to a node");
             }
             "save" | "s" => {
-                match std::fs::write(WALLET_FILE, &w.save()) {
-                    Ok(_) => println!("saved to {}", WALLET_FILE),
+                match w.save_to_path(wallet_path) {
+                    Ok(_) => println!("saved to {}", wallet_path),
                     Err(e) => println!("save failed: {}", e),
                 }
             }
             "exit" | "quit" | "q" => {
-                let _ = std::fs::write(WALLET_FILE, &w.save());
+                let _ = w.save_to_path(wallet_path);
                 println!("wallet saved. goodbye.");
                 break;
             }

@@ -5,17 +5,34 @@ use chacha20poly1305::{
 };
 use rand::RngCore;
 
+// FIPS 204 ML-DSA-65 signatures (RustCrypto ml-dsa). Secret keys are handled
+// exclusively as 32-byte seeds — the expanded signing key is re-derived.
+use ml_dsa::{
+    B32 as DsaSeed, EncodedVerifyingKey as DsaVerifyingKeyBytes, Generate as _, Keypair as _,
+    MlDsa65, Signature as DsaSignature, Signer as _, SigningKey, Verifier as _, VerifyingKey,
+};
+// FIPS 203 ML-KEM-512 key encapsulation (RustCrypto ml-kem).
+use ml_kem::{
+    Ciphertext as KemCiphertext, Decapsulate as _, DecapsulationKey, Encapsulate as _,
+    EncapsulationKey, Kem as _, KeyExport as _, MlKem512, Seed as KemSeed,
+};
+
 pub mod cuckoo;
 
 pub const VESS_ID_V1: &[u8] = b"vess-id-v1";
 pub const VESS_AMOUNT_V1: &[u8] = b"vess-amount-v1";
 pub const VESS_PAYMENT_V1: &[u8] = b"vess-payment-v1";
+pub const VESS_MINT_ID_V1: &[u8] = b"vess-mint-id-v1";
+pub const VESS_HEADER_V1: &[u8] = b"VESS_HEADER_V1";
 pub const DIFFICULTY_BASE_BITS: u32 = 0;  // start at 0; DAA adjusts upward
-pub const MINING_DIFFICULTY: u32 = 10;    
-pub const DIFFICULTY_WINDOW: usize = 10; // adjust every 10 blocks (~10s at 1s target)
+pub const MINING_DIFFICULTY: u32 = 10;
+pub const DIFFICULTY_WINDOW: usize = 40; // adjust every 40 blocks, matches prune window
 pub const MAX_INPUTS: usize = 5;
 pub const MAX_OUTPUTS: usize = 5;
-pub const DEV_PUBKEY_HASH: OwnerHash = [110, 21, 195, 148, 223, 13, 67, 230, 129, 206, 239, 20, 52, 239, 139, 196, 34, 240, 125, 188, 221, 191, 106, 2, 128, 22, 222, 125, 240, 39, 140, 248]; // TODO: replace with real dev pubkey hash
+pub const MAX_BLOCK_PAYMENTS: usize = 10_000; // decode cap; consensus caps far lower
+// Testnet dev fund: blake3 of the ML-DSA-65 pubkey in dev-key-testnet.hex (gitignored).
+// pubkey_hash = f2861d4dadd5aa196eb8e5b89869b148a61021b3d3282c17beaf740ab18f511e
+pub const DEV_PUBKEY_HASH: OwnerHash = [0xf2, 0x86, 0x1d, 0x4d, 0xad, 0xd5, 0xaa, 0x19, 0x6e, 0xb8, 0xe5, 0xb8, 0x98, 0x69, 0xb1, 0x48, 0xa6, 0x10, 0x21, 0xb3, 0xd3, 0x28, 0x2c, 0x17, 0xbe, 0xaf, 0x74, 0x0a, 0xb1, 0x8f, 0x51, 0x1e];
 
 /// Dev subsidy: 1% of block reward, minimum 1 Vess.
 pub fn dev_reward(miner_reward: Amount) -> Amount {
@@ -69,7 +86,9 @@ pub fn random_bytes<const N: usize>() -> [u8; N] {
     buf
 }
 
+/// Total: never indexes out of bounds — any target_bits > 256 is simply unmet.
 pub fn check_difficulty(hash: &[u8; 32], target_bits: u32) -> bool {
+    if target_bits > 256 { return false; }
     let full_bytes = (target_bits / 8) as usize;
     let rem_bits = target_bits % 8;
     for i in 0..full_bytes {
@@ -90,8 +109,11 @@ pub fn required_difficulty(amount: Amount) -> u32 {
 }
 
 /// Block reward: 1 Vess below MINING_DIFFICULTY, doubles each bit beyond.
+/// Total: saturates at Amount::MAX past 73 bits instead of overflowing the shift
+/// (the ≤60 bits consensus cap lives in vess-node).
 pub fn block_reward(difficulty_bits: u32) -> Amount {
     if difficulty_bits < MINING_DIFFICULTY { return 1; }
+    if difficulty_bits > 73 { return Amount::MAX; } // 1 << (bits - 10) would overflow u64
     1u64 << (difficulty_bits - MINING_DIFFICULTY) as u32
 }
 
@@ -110,51 +132,98 @@ pub fn adjust_difficulty(current_bits: u32, recent_times: &[u64], target_ms: u64
     next.min(60)  // cap at 60 to prevent shift overflow in cumulative work
 }
 
-/// Deterministic VessId for a dev subsidy mint (no PoW proof needed).
-pub fn dev_mint_vess_id(amount: Amount, owner_hash: &OwnerHash, timestamp: u64) -> VessId {
-    blake3_hash_multi(&[b"vess-dev-mint", &amount.to_le_bytes(), owner_hash, &timestamp.to_le_bytes()])
-}
-
-pub use pqcrypto_dilithium::dilithium3;
-pub use pqcrypto_kyber::kyber512;
-use pqcrypto_traits::sign::{DetachedSignature as _, PublicKey as _};
-use pqcrypto_traits::kem::{Ciphertext as _, SharedSecret as _};
-
 pub type Signature = Vec<u8>;
 pub type NodeId = [u8; 32];
 pub type MerkleRoot = [u8; 32];
 
-pub fn dsa_generate() -> (dilithium3::PublicKey, dilithium3::SecretKey) {
-    dilithium3::keypair()
+/// Copy a fixed-size key/signature array into an owned Vec (AsRef<[u8]> is
+/// ambiguous on hybrid-array types, hence the explicit helper).
+fn arr_bytes(a: &impl AsRef<[u8]>) -> Vec<u8> {
+    a.as_ref().to_vec()
 }
 
-pub fn dsa_pubkey_hash(pk: &dilithium3::PublicKey) -> OwnerHash {
-    blake3_hash(pk.as_bytes())
+// ---- ML-DSA-65 (FIPS 204) ----
+//
+// Public keys are 1952 bytes, signatures 3309 bytes. The secret key handled by
+// this API is always the 32-byte seed; the expanded signing key is re-derived
+// from it at signing time.
+
+pub const DSA_PUBKEY_BYTES: usize = 1952;
+pub const DSA_SEED_BYTES: usize = 32;
+pub const DSA_SIGNATURE_BYTES: usize = 3309;
+
+/// Generate a fresh ML-DSA-65 keypair. Returns (verifying_key bytes, seed bytes).
+/// Store the SEED — the full signing key is deterministically re-derived from it.
+pub fn dsa_generate() -> (Vec<u8>, Vec<u8>) {
+    let sk = SigningKey::<MlDsa65>::generate();
+    let vk = sk.verifying_key();
+    (arr_bytes(&vk.encode()), arr_bytes(&sk.to_seed()))
 }
 
-pub fn dsa_sign(sk: &dilithium3::SecretKey, message: &[u8]) -> Vec<u8> {
-    dilithium3::detached_sign(message, sk).as_bytes().to_vec()
+/// Derive the verifying key bytes for a 32-byte seed. None if seed length is wrong.
+pub fn dsa_public_from_seed(seed: &[u8]) -> Option<Vec<u8>> {
+    let seed: [u8; DSA_SEED_BYTES] = seed.try_into().ok()?;
+    let sk = SigningKey::<MlDsa65>::from_seed(&DsaSeed::from(seed));
+    Some(arr_bytes(&sk.verifying_key().encode()))
 }
 
-pub fn dsa_verify(pk: &dilithium3::PublicKey, message: &[u8], sig: &[u8]) -> bool {
-    dilithium3::DetachedSignature::from_bytes(sig)
-        .map(|s| dilithium3::verify_detached_signature(&s, message, pk).is_ok())
-        .unwrap_or(false)
+pub fn dsa_pubkey_hash(pk: &[u8]) -> OwnerHash {
+    blake3_hash(pk)
 }
 
-pub fn kem_generate() -> (kyber512::PublicKey, kyber512::SecretKey) {
-    kyber512::keypair()
+/// Sign `message` with the key derived from `seed` (32 bytes).
+/// Returns the 3309-byte signature, or None if the seed is malformed.
+pub fn dsa_sign(seed: &[u8], message: &[u8]) -> Option<Vec<u8>> {
+    let seed: [u8; DSA_SEED_BYTES] = seed.try_into().ok()?;
+    let sk = SigningKey::<MlDsa65>::from_seed(&DsaSeed::from(seed));
+    Some(arr_bytes(&sk.try_sign(message).ok()?.encode()))
 }
 
-pub fn kem_encapsulate(pk: &kyber512::PublicKey) -> (Vec<u8>, Vec<u8>) {
-    let (ss, ct) = kyber512::encapsulate(pk);
-    (ct.as_bytes().to_vec(), ss.as_bytes().to_vec())
+/// Verify an ML-DSA-65 signature. False on any parse or verify failure — never panics.
+pub fn dsa_verify(pk: &[u8], message: &[u8], sig: &[u8]) -> bool {
+    let vk = DsaVerifyingKeyBytes::<MlDsa65>::try_from(pk)
+        .map(|enc| VerifyingKey::<MlDsa65>::decode(&enc));
+    let (Ok(vk), Ok(sig)) = (vk, DsaSignature::<MlDsa65>::try_from(sig)) else { return false; };
+    vk.verify(message, &sig).is_ok()
 }
 
-pub fn kem_decapsulate(ct: &[u8], sk: &kyber512::SecretKey) -> Option<Vec<u8>> {
-    kyber512::Ciphertext::from_bytes(ct)
-        .map(|c| kyber512::decapsulate(&c, sk).as_bytes().to_vec())
-        .ok()
+/// Node identity: blake3 of the ML-DSA verifying key bytes.
+pub fn node_id(pk: &[u8]) -> NodeId {
+    blake3_hash(pk)
+}
+
+// ---- ML-KEM-512 (FIPS 203) ----
+//
+// Encapsulation keys are 800 bytes, ciphertexts 768 bytes, shared secrets 32
+// bytes. Decapsulation keys are handled as their 64-byte seed serialization.
+
+pub const KEM_PUBKEY_BYTES: usize = 800;
+pub const KEM_SEED_BYTES: usize = 64;
+pub const KEM_CIPHERTEXT_BYTES: usize = 768;
+pub const KEM_SHARED_SECRET_BYTES: usize = 32;
+
+/// Generate a fresh ML-KEM-512 keypair. Returns (encapsulation_key bytes, decapsulation seed bytes).
+pub fn kem_generate() -> (Vec<u8>, Vec<u8>) {
+    let (dk, ek) = MlKem512::generate_keypair();
+    (arr_bytes(&ek.to_bytes()), arr_bytes(&dk.to_bytes()))
+}
+
+/// Encapsulate against an untrusted peer encapsulation key. Validates the key;
+/// returns (ciphertext, shared_secret) or None if the key is malformed.
+pub fn kem_encapsulate(ek_bytes: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+    let enc = ml_kem::Key::<EncapsulationKey<MlKem512>>::try_from(ek_bytes).ok()?;
+    let ek = EncapsulationKey::<MlKem512>::new(&enc).ok()?;
+    let (ct, ss) = ek.encapsulate();
+    Some((arr_bytes(&ct), arr_bytes(&ss)))
+}
+
+/// Decapsulate a ciphertext with our decapsulation seed. Returns the shared
+/// secret, or None if the ciphertext or seed length is wrong.
+pub fn kem_decapsulate(ct_bytes: &[u8], dk_bytes: &[u8]) -> Option<Vec<u8>> {
+    let seed = KemSeed::try_from(dk_bytes).ok()?;
+    let dk = DecapsulationKey::<MlKem512>::from_seed(seed);
+    let ct = KemCiphertext::<MlKem512>::try_from(ct_bytes).ok()?;
+    Some(arr_bytes(&dk.decapsulate(&ct)))
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -195,8 +264,7 @@ pub struct Vess {
     pub nonce: u64,
     pub salt: [u8; 32],
     pub pubkey: Vec<u8>,
-    pub spend_key: Vec<u8>,
-    pub proof: Vec<u32>,        // cuckatoo proof: 42 sorted nonces for Mint, empty for Output
+    pub spend_key: Vec<u8>,     // 32-byte ML-DSA seed; LOCAL STORAGE ONLY — never on the wire
     pub spend_condition: Option<SpendCondition>,  // optional hashlock + expiry
 }
 
@@ -207,14 +275,6 @@ pub enum VessVariant {
 }
 
 impl Vess {
-    pub fn mint_vess_id_from_proof(proof: &[u32]) -> VessId {
-        cuckoo::proof_to_id(proof)
-    }
-
-    pub fn mint_header_hash(amount: Amount, owner_hash: &OwnerHash, timestamp: u64, nonce: u64) -> [u8; 32] {
-        cuckoo::mint_header(amount, owner_hash, timestamp, nonce)
-    }
-
     pub fn output_vess_id(amount_hash: &AmountHash, owner_hash: &OwnerHash) -> VessId {
         blake3_hash_multi(&[VESS_ID_V1, amount_hash, owner_hash])
     }
@@ -223,18 +283,17 @@ impl Vess {
         blake3_hash_multi(&[VESS_AMOUNT_V1, &amount.to_le_bytes(), salt])
     }
 
+    /// Canonical VessId — pure function of the Vess' public fields. Mint and
+    /// Output both commit to (amount_hash, owner_hash); Mint additionally
+    /// commits to (timestamp, nonce). Never touches spend_key.
     pub fn vess_id(&self) -> VessId {
+        let ah = Self::amount_hash(self.amount, &self.salt);
         match self.variant {
             VessVariant::Mint => {
-                if self.proof.is_empty() {
-                    // Dev subsidy — deterministic ID from (amount, owner_hash, timestamp)
-                    dev_mint_vess_id(self.amount, &self.owner_hash, self.timestamp)
-                } else {
-                    Self::mint_vess_id_from_proof(&self.proof)
-                }
+                blake3_hash_multi(&[VESS_MINT_ID_V1, &ah, &self.owner_hash,
+                    &self.timestamp.to_le_bytes(), &self.nonce.to_le_bytes()])
             }
             VessVariant::Output => {
-                let ah = Self::amount_hash(self.amount, &self.salt);
                 // Include spend condition in the output ID if present
                 if let Some(ref sc) = self.spend_condition {
                     blake3_hash_multi(&[VESS_ID_V1, &ah, &self.owner_hash, &sc.encode()])
@@ -297,13 +356,20 @@ pub struct VessBlock {
     pub nonce: u64,
     pub payment_merkle: MerkleRoot,
     pub state_merkle: MerkleRoot,
+    /// Cuckatoo PoW: exactly cuckoo::CYCLE_LENGTH strictly-ascending nonces.
+    /// NOT committed to by header_hash — mining finds the proof for a given header.
+    pub proof: Vec<u32>,
     pub coinbase: VessPayment,
     pub payments: Vec<VessPayment>,
 }
 
 impl VessBlock {
+    /// Header commitment: version, parents, timestamp, difficulty, nonce and
+    /// both merkle roots — but NOT the proof (mining varies the proof for a
+    /// fixed header) and NOT the body (committed via payment_merkle).
     pub fn header_hash(&self) -> BlockHash {
         let mut pre = Vec::new();
+        pre.extend_from_slice(VESS_HEADER_V1);
         pre.extend_from_slice(&self.version.to_le_bytes());
         pre.push(self.parents.len() as u8);
         for p in &self.parents {
@@ -327,6 +393,8 @@ impl VessBlock {
         write_u64(&mut buf, self.nonce);
         write_fixed(&mut buf, &self.payment_merkle);
         write_fixed(&mut buf, &self.state_merkle);
+        write_u32(&mut buf, self.proof.len() as u32);
+        for &n in &self.proof { write_u32(&mut buf, n); }
         buf.extend_from_slice(&self.coinbase.encode());
         write_u32(&mut buf, self.payments.len() as u32);
         for p in &self.payments { buf.extend_from_slice(&p.encode()); }
@@ -343,11 +411,17 @@ impl VessBlock {
         let nonce = read_u64(bytes, pos)?;
         let payment_merkle = read_fixed(bytes, pos)?;
         let state_merkle = read_fixed(bytes, pos)?;
+        // A block proof is exactly CYCLE_LENGTH nonces — nothing else is a block.
+        let proof_len = read_u32(bytes, pos)? as usize;
+        if proof_len != cuckoo::CYCLE_LENGTH { return None; }
+        let mut proof = Vec::with_capacity(cuckoo::CYCLE_LENGTH);
+        for _ in 0..proof_len { proof.push(read_u32(bytes, pos)?); }
         let coinbase = VessPayment::decode(bytes, pos)?;
         let pay_len = read_u32(bytes, pos)? as usize;
+        if pay_len > MAX_BLOCK_PAYMENTS { return None; }
         let mut payments = Vec::with_capacity(pay_len);
         for _ in 0..pay_len { payments.push(VessPayment::decode(bytes, pos)?); }
-        Some(VessBlock { version, parents, timestamp, difficulty_bits, nonce, payment_merkle, state_merkle, coinbase, payments })
+        Some(VessBlock { version, parents, timestamp, difficulty_bits, nonce, payment_merkle, state_merkle, proof, coinbase, payments })
     }
 }
 
@@ -410,6 +484,8 @@ pub fn read_fixed<const N: usize>(bytes: &[u8], pos: &mut usize) -> Option<[u8; 
 }
 
 impl Vess {
+    /// Canonical wire/consensus encoding. Secrets are NEVER serialized here —
+    /// spend_key is local-only key material (see encode_with_secrets).
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         write_u8(&mut buf, if self.variant == VessVariant::Mint { 0 } else { 1 });
@@ -419,9 +495,6 @@ impl Vess {
         write_u64(&mut buf, self.nonce);
         write_fixed(&mut buf, &self.salt);
         write_bytes(&mut buf, &self.pubkey);
-        write_bytes(&mut buf, &self.spend_key);
-        write_u32(&mut buf, self.proof.len() as u32);
-        for &n in &self.proof { write_u32(&mut buf, n); }
         // Spend condition: 1 byte discriminant + optional 40 bytes
         if let Some(ref sc) = self.spend_condition {
             write_u8(&mut buf, 1);
@@ -429,6 +502,14 @@ impl Vess {
         } else {
             write_u8(&mut buf, 0);
         }
+        buf
+    }
+
+    /// Local-storage encoding: canonical form + spend key seed.
+    /// Used ONLY for local key stores (node mined_keys table, wallet file).
+    pub fn encode_with_secrets(&self) -> Vec<u8> {
+        let mut buf = self.encode();
+        write_bytes(&mut buf, &self.spend_key);
         buf
     }
 
@@ -440,15 +521,18 @@ impl Vess {
         let nonce = read_u64(bytes, pos)?;
         let salt = read_fixed(bytes, pos)?;
         let pubkey = read_bytes(bytes, pos)?;
-        let spend_key = read_bytes(bytes, pos)?;
-        let proof_len = read_u32(bytes, pos)? as usize;
-        let mut proof = Vec::with_capacity(proof_len);
-        for _ in 0..proof_len { proof.push(read_u32(bytes, pos)?); }
         let spend_condition = match read_u8(bytes, pos)? {
             1 => SpendCondition::decode(bytes, pos),
             _ => None,
         };
-        Some(Vess { variant, amount, owner_hash, timestamp, nonce, salt, pubkey, spend_key, proof, spend_condition })
+        Some(Vess { variant, amount, owner_hash, timestamp, nonce, salt, pubkey, spend_key: Vec::new(), spend_condition })
+    }
+
+    /// Decode the local-storage form written by encode_with_secrets.
+    pub fn decode_with_secrets(bytes: &[u8], pos: &mut usize) -> Option<Self> {
+        let mut v = Self::decode(bytes, pos)?;
+        v.spend_key = read_bytes(bytes, pos)?;
+        Some(v)
     }
 }
 
@@ -463,13 +547,14 @@ impl VessPayment {
         for v in &self.outputs { buf.extend_from_slice(&v.encode()); }
         write_u32(&mut buf, self.sigs.len() as u32);
         for s in &self.sigs { write_bytes(&mut buf, s); }
-        // Preimages: 1 byte per input (0=none, 1=present) + 32 bytes if present
-        for pi in &self.preimages {
-            if let Some(preimage) = pi {
-                write_u8(&mut buf, 1);
-                buf.extend_from_slice(preimage);
-            } else {
-                write_u8(&mut buf, 0);
+        // Preimages: exactly one per input (0=none, 1=present) + 32 bytes if present
+        for i in 0..self.inputs.len() {
+            match self.preimages.get(i).and_then(|pi| pi.as_ref()) {
+                Some(preimage) => {
+                    write_u8(&mut buf, 1);
+                    buf.extend_from_slice(preimage);
+                }
+                None => write_u8(&mut buf, 0),
             }
         }
         buf
@@ -485,6 +570,7 @@ impl VessPayment {
         let mut outputs = Vec::with_capacity(out_len.min(MAX_OUTPUTS));
         for _ in 0..out_len { outputs.push(Vess::decode(bytes, pos)?); }
         let sig_len = read_u32(bytes, pos)? as usize;
+        if sig_len > MAX_INPUTS { return None; } // never pre-allocate from untrusted lengths
         let mut sigs = Vec::with_capacity(sig_len);
         for _ in 0..sig_len { sigs.push(read_bytes(bytes, pos)?); }
         // Preimages: one per input
@@ -534,6 +620,230 @@ pub fn merkle_root_stream<I: IntoIterator<Item = [u8; 32]>>(items: I) -> [u8; 32
     stack[0].0
 }
 
-pub fn node_id(pk: &dilithium3::PublicKey) -> NodeId {
-    blake3_hash(pk.as_bytes())
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_payment() -> VessPayment {
+        let (_, seed) = dsa_generate();
+        let input = Vess {
+            variant: VessVariant::Output, amount: 5, owner_hash: [1u8; 32],
+            timestamp: 0, nonce: 0, salt: [2u8; 32],
+            pubkey: Vec::new(), spend_key: seed, spend_condition: None,
+        };
+        let output = Vess {
+            variant: VessVariant::Output, amount: 5, owner_hash: [3u8; 32],
+            timestamp: 0, nonce: 0, salt: [4u8; 32],
+            pubkey: Vec::new(), spend_key: Vec::new(), spend_condition: None,
+        };
+        let mut p = VessPayment {
+            payment_id: [0u8; 32], inputs: vec![input], outputs: vec![output],
+            timestamp: 0, sigs: Vec::new(), preimages: Vec::new(),
+        };
+        p.compute();
+        p
+    }
+
+    #[test]
+    fn test_dsa_roundtrip() {
+        let (pk, seed) = dsa_generate();
+        assert_eq!(pk.len(), DSA_PUBKEY_BYTES);
+        assert_eq!(seed.len(), DSA_SEED_BYTES);
+        assert_eq!(dsa_public_from_seed(&seed).unwrap(), pk, "seed must re-derive the same pubkey");
+        let sig = dsa_sign(&seed, b"hello").expect("signing with a valid seed works");
+        assert_eq!(sig.len(), DSA_SIGNATURE_BYTES);
+        assert!(dsa_verify(&pk, b"hello", &sig));
+        assert!(!dsa_verify(&pk, b"HELLO", &sig), "wrong message rejected");
+        let (pk2, _) = dsa_generate();
+        assert!(!dsa_verify(&pk2, b"hello", &sig), "wrong key rejected");
+    }
+
+    #[test]
+    fn test_dsa_verify_never_panics_on_garbage() {
+        let (pk, seed) = dsa_generate();
+        let sig = dsa_sign(&seed, b"m").unwrap();
+        assert!(!dsa_verify(&[], b"m", &sig));
+        assert!(!dsa_verify(&pk[..17], b"m", &sig));
+        assert!(!dsa_verify(&pk, b"m", &[]));
+        assert!(!dsa_verify(&pk, b"m", &sig[..100]));
+        assert!(!dsa_verify(&[0xAB; DSA_PUBKEY_BYTES], b"m", &sig));
+        assert!(dsa_sign(&[0u8; 31], b"m").is_none(), "short seed rejected");
+        assert!(dsa_sign(&[], b"m").is_none());
+    }
+
+    #[test]
+    fn test_kem_roundtrip() {
+        let (ek, dk) = kem_generate();
+        assert_eq!(ek.len(), KEM_PUBKEY_BYTES);
+        assert_eq!(dk.len(), KEM_SEED_BYTES);
+        let (ct, ss) = kem_encapsulate(&ek).expect("valid ek encapsulates");
+        assert_eq!(ct.len(), KEM_CIPHERTEXT_BYTES);
+        assert_eq!(ss.len(), KEM_SHARED_SECRET_BYTES);
+        assert_eq!(kem_decapsulate(&ct, &dk).unwrap(), ss, "shared secrets match");
+        assert!(kem_encapsulate(&ek[..100]).is_none(), "truncated ek rejected");
+        assert!(kem_decapsulate(&ct[..100], &dk).is_none(), "truncated ct rejected");
+        assert!(kem_decapsulate(&ct, &dk[..32]).is_none(), "truncated dk rejected");
+        // Tampered ciphertext: implicit rejection yields a DIFFERENT secret, never a panic.
+        let mut bad_ct = ct.clone();
+        bad_ct[0] ^= 1;
+        assert_ne!(kem_decapsulate(&bad_ct, &dk).unwrap(), ss);
+    }
+
+    #[test]
+    fn test_vess_wire_excludes_spend_key() {
+        let (_, seed) = dsa_generate();
+        let v = Vess {
+            variant: VessVariant::Output, amount: 7, owner_hash: [9u8; 32],
+            timestamp: 0, nonce: 0, salt: [8u8; 32],
+            pubkey: vec![1, 2, 3], spend_key: seed.clone(), spend_condition: None,
+        };
+        let wire = v.encode();
+        // The 32-byte seed must not appear in the canonical encoding.
+        assert!(wire.windows(DSA_SEED_BYTES).all(|w| w != seed.as_slice()),
+            "spend_key must never be in the wire encoding");
+        let mut pos = 0;
+        let decoded = Vess::decode(&wire, &mut pos).unwrap();
+        assert!(decoded.spend_key.is_empty(), "decode leaves spend_key empty");
+        assert_eq!(decoded.vess_id(), v.vess_id(), "id is a function of public fields only");
+        // Local-storage form round-trips the seed.
+        let mut pos = 0;
+        let restored = Vess::decode_with_secrets(&v.encode_with_secrets(), &mut pos).unwrap();
+        assert_eq!(restored.spend_key, seed);
+    }
+
+    #[test]
+    fn test_mint_vess_id_stable() {
+        // Mint ids come from normal fields — identical twice, distinct on any field change.
+        let m = Vess {
+            variant: VessVariant::Mint, amount: 10, owner_hash: [1u8; 32],
+            timestamp: 42, nonce: 0, salt: [7u8; 32],
+            pubkey: Vec::new(), spend_key: Vec::new(), spend_condition: None,
+        };
+        assert_eq!(m.vess_id(), m.vess_id());
+        let mut m2 = m.clone();
+        m2.salt[0] ^= 1;
+        assert_ne!(m.vess_id(), m2.vess_id());
+        let mut m3 = m.clone();
+        m3.timestamp += 1;
+        assert_ne!(m.vess_id(), m3.vess_id());
+        let mut m4 = m.clone();
+        m4.spend_key = vec![0xFF; 32];
+        assert_eq!(m.vess_id(), m4.vess_id(), "spend_key never enters the id");
+    }
+
+    #[test]
+    fn test_payment_preimage_encode_symmetric() {
+        // Encode writes exactly inputs.len() preimage slots even if preimages is short.
+        let mut p = test_payment();
+        p.inputs.push(p.inputs[0].clone());
+        p.preimages = vec![None]; // shorter than inputs
+        let enc = p.encode();
+        let mut pos = 0;
+        let decoded = VessPayment::decode(&enc, &mut pos).unwrap();
+        assert_eq!(decoded.preimages.len(), decoded.inputs.len());
+        assert_eq!(pos, enc.len(), "encode/decode fully symmetric");
+    }
+
+    #[test]
+    fn test_payment_decode_sig_count_capped() {
+        // A huge sig count must fail fast, not pre-allocate.
+        let p = test_payment();
+        let mut enc = p.encode();
+        // Layout: payment_id(32) || ts(8) || in_len(4)+inputs || out_len(4)+outputs || sig_len(4)
+        let inputs_end = 32 + 8 + 4 + p.inputs[0].encode().len();
+        let sig_len_off = inputs_end + 4 + p.outputs[0].encode().len();
+        enc.truncate(sig_len_off);
+        enc.extend_from_slice(&u32::MAX.to_le_bytes());
+        let mut pos = 0;
+        assert!(VessPayment::decode(&enc, &mut pos).is_none(), "huge sig_len rejected");
+    }
+
+    #[test]
+    fn test_block_proof_wire_rules() {
+        let (pk, seed) = dsa_generate();
+        let cb_out = Vess {
+            variant: VessVariant::Mint, amount: 1, owner_hash: dsa_pubkey_hash(&pk),
+            timestamp: 1, nonce: 0, salt: [5u8; 32],
+            pubkey: pk, spend_key: seed, spend_condition: None,
+        };
+        let mut coinbase = VessPayment {
+            payment_id: [0u8; 32], inputs: vec![], outputs: vec![cb_out],
+            timestamp: 0, sigs: vec![], preimages: vec![],
+        };
+        coinbase.compute();
+        let block = VessBlock {
+            version: 1, parents: vec![], timestamp: 1, difficulty_bits: 2, nonce: 0,
+            payment_merkle: merkle_root(&[coinbase.payment_id]), state_merkle: [0u8; 32],
+            proof: (0..cuckoo::CYCLE_LENGTH as u32).collect(), coinbase, payments: vec![],
+        };
+        let enc = block.encode();
+        let mut pos = 0;
+        let decoded = VessBlock::decode(&enc, &mut pos).unwrap();
+        assert_eq!(decoded.proof, block.proof);
+        assert_eq!(decoded.header_hash(), block.header_hash());
+        assert_eq!(pos, enc.len());
+
+        // header_hash must NOT commit to the proof
+        let mut other = block.clone();
+        other.proof = (0..cuckoo::CYCLE_LENGTH as u32).map(|n| n + 100).collect();
+        assert_eq!(other.header_hash(), block.header_hash());
+
+        // Any proof length other than CYCLE_LENGTH is rejected at decode
+        let mut bad = block.clone();
+        bad.proof = vec![0u32; cuckoo::CYCLE_LENGTH - 1];
+        let enc = bad.encode();
+        let mut pos = 0;
+        assert!(VessBlock::decode(&enc, &mut pos).is_none());
+        let mut bad2 = block.clone();
+        bad2.proof = Vec::new();
+        let enc = bad2.encode();
+        let mut pos = 0;
+        assert!(VessBlock::decode(&enc, &mut pos).is_none());
+    }
+
+    #[test]
+    fn test_block_payments_count_capped() {
+        let p = test_payment();
+        let coinbase = p.clone();
+        let block = VessBlock {
+            version: 1, parents: vec![], timestamp: 1, difficulty_bits: 2, nonce: 0,
+            payment_merkle: [0u8; 32], state_merkle: [0u8; 32],
+            proof: vec![0u32; cuckoo::CYCLE_LENGTH], coinbase, payments: vec![p],
+        };
+        let mut enc = block.encode();
+        // Truncate everything after the payments count and inflate it.
+        let fixed = 4 + 1 + 8 + 4 + 8 + 32 + 32 + 4 + cuckoo::CYCLE_LENGTH * 4;
+        let tail = block.coinbase.encode().len();
+        enc.truncate(fixed + tail);
+        enc.extend_from_slice(&u32::MAX.to_le_bytes());
+        let mut pos = 0;
+        assert!(VessBlock::decode(&enc, &mut pos).is_none(), "huge payment count rejected");
+    }
+
+    #[test]
+    fn test_check_difficulty_bounds() {
+        let zero = [0u8; 32];
+        assert!(check_difficulty(&zero, 0));
+        assert!(check_difficulty(&zero, 255));
+        assert!(check_difficulty(&zero, 256));
+        assert!(!check_difficulty(&zero, 257), "out-of-range target is simply unmet");
+        assert!(!check_difficulty(&zero, u32::MAX));
+        let mut h = [0u8; 32];
+        h[31] = 1;
+        assert!(check_difficulty(&h, 255));
+        assert!(!check_difficulty(&h, 256));
+        h[0] = 0x80;
+        assert!(!check_difficulty(&h, 1));
+    }
+
+    #[test]
+    fn test_block_reward_bounds() {
+        assert_eq!(block_reward(0), 1);
+        assert_eq!(block_reward(MINING_DIFFICULTY - 1), 1);
+        assert_eq!(block_reward(MINING_DIFFICULTY), 1);
+        assert_eq!(block_reward(MINING_DIFFICULTY + 1), 2);
+        assert_eq!(block_reward(73), 1u64 << 63);
+        assert_eq!(block_reward(74), Amount::MAX, "saturates instead of overflowing");
+        assert_eq!(block_reward(u32::MAX), Amount::MAX);
+    }
 }

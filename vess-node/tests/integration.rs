@@ -70,6 +70,74 @@ mod integration {
     }
 
     #[test]
+    fn test_duplicate_block_is_idempotent() {
+        let (mut node, _sock) = start_node_at("127.0.0.1:19883", "vess-db-duplicate-block");
+        let (pk, sk) = dsa_generate();
+        let oh = dsa_pubkey_hash(&pk);
+        let coin = mine_coins(&mut node, oh, pk.as_bytes(), sk.as_bytes());
+        let block = node.pending_blocks.last().cloned().expect("mined block recorded for gossip");
+        let count_before = node.utxo_count();
+        let root_before = node.merkle();
+
+        assert!(node.process_block(&block), "duplicate block is harmlessly acknowledged");
+        assert_eq!(node.utxo_count(), count_before, "duplicate must not mutate UTXO state");
+        assert_eq!(node.merkle(), root_before, "duplicate must not change state root");
+        assert!(node.check(&coin.vess_id()), "original output remains available");
+    }
+
+    #[test]
+    fn test_fragmented_message_completion_ack() {
+        let (mut n1, _s1) = start_node_at("127.0.0.1:19885", "vess-db-frag-ack-1");
+        let (mut n2, _s2) = start_node_at("127.0.0.1:19886", "vess-db-frag-ack-2");
+        let a1: std::net::SocketAddr = "127.0.0.1:19885".parse().unwrap();
+        let a2: std::net::SocketAddr = "127.0.0.1:19886".parse().unwrap();
+        let key = [0xA5; 32];
+        n1.inject_session(a2, n2.network.my_node_id(), key);
+        n2.inject_session(a1, n1.network.my_node_id(), key);
+
+        let ids: Vec<VessId> = (0..100).map(|i| {
+            let mut id = [0u8; 32];
+            id[0] = i;
+            id
+        }).collect();
+        n1.send(a2, &GossipMessage::StateSyncChunk(0, ids));
+        assert_eq!(n1.reliable_message_count(), 1, "fragmented message cached for retry");
+
+        let mut packets = n1.cycle();
+        packets.reverse();
+        for (_dest, packet) in packets { let _ = n2.process(a1, &packet); }
+        let lost_acknowledgements = n2.cycle();
+        assert!(!lost_acknowledgements.is_empty(), "receiver produced completion acknowledgement");
+        n1.ticks += 200;
+        let retries = n1.cycle();
+        assert!(!retries.is_empty(), "missing acknowledgement triggers retransmission");
+        for (_dest, packet) in retries { let _ = n2.process(a1, &packet); }
+        let acknowledgements = n2.cycle();
+        assert!(!acknowledgements.is_empty(), "receiver acknowledges completed assembly");
+        for (_dest, packet) in acknowledgements { let _ = n1.process(a2, &packet); }
+        assert_eq!(n1.reliable_message_count(), 0, "completion acknowledgement clears retry cache");
+    }
+
+    #[test]
+    fn test_restart_rebuilds_canonical_state() {
+        let db = "vess-db-restart-recovery";
+        let _ = std::fs::remove_dir_all(db);
+        let addr: std::net::SocketAddr = "127.0.0.1:19884".parse().unwrap();
+        let (pk, sk) = dsa_generate();
+        let oh = dsa_pubkey_hash(&pk);
+        let coin = {
+            let mut node = Node::new_test_at(addr, db);
+            mine_coins(&mut node, oh, pk.as_bytes(), sk.as_bytes())
+        };
+
+        let recovered = Node::new_test_at(addr, db);
+        assert!(recovered.check(&coin.vess_id()), "canonical output restored from persisted blocks");
+        assert!(recovered.utxo_count() > 0, "UTXO index rebuilt on restart");
+        drop(recovered);
+        let _ = std::fs::remove_dir_all(db);
+    }
+
+    #[test]
     fn test_full_flow() {
         let _ = std::fs::remove_dir_all("vess-db-flow");
         let (mut n1, s1) = start_node_at("127.0.0.1:19880", "vess-db-flow");
@@ -250,9 +318,9 @@ mod integration {
     // ── HIGH PRIORITY TESTS ──
 
     #[test]
-    fn test_conflict_annihilation() {
-        // Two payments spending the same input in one block → both annihilated.
-        let (mut node, _s) = start_node_at("127.0.0.1:19920", "vess-db-annihilate");
+    fn test_conflicting_block_is_rejected() {
+        // Two payments spending the same input make the entire block invalid.
+        let (mut node, _s) = start_node_at("127.0.0.1:19920", "vess-db-reject-conflicting");
         let (pk, sk) = dsa_generate();
         let oh = dsa_pubkey_hash(&pk);
         let v = mine_coins(&mut node, oh, pk.as_bytes(), sk.as_bytes());
@@ -292,19 +360,16 @@ mod integration {
             state_merkle: [0u8; 32],
             coinbase: cb, payments: vec![p1, p2],
         };
-        node.process_block(&block);
+        assert!(!node.process_block(&block), "conflicting block rejected");
 
-        // Both inputs AND outputs should be annihilated (gone from LMDB)
-        assert!(!node.check(&v.vess_id()), "spent input annihilated");
-        // The coinbase output should survive (different ID due to random salt)
-        assert!(node.check(&cb_id), "coinbase survived");
+        assert!(node.check(&v.vess_id()), "input remains after rejection");
+        assert!(!node.check(&cb_id), "coinbase was never applied");
     }
 
     #[test]
-    fn test_merkle_mismatch_not_rejected() {
-        // Block with wrong state_merkle must still be accepted — PoW is consensus.
-        // state_merkle is a miner claim, not a validity condition.
-        let (mut node, _s) = start_node_at("127.0.0.1:19922", "vess-db-merklemis");
+    fn test_merkle_mismatch_is_rejected() {
+        // A committed non-zero state root must match the deterministic transition.
+        let (mut node, _s) = start_node_at("127.0.0.1:19922", "vess-db-reject-merkle");
         let (pk, sk) = dsa_generate();
         let oh = dsa_pubkey_hash(&pk);
 
@@ -332,15 +397,13 @@ mod integration {
         let fake_block = VessBlock {
             version: 1, parents: node.tip_hashes.clone(), timestamp: 0, difficulty_bits: 9, nonce: 0,
             payment_merkle: merkle_root(&[cb.payment_id, spend.payment_id]),
-            state_merkle: [0xFFu8; 32], // deliberately wrong — must NOT cause rejection
+            state_merkle: [0xFFu8; 32],
             coinbase: cb, payments: vec![spend.clone()],
         };
-        node.process_block(&fake_block);
+        assert!(!node.process_block(&fake_block), "wrong state root rejected");
 
-        // Block must still be accepted: PoW is the consensus rule.
-        // Payments must be applied even though state_merkle was wrong.
-        assert!(!node.check(&v.vess_id()), "spent input removed despite wrong merkle");
-        assert!(node.check(&out_v.vess_id()), "output applied despite wrong merkle");
+        assert!(node.check(&v.vess_id()), "input retained after rejection");
+        assert!(!node.check(&out_v.vess_id()), "output not applied after rejection");
     }
 
     #[test]
@@ -351,7 +414,7 @@ mod integration {
         // Build tip A: one block at diff=9 (work=512)
         let (pk_a, sk_a) = dsa_generate();
         let oh_a = dsa_pubkey_hash(&pk_a);
-        let _coins_a = mine_coins(&mut node, oh_a, pk_a.as_bytes(), sk_a.as_bytes());
+        let coins_a = mine_coins(&mut node, oh_a, pk_a.as_bytes(), sk_a.as_bytes());
         let tip_a_hash = node.tip_hashes[0];
         let work_a = node.cumulative_work(&tip_a_hash);
         assert!(work_a > 0, "chain A has work");
@@ -362,6 +425,7 @@ mod integration {
         let cb1_out = Vess { variant: VessVariant::Mint, amount: 2, owner_hash: oh_b,
             timestamp: 0, nonce: 0, salt: random_bytes(), pubkey: pk_b.as_bytes().to_vec(),
             spend_key: sk_b.as_bytes().to_vec(), proof: vec![], spend_condition: None };
+        let cb1_id = cb1_out.vess_id();
         let mut cb1 = VessPayment { payment_id: [0u8;32], inputs: vec![], outputs: vec![cb1_out.clone()], timestamp: 0, sigs: vec![], preimages: vec![] };
         cb1.compute();
         let block1 = VessBlock { version: 1, parents: vec![], timestamp: 1000, difficulty_bits: 10, nonce: 0,
@@ -369,9 +433,11 @@ mod integration {
             coinbase: cb1, payments: vec![] };
         node.process_block(&block1);
 
-        let cb2_out = Vess { variant: VessVariant::Mint, amount: 2, owner_hash: oh_b,
-            timestamp: 0, nonce: 0, salt: random_bytes(), pubkey: pk_b.as_bytes().to_vec(),
-            spend_key: sk_b.as_bytes().to_vec(), proof: vec![], spend_condition: None };
+        let (pk_b2, sk_b2) = dsa_generate();
+        let oh_b2 = dsa_pubkey_hash(&pk_b2);
+        let cb2_out = Vess { variant: VessVariant::Mint, amount: 2, owner_hash: oh_b2,
+            timestamp: 0, nonce: 0, salt: random_bytes(), pubkey: pk_b2.as_bytes().to_vec(),
+            spend_key: sk_b2.as_bytes().to_vec(), proof: vec![], spend_condition: None };
         let mut cb2 = VessPayment { payment_id: [0u8;32], inputs: vec![], outputs: vec![cb2_out], timestamp: 0, sigs: vec![], preimages: vec![] };
         cb2.compute();
         let block2 = VessBlock { version: 1, parents: vec![block1.header_hash()], timestamp: 2000, difficulty_bits: 10, nonce: 0,
@@ -383,8 +449,8 @@ mod integration {
         let tip_b_work = node.cumulative_work(&block2.header_hash());
         let tip_a_work = node.cumulative_work(&tip_a_hash);
         assert!(tip_b_work > tip_a_work, "chain B has more work");
-        // Node should have both chains available
-        assert!(node.tip_hashes.len() >= 1, "node tracks tips");
+        assert!(node.check(&cb1_id), "canonical fork output retained");
+        assert!(!node.check(&coins_a.vess_id()), "abandoned fork output removed from canonical state");
     }
 
     // ── MEDIUM PRIORITY TESTS ──
@@ -491,7 +557,7 @@ mod integration {
         assert!(node.submit(lock), "lock with hashlock output must succeed");
 
         // Mine to confirm the locked output
-        let _ = mine_coins(&mut node, oh, pk.as_bytes(), sk.as_bytes());
+        let second_input = mine_coins(&mut node, oh, pk.as_bytes(), sk.as_bytes());
 
         // Now try to SPEND the hashlocked output with correct preimage
         let mut out_spendable = out_v.clone();
@@ -516,13 +582,13 @@ mod integration {
         // Wrong preimage must fail (different payment)
         let wrong_hash = blake3_hash(b"wrong");
         let out_v2 = Vess {
-            variant: VessVariant::Output, amount: v.amount, owner_hash: oh2,
+            variant: VessVariant::Output, amount: second_input.amount, owner_hash: oh2,
             timestamp: 0, nonce: 0, salt: random_bytes(),
             pubkey: Vec::new(), spend_key: Vec::new(), proof: vec![],
             spend_condition: Some(SpendCondition { hashlock, expires_at: 0 }),
         };
         let mut lock2 = VessPayment {
-            payment_id: [0u8;32], inputs: vec![v.clone()], outputs: vec![out_v2.clone()],
+            payment_id: [0u8;32], inputs: vec![second_input.clone()], outputs: vec![out_v2.clone()],
             timestamp: 0, sigs: vec![], preimages: vec![None],
         };
         lock2.compute();
@@ -634,6 +700,110 @@ mod integration {
         dead.compute();
         dead.sigs.push(dsa_sign(&sk2, &dead.payment_id));
         assert!(!node.submit(dead), "expired must reject even with preimage");
+    }
+
+    #[test]
+    fn test_malformed_payment_empty_sigs() {
+        let (mut n1, _s1) = start_node_at("127.0.0.1:19951", "vess-db-emptysig");
+        let (pk, sk) = dsa_generate();
+        let oh = dsa_pubkey_hash(&pk);
+        let v = mine_coins(&mut n1, oh, pk.as_bytes(), sk.as_bytes());
+        let (pk2, _) = dsa_generate();
+        let oh2 = dsa_pubkey_hash(&pk2);
+        let out_v = Vess { variant: VessVariant::Output, amount: v.amount, owner_hash: oh2, timestamp: 0,
+            nonce: 0, salt: random_bytes(), pubkey: Vec::new(), spend_key: Vec::new(), proof: vec![], spend_condition: None };
+        let mut spend = VessPayment { payment_id: [0u8;32], inputs: vec![v], outputs: vec![out_v],
+            timestamp: 0, sigs: vec![], preimages: vec![None] };
+        spend.compute();
+        // sigs left empty — must be rejected
+        assert!(!n1.submit(spend), "payment with no signatures must be rejected");
+    }
+
+    #[test]
+    fn test_malformed_payment_wrong_sig() {
+        let (mut n1, _s1) = start_node_at("127.0.0.1:19952", "vess-db-wrongsig");
+        let (pk, sk) = dsa_generate();
+        let oh = dsa_pubkey_hash(&pk);
+        let v = mine_coins(&mut n1, oh, pk.as_bytes(), sk.as_bytes());
+        let (pk2, _) = dsa_generate();
+        let oh2 = dsa_pubkey_hash(&pk2);
+        let out_v = Vess { variant: VessVariant::Output, amount: v.amount, owner_hash: oh2, timestamp: 0,
+            nonce: 0, salt: random_bytes(), pubkey: Vec::new(), spend_key: Vec::new(), proof: vec![], spend_condition: None };
+        let mut spend = VessPayment { payment_id: [0u8;32], inputs: vec![v], outputs: vec![out_v],
+            timestamp: 0, sigs: vec![], preimages: vec![None] };
+        spend.compute();
+        // Sign with a different key — must be rejected
+        let (_, wrong_sk) = dsa_generate();
+        spend.sigs = vec![dsa_sign(&wrong_sk, &spend.payment_id)];
+        assert!(!n1.submit(spend), "payment with wrong signature must be rejected");
+    }
+
+    #[test]
+    fn test_malformed_payment_tampered_id() {
+        let (mut n1, _s1) = start_node_at("127.0.0.1:19953", "vess-db-tamper");
+        let (pk, sk) = dsa_generate();
+        let oh = dsa_pubkey_hash(&pk);
+        let v = mine_coins(&mut n1, oh, pk.as_bytes(), sk.as_bytes());
+        let (pk2, _) = dsa_generate();
+        let oh2 = dsa_pubkey_hash(&pk2);
+        let out_v = Vess { variant: VessVariant::Output, amount: v.amount, owner_hash: oh2, timestamp: 0,
+            nonce: 0, salt: random_bytes(), pubkey: Vec::new(), spend_key: Vec::new(), proof: vec![], spend_condition: None };
+        let mut spend = VessPayment { payment_id: [0u8;32], inputs: vec![v], outputs: vec![out_v],
+            timestamp: 0, sigs: vec![], preimages: vec![None] };
+        spend.compute();
+        spend.sigs = vec![dsa_sign(&sk, &spend.payment_id)];
+        // Tamper with payment_id after signing — sig no longer matches
+        spend.payment_id[0] ^= 1;
+        assert!(!n1.submit(spend), "payment with tampered id must be rejected");
+    }
+
+    #[test]
+    fn test_rate_limit_ban() {
+        let node_addr: std::net::SocketAddr = "127.0.0.1:19954".parse().unwrap();
+        let (mut node, _sock) = start_node_at("127.0.0.1:19954", "vess-db-ratelimit");
+        let attacker: std::net::SocketAddr = "127.0.0.1:19955".parse().unwrap();
+        let att_sock = UdpSocket::bind(attacker).unwrap();
+        att_sock.set_nonblocking(true).unwrap();
+        // Send 7 bad frames — 6th triggers ban (>5 strikes), 7th should be silent
+        let garbage = vec![0u8; 100]; // won't unframe
+        for i in 0..7 {
+            att_sock.send_to(&garbage, node_addr).unwrap();
+            thread::sleep(Duration::from_millis(2));
+            let resp = node.process(attacker, &garbage);
+            if i >= 5 {
+                assert!(resp.is_none(), "banned peer must get no response at strike {}", i);
+            }
+        }
+        // Verify the ban is recorded
+        assert!(node.process(attacker, &garbage).is_none(), "still banned");
+    }
+
+    #[test]
+    fn test_packet_loss_resilience() {
+        let _ = std::fs::remove_dir_all("vess-db-loss1");
+        let _ = std::fs::remove_dir_all("vess-db-loss2");
+        let (mut n1, s1) = start_node_at("127.0.0.1:19956", "vess-db-loss1");
+        let (mut n2, s2) = start_node_at("127.0.0.1:19957", "vess-db-loss2");
+        let n2_addr: std::net::SocketAddr = "127.0.0.1:19957".parse().unwrap();
+        let init = n1.add_peer(n2_addr);
+        s1.send_to(&init, n2_addr).unwrap();
+        // Cycle to establish session
+        for _ in 0..6 { thread::sleep(Duration::from_millis(5)); cycle_node(&mut n2, &s2); cycle_node(&mut n1, &s1); }
+        n1.needs_sync = false; n2.needs_sync = false;
+
+        let (pk, sk) = dsa_generate();
+        let oh = dsa_pubkey_hash(&pk);
+        // Mine block on n1 — gossip to n2
+        mine_coins(&mut n1, oh, pk.as_bytes(), sk.as_bytes());
+        // Simulate packet loss: only cycle n2 every other attempt
+        for round in 0..20 {
+            cycle_node(&mut n1, &s1);
+            if round % 2 == 0 { cycle_node(&mut n2, &s2); } // drop 50% of n2 cycles
+            thread::sleep(Duration::from_millis(2));
+        }
+        // n2 should still eventually receive the block via retransmission
+        cycle_node(&mut n2, &s2); cycle_node(&mut n1, &s1);
+        assert_eq!(n1.merkle(), n2.merkle(), "merkle roots converge despite packet loss");
     }
 
 }

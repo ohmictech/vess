@@ -7,14 +7,10 @@ edition.workspace = true
 vess-crypto = { path = "../vess-crypto" }
 vess-network = { path = "../vess-network" }
 rand = "0.8"
-pqcrypto-dilithium = "0.5"
-pqcrypto-traits = "0.3"
 heed = "0.20"
 ureq = "2"
 
 [dev-dependencies]
-pqcrypto-dilithium = "0.5"
-pqcrypto-traits = "0.3"
 vess-wallet = { path = "../vess-wallet" }
 
 [[bin]]

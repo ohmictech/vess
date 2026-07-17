@@ -66,8 +66,20 @@ fn edge_pair(key: &[u8; 16], nonce: u64, edge_bits: u32) -> (u64, u64) {
 
 // ---------- verifier ----------
 
+/// Edge space searched by the solver for these parameters (nonces must stay inside it).
+/// Production: 2^EDGE_BITS. Test/handshake params use the smaller test table.
+fn max_edges_for(edge_bits: u32) -> u64 {
+    if edge_bits <= 20 { MAX_EDGES_TEST as u64 } else { MAX_EDGES as u64 }
+}
+
 pub fn verify(header_hash: &[u8; 32], proof: &[u32], cycle_len: usize, edge_bits: u32) -> bool {
     if proof.len() != cycle_len { return false; }
+    // Canonical form: strictly ascending nonces. Rejects permutation grinding
+    // (same cycle, different order → different difficulty hash) and duplicates.
+    if proof.windows(2).any(|w| w[0] >= w[1]) { return false; }
+    // Every nonce must index an edge the solver could actually have used.
+    let max_edges = max_edges_for(edge_bits);
+    if proof.iter().any(|&n| n as u64 >= max_edges) { return false; }
     let key = siphash_key(header_hash);
     let edges: Vec<(u64, u64)> = proof.iter()
         .map(|&n| edge_pair(&key, n as u64, edge_bits))
@@ -269,6 +281,46 @@ mod tests {
         let id = proof_to_id(&p);
         assert_ne!(id, [0u8; 32]);
         assert_eq!(proof_to_id(&p), id);
+    }
+
+    /// Solve and return (header, proof) for the header the proof actually verifies against.
+    fn solved_header_and_proof() -> ([u8; 32], Vec<u32>) {
+        let h = [0xAA; 32];
+        let p = solve_retry(&h, TEST_CYCLE_LENGTH, TEST_EDGE_BITS, MAX_SOLVE_ATTEMPTS).unwrap();
+        let mut hdr = h;
+        for _ in 0..MAX_SOLVE_ATTEMPTS {
+            if verify(&hdr, &p, TEST_CYCLE_LENGTH, TEST_EDGE_BITS) { return (hdr, p); }
+            hdr = crate::blake3_hash(&hdr);
+        }
+        panic!("proof must verify against some header");
+    }
+
+    #[test]
+    fn test_permuted_proof_rejected() {
+        let (hdr, p) = solved_header_and_proof();
+        assert!(p.windows(2).all(|w| w[0] < w[1]), "solver emits ascending proofs");
+        let mut permuted = p.clone();
+        permuted.swap(0, 1); // breaks ascending order
+        assert!(!verify(&hdr, &permuted, TEST_CYCLE_LENGTH, TEST_EDGE_BITS),
+            "permuted proof must be rejected");
+    }
+
+    #[test]
+    fn test_duplicate_nonce_rejected() {
+        let (hdr, p) = solved_header_and_proof();
+        let mut dup = p.clone();
+        dup[1] = dup[0]; // duplicate — also breaks strict ascending
+        assert!(!verify(&hdr, &dup, TEST_CYCLE_LENGTH, TEST_EDGE_BITS),
+            "duplicate nonce must be rejected");
+    }
+
+    #[test]
+    fn test_out_of_range_nonce_rejected() {
+        let (hdr, p) = solved_header_and_proof();
+        let mut oob = p.clone();
+        *oob.last_mut().unwrap() = MAX_EDGES_TEST as u32; // beyond the solver's edge space
+        assert!(!verify(&hdr, &oob, TEST_CYCLE_LENGTH, TEST_EDGE_BITS),
+            "out-of-range nonce must be rejected");
     }
 
     /// Run `cargo test cuckoo::tests::bench_difficulty -- --ignored --nocapture`

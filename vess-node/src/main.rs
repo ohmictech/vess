@@ -3,11 +3,28 @@ use std::net::UdpSocket;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 use vess_crypto::VessBlock;
-use vess_network::GossipMessage;
+use vess_network::data_packets;
 use vess_node::Node;
+
+const MAX_MINING_CORES: u32 = 32;
+
+fn permitted_mining_cores(requested: u32) -> u32 {
+    let available = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) as u32;
+    requested.min(available.max(1)).min(MAX_MINING_CORES)
+}
 
 fn fmt8(b: &[u8]) -> String {
     b.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join("")
+}
+
+fn send_datagrams(socket: &UdpSocket, dest: std::net::SocketAddr, data: &[u8]) {
+    if data_packets::is_fragment(data) {
+        let _ = socket.send_to(data, dest);
+        return;
+    }
+    if let Some(fragments) = data_packets::fragment_message(data) {
+        for fragment in fragments { let _ = socket.send_to(&fragment, dest); }
+    }
 }
 
 fn main() -> std::io::Result<()> {
@@ -39,6 +56,9 @@ fn main() -> std::io::Result<()> {
             resolved.push(addr);
         } else {
             let lines: Vec<String> = if bp.starts_with("http://") || bp.starts_with("https://") {
+                if bp.starts_with("http://") {
+                    eprintln!("warning: bootstrap list is unauthenticated HTTP; prefer HTTPS or a local signed file");
+                }
                 eprintln!("fetching peer list from {}", bp);
                 match ureq::get(bp).call() {
                     Ok(r) => r.into_string().unwrap_or_default()
@@ -62,13 +82,19 @@ fn main() -> std::io::Result<()> {
             }
         }
     }
+    resolved.sort();
+    resolved.dedup();
+    if resolved.len() > 100 {
+        eprintln!("bootstrap list capped at 100 distinct peers");
+        resolved.truncate(100);
+    }
     {
         let mut n = node.lock().unwrap();
         for bs in &resolved {
             eprintln!("bootstrapping to {} (solving handshake PoW)...", bs);
             let init = n.add_peer(*bs);
             if !init.is_empty() {
-                let _ = socket.send_to(&init, *bs);
+                send_datagrams(&socket, *bs, &init);
                 eprintln!("  handshake init sent ({} bytes)", init.len());
             }
         }
@@ -76,7 +102,7 @@ fn main() -> std::io::Result<()> {
         if !reconnects.is_empty() {
             eprintln!("reconnecting to {} known peers...", reconnects.len());
             for (addr, init) in reconnects {
-                let _ = socket.send_to(&init, addr);
+                send_datagrams(&socket, addr, &init);
             }
         }
     }
@@ -90,6 +116,8 @@ fn main() -> std::io::Result<()> {
     // Hash counter — total nonces tried across all mining threads (for display).
     let hash_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let hash_count_status = hash_count.clone();
+    let mining_since = std::sync::Arc::new(std::sync::Mutex::new(None::<std::time::Instant>));
+    let mining_since_status = mining_since.clone();
 
     // Mining pool — spawns N threads per candidate, partitioned nonce space
     let miner_node = node.clone();
@@ -97,7 +125,7 @@ fn main() -> std::io::Result<()> {
     std::thread::spawn(move || loop {
         let cores = {
             let n = miner_node.lock().unwrap();
-            n.mining_cores
+            permitted_mining_cores(n.mining_cores)
         };
         if cores == 0 {
             std::thread::sleep(Duration::from_millis(200));
@@ -112,22 +140,24 @@ fn main() -> std::io::Result<()> {
             }
         };
         let started_at = block_count_miner.load(std::sync::atomic::Ordering::Relaxed);
-        hash_count.store(0, std::sync::atomic::Ordering::Relaxed);
         // Run N solver threads; first to find a solution cancels the rest
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (result_tx, result_rx) = mpsc::channel();
         let cores_u64 = cores as u64;
+        let mut workers = Vec::with_capacity(cores as usize);
         for t in 0..cores_u64 {
             let b = candidate.clone();
             let tx = result_tx.clone();
             let c = cancel.clone();
             let hc = hash_count.clone();
-            std::thread::spawn(move || {
+            workers.push(std::thread::spawn(move || {
                 if let Some((nonce, proof)) = Node::mine_pow(&b, t, cores_u64, c.as_ref(), hc.as_ref()) {
                     let _ = tx.send((nonce, proof));
                 }
-            });
+            }));
         }
+        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        for worker in workers { let _ = worker.join(); }
         drop(result_tx);
         // Wait for solution, but check periodically for stale work / stop
         loop {
@@ -161,6 +191,7 @@ fn main() -> std::io::Result<()> {
 
     // Stdin thread for runtime commands
     let cmd_node = node.clone();
+    let mining_since_cmd = mining_since.clone();
     let (tx, rx) = mpsc::channel::<String>();
     let (ptx, prx) = mpsc::channel::<std::net::SocketAddr>();
     std::thread::spawn(move || {
@@ -176,17 +207,22 @@ fn main() -> std::io::Result<()> {
                     }
                 } else if trimmed == "mine" {
                     cmd_node.lock().unwrap().mining_cores = 1;
+                    *mining_since_cmd.lock().unwrap() = Some(std::time::Instant::now());
                     eprintln!("mining ON (1 core)");
                 } else if trimmed == "mine stop" {
                     cmd_node.lock().unwrap().mining_cores = 0;
+                    *mining_since_cmd.lock().unwrap() = None;
                     eprintln!("mining OFF");
                 } else if let Some(n_str) = trimmed.strip_prefix("mine ") {
                     if let Ok(n) = n_str.parse::<u32>() {
                         if n > 0 {
-                            cmd_node.lock().unwrap().mining_cores = n;
-                            eprintln!("mining ON ({} cores)", n);
+                            let cores = permitted_mining_cores(n);
+                            cmd_node.lock().unwrap().mining_cores = cores;
+                            *mining_since_cmd.lock().unwrap() = Some(std::time::Instant::now());
+                            eprintln!("mining ON ({} cores)", cores);
                         } else {
                             cmd_node.lock().unwrap().mining_cores = 0;
+                            *mining_since_cmd.lock().unwrap() = None;
                             eprintln!("mining OFF");
                         }
                     }
@@ -213,15 +249,6 @@ fn main() -> std::io::Result<()> {
         while let Ok((block, nonce, proof)) = block_rx.try_recv() {
             node.lock().unwrap().apply_mined_block(block, nonce, proof);
             block_count_main.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            // Broadcast the new block
-            if let Ok(n) = node.lock() {
-                if let Some(last) = n.pending_blocks.last() {
-                    let msg = GossipMessage::Block(last.clone());
-                    let addrs: Vec<std::net::SocketAddr> = n.peers.iter()
-                        .filter(|(_, id)| **id != [0u8; 32]).map(|(a, _)| *a).collect();
-                    for a in addrs { let _ = socket.send_to(&msg.encode(), a); }
-                }
-            }
         }
 
         // Check for peer connection requests
@@ -229,7 +256,7 @@ fn main() -> std::io::Result<()> {
             eprintln!("connecting to {} (solving handshake PoW)...", peer_addr);
             let init = node.lock().unwrap().add_peer(peer_addr);
             if !init.is_empty() {
-                let _ = socket.send_to(&init, peer_addr);
+                send_datagrams(&socket, peer_addr, &init);
                 eprintln!("  handshake init sent ({} bytes)", init.len());
             }
         }
@@ -240,7 +267,7 @@ fn main() -> std::io::Result<()> {
         match socket.recv_from(&mut buf) {
             Ok((len, src)) => {
                 if let Some(resp) = node.lock().unwrap().process(src, &buf[..len]) {
-                    let _ = socket.send_to(&resp, src);
+                    send_datagrams(&socket, src, &resp);
                 }
                 block_count_main.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
@@ -255,13 +282,15 @@ fn main() -> std::io::Result<()> {
             if n.ticks.saturating_sub(last_status) >= 2000 {
                 last_status = n.ticks;
                 let m = n.merkle();
-                let h = hash_count_status.load(std::sync::atomic::Ordering::Relaxed);
-                let hps = h / 2;
                 if n.mining_cores > 0 {
-                    eprintln!("[{}:{}] peers={} limbo={} utxos={} diff={} mine={}c {}h/s merkle={}",
+                    let h = hash_count_status.load(std::sync::atomic::Ordering::Relaxed);
+                    let elapsed = mining_since_status.lock().unwrap()
+                        .map(|t| t.elapsed().as_secs().max(1))
+                        .unwrap_or(1);
+                    eprintln!("[{}:{}] peers={} limbo={} utxos={} diff={} mine={}c tries={} {}/s merkle={}",
                         n.ticks, addr.port(), n.peer_count(), n.limbo_len(),
                         n.utxo_count(), n.current_difficulty, n.mining_cores,
-                        hps, fmt8(&m[..8]));
+                        h, h / elapsed, fmt8(&m[..8]));
                 } else {
                     eprintln!("[{}:{}] peers={} limbo={} utxos={} diff={} merkle={}",
                         n.ticks, addr.port(), n.peer_count(), n.limbo_len(),
@@ -271,7 +300,7 @@ fn main() -> std::io::Result<()> {
             ob
         };
         for (dest, data) in outbound {
-            let _ = socket.send_to(&data, dest);
+            send_datagrams(&socket, dest, &data);
         }
 
         std::thread::sleep(Duration::from_millis(1));

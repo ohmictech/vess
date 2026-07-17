@@ -4,13 +4,31 @@ use rand::Rng;
 use pqcrypto_traits::sign::{PublicKey as _, SecretKey as _};
 use vess_crypto::*;
 use vess_network::*;
+use vess_network::data_packets::{self, PacketReassembler};
 
 const DANDELION_MAX_STEM: u8 = 4;
 const DANDELION_FLUFF_PROB: f64 = 0.10; // 10% chance per hop to switch to fluff
 const DANDELION_EMBARGO_TICKS: u64 = 40; // ~200ms embargo before fluff broadcast
 const HOLE_PUNCH_MAX_RETRIES: u8 = 3;
 const STEM_RELAY_MAX_PER_TICK: usize = 2;
-const MAX_FRAME_SIZE: usize = 20 * 1024 * 1024;  // 20 MB max UDP datagram (block + overhead)
+const MAX_FRAME_SIZE: usize = data_packets::MAX_MESSAGE_SIZE;
+const MAX_FUTURE_BLOCK_TIME_MS: u64 = 120_000;
+const MAX_LIMBO_PAYMENTS: usize = 10_000;
+const LIMBO_TTL_TICKS: u64 = 12_000;
+const MAX_REASSEMBLY_PEERS: usize = 32;
+const MAX_RELIABLE_MESSAGES: usize = 32;
+const MAX_RELIABLE_BYTES: usize = 4 * 1024 * 1024;
+const RETRANSMIT_TICKS: u64 = 200;
+const MAX_RETRANSMITS: u8 = 5;
+const COMPLETED_PACKET_TTL_TICKS: u64 = 6000;
+const MAX_COMPLETED_PACKETS_PER_PEER: usize = 256;
+
+struct ReliableMessage {
+    addr: SocketAddr,
+    packets: Vec<Vec<u8>>,
+    last_sent: u64,
+    retries: u8,
+}
 
 /// NAT reachability classification.
 #[derive(PartialEq, Clone, Copy, Debug)]
@@ -43,6 +61,7 @@ pub struct Node {
     meta: heed::Database<heed::types::Str, heed::types::Bytes>,
     mined_keys: heed::Database<heed::types::Bytes, heed::types::Bytes>, // owner_hash → pubkey||spend_key
     peers_db: heed::Database<heed::types::Bytes, heed::types::Unit>,   // persisted peer addresses
+    blocks_db: heed::Database<heed::types::Bytes, heed::types::Bytes>, // block_hash → encoded block
     limbo: HashMap<PaymentId, (VessPayment, u64)>,       // payment → (data, entry_tick)
     limbo_inputs: HashMap<VessId, Vec<PaymentId>>,       // which limbo payments claim each input
     contested: HashSet<PaymentId>,                        // payments with conflicting inputs (burn on block inclusion)
@@ -58,6 +77,7 @@ pub struct Node {
     pub tip_hashes: Vec<BlockHash>,               // DAG tips for parent selection
     current_tip: Option<BlockHash>,           // tip our LMDB state corresponds to
     pub mining_cores: u32,                     // 0 = off, 1+ = mining with that many threads
+    last_mine_tick: u64,                       // last tick we attempted mining (for periodic spacing)
     pub current_difficulty: u32,               // adjusts via DAA every DIFFICULTY_WINDOW blocks
     pub pending_blocks: Vec<VessBlock>,            // blocks waiting for gossip broadcast
     // NAT traversal
@@ -65,6 +85,9 @@ pub struct Node {
     pub introducer: Option<SocketAddr>,         // public peer helping us punch through
     pub introduced_peers: HashMap<NodeId, IntroducedPeer>, // peers we're hole-punching toward
     relay_queue: Vec<(NodeId, Vec<u8>)>,        // StemRelay fallback queue (target_id, gossip_bytes)
+    packet_reassembly: HashMap<SocketAddr, PacketReassembler>,
+    reliable_messages: HashMap<data_packets::MessageId, ReliableMessage>,
+    completed_packets: HashMap<SocketAddr, Vec<(data_packets::MessageId, u64)>>,
     // State sync
     sync_peer: Option<SocketAddr>,               // peer we're syncing UTXOs from
     sync_offset: u64,                             // how many UTXO IDs received so far
@@ -82,34 +105,60 @@ impl Node {
 
     fn new_inner(addr: SocketAddr, db_path: &str, test_mode: bool) -> Self {
         let _ = std::fs::create_dir(db_path);
-        let env = unsafe { heed::EnvOpenOptions::new().map_size(1_073_741_824).max_dbs(5).open(db_path) }.unwrap();
+        let env = unsafe { heed::EnvOpenOptions::new().map_size(1_073_741_824).max_dbs(6).open(db_path) }.unwrap();
         let mut wtxn = env.write_txn().unwrap();
         let db: heed::Database<heed::types::Bytes, heed::types::Unit> = env.create_database(&mut wtxn, Some("vess")).unwrap();
         let ban_list: heed::Database<heed::types::Bytes, heed::types::Unit> = env.create_database(&mut wtxn, Some("bans")).unwrap();
         let meta: heed::Database<heed::types::Str, heed::types::Bytes> = env.create_database(&mut wtxn, Some("meta")).unwrap();
         let mined_keys: heed::Database<heed::types::Bytes, heed::types::Bytes> = env.create_database(&mut wtxn, Some("keys")).unwrap();
         let peers_db: heed::Database<heed::types::Bytes, heed::types::Unit> = env.create_database(&mut wtxn, Some("peers")).unwrap();
+        let blocks_db: heed::Database<heed::types::Bytes, heed::types::Bytes> = env.create_database(&mut wtxn, Some("blocks")).unwrap();
         wtxn.commit().unwrap();
 
         let (saved_ticks, saved_diff) = Self::load_meta(&env, &meta);
         let mut node = Self { addr, network: Network::new(), peers: HashMap::new(), max_peers: 32, needs_sync: true, env, vess_index: db, ban_list, meta, mined_keys, peers_db,
-            limbo: HashMap::new(), limbo_inputs: HashMap::new(), contested: HashSet::new(),
+            blocks_db, limbo: HashMap::new(), limbo_inputs: HashMap::new(), contested: HashSet::new(),
             outbox: Vec::new(), ticks: saved_ticks, fails: HashMap::new(),
             peer_msg_count: HashMap::new(), msg_window_start: 0, peer_merkle: HashMap::new(),
             stems: HashMap::new(), fluff_embargo: HashMap::new(),
             blocks: HashMap::new(), tip_hashes: Vec::new(), current_tip: None, mining_cores: 0,
+            last_mine_tick: 0,
             current_difficulty: saved_diff,
             pending_blocks: Vec::new(),
             nat_type: NatType::Unknown,
             introducer: None,
             introduced_peers: HashMap::new(),
             relay_queue: Vec::new(),
+            packet_reassembly: HashMap::new(),
+            reliable_messages: HashMap::new(),
+            completed_packets: HashMap::new(),
             sync_peer: None,
             sync_offset: 0,
             sync_target_root: None,
-            sync_chunk_size: 10000,
+            sync_chunk_size: 10_000,
             auto_sync_until: 0,
             test_mode };
+        // Recover the block graph before serving or mining. The UTXO index is
+        // rebuilt from its canonical tip below, rather than trusted directly.
+        if let Ok(t) = node.env.read_txn() {
+            if let Ok(iter) = blocks_db.iter(&t) {
+                for entry in iter.flatten() {
+                    let (hash, bytes) = entry;
+                    let Ok(hash) = <[u8; 32]>::try_from(hash) else { continue; };
+                    let mut pos = 0;
+                    if let Some(block) = VessBlock::decode(bytes, &mut pos) {
+                        if pos == bytes.len() && block.header_hash() == hash {
+                            node.blocks.insert(hash, block);
+                        }
+                    }
+                }
+            }
+        }
+        node.tip_hashes = node.blocks.iter()
+            .filter(|(hash, _)| !node.blocks.values().any(|other| other.parents.contains(hash)))
+            .map(|(hash, _)| *hash)
+            .collect();
+        node.reorg_if_needed();
         // Load persisted bans
         if let Ok(t) = node.env.read_txn() {
             if let Ok(iter) = node.ban_list.iter(&t) {
@@ -171,6 +220,7 @@ impl Node {
         self.peers.iter().filter(|(_,id)| **id != [0u8;32]).count()
     }
     pub fn limbo_len(&self) -> usize { self.limbo.len() }
+    pub fn reliable_message_count(&self) -> usize { self.reliable_messages.len() }
     /// Number of UTXOs in the LMDB state index.
     pub fn utxo_count(&self) -> usize {
         self.env.read_txn().ok()
@@ -364,8 +414,10 @@ impl Node {
     // ---- submit ----
 
     pub fn submit(&mut self, p: VessPayment) -> bool {
+        self.evict_limbo();
         // Don't accept payments while catching up; isolated nodes are always "synced"
         if self.needs_sync && self.peer_count() > 0 { return false; }
+        if self.limbo.len() >= MAX_LIMBO_PAYMENTS { return false; }
         if self.limbo.contains_key(&p.payment_id) { return false; }
         if !self.verify(&p) { return false; }
 
@@ -394,6 +446,20 @@ impl Node {
     }
 
     // ---- limbo maintenance ----
+
+    fn evict_limbo(&mut self) {
+        let expired: HashSet<PaymentId> = self.limbo.iter()
+            .filter(|(_, (_, entered))| self.ticks.saturating_sub(*entered) >= LIMBO_TTL_TICKS)
+            .map(|(id, _)| *id)
+            .collect();
+        if expired.is_empty() { return; }
+        self.limbo.retain(|id, _| !expired.contains(id));
+        self.contested.retain(|id| !expired.contains(id));
+        for claims in self.limbo_inputs.values_mut() {
+            claims.retain(|id| !expired.contains(id));
+        }
+        self.limbo_inputs.retain(|_, claims| !claims.is_empty());
+    }
 
     /// Apply all clean (non-contested) limbo payments to LMDB.
     /// In production, this is done by block processing. For tests/standalone.
@@ -448,13 +514,14 @@ impl Node {
     pub fn test_mine(&mut self, owner_hash: OwnerHash, pubkey: Vec<u8>, spend_key: Vec<u8>) -> Vec<Vess> {
         let diff = MINING_DIFFICULTY; // reward = 1 Vess at threshold
         let reward = block_reward(diff);
+        let mint_timestamp = self.blocks.len() as u64 + 1;
         let mut coinbase_outputs = Vec::new();
         if reward > 0 {
             coinbase_outputs.push(Vess { variant: VessVariant::Mint, amount: reward, owner_hash,
-                timestamp: 0, nonce: 0, salt: random_bytes(), pubkey, spend_key, proof: vec![], spend_condition: None });
+                timestamp: mint_timestamp, nonce: 0, salt: random_bytes(), pubkey, spend_key, proof: vec![], spend_condition: None });
         }
         coinbase_outputs.push(Vess { variant: VessVariant::Mint, amount: dev_reward(reward), owner_hash: DEV_PUBKEY_HASH,
-            timestamp: 0, nonce: 0, salt: random_bytes(), pubkey: vec![], spend_key: vec![], proof: vec![], spend_condition: None });
+            timestamp: mint_timestamp, nonce: 0, salt: random_bytes(), pubkey: vec![], spend_key: vec![], proof: vec![], spend_condition: None });
         // Persist coinbase to treasure chest (mined_keys) for wallet import
         for v in &coinbase_outputs {
             if let Ok(mut w) = self.env.write_txn() {
@@ -497,27 +564,29 @@ impl Node {
             .collect();
 
         let has_work = !clean.is_empty() || !self.contested.is_empty();
-        let periodic = self.ticks % 4000 == 0;
-        let genesis = self.blocks.is_empty(); // always mine the first block immediately
-        if !has_work && !periodic && !genesis { return None; }
+        let genesis = self.blocks.is_empty();
+        let periodic = self.ticks.saturating_sub(self.last_mine_tick) >= 4000;
+        if !has_work && !genesis && !periodic { return None; }
+        self.last_mine_tick = self.ticks;
 
         let diff = self.current_difficulty;
+        let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_millis() as u64;
         let reward = block_reward(diff);
         let (pk, sk) = dsa_generate();
         let miner_oh = dsa_pubkey_hash(&pk);
         let mut coinbase_outputs = Vec::new();
         if reward > 0 {
             coinbase_outputs.push(Vess { variant: VessVariant::Mint, amount: reward, owner_hash: miner_oh,
-                timestamp: 0, nonce: 0, salt: random_bytes(), pubkey: pk.as_bytes().to_vec(), spend_key: sk.as_bytes().to_vec(), proof: vec![], spend_condition: None });
+                timestamp, nonce: 0, salt: random_bytes(), pubkey: pk.as_bytes().to_vec(), spend_key: sk.as_bytes().to_vec(), proof: vec![], spend_condition: None });
         }
         let dev_share = dev_reward(reward);
         if dev_share > 0 {
             coinbase_outputs.push(Vess { variant: VessVariant::Mint, amount: dev_share, owner_hash: DEV_PUBKEY_HASH,
-            timestamp: 0, nonce: 0, salt: random_bytes(), pubkey: vec![], spend_key: vec![], proof: vec![], spend_condition: None });
+            timestamp, nonce: 0, salt: random_bytes(), pubkey: vec![], spend_key: vec![], proof: vec![], spend_condition: None });
         }
         if coinbase_outputs.is_empty() {
             coinbase_outputs.push(Vess { variant: VessVariant::Mint, amount: 0, owner_hash: DEV_PUBKEY_HASH,
-            timestamp: 0, nonce: 0, salt: random_bytes(), pubkey: vec![], spend_key: vec![], proof: vec![], spend_condition: None });
+            timestamp, nonce: 0, salt: random_bytes(), pubkey: vec![], spend_key: vec![], proof: vec![], spend_condition: None });
         }
         for v in &coinbase_outputs {
             if let Ok(mut w) = self.env.write_txn() {
@@ -535,7 +604,7 @@ impl Node {
 
         Some(VessBlock {
             version: 1, parents: self.tip_hashes.clone(),
-            timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64,
+            timestamp,
             difficulty_bits: diff, nonce: 0,
             payment_merkle: merkle_root(&all_ids), state_merkle: [0u8; 32],
             coinbase, payments: clean,
@@ -618,8 +687,13 @@ impl Node {
     }
 
     /// Process a mined/received block. Returns false if our state merkle
-    /// didn't match the block's claim (we're missing UTXO entries — sync needed).
+    /// doesn't match the deterministic state transition.
     pub fn process_block(&mut self, block: &VessBlock) -> bool {
+        let block_hash = block.header_hash();
+        // A block may be received through multiple gossip paths. Never apply a
+        // known block twice: state mutation must be idempotent.
+        if self.blocks.contains_key(&block_hash) { return true; }
+
         // Verify Cuckatoo27 PoW (skip in test mode)
         if !self.test_mode {
             let proof = block.coinbase.outputs.first()
@@ -639,67 +713,150 @@ impl Node {
             }
         }
 
-        // Collect all payments (coinbase + block payments), verify each
-        let mut all_payments: Vec<VessPayment> = vec![block.coinbase.clone()];
-        for p in &block.payments {
-            if self.verify(p) { all_payments.push(p.clone()); }
-        }
-
-        // Detect intra-block conflicts: direct + daisy-chain
-        let conflicted = Self::find_conflicts(&all_payments);
-
-        // Apply payments to LMDB unconditionally — PoW is the consensus rule.
-        // state_merkle is a miner claim, not a validity condition. A wrong
-        // state_merkle means the miner was buggy, but the block is still valid.
-        if let Ok(mut w) = self.env.write_txn() {
-            for (i, p) in all_payments.iter().enumerate() {
-                if conflicted.contains(&i) {
-                    for inp in &p.inputs { let _ = self.vess_index.delete(&mut w, &inp.vess_id()); }
-                    for out in &p.outputs { let _ = self.vess_index.delete(&mut w, &out.vess_id()); }
-                } else {
-                    for inp in &p.inputs { let _ = self.vess_index.delete(&mut w, &inp.vess_id()); }
-                    for out in &p.outputs { let _ = self.vess_index.put(&mut w, &out.vess_id(), &()); }
-                }
-            }
-            if w.commit().is_err() {
-                // LMDB commit failed (disk full, etc.) — leave limbo intact, retry later
-                return false;
-            }
-        } else {
+        let state = match self.validate_block(block) {
+            Some(state) => state,
+            None => return false,
+        };
+        // A non-zero state root is always a consensus commitment. Test helpers
+        // may use zero while constructing synthetic blocks.
+        if (!self.test_mode || block.state_merkle != [0u8; 32])
+            && Self::state_root(&state) != block.state_merkle {
             return false;
         }
 
         // Remove all processed payments from limbo
-        for p in &all_payments {
+        for p in block.payments.iter().chain(std::iter::once(&block.coinbase)) {
             self.limbo.remove(&p.payment_id);
             for v in &p.inputs { self.limbo_inputs.remove(&v.vess_id()); }
             self.contested.remove(&p.payment_id);
         }
 
         // Store block, update tips
-        let block_hash = block.header_hash();
         self.blocks.insert(block_hash, block.clone());
+        if let Ok(mut w) = self.env.write_txn() {
+            if self.blocks_db.put(&mut w, &block_hash, &block.encode()).is_err() || w.commit().is_err() {
+                self.blocks.remove(&block_hash);
+                return false;
+            }
+        } else {
+            self.blocks.remove(&block_hash);
+            return false;
+        }
         self.tip_hashes.retain(|h| !block.parents.contains(h));
         self.tip_hashes.push(block_hash);
-        if self.current_tip.is_none() { self.current_tip = Some(block_hash); }
         self.reorg_if_needed();
         self.prune_blocks();
 
-        // DAA: adjust difficulty every DIFFICULTY_WINDOW blocks
-        if self.blocks.len() >= DIFFICULTY_WINDOW {
-            let mut times: Vec<u64> = self.blocks.values().map(|b| b.timestamp).collect();
-            times.sort();
-            let deltas: Vec<u64> = times.windows(2).map(|w| w[1].saturating_sub(w[0])).collect();
-            let recent: Vec<u64> = deltas.iter().rev().take(DIFFICULTY_WINDOW).copied().collect();
+        // DAA uses the canonical chain only and changes at fixed boundaries.
+        let canonical = self.canonical_chain(self.current_tip);
+        if canonical.len() >= DIFFICULTY_WINDOW && canonical.len() % DIFFICULTY_WINDOW == 0 {
+            let recent: Vec<u64> = canonical.windows(2)
+                .rev()
+                .take(DIFFICULTY_WINDOW - 1)
+                .filter_map(|pair| {
+                    let older = self.blocks.get(&pair[0])?;
+                    let newer = self.blocks.get(&pair[1])?;
+                    Some(newer.timestamp.saturating_sub(older.timestamp))
+                })
+                .collect();
             self.current_difficulty = adjust_difficulty(self.current_difficulty, &recent, 1000);
         }
 
         self.save_meta();
+        true
+    }
 
-        // Compare our post-application merkle against the block's claim.
-        // Self-mined blocks use [0u8;32] → always "match" (miner trusts itself).
-        if block.state_merkle == [0u8; 32] { return true; }
-        self.merkle() == block.state_merkle
+    fn canonical_chain(&self, tip: Option<BlockHash>) -> Vec<BlockHash> {
+        let mut chain = Vec::new();
+        let mut current = tip;
+        let mut seen = HashSet::new();
+        while let Some(hash) = current {
+            if !seen.insert(hash) { return Vec::new(); }
+            chain.push(hash);
+            current = self.blocks.get(&hash).and_then(|b| b.parents.first().copied());
+        }
+        chain.reverse();
+        chain
+    }
+
+    fn state_for_tip(&self, tip: Option<BlockHash>) -> Option<HashSet<VessId>> {
+        let mut state = HashSet::new();
+        for hash in self.canonical_chain(tip) {
+            let block = self.blocks.get(&hash)?;
+            for payment in block.payments.iter().chain(std::iter::once(&block.coinbase)) {
+                for input in &payment.inputs { state.remove(&input.vess_id()); }
+                for output in &payment.outputs { state.insert(output.vess_id()); }
+            }
+        }
+        Some(state)
+    }
+
+    fn state_root(state: &HashSet<VessId>) -> MerkleRoot {
+        let mut ids: Vec<VessId> = state.iter().copied().collect();
+        ids.sort();
+        merkle_root(&ids)
+    }
+
+    fn validate_block(&self, block: &VessBlock) -> Option<HashSet<VessId>> {
+        if block.version != 1 || block.difficulty_bits > 60 || block.parents.len() > 1 { return None; }
+        let parent = block.parents.first().copied();
+        if let Some(parent_hash) = parent {
+            let parent_block = self.blocks.get(&parent_hash)?;
+            if !self.test_mode && block.timestamp < parent_block.timestamp { return None; }
+        }
+        if !self.test_mode {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_millis() as u64;
+            if block.timestamp > now.saturating_add(MAX_FUTURE_BLOCK_TIME_MS) { return None; }
+        }
+
+        let mut payment_ids = Vec::with_capacity(block.payments.len() + 1);
+        payment_ids.push(block.coinbase.payment_id);
+        payment_ids.extend(block.payments.iter().map(|p| p.payment_id));
+        payment_ids.sort();
+        if payment_ids.windows(2).any(|pair| pair[0] == pair[1]) || merkle_root(&payment_ids) != block.payment_merkle {
+            return None;
+        }
+        if block.coinbase.inputs.len() != 0 || block.coinbase.outputs.is_empty()
+            || block.coinbase.outputs.len() > MAX_OUTPUTS
+            || block.coinbase.outputs.iter().any(|v| v.variant != VessVariant::Mint) {
+            return None;
+        }
+        let mut canonical_coinbase = block.coinbase.clone();
+        canonical_coinbase.compute();
+        if canonical_coinbase.payment_id != block.coinbase.payment_id { return None; }
+
+        let mut state = self.state_for_tip(parent)?;
+        for output in &block.coinbase.outputs {
+            if !state.insert(output.vess_id()) { return None; }
+        }
+        for payment in &block.payments {
+            let mut canonical = payment.clone();
+            canonical.compute();
+            if canonical.payment_id != payment.payment_id || payment.is_mint()
+                || payment.inputs.is_empty() || payment.outputs.is_empty()
+                || payment.inputs.len() > MAX_INPUTS || payment.outputs.len() > MAX_OUTPUTS
+                || payment.input_sum() != payment.output_sum() || payment.sigs.len() != payment.inputs.len() {
+                return None;
+            }
+            for (i, input) in payment.inputs.iter().enumerate() {
+                if !state.contains(&input.vess_id()) { return None; }
+                let pk = dilithium3::PublicKey::from_bytes(&input.pubkey).ok()?;
+                if !dsa_verify(&pk, &payment.payment_id, &payment.sigs[i]) { return None; }
+                if let Some(cond) = &input.spend_condition {
+                    if cond.hashlock != [0u8; 32]
+                        && (i >= payment.preimages.len() || payment.preimages[i]
+                            .map(|preimage| blake3_hash(&preimage) != cond.hashlock).unwrap_or(true)) {
+                        return None;
+                    }
+                    if cond.expires_at > 0 && block.timestamp / 1000 >= cond.expires_at { return None; }
+                }
+            }
+            for input in &payment.inputs { state.remove(&input.vess_id()); }
+            for output in &payment.outputs {
+                if output.variant != VessVariant::Output || !state.insert(output.vess_id()) { return None; }
+            }
+        }
+        Some(state)
     }
 
     /// Cumulative work of a block's ancestor chain (sum of 2^difficulty_bits).
@@ -743,6 +900,16 @@ impl Node {
             } else { break; }
         }
         self.blocks.retain(|h, _| keep.contains(h));
+        if let Ok(mut w) = self.env.write_txn() {
+            let persisted: Vec<BlockHash> = self.blocks_db.iter(&w).ok().into_iter().flatten()
+                .filter_map(|entry| entry.ok())
+                .filter_map(|(hash, _)| hash.try_into().ok())
+                .collect();
+            for hash in persisted.into_iter().filter(|hash| !keep.contains(hash)) {
+                let _ = self.blocks_db.delete(&mut w, &hash);
+            }
+            let _ = w.commit();
+        }
         self.tip_hashes.retain(|h| keep.contains(h));
     }
 
@@ -750,65 +917,23 @@ impl Node {
     fn reorg_if_needed(&mut self) {
         let Some(heaviest) = self.heaviest_tip() else { return };
         if self.current_tip == Some(heaviest) { return; }
-
-        // Find common ancestor
-        let mut old_set: HashSet<BlockHash> = HashSet::new();
-        let mut cur = self.current_tip;
-        while let Some(h) = cur {
-            old_set.insert(h);
-            cur = self.blocks.get(&h).and_then(|b| b.parents.first().copied());
-        }
-        let mut common = heaviest;
-        loop {
-            if old_set.contains(&common) { break; }
-            common = match self.blocks.get(&common).and_then(|b| b.parents.first().copied()) {
-                Some(p) => p, None => { common = heaviest; break; }
-            };
-        }
-
-        // Reverse old blocks back to common ancestor
-        cur = self.current_tip;
-        while let Some(h) = cur {
-            if h == common { break; }
-            let block = self.blocks.get(&h).cloned();
-            if let Some(ref b) = block { self.reverse_block(b); }
-            cur = block.as_ref().and_then(|b| b.parents.first().copied());
-        }
-
-        // Apply new blocks from common ancestor to heaviest
-        let mut to_apply = Vec::new();
-        cur = Some(heaviest);
-        while let Some(h) = cur {
-            if h == common { break; }
-            to_apply.push(h);
-            cur = self.blocks.get(&h).and_then(|b| b.parents.first().copied());
-        }
-        for h in to_apply.iter().rev() {
-            let block = self.blocks.get(h).cloned();
-            if let Some(ref b) = block { self.apply_block_state(b); }
-        }
-
-        self.current_tip = Some(heaviest);
-        self.save_meta();
-    }
-
-    fn reverse_block(&mut self, block: &VessBlock) {
+        let chain = self.canonical_chain(Some(heaviest));
         if let Ok(mut w) = self.env.write_txn() {
-            for p in block.payments.iter().chain(std::iter::once(&block.coinbase)) {
-                for v in &p.inputs { let _ = self.vess_index.put(&mut w, &v.vess_id(), &()); }
-                for v in &p.outputs { let _ = self.vess_index.delete(&mut w, &v.vess_id()); }
+            let existing: Vec<VessId> = self.vess_index.iter(&w).ok().into_iter().flatten()
+                .filter_map(|entry| entry.ok())
+                .filter_map(|(id, _)| id.try_into().ok())
+                .collect();
+            for id in existing { let _ = self.vess_index.delete(&mut w, &id); }
+            for hash in chain {
+                let Some(block) = self.blocks.get(&hash) else { return; };
+                for payment in block.payments.iter().chain(std::iter::once(&block.coinbase)) {
+                    for input in &payment.inputs { let _ = self.vess_index.delete(&mut w, &input.vess_id()); }
+                    for output in &payment.outputs { let _ = self.vess_index.put(&mut w, &output.vess_id(), &()); }
+                }
             }
-            let _ = w.commit();
-        }
-    }
-
-    fn apply_block_state(&mut self, block: &VessBlock) {
-        if let Ok(mut w) = self.env.write_txn() {
-            for p in block.payments.iter().chain(std::iter::once(&block.coinbase)) {
-                for v in &p.inputs { let _ = self.vess_index.delete(&mut w, &v.vess_id()); }
-                for v in &p.outputs { let _ = self.vess_index.put(&mut w, &v.vess_id(), &()); }
-            }
-            let _ = w.commit();
+            if w.commit().is_err() { return; }
+            self.current_tip = Some(heaviest);
+            self.save_meta();
         }
     }
 
@@ -816,6 +941,8 @@ impl Node {
 
     pub fn cycle(&mut self) -> Vec<(SocketAddr, Vec<u8>)> {
         self.ticks = self.ticks.wrapping_add(1);
+        self.evict_limbo();
+        self.retry_reliable_messages();
         // Reset per-second rate limiter every ~1s (200 ticks at 5ms)
         if self.ticks.saturating_sub(self.msg_window_start) >= 200 {
             self.peer_msg_count.clear();
@@ -964,6 +1091,31 @@ impl Node {
     pub fn process(&mut self, addr: SocketAddr, data: &[u8]) -> Option<Vec<u8>> {
         // Reject banned peers immediately
         if self.fails.get(&addr).copied().unwrap_or(0) > 5 { return None; }
+        let assembled;
+        let completed_id;
+        let data = if data_packets::is_fragment(data) {
+            if !self.packet_reassembly.contains_key(&addr) && self.packet_reassembly.len() >= MAX_REASSEMBLY_PEERS {
+                return None;
+            }
+            match self.packet_reassembly.entry(addr).or_insert_with(PacketReassembler::new).push(data, self.ticks) {
+                Ok(Some((id, message))) => {
+                    let recent = self.completed_packets.entry(addr).or_default();
+                    recent.retain(|(_, completed_at)| self.ticks.saturating_sub(*completed_at) < COMPLETED_PACKET_TTL_TICKS);
+                    if recent.iter().any(|(completed_id, _)| *completed_id == id) {
+                        self.send(addr, &GossipMessage::DataAck(id));
+                        return None;
+                    }
+                    completed_id = Some(id);
+                    assembled = message;
+                    assembled.as_slice()
+                }
+                Ok(None) => return None,
+                Err(()) => { self.strike(addr); return None; }
+            }
+        } else {
+            completed_id = None;
+            data
+        };
         // Reject oversize frames (DoS protection)
         if data.len() > MAX_FRAME_SIZE { self.strike(addr); return None; }
         if data.len() < 5 { return None; }  // minimum: tag(1) + len(4)
@@ -1012,7 +1164,14 @@ impl Node {
 
         let s = match self.network.session_by_addr_mut(&addr) { Some(s) => s, None => { self.strike(addr); return None; } };
         let plain = match s.decrypt(payload) { Some(p) => p, None => { self.strike(addr); return None; } };
-        self.route(addr, &plain)
+        let response = self.route(addr, &plain);
+        if let Some(id) = completed_id {
+            let recent = self.completed_packets.entry(addr).or_default();
+            if recent.len() >= MAX_COMPLETED_PACKETS_PER_PEER { recent.remove(0); }
+            recent.push((id, self.ticks));
+            self.send(addr, &GossipMessage::DataAck(id));
+        }
+        response
     }
 
     pub fn route(&mut self, addr: SocketAddr, plain: &[u8]) -> Option<Vec<u8>> {
@@ -1120,9 +1279,31 @@ impl Node {
                     }
                 }
             }
+            GossipMessage::DataAck(id) => {
+                if self.reliable_messages.get(id).map(|message| message.addr == addr).unwrap_or(false) {
+                    self.reliable_messages.remove(id);
+                }
+            }
             _ => {}
         }
         None
+    }
+
+    fn retry_reliable_messages(&mut self) {
+        let mut retry = Vec::new();
+        let mut expire = Vec::new();
+        for (id, message) in &self.reliable_messages {
+            if self.ticks.saturating_sub(message.last_sent) < RETRANSMIT_TICKS { continue; }
+            if message.retries >= MAX_RETRANSMITS { expire.push(*id); } else { retry.push(*id); }
+        }
+        for id in expire { self.reliable_messages.remove(&id); }
+        for id in retry {
+            if let Some(message) = self.reliable_messages.get_mut(&id) {
+                message.retries += 1;
+                message.last_sent = self.ticks;
+                for packet in &message.packets { self.outbox.push((message.addr, packet.clone())); }
+            }
+        }
     }
 
     fn rpc(&mut self, tag: u8, payload: &[u8]) -> Option<Vec<u8>> {
@@ -1181,13 +1362,33 @@ impl Node {
     }
 
     pub fn send(&mut self, addr: SocketAddr, msg: &GossipMessage) {
+        let encoded = msg.encode();
         if let Some(s) = self.network.session_by_addr_mut(&addr) {
-            self.outbox.push((addr, frame(ENCRYPTED_DATA, &s.encrypt(&msg.encode()))));
+            let packet = frame(ENCRYPTED_DATA, &s.encrypt(&encoded));
+            let Some(fragmented) = data_packets::fragment_with_id(&packet) else {
+                eprintln!("dropping oversized logical message ({} bytes)", encoded.len());
+                return;
+            };
+            if let Some(id) = fragmented.id {
+                let bytes: usize = fragmented.packets.iter().map(Vec::len).sum();
+                let in_flight: usize = self.reliable_messages.values()
+                    .map(|message| message.packets.iter().map(Vec::len).sum::<usize>())
+                    .sum();
+                if self.reliable_messages.len() >= MAX_RELIABLE_MESSAGES
+                    || in_flight.saturating_add(bytes) > MAX_RELIABLE_BYTES { return; }
+                self.reliable_messages.insert(id, ReliableMessage {
+                    addr,
+                    packets: fragmented.packets.clone(),
+                    last_sent: self.ticks,
+                    retries: 0,
+                });
+            }
+            for fragment in fragmented.packets { self.outbox.push((addr, fragment)); }
         } else if self.is_behind_nat() && self.introducer.is_some() {
             // No direct session — relay through introducer (stem relay fallback)
             if let Some(target_id) = self.peers.get(&addr).copied() {
                 if target_id != [0u8; 32] {
-                    self.relay_through_introducer(target_id, msg.encode());
+                    self.relay_through_introducer(target_id, encoded);
                 }
             }
         }

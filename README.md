@@ -106,8 +106,7 @@ vess-wallet --balance              # check balance
 vess-wallet --sync                 # confirm unclaimed UTXOs against node
 vess-wallet --invoice 100          # generate vess:// invoice
 vess-wallet --pay "vess://..." --out payment.vess
-vess-wallet --submit payment.vess  # claim received blob
-vess-wallet --receive payment.vess # import blob into wallet
+vess-wallet --receive payment.vess # claim received blob
 vess-wallet --consolidate          # merge small UTXOs
 ```
 
