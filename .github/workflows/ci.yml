@@ -11,7 +11,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Lint
+        run: cargo clippy --all-targets -- -D warnings
       - name: Test
         run: cargo test --all
       - name: Release build
         run: cargo build --release --workspace
+      - name: Security audit
+        run: |
+          cargo install cargo-audit
+          cargo audit

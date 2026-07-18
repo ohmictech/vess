@@ -5,3 +5,4 @@ edition.workspace = true
 
 [dependencies]
 vess-crypto = { path = "../vess-crypto" }
+zeroize = { version = "1", features = ["derive"] }

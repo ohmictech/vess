@@ -20,7 +20,7 @@ What this network achieves:
 
 The reason for its existence overlaps precisely zero with almost the entirety of DeFi. If you're interested in making a quick buck, move along.
 
-Vess is backed 1:1 by energy. It is intended as a thermodynamic currency, rather than a speculative asset to hold and sell for more later on. There are no arbitrary tokenomics or programmatic deflation schedules. Mine it, spend it, move it around. Create velocity rather than stagnation, using it as an actual payment method.
+Vess is intended as a thermodynamic currency, rather than a speculative asset to hold and sell for more later on. There are no arbitrary tokenomics or programmatic deflation schedules. Mine it, spend it, move it around. Create velocity rather than stagnation, using it as an actual payment method. Supply is elastic and linear, to capture total energy input.
 
 ---
 
@@ -37,6 +37,8 @@ So, a conflict in Vess is resolved with appropriate force: a total vaporization 
 Vess payments never touch the node network until the receiver decides to submit them. A `vess://` invoice and its signed `VessPayment` blob travel between payer and payee through whatever channel they already use: a messaging app, a QR code, an email, a USB drive, a printed piece of paper. The network only sees the blob when the receiver claims it. Until then, the bytes are inert.
 
 This scatters the payment graph across carriers the network has no visibility into. An analyst who reconstructs every on-chain event still doesn't know whether the blob traveled through Signal or a sticker on a coffee shop counter. You can't eclipse-attack a payment that doesn't touch the mesh. You can't DDoS a transaction out of a mempool that isn't involved until the receiver is ready. Payer and receiver can complete the entire exchange while both are fully offline from the Vess network.
+
+**Claim-latency rule: never deliver before inclusion.** A `VessPayment` blob is a signed promise — it has no value until the receiver submits it to the network *and* a miner includes it in a block. The receiver must not treat the payment as delivered until they see it confirmed on-chain. If you ship goods, stream content, or unlock a door on receipt of the blob alone, you are trusting the payer not to double-spend before submission. This is the same trust model as handing someone a signed check: the check isn't money until it clears. For most payments the exposure window is under a second (the block time). For high-value transfers, wait for one confirmation.
 
 The format is just bytes. Any app can generate an invoice, any wallet can sign a payment, any node can accept the submission. No API key, no registration, no handshake.
 

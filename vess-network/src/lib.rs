@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 use vess_crypto::*;
+use zeroize::Zeroizing;
 
 pub mod data_packets;
 
@@ -16,6 +17,8 @@ pub const TAG_INTRODUCE: u8 = 0x0C;
 pub const TAG_HOLE_PUNCH: u8 = 0x0D;
 pub const TAG_STEM_RELAY: u8 = 0x0E;
 pub const TAG_DATA_ACK: u8 = 0x0F;
+pub const TAG_BLOCK_REQ: u8 = 0x03;
+pub const TAG_BLOCK_RESP: u8 = 0x04;
 
 pub const RPC_CHECK: u8 = 0x10;
 pub const RPC_CHECK_RESP: u8 = 0x11;
@@ -57,6 +60,10 @@ pub enum GossipMessage {
     StemRelay(NodeId, Vec<u8>),
     /// Authenticated completion acknowledgement for an application data packet.
     DataAck(data_packets::MessageId),
+    /// Request a missing parent block by hash (minimal block sync).
+    BlockReq(BlockHash),
+    /// Response: the requested block (or empty if unknown).
+    BlockResp(Option<VessBlock>),
 }
 
 #[derive(Debug)]
@@ -147,6 +154,9 @@ impl GossipMessage {
                 frame(TAG_STEM_RELAY, &p)
             }
             GossipMessage::DataAck(id) => frame(TAG_DATA_ACK, id),
+            GossipMessage::BlockReq(hash) => frame(TAG_BLOCK_REQ, hash),
+            GossipMessage::BlockResp(Some(block)) => frame(TAG_BLOCK_RESP, &block.encode()),
+            GossipMessage::BlockResp(None) => frame(TAG_BLOCK_RESP, &[]),
         }
     }
 
@@ -210,6 +220,14 @@ impl GossipMessage {
                 Some(GossipMessage::StemRelay(target_id, data))
             }
             TAG_DATA_ACK => Some(GossipMessage::DataAck(read_fixed(payload, &mut pos)?)),
+            TAG_BLOCK_REQ => Some(GossipMessage::BlockReq(read_fixed(payload, &mut pos)?)),
+            TAG_BLOCK_RESP => {
+                if payload.is_empty() {
+                    Some(GossipMessage::BlockResp(None))
+                } else {
+                    VessBlock::decode(payload, &mut pos).map(|b| GossipMessage::BlockResp(Some(b)))
+                }
+            }
             _ => None,
         }
     }
@@ -337,9 +355,9 @@ impl Session {
 
 pub struct Network {
     pub sessions: Vec<Session>,
-    pub dsa_sk: Vec<u8>,   // 32-byte ML-DSA-65 seed
+    pub dsa_sk: Zeroizing<Vec<u8>>,   // 32-byte ML-DSA-65 seed — zeroized on drop
     pub dsa_pk: Vec<u8>,   // 1952-byte ML-DSA-65 verifying key
-    pub kem_sk: Vec<u8>,   // 64-byte ML-KEM-512 decapsulation seed
+    pub kem_sk: Zeroizing<Vec<u8>>,   // 64-byte ML-KEM-512 decapsulation seed — zeroized on drop
     pub kem_pk: Vec<u8>,   // 800-byte ML-KEM-512 encapsulation key
 }
 
@@ -347,7 +365,7 @@ impl Network {
     pub fn new() -> Self {
         let (dsa_pk, dsa_sk) = dsa_generate();
         let (kem_pk, kem_sk) = kem_generate();
-        Self { sessions: Vec::new(), dsa_sk, dsa_pk, kem_sk, kem_pk }
+        Self { sessions: Vec::new(), dsa_sk: Zeroizing::new(dsa_sk), dsa_pk, kem_sk: Zeroizing::new(kem_sk), kem_pk }
     }
 
     pub fn my_node_id(&self) -> NodeId { node_id(&self.dsa_pk) }

@@ -3,6 +3,7 @@ use std::net::{SocketAddr, UdpSocket};
 use vess_crypto::*;
 use vess_network::{unframe, GossipMessage, Network, RpcRequest, RpcResponse, HANDSHAKE_RESP, HANDSHAKE_INIT, frame, ENCRYPTED_DATA};
 use vess_network::data_packets::{self, MessageId, PacketReassembler};
+use zeroize::Zeroize;
 
 mod ffi;
 
@@ -597,7 +598,7 @@ impl Wallet {
         write_fixed(&mut plain, &self.salt);
         let nonce = random_bytes::<12>();
         let ct = chacha_encrypt(&self.password_hash, &nonce, &plain);
-        plain.fill(0);
+        plain.zeroize();
         // Format: magic(8) || version(1) || nonce(12) || salt(32) || ciphertext
         let mut out = Vec::with_capacity(WALLET_HEADER_LEN + ct.len());
         out.extend_from_slice(WALLET_MAGIC);
@@ -640,7 +641,7 @@ impl Wallet {
         let key = argon2id_key(password, &salt);
         let mut plain = chacha_decrypt(&key, &nonce, &data[cipher_offset..])?;
         let result = Self::load_plain(&plain, key, salt);
-        plain.fill(0);
+        plain.zeroize();
         result
     }
 

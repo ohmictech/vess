@@ -140,7 +140,9 @@ fn main() -> std::io::Result<()> {
             }
         };
         let started_at = block_count_miner.load(std::sync::atomic::Ordering::Relaxed);
-        // Run N solver threads; first to find a solution cancels the rest
+        // Run N solver threads; first to find a solution cancels the rest.
+        // DO NOT cancel immediately — let the threads run continuously until
+        // one finds a solution or work becomes stale.
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (result_tx, result_rx) = mpsc::channel();
         let cores_u64 = cores as u64;
@@ -156,8 +158,6 @@ fn main() -> std::io::Result<()> {
                 }
             }));
         }
-        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-        for worker in workers { let _ = worker.join(); }
         drop(result_tx);
         // Wait for solution, but check periodically for stale work / stop
         loop {
@@ -185,6 +185,7 @@ fn main() -> std::io::Result<()> {
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
+        for worker in workers { let _ = worker.join(); }
         // Brief pause between rounds so the main loop gets the lock
         std::thread::sleep(Duration::from_millis(100));
     });
@@ -248,7 +249,6 @@ fn main() -> std::io::Result<()> {
         // Apply mined blocks from background thread
         while let Ok((block, nonce, proof)) = block_rx.try_recv() {
             node.lock().unwrap().apply_mined_block(block, nonce, proof);
-            block_count_main.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
 
         // Check for peer connection requests
@@ -277,6 +277,8 @@ fn main() -> std::io::Result<()> {
         let outbound = {
             let mut n = node.lock().unwrap();
             let ob = n.cycle();
+            // Sync block counter so the mining pool detects new blocks (mined or received).
+            block_count_main.store(n.accepted_blocks, std::sync::atomic::Ordering::Relaxed);
             // Status — do it here while we hold the lock, no second acquisition
             if n.ticks.saturating_sub(last_status) >= 2000 {
                 last_status = n.ticks;

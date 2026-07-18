@@ -16,3 +16,4 @@ vess-network = { path = "../vess-network" }
 hex = "0.4"
 rand = "0.8"
 heed = "0.20"
+zeroize = { version = "1", features = ["derive"] }

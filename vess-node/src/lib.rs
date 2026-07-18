@@ -79,9 +79,14 @@ pub struct Node {
     last_mine_tick: u64,                       // last tick we attempted mining (for periodic spacing)
     pub current_difficulty: u32,               // adjusts via DAA every DIFFICULTY_WINDOW blocks
     pub pending_blocks: Vec<VessBlock>,            // blocks waiting for gossip broadcast
+    pub accepted_blocks: u64,                       // increments on every accepted block (mined or received)
     block_seen: HashSet<BlockHash>,                 // deduplicate block relay
     #[allow(dead_code)]
     payment_seen: HashMap<PaymentId, u64>,          // deduplicate payment relay with TTL
+    orphans: HashMap<BlockHash, VessBlock>,          // blocks waiting for missing parents
+    missing_parents: HashMap<BlockHash, Vec<BlockHash>>, // parent → children waiting for it
+    // State sync buffer: accumulate chunks here, verify root, then commit.
+    sync_buffer: HashSet<VessId>,
     // NAT traversal
     pub nat_type: NatType,                      // our reachability classification
     pub introducer: Option<SocketAddr>,         // public peer helping us punch through
@@ -127,8 +132,12 @@ impl Node {
             last_mine_tick: 0,
             current_difficulty: saved_diff,
             pending_blocks: Vec::new(),
+            accepted_blocks: 0,
             block_seen: HashSet::new(),
             payment_seen: HashMap::new(),
+            orphans: HashMap::new(),
+            missing_parents: HashMap::new(),
+            sync_buffer: HashSet::new(),
             nat_type: NatType::Unknown,
             introducer: None,
             introduced_peers: HashMap::new(),
@@ -609,10 +618,18 @@ impl Node {
         let mut coinbase = VessPayment { payment_id: [0u8;32], inputs: vec![], outputs: coinbase_outputs, timestamp: 0, sigs: vec![], preimages: vec![] };
         coinbase.compute();
 
+        // Contested payments go into the block body so the burn is committed
+        // in both payment_merkle and state_merkle. Each is individually validated;
+        // conflicting inputs burn deterministically, no outputs are created.
+        let contested_payments: Vec<VessPayment> = self.contested.iter()
+            .filter_map(|pid| self.limbo.get(pid).map(|(p, _)| p.clone()))
+            .collect();
         let mut all_ids: Vec<VessId> = vec![coinbase.payment_id];
-        for p in &clean { all_ids.push(p.payment_id); }
-        for pid in &self.contested { if let Some((p, _)) = self.limbo.get(pid) { all_ids.push(p.payment_id); } }
+        for p in clean.iter().chain(contested_payments.iter()) { all_ids.push(p.payment_id); }
         all_ids.sort(); all_ids.dedup();
+
+        let mut block_payments = clean;
+        block_payments.extend(contested_payments);
 
         Some(VessBlock {
             version: 1, parents: self.tip_hashes.clone(),
@@ -620,7 +637,7 @@ impl Node {
             difficulty_bits: diff, nonce: 0,
             payment_merkle: merkle_root(&all_ids), state_merkle: [0u8; 32],
             proof: Vec::new(), // filled in by apply_mined_block once PoW is found
-            coinbase, payments: clean,
+            coinbase, payments: block_payments,
         })
     }
 
@@ -705,6 +722,18 @@ impl Node {
         // known block twice: state mutation must be idempotent.
         if self.blocks.contains_key(&block_hash) { return true; }
 
+        // Orphan handling: if any parent is unknown, store the block and fetch
+        // the missing parent. When the parent arrives, the orphan is retried.
+        if let Some(parent_hash) = block.parents.first().copied() {
+            if !self.blocks.contains_key(&parent_hash) && !block.parents.is_empty() {
+                if self.orphans.len() < 256 {
+                    self.orphans.insert(block_hash, block.clone());
+                    self.missing_parents.entry(parent_hash).or_default().push(block_hash);
+                }
+                return false;
+            }
+        }
+
         // Gate difficulty bounds before any expensive verification.
         if block.difficulty_bits > 60 { return false; }
 
@@ -732,16 +761,9 @@ impl Node {
             return false;
         }
 
-        // Remove all processed payments from limbo.
-        // Wire vaporization: contested payments burn all inputs and outputs.
-        {
-            let contested: Vec<VessPayment> = self.contested.iter()
-                .filter_map(|pid| self.limbo.get(pid).map(|(p, _)| p.clone()))
-                .collect();
-            if !contested.is_empty() {
-                self.annihilate(&contested);
-            }
-        }
+        // Remove all processed payments from limbo. Burns are handled
+        // deterministically inside validate_block via the state transition —
+        // annihilate no longer touches LMDB directly.
         for p in block.payments.iter().chain(std::iter::once(&block.coinbase)) {
             self.limbo.remove(&p.payment_id);
             for v in &p.inputs { self.limbo_inputs.remove(&v.vess_id()); }
@@ -780,6 +802,18 @@ impl Node {
         }
 
         self.save_meta();
+        self.accepted_blocks = self.accepted_blocks.wrapping_add(1);
+
+        // Resolve orphans: any block waiting for THIS block as its parent
+        // can now be retried.
+        if let Some(waiting) = self.missing_parents.remove(&block_hash) {
+            for child_hash in waiting {
+                if let Some(child) = self.orphans.remove(&child_hash) {
+                    self.process_block(&child);
+                }
+            }
+        }
+
         true
     }
 
@@ -796,13 +830,31 @@ impl Node {
         chain
     }
 
+    /// Returns indices into `block.payments` that are intra-block conflicted
+    /// (direct double-spend or daisy-chain). Coinbase (index 0 in the internal
+    /// list) is excluded — it has no inputs so can never be conflicted.
+    fn block_conflicted(block: &VessBlock) -> HashSet<usize> {
+        let mut all = vec![block.coinbase.clone()];
+        all.extend(block.payments.clone());
+        let conflicted = Self::find_conflicts(&all);
+        conflicted.iter().filter(|&&i| i > 0).map(|&i| i - 1).collect()
+    }
+
     fn state_for_tip(&self, tip: Option<BlockHash>) -> Option<HashSet<VessId>> {
         let mut state = HashSet::new();
         for hash in self.canonical_chain(tip) {
             let block = self.blocks.get(&hash)?;
-            for payment in block.payments.iter().chain(std::iter::once(&block.coinbase)) {
+            let conflicted = Self::block_conflicted(block);
+            // Coinbase always creates outputs
+            for output in &block.coinbase.outputs {
+                state.insert(output.vess_id());
+            }
+            for (i, payment) in block.payments.iter().enumerate() {
                 for input in &payment.inputs { state.remove(&input.vess_id()); }
-                for output in &payment.outputs { state.insert(output.vess_id()); }
+                if !conflicted.contains(&i) {
+                    for output in &payment.outputs { state.insert(output.vess_id()); }
+                }
+                // Conflicted payments: inputs burn, no outputs created.
             }
         }
         Some(state)
@@ -866,7 +918,8 @@ impl Node {
         for output in &block.coinbase.outputs {
             if !state.insert(output.vess_id()) { return None; }
         }
-        for payment in &block.payments {
+        let conflicted = Self::block_conflicted(block);
+        for (pi, payment) in block.payments.iter().enumerate() {
             let mut canonical = payment.clone();
             canonical.compute();
             if canonical.payment_id != payment.payment_id || payment.is_mint()
@@ -891,8 +944,12 @@ impl Node {
                 }
             }
             for input in &payment.inputs { state.remove(&input.vess_id()); }
-            for output in &payment.outputs {
-                if output.variant != VessVariant::Output || !state.insert(output.vess_id()) { return None; }
+            // Intra-block conflicted payments: inputs burn, outputs are NOT created.
+            // This is the vaporization mechanic — the penalty falls entirely on the attacker.
+            if !conflicted.contains(&pi) {
+                for output in &payment.outputs {
+                    if output.variant != VessVariant::Output || !state.insert(output.vess_id()) { return None; }
+                }
             }
         }
         Some(state)
@@ -967,9 +1024,14 @@ impl Node {
             for id in existing { let _ = self.vess_index.delete(&mut w, &id); }
             for hash in chain {
                 let Some(block) = self.blocks.get(&hash) else { return; };
-                for payment in block.payments.iter().chain(std::iter::once(&block.coinbase)) {
+                let conflicted = Self::block_conflicted(block);
+                // Coinbase always creates outputs
+                for output in &block.coinbase.outputs { let _ = self.vess_index.put(&mut w, &output.vess_id(), &()); }
+                for (i, payment) in block.payments.iter().enumerate() {
                     for input in &payment.inputs { let _ = self.vess_index.delete(&mut w, &input.vess_id()); }
-                    for output in &payment.outputs { let _ = self.vess_index.put(&mut w, &output.vess_id(), &()); }
+                    if !conflicted.contains(&i) {
+                        for output in &payment.outputs { let _ = self.vess_index.put(&mut w, &output.vess_id(), &()); }
+                    }
                 }
             }
             if w.commit().is_err() { return; }
@@ -1188,11 +1250,20 @@ impl Node {
             }
             return resp;
         }
-        // HolePunch is a raw frame — no encryption session required
+        // HolePunch is a raw frame — no encryption session required.
+        // Only pass through to route() if the sender is plausibly known
+        // (has a session, a pending intro, or we're behind NAT).
         if tag == TAG_HOLE_PUNCH {
             if payload.len() >= 4 {
-                let nonce = u32::from_le_bytes(payload[..4].try_into().unwrap());
-                self.route(addr, &GossipMessage::HolePunch(nonce).encode());
+                let is_known = self.has_session_for(&addr)
+                    || self.introduced_peers.values().any(|ip| ip.observed_addr == addr)
+                    || self.is_behind_nat();
+                if is_known {
+                    let nonce = u32::from_le_bytes(payload[..4].try_into().unwrap());
+                    self.route(addr, &GossipMessage::HolePunch(nonce).encode());
+                } else {
+                    self.strike(addr);
+                }
             }
             return None;
         }
@@ -1243,6 +1314,12 @@ impl Node {
                 // Deduplicate: only process and relay blocks we haven't seen.
                 // Without this, invalid/rejected blocks circulate forever.
                 if self.block_seen.contains(&hash) { return None; }
+                // If a parent is unknown and genesis is known, request it from sender.
+                if let Some(parent_hash) = block.parents.first().copied() {
+                    if !self.blocks.contains_key(&parent_hash) && !self.blocks.is_empty() {
+                        self.send(addr, &GossipMessage::BlockReq(parent_hash));
+                    }
+                }
                 let matched = self.process_block(block);
                 self.block_seen.insert(hash);
                 if matched {
@@ -1315,11 +1392,11 @@ impl Node {
             }
             GossipMessage::HolePunch(nonce) => {
                 // Gate holepunch responses: if we're public, only respond to peers
-                // we're expecting (pending introductions). Behind NAT, accept any
-                // holepunch since our introducer may arrange connections we didn't
-                // anticipate. This prevents public nodes from being DDoS reflectors.
+                // we're expecting (pending introductions with matching nonce).
+                // Behind NAT, accept any holepunch since our introducer may
+                // arrange connections we didn't anticipate.
                 let is_known = self.has_session_for(&addr)
-                    || self.introduced_peers.values().any(|ip| ip.observed_addr == addr)
+                    || self.introduced_peers.values().any(|ip| ip.observed_addr == addr && ip.punch_nonce == *nonce)
                     || self.is_behind_nat();
                 if !is_known {
                     self.strike(addr);
@@ -1354,6 +1431,17 @@ impl Node {
                     self.reliable_messages.remove(id);
                 }
             }
+            GossipMessage::BlockReq(hash) => {
+                if let Some(block) = self.blocks.get(&hash[..]) {
+                    self.send(addr, &GossipMessage::BlockResp(Some(block.clone())));
+                } else {
+                    self.send(addr, &GossipMessage::BlockResp(None));
+                }
+            }
+            GossipMessage::BlockResp(Some(block)) => {
+                let _ = self.process_block(block);
+            }
+            GossipMessage::BlockResp(None) => {}
             _ => {}
         }
         None
@@ -1518,54 +1606,63 @@ impl Node {
     }
 
     /// Process an incoming StateSyncChunk from a peer.
+    /// Chunks are buffered in memory until the sync peer finishes sending;
+    /// only then is the merkle root verified against quorum consensus and
+    /// committed to LMDB atomically. This prevents sybil peers from poisoning
+    /// the UTXO set with fabricated chunks.
     fn handle_sync_chunk(&mut self, addr: SocketAddr, start: u64, ids: &[VessId]) {
         let is_from_sync_peer = self.sync_peer == Some(addr);
 
         if !ids.is_empty() {
-            // Insert only UTXO IDs we don't already have (idempotent)
-            if let Ok(mut w) = self.env.write_txn() {
-                let rt = self.env.read_txn().unwrap();
-                for id in ids {
-                    if self.vess_index.get(&rt, id).unwrap().is_none() {
-                        let _ = self.vess_index.put(&mut w, id, &());
-                    }
-                }
-                drop(rt);
-                let _ = w.commit();
-            }
+            // Buffer — do NOT insert into LMDB yet.
+            for id in ids { self.sync_buffer.insert(*id); }
 
             if is_from_sync_peer {
                 self.sync_offset = start.saturating_add(ids.len() as u64);
             }
-
-            self.save_meta();
         }
 
-        // If chunk is smaller than requested, we've reached the end of the peer's UTXO set
+        // If chunk is smaller than requested, the peer finished sending.
         if (ids.len() as u32) < self.sync_chunk_size {
             if is_from_sync_peer {
-                // Check if our merkle now matches target
-                if let Some(target) = self.sync_target_root {
-                    if self.merkle() == target {
-                        self.needs_sync = false;
-                        self.sync_peer = None;
-                        self.sync_target_root = None;
-                        self.sync_offset = 0;
-                        return;
+                // Verify buffered root against quorum consensus before committing.
+                let mut sorted: Vec<VessId> = self.sync_buffer.iter().copied().collect();
+                sorted.sort();
+                let buffered_root = merkle_root(&sorted);
+
+                let committed = if let Some(target) = self.sync_target_root {
+                    buffered_root == target
+                } else {
+                    // Fallback: require ≥2 peers to agree on this root.
+                    self.consensus_merkle()
+                        .map(|(_, r)| r == buffered_root)
+                        .unwrap_or(false)
+                };
+
+                if committed {
+                    // Atomically replace LMDB with the verified buffer.
+                    if let Ok(mut w) = self.env.write_txn() {
+                        // Clear existing UTXOs
+                        let existing: Vec<VessId> = self.vess_index.iter(&w).ok().into_iter().flatten()
+                            .filter_map(|entry| entry.ok())
+                            .filter_map(|(id, _)| id.try_into().ok())
+                            .collect();
+                        for id in existing { let _ = self.vess_index.delete(&mut w, &id); }
+                        // Insert buffered
+                        for id in &self.sync_buffer { let _ = self.vess_index.put(&mut w, id, &()); }
+                        let _ = w.commit();
                     }
+                    self.needs_sync = false;
+                    self.sync_peer = None;
+                    self.sync_target_root = None;
+                    self.sync_offset = 0;
+                } else {
+                    // Root didn't verify — restart sync from a different peer.
+                    self.sync_peer = None;
+                    self.sync_target_root = None;
+                    self.sync_offset = 0;
                 }
-                // Didn't match — restart sync from beginning (peer may have new state)
-                self.sync_offset = 0;
-            } else {
-                // Unsolicited chunk from non-sync peer: if it was a response to a
-                // block-triggered request, check if we're caught up now.
-                if let Some(&(_, expected_root)) = self.peer_merkle.get(&addr) {
-                    if self.merkle() != expected_root {
-                        // Still behind — request more from this peer
-                        let next_start = start.saturating_add(ids.len() as u64);
-                        self.send(addr, &GossipMessage::StateSyncReq(next_start, self.sync_chunk_size));
-                    }
-                }
+                self.sync_buffer.clear();
             }
         }
     }
