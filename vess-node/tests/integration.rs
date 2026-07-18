@@ -323,8 +323,9 @@ mod integration {
     // ── HIGH PRIORITY TESTS ──
 
     #[test]
-    fn test_conflicting_block_is_rejected() {
-        // Two payments spending the same input make the entire block invalid.
+    fn test_conflicting_block_vaporizes() {
+        // Two payments spending the same input: the block is VALID, and both
+        // payments vaporize — all inputs burn, no outputs are created.
         let (mut node, _s) = start_node_at("127.0.0.1:19920", "vess-db-reject-conflicting");
         let (pk, sk) = dsa_generate();
         let oh = dsa_pubkey_hash(&pk);
@@ -358,7 +359,8 @@ mod integration {
         // Verify the IDs match before moving p1/p2
         assert_eq!(v.vess_id(), p1.inputs[0].vess_id(), "p1 input same as v");
         assert_eq!(v.vess_id(), p2.inputs[0].vess_id(), "p2 input same as v");
-        let all_ids = vec![cb.payment_id, p1.payment_id, p2.payment_id];
+        let mut all_ids = vec![cb.payment_id, p1.payment_id, p2.payment_id];
+        all_ids.sort(); // validate_block commits to the sorted order
         let block = VessBlock {
             version: 1, parents: node.tip_hashes.clone(), timestamp: 0, difficulty_bits: 9, nonce: 0,
             payment_merkle: merkle_root(&all_ids),
@@ -366,10 +368,72 @@ mod integration {
             proof: Vec::new(), // test mode skips PoW verification
             coinbase: cb, payments: vec![p1, p2],
         };
-        assert!(!node.process_block(&block), "conflicting block rejected");
+        let out1_id = block.payments[0].outputs[0].vess_id();
+        let out2_id = block.payments[1].outputs[0].vess_id();
+        assert!(node.process_block(&block), "conflicting block is valid — conflicts vaporize");
+        assert!(!node.check(&v.vess_id()), "double-spent input vaporized");
+        assert!(!node.check(&out1_id), "conflicting output 1 never created");
+        assert!(!node.check(&out2_id), "conflicting output 2 never created");
+        assert!(node.check(&cb_id), "coinbase applied");
 
-        assert!(node.check(&v.vess_id()), "input remains after rejection");
-        assert!(!node.check(&cb_id), "coinbase was never applied");
+        // The burned input is dead forever: a later spend of it must fail.
+        let (pk4, sk4) = dsa_generate();
+        let oh4 = dsa_pubkey_hash(&pk4);
+        let out3 = Vess { variant: VessVariant::Output, amount: v.amount, owner_hash: oh4,
+            timestamp: 0, nonce: 0, salt: random_bytes(),
+            pubkey: pk4.clone(), spend_key: sk4.clone(), spend_condition: None };
+        let mut p3 = VessPayment { payment_id: [0u8;32], inputs: vec![v.clone()], outputs: vec![out3], timestamp: 0, sigs: vec![], preimages: vec![] };
+        p3.compute(); p3.sigs = vec![dsa_sign(&sk, &p3.payment_id).unwrap()];
+        let mut cb2 = VessPayment { payment_id: [0u8;32], inputs: vec![], outputs: vec![Vess { variant: VessVariant::Mint, amount: 1, owner_hash: oh4,
+            timestamp: 0, nonce: 0, salt: random_bytes(), pubkey: pk4.clone(), spend_key: sk4.clone(), spend_condition: None }], timestamp: 0, sigs: vec![], preimages: vec![] };
+        cb2.compute();
+        let mut ids2 = vec![cb2.payment_id, p3.payment_id];
+        ids2.sort();
+        let block2 = VessBlock {
+            version: 1, parents: node.tip_hashes.clone(), timestamp: 1, difficulty_bits: 9, nonce: 0,
+            payment_merkle: merkle_root(&ids2),
+            state_merkle: [0u8; 32], proof: vec![],
+            coinbase: cb2, payments: vec![p3],
+        };
+        assert!(!node.process_block(&block2), "spending a vaporized input is rejected");
+    }
+
+    #[test]
+    fn test_prepare_block_burns_contested() {
+        // Regression: blocks built by prepare_block while contested payments are
+        // in limbo must be VALID (this wedged production mining twice) and must
+        // vaporize the conflict through the committed state root.
+        let (mut node, _s) = start_node_at("127.0.0.1:19930", "vess-db-contested-mine");
+        let (pk, sk) = dsa_generate();
+        let oh = dsa_pubkey_hash(&pk);
+        let v = mine_coins(&mut node, oh, &pk, &sk);
+        let v_id = v.vess_id();
+
+        // Two conflicting spends of the same coin
+        let (pk2, sk2) = dsa_generate();
+        let oh2 = dsa_pubkey_hash(&pk2);
+        let out_a = Vess { variant: VessVariant::Output, amount: v.amount, owner_hash: oh2,
+            timestamp: 0, nonce: 0, salt: random_bytes(), pubkey: pk2.clone(), spend_key: sk2.clone(), spend_condition: None };
+        let out_b = Vess { variant: VessVariant::Output, amount: v.amount, owner_hash: oh2,
+            timestamp: 0, nonce: 0, salt: random_bytes(), pubkey: pk2.clone(), spend_key: sk2.clone(), spend_condition: None };
+        let out_a_id = out_a.vess_id();
+        let out_b_id = out_b.vess_id();
+        let mut p1 = VessPayment { payment_id: [0u8;32], inputs: vec![v.clone()], outputs: vec![out_a], timestamp: 0, sigs: vec![], preimages: vec![] };
+        p1.compute(); p1.sigs = vec![dsa_sign(&sk, &p1.payment_id).unwrap()];
+        let mut p2 = VessPayment { payment_id: [0u8;32], inputs: vec![v.clone()], outputs: vec![out_b], timestamp: 0, sigs: vec![], preimages: vec![] };
+        p2.compute(); p2.sigs = vec![dsa_sign(&sk, &p2.payment_id).unwrap()];
+
+        assert!(node.submit(p1), "first spend enters limbo");
+        assert!(node.submit(p2), "conflicting spend enters limbo and contests both");
+
+        let block = node.prepare_block().expect("contested payments are mining work");
+        assert_eq!(block.payments.len(), 2, "both contested payments included as burn evidence");
+        // apply_mined_block recomputes state_merkle; a non-zero root means the
+        // full commitment is verified even in test mode.
+        node.apply_mined_block(block, 0, vec![]);
+        assert!(!node.check(&v_id), "double-spent input vaporized");
+        assert!(!node.check(&out_a_id), "conflicting output A never created");
+        assert!(!node.check(&out_b_id), "conflicting output B never created");
     }
 
     #[test]

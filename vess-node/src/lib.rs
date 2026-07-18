@@ -516,14 +516,16 @@ impl Node {
             .map(|(k, _)| { let mut a = [0u8;32]; a.copy_from_slice(&k); a })
             .collect();
         drop(rt);
+        // Clean payments first (same application order as validate_block).
         for (i, p) in all_payments.iter().enumerate() {
-            if conflicted.contains(&i) {
-                for inp in &p.inputs { ids.retain(|id| id != &inp.vess_id()); }
-                for out in &p.outputs { ids.retain(|id| id != &out.vess_id()); }
-            } else {
-                for inp in &p.inputs { ids.retain(|id| id != &inp.vess_id()); }
-                for out in &p.outputs { ids.push(out.vess_id()); }
-            }
+            if conflicted.contains(&i) { continue; }
+            for inp in &p.inputs { ids.retain(|id| id != &inp.vess_id()); }
+            for out in &p.outputs { ids.push(out.vess_id()); }
+        }
+        // Conflicted payments: inputs burn, no outputs created.
+        for (i, p) in all_payments.iter().enumerate() {
+            if !conflicted.contains(&i) { continue; }
+            for inp in &p.inputs { ids.retain(|id| id != &inp.vess_id()); }
         }
         ids.sort(); ids.dedup();
         merkle_root(&ids)
@@ -691,22 +693,21 @@ impl Node {
         for owners in input_owners.values() {
             if owners.len() >= 2 { for &i in owners { conflicted.insert(i); } }
         }
+        // Propagate: a payment spending an output of a conflicted payment can
+        // never be satisfied (those outputs are never created), so it is voided
+        // too. Iterate to a fixpoint. In-block chains through CLEAN payments are
+        // fine and must NOT be marked.
         loop {
             let mut changed = false;
-            let clean_outputs: HashSet<VessId> = payments.iter().enumerate()
-                .filter(|(i, _)| !conflicted.contains(i))
+            let conflicted_outputs: HashSet<VessId> = payments.iter().enumerate()
+                .filter(|(i, _)| conflicted.contains(i))
                 .flat_map(|(_, p)| p.outputs.iter().map(|v| v.vess_id()))
                 .collect();
             for (i, p) in payments.iter().enumerate() {
                 if conflicted.contains(&i) { continue; }
-                for v in &p.inputs {
-                    if clean_outputs.contains(&v.vess_id()) {
-                        for (j, cp) in payments.iter().enumerate() {
-                            if cp.outputs.iter().any(|o| o.vess_id() == v.vess_id()) { conflicted.insert(j); }
-                        }
-                        conflicted.insert(i);
-                        changed = true;
-                    }
+                if p.inputs.iter().any(|v| conflicted_outputs.contains(&v.vess_id())) {
+                    conflicted.insert(i);
+                    changed = true;
                 }
             }
             if !changed { break; }
@@ -849,12 +850,16 @@ impl Node {
             for output in &block.coinbase.outputs {
                 state.insert(output.vess_id());
             }
+            // Clean payments first (same application order as validate_block).
             for (i, payment) in block.payments.iter().enumerate() {
+                if conflicted.contains(&i) { continue; }
                 for input in &payment.inputs { state.remove(&input.vess_id()); }
-                if !conflicted.contains(&i) {
-                    for output in &payment.outputs { state.insert(output.vess_id()); }
-                }
-                // Conflicted payments: inputs burn, no outputs created.
+                for output in &payment.outputs { state.insert(output.vess_id()); }
+            }
+            // Conflicted payments: inputs burn, no outputs created.
+            for (i, payment) in block.payments.iter().enumerate() {
+                if !conflicted.contains(&i) { continue; }
+                for input in &payment.inputs { state.remove(&input.vess_id()); }
             }
         }
         Some(state)
@@ -919,7 +924,10 @@ impl Node {
             if !state.insert(output.vess_id()) { return None; }
         }
         let conflicted = Self::block_conflicted(block);
-        for (pi, payment) in block.payments.iter().enumerate() {
+        // Pass 1: validate every payment fully — canonical id, amounts, owner
+        // binding, signatures, spend conditions. Conflicted payments get the
+        // same cryptographic scrutiny as clean ones.
+        for payment in &block.payments {
             let mut canonical = payment.clone();
             canonical.compute();
             if canonical.payment_id != payment.payment_id || payment.is_mint()
@@ -929,7 +937,6 @@ impl Node {
                 return None;
             }
             for (i, input) in payment.inputs.iter().enumerate() {
-                if !state.contains(&input.vess_id()) { return None; }
                 // Owner binding: the pubkey must hash to the claimed owner_hash.
                 // Without this, anyone can spend any UTXO by providing their own pubkey.
                 if dsa_pubkey_hash(&input.pubkey) != input.owner_hash { return None; }
@@ -943,12 +950,38 @@ impl Node {
                     if cond.expires_at > 0 && block.timestamp / 1000 >= cond.expires_at { return None; }
                 }
             }
-            for input in &payment.inputs { state.remove(&input.vess_id()); }
-            // Intra-block conflicted payments: inputs burn, outputs are NOT created.
-            // This is the vaporization mechanic — the penalty falls entirely on the attacker.
-            if !conflicted.contains(&pi) {
-                for output in &payment.outputs {
-                    if output.variant != VessVariant::Output || !state.insert(output.vess_id()) { return None; }
+        }
+        // Pass 2: apply clean payments in block order. Conflict closure
+        // guarantees clean payments never share inputs with any other payment,
+        // so each input must be present exactly when spent.
+        for (pi, payment) in block.payments.iter().enumerate() {
+            if conflicted.contains(&pi) { continue; }
+            for input in &payment.inputs {
+                if !state.remove(&input.vess_id()) { return None; }
+            }
+            for output in &payment.outputs {
+                if output.variant != VessVariant::Output || !state.insert(output.vess_id()) { return None; }
+            }
+        }
+        // Pass 3: vaporize conflicted payments. Inputs burn, outputs are NOT
+        // created — the penalty falls entirely on the double-spender. An input
+        // is satisfiable if it still exists (burn it), was already burned by an
+        // earlier conflicted payment (that double-removal IS the conflict), or
+        // is an output of a conflicted payment in this block (void — nothing
+        // to burn, but not a reason to reject the whole block).
+        let conflicted_outputs: HashSet<VessId> = block.payments.iter().enumerate()
+            .filter(|(pi, _)| conflicted.contains(pi))
+            .flat_map(|(_, p)| p.outputs.iter().map(|v| v.vess_id()))
+            .collect();
+        let mut burned: HashSet<VessId> = HashSet::new();
+        for (pi, payment) in block.payments.iter().enumerate() {
+            if !conflicted.contains(&pi) { continue; }
+            for input in &payment.inputs {
+                let id = input.vess_id();
+                if state.remove(&id) {
+                    burned.insert(id);
+                } else if !burned.contains(&id) && !conflicted_outputs.contains(&id) {
+                    return None;
                 }
             }
         }
@@ -1027,11 +1060,16 @@ impl Node {
                 let conflicted = Self::block_conflicted(block);
                 // Coinbase always creates outputs
                 for output in &block.coinbase.outputs { let _ = self.vess_index.put(&mut w, &output.vess_id(), &()); }
+                // Clean payments first (same application order as validate_block).
                 for (i, payment) in block.payments.iter().enumerate() {
+                    if conflicted.contains(&i) { continue; }
                     for input in &payment.inputs { let _ = self.vess_index.delete(&mut w, &input.vess_id()); }
-                    if !conflicted.contains(&i) {
-                        for output in &payment.outputs { let _ = self.vess_index.put(&mut w, &output.vess_id(), &()); }
-                    }
+                    for output in &payment.outputs { let _ = self.vess_index.put(&mut w, &output.vess_id(), &()); }
+                }
+                // Conflicted payments: inputs burn, no outputs created.
+                for (i, payment) in block.payments.iter().enumerate() {
+                    if !conflicted.contains(&i) { continue; }
+                    for input in &payment.inputs { let _ = self.vess_index.delete(&mut w, &input.vess_id()); }
                 }
             }
             if w.commit().is_err() { return; }

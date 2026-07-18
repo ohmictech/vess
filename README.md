@@ -38,7 +38,7 @@ Vess payments never touch the node network until the receiver decides to submit 
 
 This scatters the payment graph across carriers the network has no visibility into. An analyst who reconstructs every on-chain event still doesn't know whether the blob traveled through Signal or a sticker on a coffee shop counter. You can't eclipse-attack a payment that doesn't touch the mesh. You can't DDoS a transaction out of a mempool that isn't involved until the receiver is ready. Payer and receiver can complete the entire exchange while both are fully offline from the Vess network.
 
-**Claim-latency rule: never deliver before inclusion.** A `VessPayment` blob is a signed promise — it has no value until the receiver submits it to the network *and* a miner includes it in a block. The receiver must not treat the payment as delivered until they see it confirmed on-chain. If you ship goods, stream content, or unlock a door on receipt of the blob alone, you are trusting the payer not to double-spend before submission. This is the same trust model as handing someone a signed check: the check isn't money until it clears. For most payments the exposure window is under a second (the block time). For high-value transfers, wait for one confirmation.
+**Claim-latency rule: never deliver before inclusion.** A `VessPayment` blob is a signed promise which has no guaranteed value until the receiver submits it to the network *and* a miner includes it in a block with confirmation. Treat it like receiving a signed cheque.
 
 The format is just bytes. Any app can generate an invoice, any wallet can sign a payment, any node can accept the submission. No API key, no registration, no handshake.
 
