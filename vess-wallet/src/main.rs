@@ -53,13 +53,13 @@ fn list_wallets() {
     for path in wallets { println!("{}", path); }
 }
 
-fn load_or_create(wallet_path: &str, password: &[u8]) -> Wallet {
-    if let Ok(data) = std::fs::read(wallet_path) {
-        if let Some(w) = Wallet::load(&data, password) {
-            return w;
-        }
+fn load_or_create(wallet_path: &str, password: &[u8]) -> Option<Wallet> {
+    if std::path::Path::new(wallet_path).exists() {
+        let Ok(data) = std::fs::read(wallet_path) else { return None; };
+        Wallet::load(&data, password)
+    } else {
+        Some(Wallet::new(password))
     }
-    Wallet::new(password)
 }
 
 fn run_flags(args: &[String]) {
@@ -91,7 +91,10 @@ fn run_flags(args: &[String]) {
         i += 1;
     }
 
-    let mut w = load_or_create(&wallet_path, &password);
+    let mut w = match load_or_create(&wallet_path, &password) {
+        Some(w) => w,
+        None => { eprintln!("error: wrong password or corrupt wallet file"); return; }
+    };
     if !w.connect_full(node_addr) {
         eprintln!("warning: handshake with {} failed, RPC may not work", node_addr);
     }
@@ -200,7 +203,8 @@ fn run_interactive(wallet_path: &str) {
             if wallet.is_some() {
                 println!("wallet loaded ({} VESS balance)", wallet.as_ref().unwrap().balance());
             } else {
-                println!("bad password — starting with empty wallet");
+                println!("bad password — use --wallet <new-file> or delete the existing one to start fresh");
+                return;
             }
         }
     }

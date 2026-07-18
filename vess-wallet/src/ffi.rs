@@ -37,6 +37,15 @@ macro_rules! wallet_ref {
     }};
 }
 
+macro_rules! catch_ffi {
+    ($body:expr, $fallback:expr) => {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| $body)) {
+            Ok(v) => v,
+            Err(_) => $fallback,
+        }
+    };
+}
+
 fn outputs_from_ffi(
     hashes: *const u8,
     amounts: *const u64,
@@ -178,18 +187,20 @@ pub extern "C" fn vess_wallet_build_payment(
     hashlock_preimages: *const u8, expires_ats: *const u64,
     count: u32, out_len: *mut u32,
 ) -> *mut u8 {
-    if out_len.is_null() { return std::ptr::null_mut(); }
-    let w = wallet_mut!(wallet, std::ptr::null_mut());
-    let Some(outputs) = outputs_from_ffi(hashes, amounts, hashlock_preimages, expires_ats, count) else { return std::ptr::null_mut(); };
-    if let Some(p) = w.build_payment(&outputs) {
-        let data = p.encode();
-        unsafe { *out_len = data.len() as u32; }
-        let ptr = data.as_ptr();
-        std::mem::forget(data);
-        ptr as *mut u8
-    } else {
-        std::ptr::null_mut()
-    }
+    catch_ffi!({
+        if out_len.is_null() { return std::ptr::null_mut(); }
+        let w = wallet_mut!(wallet, std::ptr::null_mut());
+        let Some(outputs) = outputs_from_ffi(hashes, amounts, hashlock_preimages, expires_ats, count) else { return std::ptr::null_mut(); };
+        if let Some(p) = w.build_payment(&outputs) {
+            let data = p.encode();
+            unsafe { *out_len = data.len() as u32; }
+            let ptr = data.as_ptr();
+            std::mem::forget(data);
+            ptr as *mut u8
+        } else {
+            std::ptr::null_mut()
+        }
+    }, std::ptr::null_mut())
 }
 
 #[no_mangle]
@@ -333,9 +344,9 @@ pub extern "C" fn vess_wallet_history_counts(wallet: *mut Wallet, out_built: *mu
 // ---- memory ----
 
 #[no_mangle]
-pub extern "C" fn vess_free_bytes(ptr: *mut u8, len: u32) {
+pub extern "C" fn vess_free_bytes(ptr: *mut u8, len: u32, capacity: u32) {
     if ptr.is_null() { return; }
-    unsafe { drop(Vec::from_raw_parts(ptr, len as usize, len as usize)); }
+    unsafe { drop(Vec::from_raw_parts(ptr, len as usize, capacity as usize)); }
 }
 
 #[no_mangle]

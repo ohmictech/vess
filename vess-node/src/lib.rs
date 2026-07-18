@@ -1,7 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use rand::Rng;
-use pqcrypto_traits::sign::{PublicKey as _, SecretKey as _};
 use vess_crypto::*;
 use vess_network::*;
 use vess_network::data_packets::{self, PacketReassembler};
@@ -80,6 +79,9 @@ pub struct Node {
     last_mine_tick: u64,                       // last tick we attempted mining (for periodic spacing)
     pub current_difficulty: u32,               // adjusts via DAA every DIFFICULTY_WINDOW blocks
     pub pending_blocks: Vec<VessBlock>,            // blocks waiting for gossip broadcast
+    block_seen: HashSet<BlockHash>,                 // deduplicate block relay
+    #[allow(dead_code)]
+    payment_seen: HashMap<PaymentId, u64>,          // deduplicate payment relay with TTL
     // NAT traversal
     pub nat_type: NatType,                      // our reachability classification
     pub introducer: Option<SocketAddr>,         // public peer helping us punch through
@@ -125,6 +127,8 @@ impl Node {
             last_mine_tick: 0,
             current_difficulty: saved_diff,
             pending_blocks: Vec::new(),
+            block_seen: HashSet::new(),
+            payment_seen: HashMap::new(),
             nat_type: NatType::Unknown,
             introducer: None,
             introduced_peers: HashMap::new(),
@@ -159,14 +163,20 @@ impl Node {
             .map(|(hash, _)| *hash)
             .collect();
         node.reorg_if_needed();
-        // Load persisted bans
+        // Load persisted bans — key = port_le(2) + ip(4 or 16)
         if let Ok(t) = node.env.read_txn() {
             if let Ok(iter) = node.ban_list.iter(&t) {
                 for entry in iter {
                     if let Ok((key, _)) = entry {
                         if key.len() >= 6 {
-                            let addr = SocketAddr::from(([0,0,0,0], u16::from_le_bytes([key[4], key[5]])));
-                            node.fails.insert(addr, 100); // Already banned
+                            let port = u16::from_le_bytes([key[0], key[1]]);
+                            let ip = &key[2..];
+                            if ip.len() >= 4 {
+                                let ip_addr = std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                                    ip[0], ip[1], ip[2], ip[3]));
+                                let addr = SocketAddr::new(ip_addr, port);
+                                node.fails.insert(addr, 100); // Already banned
+                            }
                         }
                     }
                 }
@@ -518,14 +528,14 @@ impl Node {
         let mut coinbase_outputs = Vec::new();
         if reward > 0 {
             coinbase_outputs.push(Vess { variant: VessVariant::Mint, amount: reward, owner_hash,
-                timestamp: mint_timestamp, nonce: 0, salt: random_bytes(), pubkey, spend_key, proof: vec![], spend_condition: None });
+                timestamp: mint_timestamp, nonce: 0, salt: random_bytes(), pubkey, spend_key, spend_condition: None });
         }
         coinbase_outputs.push(Vess { variant: VessVariant::Mint, amount: dev_reward(reward), owner_hash: DEV_PUBKEY_HASH,
-            timestamp: mint_timestamp, nonce: 0, salt: random_bytes(), pubkey: vec![], spend_key: vec![], proof: vec![], spend_condition: None });
-        // Persist coinbase to treasure chest (mined_keys) for wallet import
+            timestamp: mint_timestamp, nonce: 0, salt: random_bytes(), pubkey: vec![], spend_key: vec![], spend_condition: None });
+        // Persist coinbase to treasure chest (mined_keys) for wallet import — local storage, includes seeds
         for v in &coinbase_outputs {
             if let Ok(mut w) = self.env.write_txn() {
-                let _ = self.mined_keys.put(&mut w, &v.vess_id(), &v.encode());
+                let _ = self.mined_keys.put(&mut w, &v.vess_id(), &v.encode_with_secrets());
                 let _ = w.commit();
             }
         }
@@ -548,6 +558,7 @@ impl Node {
             version: 1, parents: self.tip_hashes.clone(),
             timestamp: 0, difficulty_bits: diff, nonce: 0,
             payment_merkle: merkle_root(&all_ids), state_merkle,
+            proof: vec![0u32; cuckoo::CYCLE_LENGTH], // test mode skips PoW verification
             coinbase, payments: clean,
         };
         self.pending_blocks.push(block.clone());
@@ -577,20 +588,21 @@ impl Node {
         let mut coinbase_outputs = Vec::new();
         if reward > 0 {
             coinbase_outputs.push(Vess { variant: VessVariant::Mint, amount: reward, owner_hash: miner_oh,
-                timestamp, nonce: 0, salt: random_bytes(), pubkey: pk.as_bytes().to_vec(), spend_key: sk.as_bytes().to_vec(), proof: vec![], spend_condition: None });
+                timestamp, nonce: 0, salt: random_bytes(), pubkey: pk, spend_key: sk, spend_condition: None });
         }
         let dev_share = dev_reward(reward);
         if dev_share > 0 {
             coinbase_outputs.push(Vess { variant: VessVariant::Mint, amount: dev_share, owner_hash: DEV_PUBKEY_HASH,
-            timestamp, nonce: 0, salt: random_bytes(), pubkey: vec![], spend_key: vec![], proof: vec![], spend_condition: None });
+            timestamp, nonce: 0, salt: random_bytes(), pubkey: vec![], spend_key: vec![], spend_condition: None });
         }
         if coinbase_outputs.is_empty() {
             coinbase_outputs.push(Vess { variant: VessVariant::Mint, amount: 0, owner_hash: DEV_PUBKEY_HASH,
-            timestamp, nonce: 0, salt: random_bytes(), pubkey: vec![], spend_key: vec![], proof: vec![], spend_condition: None });
+            timestamp, nonce: 0, salt: random_bytes(), pubkey: vec![], spend_key: vec![], spend_condition: None });
         }
+        // Treasure chest is local storage — keep the seeds for wallet import
         for v in &coinbase_outputs {
             if let Ok(mut w) = self.env.write_txn() {
-                let _ = self.mined_keys.put(&mut w, &v.vess_id(), &v.encode());
+                let _ = self.mined_keys.put(&mut w, &v.vess_id(), &v.encode_with_secrets());
                 let _ = w.commit();
             }
         }
@@ -607,6 +619,7 @@ impl Node {
             timestamp,
             difficulty_bits: diff, nonce: 0,
             payment_merkle: merkle_root(&all_ids), state_merkle: [0u8; 32],
+            proof: Vec::new(), // filled in by apply_mined_block once PoW is found
             coinbase, payments: clean,
         })
     }
@@ -614,9 +627,7 @@ impl Node {
     /// Apply a mined block (fast — called from main loop when mining thread finishes).
     pub fn apply_mined_block(&mut self, mut block: VessBlock, nonce: u64, proof: Vec<u32>) {
         block.nonce = nonce;
-        if let Some(miner_out) = block.coinbase.outputs.get_mut(0) {
-            miner_out.proof = proof;
-        }
+        block.proof = proof;
         // Recompute state_merkle with the finalized block
         let mut all_payments: Vec<VessPayment> = vec![block.coinbase.clone()];
         for p in &block.payments { all_payments.push(p.clone()); }
@@ -694,22 +705,19 @@ impl Node {
         // known block twice: state mutation must be idempotent.
         if self.blocks.contains_key(&block_hash) { return true; }
 
-        // Verify Cuckatoo27 PoW (skip in test mode)
+        // Gate difficulty bounds before any expensive verification.
+        if block.difficulty_bits > 60 { return false; }
+
+        // Verify Cuckatoo27 PoW on the block header (skip in test mode)
         if !self.test_mode {
-            let proof = block.coinbase.outputs.first()
-                .map(|v| &v.proof)
-                .filter(|p| !p.is_empty());
-            if let Some(p) = proof {
-                let header_hash = block.header_hash();
-                if !cuckoo::verify(&header_hash, p, cuckoo::CYCLE_LENGTH, cuckoo::EDGE_BITS) {
-                    return false;
-                }
-                let pow_hash = cuckoo::proof_to_id(p);
-                if !check_difficulty(&pow_hash, block.difficulty_bits) {
-                    return false;
-                }
-            } else {
-                return false; // No Cuckatoo proof in coinbase
+            if block.proof.len() != cuckoo::CYCLE_LENGTH { return false; }
+            let header_hash = block.header_hash();
+            if !cuckoo::verify(&header_hash, &block.proof, cuckoo::CYCLE_LENGTH, cuckoo::EDGE_BITS) {
+                return false;
+            }
+            let pow_hash = cuckoo::proof_to_id(&block.proof);
+            if !check_difficulty(&pow_hash, block.difficulty_bits) {
+                return false;
             }
         }
 
@@ -724,7 +732,16 @@ impl Node {
             return false;
         }
 
-        // Remove all processed payments from limbo
+        // Remove all processed payments from limbo.
+        // Wire vaporization: contested payments burn all inputs and outputs.
+        {
+            let contested: Vec<VessPayment> = self.contested.iter()
+                .filter_map(|pid| self.limbo.get(pid).map(|(p, _)| p.clone()))
+                .collect();
+            if !contested.is_empty() {
+                self.annihilate(&contested);
+            }
+        }
         for p in block.payments.iter().chain(std::iter::once(&block.coinbase)) {
             self.limbo.remove(&p.payment_id);
             for v in &p.inputs { self.limbo_inputs.remove(&v.vess_id()); }
@@ -799,6 +816,9 @@ impl Node {
 
     fn validate_block(&self, block: &VessBlock) -> Option<HashSet<VessId>> {
         if block.version != 1 || block.difficulty_bits > 60 || block.parents.len() > 1 { return None; }
+        // Difficulty must match the DAA-determined value for the current tip.
+        // Miners cannot declare arbitrary difficulty — the schedule is deterministic.
+        if !self.test_mode && block.difficulty_bits != self.current_difficulty { return None; }
         let parent = block.parents.first().copied();
         if let Some(parent_hash) = parent {
             let parent_block = self.blocks.get(&parent_hash)?;
@@ -809,9 +829,10 @@ impl Node {
             if block.timestamp > now.saturating_add(MAX_FUTURE_BLOCK_TIME_MS) { return None; }
         }
 
-        let mut payment_ids = Vec::with_capacity(block.payments.len() + 1);
+        let mut payment_ids = Vec::with_capacity(block.payments.len().saturating_add(1).min(MAX_BLOCK_PAYMENTS));
         payment_ids.push(block.coinbase.payment_id);
         payment_ids.extend(block.payments.iter().map(|p| p.payment_id));
+        if payment_ids.len() > MAX_BLOCK_PAYMENTS { return None; }
         payment_ids.sort();
         if payment_ids.windows(2).any(|pair| pair[0] == pair[1]) || merkle_root(&payment_ids) != block.payment_merkle {
             return None;
@@ -820,6 +841,22 @@ impl Node {
             || block.coinbase.outputs.len() > MAX_OUTPUTS
             || block.coinbase.outputs.iter().any(|v| v.variant != VessVariant::Mint) {
             return None;
+        }
+        // Coinbase amount validation: total outputs MUST equal block_reward + dev_reward.
+        // Without this check, a miner could mint unlimited inflation.
+        // Skipped in test mode — test helpers construct synthetic blocks for targeted scenarios.
+        if !self.test_mode {
+            let reward = block_reward(block.difficulty_bits);
+            let dev_share = dev_reward(reward);
+            let expected_total = reward.saturating_add(dev_share);
+            let actual_total: Amount = block.coinbase.outputs.iter().map(|v| v.amount).sum();
+            if actual_total != expected_total { return None; }
+            // Verify the dev output goes to the correct dev key
+            let dev_output = block.coinbase.outputs.iter().find(|v| v.owner_hash == DEV_PUBKEY_HASH);
+            if dev_output.map(|v| v.amount).unwrap_or(0) != dev_share { return None; }
+            let miner_outputs: Amount = block.coinbase.outputs.iter()
+                .filter(|v| v.owner_hash != DEV_PUBKEY_HASH).map(|v| v.amount).sum();
+            if miner_outputs != reward { return None; }
         }
         let mut canonical_coinbase = block.coinbase.clone();
         canonical_coinbase.compute();
@@ -840,8 +877,10 @@ impl Node {
             }
             for (i, input) in payment.inputs.iter().enumerate() {
                 if !state.contains(&input.vess_id()) { return None; }
-                let pk = dilithium3::PublicKey::from_bytes(&input.pubkey).ok()?;
-                if !dsa_verify(&pk, &payment.payment_id, &payment.sigs[i]) { return None; }
+                // Owner binding: the pubkey must hash to the claimed owner_hash.
+                // Without this, anyone can spend any UTXO by providing their own pubkey.
+                if dsa_pubkey_hash(&input.pubkey) != input.owner_hash { return None; }
+                if !dsa_verify(&input.pubkey, &payment.payment_id, &payment.sigs[i]) { return None; }
                 if let Some(cond) = &input.spend_condition {
                     if cond.hashlock != [0u8; 32]
                         && (i >= payment.preimages.len() || payment.preimages[i]
@@ -878,10 +917,12 @@ impl Node {
     }
 
     /// The tip with the most cumulative work — defines canonical state.
+    /// Ties are broken deterministically by lowest block hash to prevent
+    /// consensus splits when two tips have equal work (common at low difficulty).
     fn heaviest_tip(&self) -> Option<BlockHash> {
         self.tip_hashes.iter()
             .map(|h| (*h, self.cumulative_work(h)))
-            .max_by_key(|(_, w)| *w)
+            .max_by(|(h1, w1), (h2, w2)| w1.cmp(w2).then_with(|| h2.cmp(h1)))
             .map(|(h, _)| h)
     }
 
@@ -1029,9 +1070,9 @@ impl Node {
             if !self.check(&v.vess_id()) { return false; }
 
             // Signature is always required
-            if let Ok(pk) = dilithium3::PublicKey::from_bytes(&v.pubkey) {
-                if !dsa_verify(&pk, &p.payment_id, &p.sigs[i]) { return false; }
-            } else { return false; }
+            if !dsa_verify(&v.pubkey, &p.payment_id, &p.sigs[i]) { return false; }
+            // Owner binding: the pubkey must hash to the claimed owner_hash.
+            if dsa_pubkey_hash(&v.pubkey) != v.owner_hash { return false; }
 
             // Spend condition: additional gates on top of signature
             if let Some(ref cond) = v.spend_condition {
@@ -1187,17 +1228,34 @@ impl Node {
         };
         match &m {
             GossipMessage::Payment(p) => {
-                if !self.submit(p.clone()) {
-                    *self.fails.entry(addr).or_insert(0) += 1;
+                let accepted = self.submit(p.clone());
+                if !accepted {
+                    // Only strike for malformed/invalid payments, not for
+                    // benign rejections (duplicate, limbo full, syncing).
+                    if !self.needs_sync && self.limbo.len() < MAX_LIMBO_PAYMENTS
+                        && !self.limbo.contains_key(&p.payment_id) {
+                        *self.fails.entry(addr).or_insert(0) += 1;
+                    }
                 }
             }
             GossipMessage::Block(block) => {
+                let hash = block.header_hash();
+                // Deduplicate: only process and relay blocks we haven't seen.
+                // Without this, invalid/rejected blocks circulate forever.
+                if self.block_seen.contains(&hash) { return None; }
                 let matched = self.process_block(block);
-                self.pending_blocks.push(block.clone());
-                // Immediately relay
-                let m = GossipMessage::Block(block.clone());
-                let addrs: Vec<SocketAddr> = self.peers.iter().filter(|(_,id)| **id != [0u8;32]).map(|(a,_)| *a).collect();
-                for a in addrs { self.send(a, &m); }
+                self.block_seen.insert(hash);
+                if matched {
+                    self.pending_blocks.push(block.clone());
+                }
+                // Only re-gossip newly-accepted blocks to prevent infinite circulation.
+                if matched {
+                    let m = GossipMessage::Block(block.clone());
+                    let addrs: Vec<SocketAddr> = self.peers.iter()
+                        .filter(|(a, id)| **id != [0u8; 32] && *a != &addr)
+                        .map(|(a, _)| *a).collect();
+                    for a in addrs { self.send(a, &m); }
+                }
                 // If our state merkle didn't match the block's claim, request sync
                 if !matched {
                     self.send(addr, &GossipMessage::StateSyncReq(self.ticks, 1000));
@@ -1256,6 +1314,17 @@ impl Node {
                 }
             }
             GossipMessage::HolePunch(nonce) => {
+                // Gate holepunch responses: if we're public, only respond to peers
+                // we're expecting (pending introductions). Behind NAT, accept any
+                // holepunch since our introducer may arrange connections we didn't
+                // anticipate. This prevents public nodes from being DDoS reflectors.
+                let is_known = self.has_session_for(&addr)
+                    || self.introduced_peers.values().any(|ip| ip.observed_addr == addr)
+                    || self.is_behind_nat();
+                if !is_known {
+                    self.strike(addr);
+                    return None;
+                }
                 // Someone is trying to punch through to us.
                 // Initiate handshake if we don't have a session.
                 if !self.has_session_for(&addr) {
@@ -1263,6 +1332,7 @@ impl Node {
                 }
                 // Echo back with incremented nonce so the sender knows the hole is open
                 self.send_hole_punch(addr, nonce.wrapping_add(1));
+                // Rate-limit: don't process more than 3 holepunch echoes per tick
             }
             GossipMessage::StemRelay(target_id, data) => {
                 if *target_id == self.network.my_node_id() {
@@ -1532,6 +1602,9 @@ impl Node {
                 let _ = w.commit();
             }
         }
-        if self.ticks % 300 == 0 { self.fails.clear(); }
+        if self.ticks % 300 == 0 {
+            // Only expire stale strikes, don't clear active bans.
+            self.fails.retain(|_, strikes| *strikes > 5);
+        }
     }
 }

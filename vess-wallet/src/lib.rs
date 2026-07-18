@@ -1,7 +1,5 @@
 use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
-use pqcrypto_dilithium::dilithium3;
-use pqcrypto_traits::sign::{PublicKey as _, SecretKey as _};
 use vess_crypto::*;
 use vess_network::{unframe, GossipMessage, Network, RpcRequest, RpcResponse, HANDSHAKE_RESP, HANDSHAKE_INIT, frame, ENCRYPTED_DATA};
 use vess_network::data_packets::{self, MessageId, PacketReassembler};
@@ -10,13 +8,13 @@ mod ffi;
 
 const RPC_TIMEOUT_MS: u64 = 5000;
 const WALLET_MAGIC: &[u8; 8] = b"VESSWLT\0";
-const WALLET_FORMAT_VERSION: u8 = 1;
+const WALLET_FORMAT_VERSION: u8 = 2; // v2: ML-DSA-65 keys, 32-byte seeds, no spend keys in canonical encodings
 const WALLET_HEADER_LEN: usize = WALLET_MAGIC.len() + 1 + 12 + 32;
 const MAX_WALLET_ITEMS: usize = 1_000_000;
 
 struct Keypair {
-    dsa_pk: dilithium3::PublicKey,
-    dsa_sk: dilithium3::SecretKey,
+    dsa_pk: Vec<u8>,   // 1952-byte ML-DSA-65 verifying key
+    dsa_sk: Vec<u8>,   // 32-byte ML-DSA-65 seed
 }
 
 pub struct Wallet {
@@ -307,7 +305,7 @@ impl Wallet {
         let mut out_vess: Vec<Vess> = outputs.iter().map(|(oh, amt, sc)| {
             Vess { variant: VessVariant::Output, amount: *amt, owner_hash: *oh,
                 timestamp: 0, nonce: 0, salt: random_bytes(),
-                pubkey: Vec::new(), spend_key: Vec::new(), proof: vec![],
+                pubkey: Vec::new(), spend_key: Vec::new(),
                 spend_condition: sc.clone() }
         }).collect();
 
@@ -315,7 +313,7 @@ impl Wallet {
             let (pk, sk) = dsa_generate();
             let oh = dsa_pubkey_hash(&pk);
             self.keypairs.insert(oh, Keypair { dsa_pk: pk, dsa_sk: sk });
-            out_vess.push(Vess { variant: VessVariant::Output, amount: change, owner_hash: oh, timestamp: 0, nonce: 0, salt: random_bytes(), pubkey: Vec::new(), spend_key: Vec::new(), proof: vec![], spend_condition: None });
+            out_vess.push(Vess { variant: VessVariant::Output, amount: change, owner_hash: oh, timestamp: 0, nonce: 0, salt: random_bytes(), pubkey: Vec::new(), spend_key: Vec::new(), spend_condition: None });
         }
 
         // Populate preimages for hashlocked inputs
@@ -327,7 +325,9 @@ impl Wallet {
 
         for v in &payment.inputs {
             if let Some(kp) = self.keypairs.get(&v.owner_hash) {
-                payment.sigs.push(dsa_sign(&kp.dsa_sk, &payment.payment_id));
+                if let Some(sig) = dsa_sign(&kp.dsa_sk, &payment.payment_id) {
+                    payment.sigs.push(sig);
+                }
             }
         }
         self.pbank_built.push(payment.clone());
@@ -353,14 +353,18 @@ impl Wallet {
         if !self.submit_payment(payment).unwrap_or(false) { return false; }
         for v in &payment.inputs {
             let id = v.vess_id();
-            self.vbank_claimed.retain(|x| x.vess_id() != id);
-            self.vbank_unclaimed.retain(|x| x.vess_id() != id);
+            // Move to pending — don't delete until confirmed by sync.
+            if let Some(pos) = self.vbank_claimed.iter().position(|x| x.vess_id() == id) {
+                self.vbank_pending.push(self.vbank_claimed.remove(pos));
+            } else if let Some(pos) = self.vbank_unclaimed.iter().position(|x| x.vess_id() == id) {
+                self.vbank_pending.push(self.vbank_unclaimed.remove(pos));
+            }
         }
         for v in &payment.outputs {
             if let Some(kp) = self.keypairs.get(&v.owner_hash) {
                 let mut owned = v.clone();
-                owned.pubkey = kp.dsa_pk.as_bytes().to_vec();
-                owned.spend_key = kp.dsa_sk.as_bytes().to_vec();
+                owned.pubkey = kp.dsa_pk.clone();
+                owned.spend_key = kp.dsa_sk.clone();
                 self.vbank_unclaimed.push(owned);
             }
         }
@@ -374,8 +378,8 @@ impl Wallet {
         for v in &payment.outputs {
             if let Some(kp) = self.keypairs.get(&v.owner_hash) {
                 let mut owned = v.clone();
-                owned.pubkey = kp.dsa_pk.as_bytes().to_vec();
-                owned.spend_key = kp.dsa_sk.as_bytes().to_vec();
+                owned.pubkey = kp.dsa_pk.clone();
+                owned.spend_key = kp.dsa_sk.clone();
                 self.vbank_unclaimed.push(owned);
             }
         }
@@ -413,16 +417,34 @@ impl Wallet {
         count
     }
 
-    pub fn receive(&mut self, payment: VessPayment) {
+    /// Import a payment (OOB receive path). Verifies signatures, idempotency,
+    /// and that outputs we claim actually belong to us before accepting.
+    pub fn receive(&mut self, payment: VessPayment) -> bool {
+        // Verify the payment is well-formed
+        let mut canonical = payment.clone();
+        canonical.compute();
+        if canonical.payment_id != payment.payment_id { return false; }
+        if payment.inputs.is_empty() || payment.outputs.is_empty() { return false; }
+        if payment.input_sum() != payment.output_sum() { return false; }
+        // Verify every signature
+        for (i, input) in payment.inputs.iter().enumerate() {
+            if i >= payment.sigs.len() { return false; }
+            if !dsa_verify(&input.pubkey, &payment.payment_id, &payment.sigs[i]) { return false; }
+            if dsa_pubkey_hash(&input.pubkey) != input.owner_hash { return false; }
+        }
+        let mut ours = 0usize;
         for v in &payment.outputs {
             if let Some(kp) = self.keypairs.get(&v.owner_hash) {
                 let mut owned = v.clone();
-                owned.pubkey = kp.dsa_pk.as_bytes().to_vec();
-                owned.spend_key = kp.dsa_sk.as_bytes().to_vec();
+                owned.pubkey = kp.dsa_pk.clone();
+                owned.spend_key = kp.dsa_sk.clone();
                 self.vbank_unclaimed.push(owned);
+                ours += 1;
             }
         }
+        if ours == 0 { return false; }
         self.pbank_received.push(payment);
+        true
     }
 
     /// Import a payment blob from raw bytes (OOB receive path — no node needed).
@@ -433,8 +455,8 @@ impl Wallet {
         let count = payment.outputs.iter()
             .filter(|v| self.keypairs.contains_key(&v.owner_hash))
             .count();
-        self.receive(payment);
-        Some(count)
+        if count == 0 { return None; }
+        if self.receive(payment) { Some(count) } else { None }
     }
 
     /// Store a hashlock preimage for a UTXO we own. Required to spend hashlocked inputs.
@@ -444,6 +466,7 @@ impl Wallet {
 
     /// Sync unclaimed outputs against the node: check each via RPC and move
     /// confirmed ones to vbank_claimed. Returns (moved, remaining).
+    /// Pending UTXOs are NOT dropped here — use `prune_pending()` explicitly.
     pub fn sync(&mut self) -> (usize, usize) {
         let ids: Vec<VessId> = self.vbank_unclaimed.iter().map(|v| v.vess_id()).collect();
         let mut moved = 0usize;
@@ -456,23 +479,30 @@ impl Wallet {
                 }
             }
         }
-        // Clean up pending: UTXOs gone from network → payment confirmed, drop them
-        let pending_ids: Vec<VessId> = self.vbank_pending.iter().map(|v| v.vess_id()).collect();
-        for id in &pending_ids {
-            if !self.check(id).unwrap_or(true) {
-                // No longer on network — receiver submitted and it got mined
-                self.vbank_pending.retain(|v| &v.vess_id() != id);
-            }
-        }
         (moved, self.vbank_unclaimed.len())
     }
 
-    /// Import a keypair from raw bytes. Returns the owner_hash for UTXO lookup.
+    /// Explicitly prune pending UTXOs that are no longer on the network
+    /// (payment confirmed and mined). Must be called deliberately.
+    pub fn prune_pending(&mut self) -> usize {
+        let pending_ids: Vec<VessId> = self.vbank_pending.iter().map(|v| v.vess_id()).collect();
+        let mut pruned = 0usize;
+        for id in &pending_ids {
+            if !self.check(id).unwrap_or(true) {
+                self.vbank_pending.retain(|v| &v.vess_id() != id);
+                pruned += 1;
+            }
+        }
+        pruned
+    }
+
+    /// Import a keypair from raw bytes (1952-byte pubkey, 32-byte seed).
+    /// Validates that the seed actually derives the pubkey. Returns the owner_hash for UTXO lookup.
     pub fn import_keypair(&mut self, pubkey_bytes: &[u8], seckey_bytes: &[u8]) -> Option<OwnerHash> {
-        let pk = dilithium3::PublicKey::from_bytes(pubkey_bytes).ok()?;
-        let sk = dilithium3::SecretKey::from_bytes(seckey_bytes).ok()?;
-        let oh = dsa_pubkey_hash(&pk);
-        self.keypairs.insert(oh, Keypair { dsa_pk: pk, dsa_sk: sk });
+        if pubkey_bytes.len() != DSA_PUBKEY_BYTES || seckey_bytes.len() != DSA_SEED_BYTES { return None; }
+        if dsa_public_from_seed(seckey_bytes)? != pubkey_bytes { return None; }
+        let oh = dsa_pubkey_hash(pubkey_bytes);
+        self.keypairs.insert(oh, Keypair { dsa_pk: pubkey_bytes.to_vec(), dsa_sk: seckey_bytes.to_vec() });
         Some(oh)
     }
 
@@ -506,7 +536,7 @@ impl Wallet {
         if let Ok(iter) = keys_db.iter(&t) {
             for entry in iter {
                 if let Ok((_key, bytes)) = entry {
-                    if let Some(v) = Vess::decode(&bytes, &mut 0) {
+                    if let Some(v) = Vess::decode_with_secrets(&bytes, &mut 0) {
                         if v.variant == VessVariant::Mint {
                             if !known.contains(&v.vess_id()) {
                                 // Must be unspent in the UTXO set
@@ -514,13 +544,9 @@ impl Wallet {
                                     continue; // already spent, skip
                                 }
                                 // Extract keypair from Vess or use stored keypair (for dev outputs)
-                                if !v.pubkey.is_empty() {
-                                    if let (Ok(pk), Ok(sk)) = (
-                                        dilithium3::PublicKey::from_bytes(&v.pubkey),
-                                        dilithium3::SecretKey::from_bytes(&v.spend_key)
-                                    ) {
-                                        self.keypairs.entry(v.owner_hash).or_insert(Keypair { dsa_pk: pk, dsa_sk: sk });
-                                    }
+                                if !v.pubkey.is_empty() && !v.spend_key.is_empty()
+                                    && !self.keypairs.contains_key(&v.owner_hash) {
+                                    let _ = self.import_keypair(&v.pubkey, &v.spend_key);
                                 }
                                 // Accept if we have the keypair (from import-key or embedded in Vess)
                                 if self.keypairs.contains_key(&v.owner_hash) {
@@ -539,11 +565,11 @@ impl Wallet {
     pub fn save(&self) -> Vec<u8> {
         let mut plain = Vec::new();
         write_u32(&mut plain, self.vbank_claimed.len() as u32);
-        for v in &self.vbank_claimed { plain.extend(&v.encode()); }
+        for v in &self.vbank_claimed { plain.extend(&v.encode_with_secrets()); }
         write_u32(&mut plain, self.vbank_unclaimed.len() as u32);
-        for v in &self.vbank_unclaimed { plain.extend(&v.encode()); }
+        for v in &self.vbank_unclaimed { plain.extend(&v.encode_with_secrets()); }
         write_u32(&mut plain, self.vbank_pending.len() as u32);
-        for v in &self.vbank_pending { plain.extend(&v.encode()); }
+        for v in &self.vbank_pending { plain.extend(&v.encode_with_secrets()); }
         write_u32(&mut plain, self.preimages.len() as u32);
         for (id, pre) in &self.preimages {
             write_fixed(&mut plain, id);
@@ -552,8 +578,8 @@ impl Wallet {
         write_u32(&mut plain, self.keypairs.len() as u32);
         for (oh, kp) in &self.keypairs {
             write_fixed(&mut plain, oh);
-            write_bytes(&mut plain, kp.dsa_pk.as_bytes());
-            write_bytes(&mut plain, kp.dsa_sk.as_bytes());
+            write_bytes(&mut plain, &kp.dsa_pk);
+            write_bytes(&mut plain, &kp.dsa_sk);
         }
         // Persist payment history: built + received
         write_u32(&mut plain, self.pbank_built.len() as u32);
@@ -623,15 +649,15 @@ impl Wallet {
         let claimed_len = read_u32(&plain, &mut pos)? as usize;
         if claimed_len > MAX_WALLET_ITEMS { return None; }
         let mut vbank_claimed = Vec::with_capacity(claimed_len);
-        for _ in 0..claimed_len { vbank_claimed.push(Vess::decode(&plain, &mut pos)?); }
+        for _ in 0..claimed_len { vbank_claimed.push(Vess::decode_with_secrets(&plain, &mut pos)?); }
         let unclaimed_len = read_u32(&plain, &mut pos)? as usize;
         if unclaimed_len > MAX_WALLET_ITEMS { return None; }
         let mut vbank_unclaimed = Vec::with_capacity(unclaimed_len);
-        for _ in 0..unclaimed_len { vbank_unclaimed.push(Vess::decode(&plain, &mut pos)?); }
+        for _ in 0..unclaimed_len { vbank_unclaimed.push(Vess::decode_with_secrets(&plain, &mut pos)?); }
         let pending_len = read_u32(&plain, &mut pos)? as usize;
         if pending_len > MAX_WALLET_ITEMS { return None; }
         let mut vbank_pending = Vec::with_capacity(pending_len);
-        for _ in 0..pending_len { vbank_pending.push(Vess::decode(&plain, &mut pos)?); }
+        for _ in 0..pending_len { vbank_pending.push(Vess::decode_with_secrets(&plain, &mut pos)?); }
         let pre_len = read_u32(&plain, &mut pos)? as usize;
         if pre_len > MAX_WALLET_ITEMS { return None; }
         let mut preimages = HashMap::new();
@@ -647,11 +673,8 @@ impl Wallet {
             let oh = read_fixed(&plain, &mut pos)?;
             let pk_bytes = read_bytes(&plain, &mut pos)?;
             let sk_bytes = read_bytes(&plain, &mut pos)?;
-            if let (Ok(dsa_pk), Ok(dsa_sk)) = (
-                dilithium3::PublicKey::from_bytes(&pk_bytes),
-                dilithium3::SecretKey::from_bytes(&sk_bytes),
-            ) {
-                keypairs.insert(oh, Keypair { dsa_pk, dsa_sk });
+            if pk_bytes.len() == DSA_PUBKEY_BYTES && sk_bytes.len() == DSA_SEED_BYTES {
+                keypairs.insert(oh, Keypair { dsa_pk: pk_bytes, dsa_sk: sk_bytes });
             }
         }
         // Load payment history

@@ -269,7 +269,6 @@ fn main() -> std::io::Result<()> {
                 if let Some(resp) = node.lock().unwrap().process(src, &buf[..len]) {
                     send_datagrams(&socket, src, &resp);
                 }
-                block_count_main.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(ref e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
@@ -303,6 +302,6 @@ fn main() -> std::io::Result<()> {
             send_datagrams(&socket, dest, &data);
         }
 
-        std::thread::sleep(Duration::from_millis(1));
+        std::thread::sleep(Duration::from_millis(5));
     }
 }

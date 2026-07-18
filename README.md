@@ -44,7 +44,7 @@ The format is just bytes. Any app can generate an invoice, any wallet can sign a
 
 ## How it works
 
-Mining is Cuckatoo27: find a 42-cycle in a bipartite graph with 2^27 edges, which takes about 1.3 GB of RAM and runs single-threaded. The 42 sorted nonces are embedded in the block header, the header is Blake3-hashed, and difficulty is the leading zero bits on that hash. Nodes verify the proof in microseconds. Difficulty adjusts each block via an exponential moving average toward a 1-second target.
+Mining is Cuckatoo27: find a 42-cycle in a bipartite graph with 2^27 edges, which takes about 1.3 GB of RAM and runs single-threaded. The 42 sorted nonces are embedded in the block header, the header is Blake3-hashed, and difficulty is the leading zero bits on that hash. Nodes verify the proof in microseconds. Difficulty adjusts every 40 blocks via an exponential moving average toward a 1-second target.
 
 The base difficulty pays 1 Vess per block. For every bit beyond 10, the reward doubles:
 

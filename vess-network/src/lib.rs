@@ -32,6 +32,11 @@ pub const ENCRYPTED_DATA: u8 = 0x00;
 
 pub const PROTOCOL_VERSION: u32 = 2;
 
+/// Decoder caps — prevent memory-DoS from untrusted lengths.
+pub const MAX_SYNC_CHUNK_IDS: usize = 20_000;
+pub const MAX_GET_PEERS: usize = 1_000;
+pub const MAX_PEER_ANNOUNCE_IP_LEN: usize = 64;
+
 #[derive(Debug, Clone)]
 pub enum GossipMessage {
     Payment(VessPayment),
@@ -155,16 +160,20 @@ impl GossipMessage {
             }
             TAG_PEER_ANNOUNCE => {
                 let id = read_fixed(payload, &mut pos)?;
+                if payload.len() < pos + 2 { return None; }
                 let port = u16::from_le_bytes(payload[pos..pos+2].try_into().ok()?); pos += 2;
                 let ip_bytes = read_bytes(payload, &mut pos)?;
+                if ip_bytes.len() > MAX_PEER_ANNOUNCE_IP_LEN { return None; }
                 let ip_str = std::str::from_utf8(&ip_bytes).ok()?;
                 let addr = format!("{}:{}", ip_str, port).parse().ok()?;
                 Some(GossipMessage::PeerAnnounce(id, addr))
             }
             TAG_PING => {
+                if payload.len() < 4 { return None; }
                 Some(GossipMessage::Ping(u32::from_le_bytes(payload[..4].try_into().ok()?)))
             }
             TAG_PONG => {
+                if payload.len() < 4 { return None; }
                 Some(GossipMessage::Pong(u32::from_le_bytes(payload[..4].try_into().ok()?)))
             }
             TAG_STATE_SYNC_REQ => {
@@ -173,6 +182,7 @@ impl GossipMessage {
             TAG_STATE_SYNC_CHUNK => {
                 let start = read_u64(payload, &mut pos)?;
                 let count = read_u32(payload, &mut pos)? as usize;
+                if count > MAX_SYNC_CHUNK_IDS { return None; }
                 let mut ids = Vec::with_capacity(count);
                 for _ in 0..count { ids.push(read_fixed(payload, &mut pos)?); }
                 Some(GossipMessage::StateSyncChunk(start, ids))
@@ -189,6 +199,7 @@ impl GossipMessage {
                 Some(GossipMessage::Introduce(id, addr))
             }
             TAG_HOLE_PUNCH => {
+                if payload.len() < 4 { return None; }
                 Some(GossipMessage::HolePunch(u32::from_le_bytes(payload[..4].try_into().ok()?)))
             }
             TAG_STEM_RELAY => {
@@ -263,6 +274,7 @@ impl RpcResponse {
             RPC_SUBMIT_RESP => Some(RpcResponse::Submit(payload.first()? != &0)),
             RPC_GET_PEERS_RESP => {
                 let count = read_u32(payload, &mut pos)? as usize;
+                if count > MAX_GET_PEERS { return None; }
                 let mut peers = Vec::with_capacity(count);
                 for _ in 0..count {
                     let id = read_fixed(payload, &mut pos)?;
@@ -352,6 +364,7 @@ impl Network {
         let mut p = Vec::new();
         p.extend_from_slice(&self.my_node_id());
         p.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
+        write_bytes(&mut p, &self.dsa_pk);  // needed for signature verification
         p.extend_from_slice(&self.kem_pk);
         self.sessions.push(Session { addr, node_id: None, session_key: [0u8; 32], peer_version: 0, reported_addr: None, nonce_ctr: 0 });
         frame(HANDSHAKE_INIT, &p)
@@ -360,34 +373,51 @@ impl Network {
     pub fn handle_handshake(&mut self, addr: SocketAddr, tag: u8, payload: &[u8]) -> Option<Vec<u8>> {
         match tag {
             HANDSHAKE_INIT => {
+                // Format: node_id(32) + version(4) + dsa_pk(variable) + kem_pk(800)
                 if payload.len() <= 36 { return None; }
                 let peer_id: NodeId = payload[..32].try_into().ok()?;
                 let peer_ver = u32::from_le_bytes(payload[32..36].try_into().ok()?);
                 if peer_ver != PROTOCOL_VERSION { return None; }
-                let ekem_raw = &payload[36..];
+                let mut pos = 36;
+                let peer_pk = read_bytes(payload, &mut pos)?;
+                // Verify the peer_id is a valid commitment to the pubkey
+                if node_id(&peer_pk) != peer_id { return None; }
+                let ekem_raw = &payload[pos..];
                 let (ct_bytes, ss_bytes) = kem_encapsulate(ekem_raw)?;
-                let sig = dsa_sign(&self.dsa_sk, &payload[..32])?;
+                // Sign the full transcript: both node ids + initiator pubkey + KEM pk + ciphertext.
+                let my_id = self.my_node_id();
+                let transcript = blake3_hash_multi(&[&peer_id, &my_id, &peer_pk, ekem_raw, &ct_bytes]);
+                let sig = dsa_sign(&self.dsa_sk, &transcript)?;
                 // Canonical ordering: both sides derive the same key
-                let (a, b) = if peer_id < self.my_node_id() { (peer_id, self.my_node_id()) } else { (self.my_node_id(), peer_id) };
+                let (a, b) = if peer_id < my_id { (peer_id, my_id) } else { (my_id, peer_id) };
                 let session_key = blake3_hash_multi(&[&ss_bytes, &a, &b]);
                 let mut resp = Vec::new();
-                resp.extend_from_slice(&self.my_node_id());
+                resp.extend_from_slice(&my_id);
                 resp.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
+                write_bytes(&mut resp, &self.dsa_pk);
                 write_bytes(&mut resp, &sig);
                 write_bytes(&mut resp, &ct_bytes);
                 self.sessions.push(Session { addr, node_id: Some(peer_id), session_key, peer_version: peer_ver, reported_addr: None, nonce_ctr: 0 });
                 Some(frame(HANDSHAKE_RESP, &resp))
             }
             HANDSHAKE_RESP => {
+                // Format: node_id(32) + version(4) + dsa_pk(variable) + sig(variable) + ct(768)
                 if payload.len() < 36 { return None; }
                 let peer_id: NodeId = payload[..32].try_into().ok()?;
                 let peer_ver = u32::from_le_bytes(payload[32..36].try_into().ok()?);
                 if peer_ver != PROTOCOL_VERSION { return None; }
                 let mut pos = 36;
-                let _sig = read_bytes(payload, &mut pos)?;
+                let peer_pk = read_bytes(payload, &mut pos)?;
+                // Verify the peer_id is a valid commitment to the pubkey
+                if node_id(&peer_pk) != peer_id { return None; }
+                let sig = read_bytes(payload, &mut pos)?;
                 let ct_bytes = read_bytes(payload, &mut pos)?;
+                // Verify the responder's signature over the full transcript.
                 let ss_bytes = kem_decapsulate(&ct_bytes, &self.kem_sk)?;
-                let (a, b) = if peer_id < self.my_node_id() { (peer_id, self.my_node_id()) } else { (self.my_node_id(), peer_id) };
+                let my_id = self.my_node_id();
+                let transcript = blake3_hash_multi(&[&my_id, &peer_id, &self.dsa_pk, &self.kem_pk, &ct_bytes]);
+                if !dsa_verify(&peer_pk, &transcript, &sig) { return None; }
+                let (a, b) = if peer_id < my_id { (peer_id, my_id) } else { (my_id, peer_id) };
                 let session_key = blake3_hash_multi(&[&ss_bytes, &a, &b]);
                 if let Some(s) = self.session_by_addr_mut(&addr) {
                     s.node_id = Some(peer_id);

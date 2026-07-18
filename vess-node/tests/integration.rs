@@ -3,7 +3,6 @@ mod integration {
     use std::net::UdpSocket;
     use std::thread;
     use std::time::Duration;
-    use pqcrypto_traits::sign::{PublicKey as _, SecretKey as _};
     use vess_crypto::*;
     use vess_network::{self, GossipMessage};
     use vess_node::{Node, NatType};
@@ -64,7 +63,7 @@ mod integration {
         let (mut n1, _s1) = start_node_at("127.0.0.1:19882", "vess-db-blockmine");
         let (pk, sk) = dsa_generate();
         let oh = dsa_pubkey_hash(&pk);
-        let v = mine_coins(&mut n1, oh, pk.as_bytes(), sk.as_bytes());
+        let v = mine_coins(&mut n1, oh, &pk, &sk);
         assert!(v.amount > 0, "coinbase must have value");
         assert!(n1.check(&v.vess_id()), "coinbase output must be spendable");
     }
@@ -74,7 +73,7 @@ mod integration {
         let (mut node, _sock) = start_node_at("127.0.0.1:19883", "vess-db-duplicate-block");
         let (pk, sk) = dsa_generate();
         let oh = dsa_pubkey_hash(&pk);
-        let coin = mine_coins(&mut node, oh, pk.as_bytes(), sk.as_bytes());
+        let coin = mine_coins(&mut node, oh, &pk, &sk);
         let block = node.pending_blocks.last().cloned().expect("mined block recorded for gossip");
         let count_before = node.utxo_count();
         let root_before = node.merkle();
@@ -127,7 +126,7 @@ mod integration {
         let oh = dsa_pubkey_hash(&pk);
         let coin = {
             let mut node = Node::new_test_at(addr, db);
-            mine_coins(&mut node, oh, pk.as_bytes(), sk.as_bytes())
+            mine_coins(&mut node, oh, &pk, &sk)
         };
 
         let recovered = Node::new_test_at(addr, db);
@@ -149,7 +148,13 @@ mod integration {
         n1.needs_sync = false; n2.needs_sync = false;
         let (pk, sk) = dsa_generate();
         let oh = dsa_pubkey_hash(&pk);
-        for _ in 0..3 { mine_coins(&mut n1, oh, pk.as_bytes(), sk.as_bytes()); mine_coins(&mut n2, oh, pk.as_bytes(), sk.as_bytes()); }
+        // Mine and exchange blocks so both nodes converge to the same state.
+        for _ in 0..3 {
+            mine_coins(&mut n1, oh, &pk, &sk);
+            mine_coins(&mut n2, oh, &pk, &sk);
+            // Exchange blocks between nodes
+            for _ in 0..2 { thread::sleep(Duration::from_millis(10)); cycle_node(&mut n1, &s1); cycle_node(&mut n2, &s2); }
+        }
         assert!(n1.merkle() != [0u8; 32], "at least one block mined");
         assert_eq!(n1.merkle(), n2.merkle(), "merkle roots match");
     }
@@ -175,13 +180,13 @@ mod integration {
         let (mut n1, _s1) = start_node_at("127.0.0.1:19892", "vess-db-dblspend");
         let (pk, sk) = dsa_generate();
         let oh = dsa_pubkey_hash(&pk);
-        let v = mine_coins(&mut n1, oh, pk.as_bytes(), sk.as_bytes());
+        let v = mine_coins(&mut n1, oh, &pk, &sk);
         let (pk2, sk2) = dsa_generate();
         let oh2 = dsa_pubkey_hash(&pk2);
         let out_v = Vess { variant: VessVariant::Output, amount: v.amount, owner_hash: oh2, timestamp: 0,
-            nonce: 0, salt: random_bytes(), pubkey: pk2.as_bytes().to_vec(), spend_key: sk2.as_bytes().to_vec(), proof: vec![], spend_condition: None };
+            nonce: 0, salt: random_bytes(), pubkey: pk2.clone(), spend_key: sk2.clone(), spend_condition: None };
         let mut spend = VessPayment { payment_id: [0u8;32], inputs: vec![v], outputs: vec![out_v], timestamp: 0, sigs: vec![], preimages: vec![] };
-        spend.compute(); spend.sigs = vec![dsa_sign(&sk, &spend.payment_id)];
+        spend.compute(); spend.sigs = vec![dsa_sign(&sk, &spend.payment_id).unwrap()];
         assert!(n1.submit(spend.clone()), "first submit succeeds");
         assert!(!n1.submit(spend.clone()), "dup submit fails");
     }
@@ -191,10 +196,10 @@ mod integration {
         let (mut n1, _s1) = start_node_at("127.0.0.1:19894", "vess-db-devsub");
         let (pk, sk) = dsa_generate();
         let oh = dsa_pubkey_hash(&pk);
-        mine_coins(&mut n1, oh, pk.as_bytes(), sk.as_bytes());
+        mine_coins(&mut n1, oh, &pk, &sk);
         // Async mint rejected
         let fake = Vess { variant: VessVariant::Mint, amount: 1, owner_hash: DEV_PUBKEY_HASH, timestamp: 0,
-            nonce: 0, salt: [0u8;32], pubkey: vec![], spend_key: vec![], proof: vec![], spend_condition: None };
+            nonce: 0, salt: [0u8;32], pubkey: vec![], spend_key: vec![], spend_condition: None };
         let mut fp = VessPayment { payment_id: [0u8;32], inputs: vec![], outputs: vec![fake], timestamp: 0, sigs: vec![], preimages: vec![] };
         fp.compute();
         assert!(!n1.submit(fp), "async mint rejected");
@@ -205,14 +210,14 @@ mod integration {
         let (mut n1, _s1) = start_node_at("127.0.0.1:19896", "vess-db-xfer");
         let (pk, sk) = dsa_generate();
         let oh = dsa_pubkey_hash(&pk);
-        let v = mine_coins(&mut n1, oh, pk.as_bytes(), sk.as_bytes());
+        let v = mine_coins(&mut n1, oh, &pk, &sk);
         assert!(n1.check(&v.vess_id()), "mined coin in index");
         let (pk2, sk2) = dsa_generate();
         let oh2 = dsa_pubkey_hash(&pk2);
         let out_v = Vess { variant: VessVariant::Output, amount: v.amount, owner_hash: oh2, timestamp: 0,
-            nonce: 0, salt: random_bytes(), pubkey: pk2.as_bytes().to_vec(), spend_key: sk2.as_bytes().to_vec(), proof: vec![], spend_condition: None };
+            nonce: 0, salt: random_bytes(), pubkey: pk2.clone(), spend_key: sk2.clone(), spend_condition: None };
         let mut spend = VessPayment { payment_id: [0u8;32], inputs: vec![v], outputs: vec![out_v], timestamp: 0, sigs: vec![], preimages: vec![] };
-        spend.compute(); spend.sigs = vec![dsa_sign(&sk, &spend.payment_id)];
+        spend.compute(); spend.sigs = vec![dsa_sign(&sk, &spend.payment_id).unwrap()];
         assert!(n1.submit(spend.clone()), "spend succeeds");
         n1.flush_limbo();
         assert!(!n1.check(&spend.inputs[0].vess_id()), "spent input removed");
@@ -235,7 +240,7 @@ mod integration {
         let (pk, sk) = dsa_generate();
         let oh = dsa_pubkey_hash(&pk);
         // Mine a block on n1 — includes coinbase for oh
-        let v = mine_coins(&mut n1, oh, pk.as_bytes(), sk.as_bytes());
+        let v = mine_coins(&mut n1, oh, &pk, &sk);
         assert!(n1.check(&v.vess_id()), "n1 has coinbase");
 
         // Relay n1's outgoing gossip (the block) to n2
@@ -323,7 +328,7 @@ mod integration {
         let (mut node, _s) = start_node_at("127.0.0.1:19920", "vess-db-reject-conflicting");
         let (pk, sk) = dsa_generate();
         let oh = dsa_pubkey_hash(&pk);
-        let v = mine_coins(&mut node, oh, pk.as_bytes(), sk.as_bytes());
+        let v = mine_coins(&mut node, oh, &pk, &sk);
         assert!(node.check(&v.vess_id()), "coin exists");
 
         // Build two payments that both spend the same input
@@ -331,22 +336,22 @@ mod integration {
         let oh2 = dsa_pubkey_hash(&pk2);
         let out1 = Vess { variant: VessVariant::Output, amount: v.amount, owner_hash: oh2,
             timestamp: 0, nonce: 0, salt: random_bytes(),
-            pubkey: pk2.as_bytes().to_vec(), spend_key: sk2.as_bytes().to_vec(), proof: vec![], spend_condition: None };
+            pubkey: pk2.clone(), spend_key: sk2.clone(), spend_condition: None };
         let out2 = Vess { variant: VessVariant::Output, amount: v.amount, owner_hash: oh2,
             timestamp: 0, nonce: 0, salt: random_bytes(),
-            pubkey: pk2.as_bytes().to_vec(), spend_key: sk2.as_bytes().to_vec(), proof: vec![], spend_condition: None };
+            pubkey: pk2.clone(), spend_key: sk2.clone(), spend_condition: None };
         let mut p1 = VessPayment { payment_id: [0u8;32], inputs: vec![v.clone()], outputs: vec![out1], timestamp: 0, sigs: vec![], preimages: vec![] };
-        p1.compute(); p1.sigs = vec![dsa_sign(&sk, &p1.payment_id)];
+        p1.compute(); p1.sigs = vec![dsa_sign(&sk, &p1.payment_id).unwrap()];
         let mut p2 = VessPayment { payment_id: [0u8;32], inputs: vec![v.clone()], outputs: vec![out2], timestamp: 0, sigs: vec![], preimages: vec![] };
-        p2.compute(); p2.sigs = vec![dsa_sign(&sk, &p2.payment_id)];
+        p2.compute(); p2.sigs = vec![dsa_sign(&sk, &p2.payment_id).unwrap()];
 
         // Build a block manually with both conflicting payments (bypass limbo)
         // Use a DIFFERENT owner_hash for the new coinbase so IDs don't collide
         let (pk3, sk3) = dsa_generate();
         let oh3 = dsa_pubkey_hash(&pk3);
         let coinbase_out = Vess { variant: VessVariant::Mint, amount: 1, owner_hash: oh3,
-            timestamp: 0, nonce: 0, salt: random_bytes(), pubkey: pk3.as_bytes().to_vec(),
-            spend_key: sk3.as_bytes().to_vec(), proof: vec![], spend_condition: None };
+            timestamp: 0, nonce: 0, salt: random_bytes(), pubkey: pk3.clone(),
+            spend_key: sk3.clone(), spend_condition: None };
         let mut cb = VessPayment { payment_id: [0u8;32], inputs: vec![], outputs: vec![coinbase_out], timestamp: 0, sigs: vec![], preimages: vec![] };
         cb.compute();
         let cb_id = cb.outputs[0].vess_id();
@@ -358,6 +363,7 @@ mod integration {
             version: 1, parents: node.tip_hashes.clone(), timestamp: 0, difficulty_bits: 9, nonce: 0,
             payment_merkle: merkle_root(&all_ids),
             state_merkle: [0u8; 32],
+            proof: Vec::new(), // test mode skips PoW verification
             coinbase: cb, payments: vec![p1, p2],
         };
         assert!(!node.process_block(&block), "conflicting block rejected");
@@ -374,7 +380,7 @@ mod integration {
         let oh = dsa_pubkey_hash(&pk);
 
         // Mine a legit block to have a spendable coin
-        let v = mine_coins(&mut node, oh, pk.as_bytes(), sk.as_bytes());
+        let v = mine_coins(&mut node, oh, &pk, &sk);
         assert!(node.check(&v.vess_id()), "coin exists");
 
         // Build a valid spend payment
@@ -382,22 +388,23 @@ mod integration {
         let oh2 = dsa_pubkey_hash(&pk2);
         let out_v = Vess { variant: VessVariant::Output, amount: v.amount, owner_hash: oh2,
             timestamp: 0, nonce: 0, salt: random_bytes(),
-            pubkey: pk2.as_bytes().to_vec(), spend_key: vec![], proof: vec![], spend_condition: None };
+            pubkey: pk2.clone(), spend_key: vec![], spend_condition: None };
         let mut spend = VessPayment { payment_id: [0u8;32], inputs: vec![v.clone()], outputs: vec![out_v.clone()], timestamp: 0, sigs: vec![], preimages: vec![] };
-        spend.compute(); spend.sigs = vec![dsa_sign(&sk, &spend.payment_id)];
+        spend.compute(); spend.sigs = vec![dsa_sign(&sk, &spend.payment_id).unwrap()];
 
         // Build a block with deliberately wrong state_merkle
         let (pk3, sk3) = dsa_generate();
         let oh3 = dsa_pubkey_hash(&pk3);
         let coinbase_out = Vess { variant: VessVariant::Mint, amount: 1, owner_hash: oh3,
-            timestamp: 0, nonce: 0, salt: random_bytes(), pubkey: pk3.as_bytes().to_vec(),
-            spend_key: sk3.as_bytes().to_vec(), proof: vec![], spend_condition: None };
+            timestamp: 0, nonce: 0, salt: random_bytes(), pubkey: pk3.clone(),
+            spend_key: sk3.clone(), spend_condition: None };
         let mut cb = VessPayment { payment_id: [0u8;32], inputs: vec![], outputs: vec![coinbase_out], timestamp: 0, sigs: vec![], preimages: vec![] };
         cb.compute();
         let fake_block = VessBlock {
             version: 1, parents: node.tip_hashes.clone(), timestamp: 0, difficulty_bits: 9, nonce: 0,
             payment_merkle: merkle_root(&[cb.payment_id, spend.payment_id]),
             state_merkle: [0xFFu8; 32],
+            proof: vec![0u32; cuckoo::CYCLE_LENGTH],
             coinbase: cb, payments: vec![spend.clone()],
         };
         assert!(!node.process_block(&fake_block), "wrong state root rejected");
@@ -414,7 +421,7 @@ mod integration {
         // Build tip A: one block at diff=9 (work=512)
         let (pk_a, sk_a) = dsa_generate();
         let oh_a = dsa_pubkey_hash(&pk_a);
-        let coins_a = mine_coins(&mut node, oh_a, pk_a.as_bytes(), sk_a.as_bytes());
+        let coins_a = mine_coins(&mut node, oh_a, &pk_a, &sk_a);
         let tip_a_hash = node.tip_hashes[0];
         let work_a = node.cumulative_work(&tip_a_hash);
         assert!(work_a > 0, "chain A has work");
@@ -423,25 +430,27 @@ mod integration {
         let (pk_b, sk_b) = dsa_generate();
         let oh_b = dsa_pubkey_hash(&pk_b);
         let cb1_out = Vess { variant: VessVariant::Mint, amount: 2, owner_hash: oh_b,
-            timestamp: 0, nonce: 0, salt: random_bytes(), pubkey: pk_b.as_bytes().to_vec(),
-            spend_key: sk_b.as_bytes().to_vec(), proof: vec![], spend_condition: None };
+            timestamp: 0, nonce: 0, salt: random_bytes(), pubkey: pk_b.clone(),
+            spend_key: sk_b.clone(), spend_condition: None };
         let cb1_id = cb1_out.vess_id();
         let mut cb1 = VessPayment { payment_id: [0u8;32], inputs: vec![], outputs: vec![cb1_out.clone()], timestamp: 0, sigs: vec![], preimages: vec![] };
         cb1.compute();
         let block1 = VessBlock { version: 1, parents: vec![], timestamp: 1000, difficulty_bits: 10, nonce: 0,
             payment_merkle: merkle_root(&[cb1.payment_id]), state_merkle: [0u8; 32],
+            proof: vec![0u32; cuckoo::CYCLE_LENGTH],
             coinbase: cb1, payments: vec![] };
         node.process_block(&block1);
 
         let (pk_b2, sk_b2) = dsa_generate();
         let oh_b2 = dsa_pubkey_hash(&pk_b2);
         let cb2_out = Vess { variant: VessVariant::Mint, amount: 2, owner_hash: oh_b2,
-            timestamp: 0, nonce: 0, salt: random_bytes(), pubkey: pk_b2.as_bytes().to_vec(),
-            spend_key: sk_b2.as_bytes().to_vec(), proof: vec![], spend_condition: None };
+            timestamp: 0, nonce: 0, salt: random_bytes(), pubkey: pk_b2.clone(),
+            spend_key: sk_b2.clone(), spend_condition: None };
         let mut cb2 = VessPayment { payment_id: [0u8;32], inputs: vec![], outputs: vec![cb2_out], timestamp: 0, sigs: vec![], preimages: vec![] };
         cb2.compute();
         let block2 = VessBlock { version: 1, parents: vec![block1.header_hash()], timestamp: 2000, difficulty_bits: 10, nonce: 0,
             payment_merkle: merkle_root(&[cb2.payment_id]), state_merkle: [0u8; 32],
+            proof: vec![0u32; cuckoo::CYCLE_LENGTH],
             coinbase: cb2, payments: vec![] };
         node.process_block(&block2);
 
@@ -467,7 +476,7 @@ mod integration {
 
         // Mine DIFFICULTY_WINDOW blocks to trigger DAA
         for _ in 0..DIFFICULTY_WINDOW {
-            mine_coins(&mut node, oh, pk.as_bytes(), sk.as_bytes());
+            mine_coins(&mut node, oh, &pk, &sk);
         }
 
         // Difficulty should have been adjusted (may go up or down depending on timestamp deltas)
@@ -495,14 +504,14 @@ mod integration {
         // Mine coin and build a payment
         let (pk, sk) = dsa_generate();
         let oh = dsa_pubkey_hash(&pk);
-        let v = mine_coins(&mut n1, oh, pk.as_bytes(), sk.as_bytes());
+        let v = mine_coins(&mut n1, oh, &pk, &sk);
         let (pk2, _sk2) = dsa_generate();
         let oh2 = dsa_pubkey_hash(&pk2);
         let out_v = Vess { variant: VessVariant::Output, amount: v.amount, owner_hash: oh2,
-            timestamp: 0, nonce: 0, salt: random_bytes(), pubkey: pk2.as_bytes().to_vec(),
-            spend_key: vec![], proof: vec![], spend_condition: None };
+            timestamp: 0, nonce: 0, salt: random_bytes(), pubkey: pk2.clone(),
+            spend_key: vec![], spend_condition: None };
         let mut spend = VessPayment { payment_id: [0u8;32], inputs: vec![v], outputs: vec![out_v], timestamp: 0, sigs: vec![], preimages: vec![] };
-        spend.compute(); spend.sigs = vec![dsa_sign(&sk, &spend.payment_id)];
+        spend.compute(); spend.sigs = vec![dsa_sign(&sk, &spend.payment_id).unwrap()];
 
         // Submit — payment enters limbo
         assert!(n1.submit(spend.clone()), "payment submitted");
@@ -537,7 +546,7 @@ mod integration {
         let preimage = blake3_hash(b"secret");
         let hashlock = blake3_hash(&preimage);
 
-        let v = mine_coins(&mut node, oh, pk.as_bytes(), sk.as_bytes());
+        let v = mine_coins(&mut node, oh, &pk, &sk);
 
         // Lock coins into a hashlocked output
         let (pk2, sk2) = dsa_generate();
@@ -545,7 +554,7 @@ mod integration {
         let out_v = Vess {
             variant: VessVariant::Output, amount: v.amount, owner_hash: oh2,
             timestamp: 0, nonce: 0, salt: random_bytes(),
-            pubkey: Vec::new(), spend_key: Vec::new(), proof: vec![],
+            pubkey: Vec::new(), spend_key: Vec::new(),
             spend_condition: Some(SpendCondition { hashlock, expires_at: 0 }),
         };
         let mut lock = VessPayment {
@@ -553,30 +562,30 @@ mod integration {
             timestamp: 0, sigs: vec![], preimages: vec![None],
         };
         lock.compute();
-        lock.sigs.push(dsa_sign(&sk, &lock.payment_id));
+        lock.sigs.push(dsa_sign(&sk, &lock.payment_id).unwrap());
         assert!(node.submit(lock), "lock with hashlock output must succeed");
 
         // Mine to confirm the locked output
-        let second_input = mine_coins(&mut node, oh, pk.as_bytes(), sk.as_bytes());
+        let second_input = mine_coins(&mut node, oh, &pk, &sk);
 
         // Now try to SPEND the hashlocked output with correct preimage
         let mut out_spendable = out_v.clone();
-        out_spendable.pubkey = pk2.as_bytes().to_vec();
-        out_spendable.spend_key = sk2.as_bytes().to_vec();
+        out_spendable.pubkey = pk2.clone();
+        out_spendable.spend_key = sk2.clone();
         let mut good = VessPayment {
             payment_id: [0u8;32],
             inputs: vec![out_spendable.clone()],
             outputs: vec![Vess {
                 variant: VessVariant::Output, amount: v.amount, owner_hash: oh,
                 timestamp: 0, nonce: 0, salt: random_bytes(),
-                pubkey: Vec::new(), spend_key: Vec::new(), proof: vec![],
+                pubkey: Vec::new(), spend_key: Vec::new(),
                 spend_condition: None,
             }],
             timestamp: 0, sigs: vec![],
             preimages: vec![Some(preimage)],
         };
         good.compute();
-        good.sigs.push(dsa_sign(&sk2, &good.payment_id));
+        good.sigs.push(dsa_sign(&sk2, &good.payment_id).unwrap());
         assert!(node.submit(good), "correct preimage must pass");
 
         // Wrong preimage must fail (different payment)
@@ -584,7 +593,7 @@ mod integration {
         let out_v2 = Vess {
             variant: VessVariant::Output, amount: second_input.amount, owner_hash: oh2,
             timestamp: 0, nonce: 0, salt: random_bytes(),
-            pubkey: Vec::new(), spend_key: Vec::new(), proof: vec![],
+            pubkey: Vec::new(), spend_key: Vec::new(),
             spend_condition: Some(SpendCondition { hashlock, expires_at: 0 }),
         };
         let mut lock2 = VessPayment {
@@ -592,27 +601,27 @@ mod integration {
             timestamp: 0, sigs: vec![], preimages: vec![None],
         };
         lock2.compute();
-        lock2.sigs.push(dsa_sign(&sk, &lock2.payment_id));
+        lock2.sigs.push(dsa_sign(&sk, &lock2.payment_id).unwrap());
         assert!(node.submit(lock2), "second lock must succeed");
-        let _ = mine_coins(&mut node, oh, pk.as_bytes(), sk.as_bytes());
+        let _ = mine_coins(&mut node, oh, &pk, &sk);
 
         let mut bad_out = out_v2.clone();
-        bad_out.pubkey = pk2.as_bytes().to_vec();
-        bad_out.spend_key = sk2.as_bytes().to_vec();
+        bad_out.pubkey = pk2.clone();
+        bad_out.spend_key = sk2.clone();
         let mut bad = VessPayment {
             payment_id: [0u8;32],
             inputs: vec![bad_out],
             outputs: vec![Vess {
                 variant: VessVariant::Output, amount: v.amount, owner_hash: oh,
                 timestamp: 0, nonce: 0, salt: random_bytes(),
-                pubkey: Vec::new(), spend_key: Vec::new(), proof: vec![],
+                pubkey: Vec::new(), spend_key: Vec::new(),
                 spend_condition: None,
             }],
             timestamp: 0, sigs: vec![],
             preimages: vec![Some(wrong_hash)],
         };
         bad.compute();
-        bad.sigs.push(dsa_sign(&sk2, &bad.payment_id));
+        bad.sigs.push(dsa_sign(&sk2, &bad.payment_id).unwrap());
         assert!(!node.submit(bad), "wrong preimage must be rejected");
     }
 
@@ -622,7 +631,7 @@ mod integration {
         let (mut node, _s) = start_node_at("127.0.0.1:19941", "vess-db-expiry");
         let (pk, sk) = dsa_generate();
         let oh = dsa_pubkey_hash(&pk);
-        let v = mine_coins(&mut node, oh, pk.as_bytes(), sk.as_bytes());
+        let v = mine_coins(&mut node, oh, &pk, &sk);
 
         let preimage = blake3_hash(b"some-secret");
         let hashlock = blake3_hash(&preimage);
@@ -637,7 +646,7 @@ mod integration {
         let out_active = Vess {
             variant: VessVariant::Output, amount: v.amount, owner_hash: oh2,
             timestamp: 0, nonce: 0, salt: random_bytes(),
-            pubkey: Vec::new(), spend_key: Vec::new(), proof: vec![],
+            pubkey: Vec::new(), spend_key: Vec::new(),
             spend_condition: Some(SpendCondition { hashlock, expires_at: future }),
         };
         let mut lock = VessPayment {
@@ -645,34 +654,34 @@ mod integration {
             timestamp: 0, sigs: vec![], preimages: vec![None],
         };
         lock.compute();
-        lock.sigs.push(dsa_sign(&sk, &lock.payment_id));
+        lock.sigs.push(dsa_sign(&sk, &lock.payment_id).unwrap());
         assert!(node.submit(lock), "not-yet-expired must submit");
-        let _ = mine_coins(&mut node, oh, pk.as_bytes(), sk.as_bytes());
+        let _ = mine_coins(&mut node, oh, &pk, &sk);
 
         // Preimage works before expiry
         let mut ok_spend = VessPayment {
             payment_id: [0u8;32],
-            inputs: vec![{ let mut o = out_active.clone(); o.pubkey = pk2.as_bytes().to_vec(); o.spend_key = sk2.as_bytes().to_vec(); o }],
+            inputs: vec![{ let mut o = out_active.clone(); o.pubkey = pk2.clone(); o.spend_key = sk2.clone(); o }],
             outputs: vec![Vess {
                 variant: VessVariant::Output, amount: v.amount, owner_hash: oh,
                 timestamp: 0, nonce: 0, salt: random_bytes(),
-                pubkey: Vec::new(), spend_key: Vec::new(), proof: vec![],
+                pubkey: Vec::new(), spend_key: Vec::new(),
                 spend_condition: None,
             }],
             timestamp: 0, sigs: vec![],
             preimages: vec![Some(preimage)],
         };
         ok_spend.compute();
-        ok_spend.sigs.push(dsa_sign(&sk2, &ok_spend.payment_id));
+        ok_spend.sigs.push(dsa_sign(&sk2, &ok_spend.payment_id).unwrap());
         assert!(node.submit(ok_spend), "preimage must work before expiry");
 
         // ── Test 2: Expired — preimage fails ──
         let expired = now.saturating_sub(3600);
-        let v2 = mine_coins(&mut node, oh, pk.as_bytes(), sk.as_bytes());
+        let v2 = mine_coins(&mut node, oh, &pk, &sk);
         let out_exp = Vess {
             variant: VessVariant::Output, amount: v2.amount, owner_hash: oh2,
             timestamp: 0, nonce: 0, salt: random_bytes(),
-            pubkey: Vec::new(), spend_key: Vec::new(), proof: vec![],
+            pubkey: Vec::new(), spend_key: Vec::new(),
             spend_condition: Some(SpendCondition { hashlock, expires_at: expired }),
         };
         let mut lock_exp = VessPayment {
@@ -680,25 +689,25 @@ mod integration {
             timestamp: 0, sigs: vec![], preimages: vec![None],
         };
         lock_exp.compute();
-        lock_exp.sigs.push(dsa_sign(&sk, &lock_exp.payment_id));
+        lock_exp.sigs.push(dsa_sign(&sk, &lock_exp.payment_id).unwrap());
         assert!(node.submit(lock_exp), "expired lock must submit");
-        let _ = mine_coins(&mut node, oh, pk.as_bytes(), sk.as_bytes());
+        let _ = mine_coins(&mut node, oh, &pk, &sk);
 
         // Try spending with correct preimage after expiry — must fail
         let mut dead = VessPayment {
             payment_id: [0u8;32],
-            inputs: vec![{ let mut o = out_exp.clone(); o.pubkey = pk2.as_bytes().to_vec(); o.spend_key = sk2.as_bytes().to_vec(); o }],
+            inputs: vec![{ let mut o = out_exp.clone(); o.pubkey = pk2.clone(); o.spend_key = sk2.clone(); o }],
             outputs: vec![Vess {
                 variant: VessVariant::Output, amount: v2.amount, owner_hash: oh,
                 timestamp: 0, nonce: 0, salt: random_bytes(),
-                pubkey: Vec::new(), spend_key: Vec::new(), proof: vec![],
+                pubkey: Vec::new(), spend_key: Vec::new(),
                 spend_condition: None,
             }],
             timestamp: 0, sigs: vec![],
             preimages: vec![Some(preimage)],
         };
         dead.compute();
-        dead.sigs.push(dsa_sign(&sk2, &dead.payment_id));
+        dead.sigs.push(dsa_sign(&sk2, &dead.payment_id).unwrap());
         assert!(!node.submit(dead), "expired must reject even with preimage");
     }
 
@@ -707,11 +716,11 @@ mod integration {
         let (mut n1, _s1) = start_node_at("127.0.0.1:19951", "vess-db-emptysig");
         let (pk, sk) = dsa_generate();
         let oh = dsa_pubkey_hash(&pk);
-        let v = mine_coins(&mut n1, oh, pk.as_bytes(), sk.as_bytes());
+        let v = mine_coins(&mut n1, oh, &pk, &sk);
         let (pk2, _) = dsa_generate();
         let oh2 = dsa_pubkey_hash(&pk2);
         let out_v = Vess { variant: VessVariant::Output, amount: v.amount, owner_hash: oh2, timestamp: 0,
-            nonce: 0, salt: random_bytes(), pubkey: Vec::new(), spend_key: Vec::new(), proof: vec![], spend_condition: None };
+            nonce: 0, salt: random_bytes(), pubkey: Vec::new(), spend_key: Vec::new(), spend_condition: None };
         let mut spend = VessPayment { payment_id: [0u8;32], inputs: vec![v], outputs: vec![out_v],
             timestamp: 0, sigs: vec![], preimages: vec![None] };
         spend.compute();
@@ -724,17 +733,17 @@ mod integration {
         let (mut n1, _s1) = start_node_at("127.0.0.1:19952", "vess-db-wrongsig");
         let (pk, sk) = dsa_generate();
         let oh = dsa_pubkey_hash(&pk);
-        let v = mine_coins(&mut n1, oh, pk.as_bytes(), sk.as_bytes());
+        let v = mine_coins(&mut n1, oh, &pk, &sk);
         let (pk2, _) = dsa_generate();
         let oh2 = dsa_pubkey_hash(&pk2);
         let out_v = Vess { variant: VessVariant::Output, amount: v.amount, owner_hash: oh2, timestamp: 0,
-            nonce: 0, salt: random_bytes(), pubkey: Vec::new(), spend_key: Vec::new(), proof: vec![], spend_condition: None };
+            nonce: 0, salt: random_bytes(), pubkey: Vec::new(), spend_key: Vec::new(), spend_condition: None };
         let mut spend = VessPayment { payment_id: [0u8;32], inputs: vec![v], outputs: vec![out_v],
             timestamp: 0, sigs: vec![], preimages: vec![None] };
         spend.compute();
         // Sign with a different key — must be rejected
         let (_, wrong_sk) = dsa_generate();
-        spend.sigs = vec![dsa_sign(&wrong_sk, &spend.payment_id)];
+        spend.sigs = vec![dsa_sign(&wrong_sk, &spend.payment_id).unwrap()];
         assert!(!n1.submit(spend), "payment with wrong signature must be rejected");
     }
 
@@ -743,15 +752,15 @@ mod integration {
         let (mut n1, _s1) = start_node_at("127.0.0.1:19953", "vess-db-tamper");
         let (pk, sk) = dsa_generate();
         let oh = dsa_pubkey_hash(&pk);
-        let v = mine_coins(&mut n1, oh, pk.as_bytes(), sk.as_bytes());
+        let v = mine_coins(&mut n1, oh, &pk, &sk);
         let (pk2, _) = dsa_generate();
         let oh2 = dsa_pubkey_hash(&pk2);
         let out_v = Vess { variant: VessVariant::Output, amount: v.amount, owner_hash: oh2, timestamp: 0,
-            nonce: 0, salt: random_bytes(), pubkey: Vec::new(), spend_key: Vec::new(), proof: vec![], spend_condition: None };
+            nonce: 0, salt: random_bytes(), pubkey: Vec::new(), spend_key: Vec::new(), spend_condition: None };
         let mut spend = VessPayment { payment_id: [0u8;32], inputs: vec![v], outputs: vec![out_v],
             timestamp: 0, sigs: vec![], preimages: vec![None] };
         spend.compute();
-        spend.sigs = vec![dsa_sign(&sk, &spend.payment_id)];
+        spend.sigs = vec![dsa_sign(&sk, &spend.payment_id).unwrap()];
         // Tamper with payment_id after signing — sig no longer matches
         spend.payment_id[0] ^= 1;
         assert!(!n1.submit(spend), "payment with tampered id must be rejected");
@@ -794,7 +803,7 @@ mod integration {
         let (pk, sk) = dsa_generate();
         let oh = dsa_pubkey_hash(&pk);
         // Mine block on n1 — gossip to n2
-        mine_coins(&mut n1, oh, pk.as_bytes(), sk.as_bytes());
+        mine_coins(&mut n1, oh, &pk, &sk);
         // Simulate packet loss: only cycle n2 every other attempt
         for round in 0..20 {
             cycle_node(&mut n1, &s1);
