@@ -46,6 +46,12 @@ pub struct PacketReassembler {
     pending: HashMap<MessageId, PendingMessage>,
 }
 
+impl Default for PacketReassembler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PacketReassembler {
     pub fn new() -> Self {
         Self { pending: HashMap::new() }

@@ -168,7 +168,7 @@ fn find_cycle_compact(edges: &[(u32, u32)], alive: &[bool], cycle_len: usize) ->
     let mut visited_edge = vec![false; edges.len()];
     let mut path = Vec::new();
 
-    for (&start, _) in &adj {
+    for &start in adj.keys() {
         path.clear();
         visited_edge.fill(false);
         if dfs_cycle(start, start, 0, cycle_len, &adj, &mut visited_edge, &mut path) {

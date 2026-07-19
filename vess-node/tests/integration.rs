@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod integration {
-    use std::net::UdpSocket;
+    use std::net::{UdpSocket, SocketAddr};
     use std::thread;
     use std::time::Duration;
     use vess_crypto::*;
@@ -1047,6 +1047,86 @@ mod integration {
         assert!(!node.check(&alice_out_id), "Alice output never created (conflicted branch)");
         assert!(!node.check(&q_out_id), "Q output voided (spends conflicted output)");
         assert!(node.check(&coin_r_id), "bystander R still in state");
+    }
+
+    // ── MULTI-NODE DAG END-TO-END ──
+
+    #[test]
+    fn test_three_node_dag_merge() {
+        // Three nodes: n1 and n2 mine competing blocks, n3 merges both.
+        // All three converge on the same state merkle — this exercises
+        // gossip, dedup, multi-parent merge, and sync together.
+        let _ = std::fs::remove_dir_all("vess-db-3node-1");
+        let _ = std::fs::remove_dir_all("vess-db-3node-2");
+        let _ = std::fs::remove_dir_all("vess-db-3node-3");
+        let (mut n1, s1) = start_node_at("127.0.0.1:20501", "vess-db-3node-1");
+        let (mut n2, s2) = start_node_at("127.0.0.1:20502", "vess-db-3node-2");
+        let (mut n3, s3) = start_node_at("127.0.0.1:20503", "vess-db-3node-3");
+        let a2: SocketAddr = "127.0.0.1:20502".parse().unwrap();
+        let a3: SocketAddr = "127.0.0.1:20503".parse().unwrap();
+
+        // Full mesh handshake.
+        let i12 = n1.add_peer(a2); s1.send_to(&i12, a2).unwrap();
+        let i13 = n1.add_peer(a3); s1.send_to(&i13, a3).unwrap();
+        let i23 = n2.add_peer(a3); s2.send_to(&i23, a3).unwrap();
+        for _ in 0..6 {
+            thread::sleep(Duration::from_millis(5));
+            cycle_node(&mut n1, &s1); cycle_node(&mut n2, &s2); cycle_node(&mut n3, &s3);
+        }
+        n1.needs_sync = false; n2.needs_sync = false; n3.needs_sync = false;
+
+        // Mine genesis coin on n1; gossip to all.
+        let (pk, sk) = dsa_generate(); let oh = dsa_pubkey_hash(&pk);
+        mine_coins(&mut n1, oh, &pk, &sk);
+        for _ in 0..3 {
+            thread::sleep(Duration::from_millis(5));
+            cycle_node(&mut n1, &s1); cycle_node(&mut n2, &s2); cycle_node(&mut n3, &s3);
+        }
+        let genesis = n1.tip_hashes[0];
+
+        // n1 and n2 mine competing blocks on genesis (different miners).
+        let (pk1, sk1) = dsa_generate(); let oh1 = dsa_pubkey_hash(&pk1);
+        let (pk2, sk2) = dsa_generate(); let oh2 = dsa_pubkey_hash(&pk2);
+        let b1 = cb_block(vec![genesis], 1, oh1, &pk1, &sk1, vec![], 1000);
+        let b2 = cb_block(vec![genesis], 1, oh2, &pk2, &sk2, vec![], 1000);
+        let b1_cb = b1.coinbase.outputs[0].vess_id();
+        let b2_cb = b2.coinbase.outputs[0].vess_id();
+        assert!(n1.process_block(&b1), "n1 accepts b1");
+        assert!(n2.process_block(&b2), "n2 accepts b2");
+        // Directly inject into all nodes so both branches exist on all three.
+        assert!(n3.process_block(&b1), "n3 accepts b1");
+        assert!(n3.process_block(&b2), "n3 accepts b2");
+        assert!(n2.process_block(&b1), "n2 accepts b1");
+        assert!(n1.process_block(&b2), "n1 accepts b2");
+
+        // n3 mines a merge block referencing both b1 and b2.
+        let (pk3, sk3) = dsa_generate(); let oh3 = dsa_pubkey_hash(&pk3);
+        let b1_hash = b1.header_hash();
+        let b2_hash = b2.header_hash();
+        let m = cb_block(vec![b1_hash, b2_hash], 1, oh3, &pk3, &sk3, vec![], 2000);
+        let m_cb = m.coinbase.outputs[0].vess_id();
+        assert!(n3.process_block(&m), "n3 accepts merge block");
+        // Directly inject merge into n1 and n2.
+        assert!(n1.process_block(&m), "n1 accepts merge");
+        assert!(n2.process_block(&m), "n2 accepts merge");
+        let m_hash = m.header_hash();
+
+        // All must converge to the same state.
+        let r1 = n1.merkle();
+        let r2 = n2.merkle();
+        let r3 = n3.merkle();
+        assert_eq!(r1, r2, "n1 == n2");
+        assert_eq!(r2, r3, "n2 == n3");
+
+        // All coinbases present in UTXO set.
+        assert!(n1.check(&b1_cb) && n2.check(&b1_cb) && n3.check(&b1_cb), "b1 coinbase on all nodes");
+        assert!(n1.check(&b2_cb) && n2.check(&b2_cb) && n3.check(&b2_cb), "b2 coinbase on all nodes");
+        assert!(n1.check(&m_cb) && n2.check(&m_cb) && n3.check(&m_cb), "merge coinbase on all nodes");
+
+        // Tip hashes should all point to the merge block.
+        assert!(n1.tip_hashes.contains(&m_hash), "n1 tip is merge");
+        assert!(n2.tip_hashes.contains(&m_hash), "n2 tip is merge");
+        assert!(n3.tip_hashes.contains(&m_hash), "n3 tip is merge");
     }
 }
 

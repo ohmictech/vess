@@ -75,7 +75,7 @@ impl Wallet {
     pub fn connected(&self) -> bool {
         self.node_addr
             .and_then(|a| self.network.session_by_addr(&a))
-            .map(|s| s.session_key != [0u8; 32])
+            .map(|s| s.out_key != [0u8; 32])
             .unwrap_or(false)
     }
 
@@ -144,7 +144,7 @@ impl Wallet {
         self.network.handle_handshake(addr, tag, payload);
         // RESP returns None (no reply needed), but the session key is set
         self.network.session_by_addr(&addr)
-            .map(|s| s.session_key != [0u8; 32])
+            .map(|s| s.out_key != [0u8; 32])
             .unwrap_or(false)
     }
 

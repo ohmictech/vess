@@ -39,6 +39,7 @@ pub const PROTOCOL_VERSION: u32 = 2;
 pub const MAX_SYNC_CHUNK_IDS: usize = 20_000;
 pub const MAX_GET_PEERS: usize = 1_000;
 pub const MAX_PEER_ANNOUNCE_IP_LEN: usize = 64;
+pub const MAX_SESSIONS: usize = 64;
 
 #[derive(Debug, Clone)]
 pub enum GossipMessage {
@@ -202,6 +203,7 @@ impl GossipMessage {
             }
             TAG_INTRODUCE => {
                 let id = read_fixed(payload, &mut pos)?;
+                if payload.len() < pos + 2 { return None; }
                 let port = u16::from_le_bytes(payload[pos..pos+2].try_into().ok()?); pos += 2;
                 let ip_bytes = read_bytes(payload, &mut pos)?;
                 let ip_str = std::str::from_utf8(&ip_bytes).ok()?;
@@ -296,6 +298,7 @@ impl RpcResponse {
                 let mut peers = Vec::with_capacity(count);
                 for _ in 0..count {
                     let id = read_fixed(payload, &mut pos)?;
+                    if payload.len() < pos + 2 { return None; }
                     let port = u16::from_le_bytes(payload[pos..pos+2].try_into().ok()?); pos += 2;
                     let ip_bytes = read_bytes(payload, &mut pos)?;
                     let ip_str = std::str::from_utf8(&ip_bytes).ok()?;
@@ -315,7 +318,8 @@ impl RpcResponse {
 pub struct Session {
     pub addr: SocketAddr,
     pub node_id: Option<NodeId>,
-    pub session_key: [u8; 32],
+    pub out_key: [u8; 32],      // key for encrypting messages TO this peer
+    pub in_key: [u8; 32],       // key for decrypting messages FROM this peer
     pub peer_version: u32,
     /// The address this peer claims is theirs (from PeerAnnounce).
     /// If this matches the observed source, the peer is publicly reachable.
@@ -330,7 +334,7 @@ impl Session {
         let mut nonce = [0u8; 12];
         nonce[..8].copy_from_slice(&self.nonce_ctr.to_le_bytes());
         self.nonce_ctr = self.nonce_ctr.wrapping_add(1);
-        let ct = chacha_encrypt(&self.session_key, &nonce, plaintext);
+        let ct = chacha_encrypt(&self.out_key, &nonce, plaintext);
         let mut out = Vec::with_capacity(8 + ct.len());
         out.extend_from_slice(&nonce[..8]);
         out.extend_from_slice(&ct);
@@ -343,7 +347,7 @@ impl Session {
         if data.len() < 8 { return None; }
         let mut nonce = [0u8; 12];
         nonce[..8].copy_from_slice(&data[..8]);
-        chacha_decrypt(&self.session_key, &nonce, &data[8..])
+        chacha_decrypt(&self.in_key, &nonce, &data[8..])
     }
 
     /// A peer is publicly reachable if their self-reported address matches
@@ -359,6 +363,12 @@ pub struct Network {
     pub dsa_pk: Vec<u8>,   // 1952-byte ML-DSA-65 verifying key
     pub kem_sk: Zeroizing<Vec<u8>>,   // 64-byte ML-KEM-512 decapsulation seed — zeroized on drop
     pub kem_pk: Vec<u8>,   // 800-byte ML-KEM-512 encapsulation key
+}
+
+impl Default for Network {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Network {
@@ -379,12 +389,19 @@ impl Network {
     }
 
     pub fn build_handshake_init(&mut self, addr: SocketAddr) -> Vec<u8> {
+        // Prune stale half-open sessions (no node_id after handshake completion)
+        // and enforce a hard cap to prevent unbounded Vec growth.
+        self.sessions.retain(|s| s.node_id.is_some());
+        if self.sessions.len() >= MAX_SESSIONS {
+            // Drop the oldest completed session to make room.
+            self.sessions.remove(0);
+        }
         let mut p = Vec::new();
         p.extend_from_slice(&self.my_node_id());
         p.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
         write_bytes(&mut p, &self.dsa_pk);  // needed for signature verification
         p.extend_from_slice(&self.kem_pk);
-        self.sessions.push(Session { addr, node_id: None, session_key: [0u8; 32], peer_version: 0, reported_addr: None, nonce_ctr: 0 });
+        self.sessions.push(Session { addr, node_id: None, out_key: [0u8; 32], in_key: [0u8; 32], peer_version: 0, reported_addr: None, nonce_ctr: 0 });
         frame(HANDSHAKE_INIT, &p)
     }
 
@@ -406,16 +423,24 @@ impl Network {
                 let my_id = self.my_node_id();
                 let transcript = blake3_hash_multi(&[&peer_id, &my_id, &peer_pk, ekem_raw, &ct_bytes]);
                 let sig = dsa_sign(&self.dsa_sk, &transcript)?;
-                // Canonical ordering: both sides derive the same key
+                // Canonical ordering: both sides derive the same base key, then
+                // split into directional out/in keys so initiator→responder and
+                // responder→initiator never share a (key, nonce) pair.
                 let (a, b) = if peer_id < my_id { (peer_id, my_id) } else { (my_id, peer_id) };
-                let session_key = blake3_hash_multi(&[&ss_bytes, &a, &b]);
+                let base = blake3_hash_multi(&[&ss_bytes, &a, &b]);
+                let (out_key, in_key) = if peer_id < my_id {
+                    // Responder is higher — its out is to the lower (peer).
+                    (blake3_hash_multi(&[&base, b"r2i"]), blake3_hash_multi(&[&base, b"i2r"]))
+                } else {
+                    (blake3_hash_multi(&[&base, b"i2r"]), blake3_hash_multi(&[&base, b"r2i"]))
+                };
                 let mut resp = Vec::new();
                 resp.extend_from_slice(&my_id);
                 resp.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
                 write_bytes(&mut resp, &self.dsa_pk);
                 write_bytes(&mut resp, &sig);
                 write_bytes(&mut resp, &ct_bytes);
-                self.sessions.push(Session { addr, node_id: Some(peer_id), session_key, peer_version: peer_ver, reported_addr: None, nonce_ctr: 0 });
+                self.sessions.push(Session { addr, node_id: Some(peer_id), out_key, in_key, peer_version: peer_ver, reported_addr: None, nonce_ctr: 0 });
                 Some(frame(HANDSHAKE_RESP, &resp))
             }
             HANDSHAKE_RESP => {
@@ -436,10 +461,17 @@ impl Network {
                 let transcript = blake3_hash_multi(&[&my_id, &peer_id, &self.dsa_pk, &self.kem_pk, &ct_bytes]);
                 if !dsa_verify(&peer_pk, &transcript, &sig) { return None; }
                 let (a, b) = if peer_id < my_id { (peer_id, my_id) } else { (my_id, peer_id) };
-                let session_key = blake3_hash_multi(&[&ss_bytes, &a, &b]);
+                let base = blake3_hash_multi(&[&ss_bytes, &a, &b]);
+                // Initiator is lower node_id — its out is i2r, in is r2i.
+                let (out_key, in_key) = if my_id < peer_id {
+                    (blake3_hash_multi(&[&base, b"i2r"]), blake3_hash_multi(&[&base, b"r2i"]))
+                } else {
+                    (blake3_hash_multi(&[&base, b"r2i"]), blake3_hash_multi(&[&base, b"i2r"]))
+                };
                 if let Some(s) = self.session_by_addr_mut(&addr) {
                     s.node_id = Some(peer_id);
-                    s.session_key = session_key;
+                    s.out_key = out_key;
+                    s.in_key = in_key;
                     s.peer_version = peer_ver;
                     s.nonce_ctr = 0;
                 }

@@ -197,45 +197,43 @@ fn main() -> std::io::Result<()> {
     let (ptx, prx) = mpsc::channel::<std::net::SocketAddr>();
     std::thread::spawn(move || {
         let stdin = std::io::stdin();
-        for line in stdin.lock().lines() {
-            if let Ok(l) = line {
-                let trimmed = l.trim().to_string();
-                if let Some(addr_str) = trimmed.strip_prefix("peer ") {
-                    if let Ok(peer_addr) = addr_str.parse::<std::net::SocketAddr>() {
-                        let _ = ptx.send(peer_addr);
-                    } else if let Ok(peer_addr) = format!("{}:9876", addr_str).parse::<std::net::SocketAddr>() {
-                        let _ = ptx.send(peer_addr);
-                    }
-                } else if trimmed == "mine" {
-                    cmd_node.lock().unwrap().mining_cores = 1;
-                    *mining_since_cmd.lock().unwrap() = Some(std::time::Instant::now());
-                    eprintln!("mining ON (1 core)");
-                } else if trimmed == "mine stop" {
-                    cmd_node.lock().unwrap().mining_cores = 0;
-                    *mining_since_cmd.lock().unwrap() = None;
-                    eprintln!("mining OFF");
-                } else if let Some(n_str) = trimmed.strip_prefix("mine ") {
-                    if let Ok(n) = n_str.parse::<u32>() {
-                        if n > 0 {
-                            let cores = permitted_mining_cores(n);
-                            cmd_node.lock().unwrap().mining_cores = cores;
-                            *mining_since_cmd.lock().unwrap() = Some(std::time::Instant::now());
-                            eprintln!("mining ON ({} cores)", cores);
-                        } else {
-                            cmd_node.lock().unwrap().mining_cores = 0;
-                            *mining_since_cmd.lock().unwrap() = None;
-                            eprintln!("mining OFF");
-                        }
-                    }
-                } else if trimmed == "status" {
-                    let n = cmd_node.lock().unwrap();
-                    let m = n.merkle();
-                    eprintln!("status: peers={} limbo={} utxos={} diff={} cores={} merkle={}",
-                        n.peer_count(), n.limbo_len(), n.utxo_count(),
-                        n.current_difficulty, n.mining_cores, fmt8(&m[..8]));
-                } else {
-                    let _ = tx.send(trimmed);
+        for l in stdin.lock().lines().flatten() {
+            let trimmed = l.trim().to_string();
+            if let Some(addr_str) = trimmed.strip_prefix("peer ") {
+                if let Ok(peer_addr) = addr_str.parse::<std::net::SocketAddr>() {
+                    let _ = ptx.send(peer_addr);
+                } else if let Ok(peer_addr) = format!("{}:9876", addr_str).parse::<std::net::SocketAddr>() {
+                    let _ = ptx.send(peer_addr);
                 }
+            } else if trimmed == "mine" {
+                cmd_node.lock().unwrap().mining_cores = 1;
+                *mining_since_cmd.lock().unwrap() = Some(std::time::Instant::now());
+                eprintln!("mining ON (1 core)");
+            } else if trimmed == "mine stop" {
+                cmd_node.lock().unwrap().mining_cores = 0;
+                *mining_since_cmd.lock().unwrap() = None;
+                eprintln!("mining OFF");
+            } else if let Some(n_str) = trimmed.strip_prefix("mine ") {
+                if let Ok(n) = n_str.parse::<u32>() {
+                    if n > 0 {
+                        let cores = permitted_mining_cores(n);
+                        cmd_node.lock().unwrap().mining_cores = cores;
+                        *mining_since_cmd.lock().unwrap() = Some(std::time::Instant::now());
+                        eprintln!("mining ON ({} cores)", cores);
+                    } else {
+                        cmd_node.lock().unwrap().mining_cores = 0;
+                        *mining_since_cmd.lock().unwrap() = None;
+                        eprintln!("mining OFF");
+                    }
+                }
+            } else if trimmed == "status" {
+                let n = cmd_node.lock().unwrap();
+                let m = n.merkle();
+                eprintln!("status: peers={} limbo={} utxos={} diff={} cores={} merkle={}",
+                    n.peer_count(), n.limbo_len(), n.utxo_count(),
+                    n.current_difficulty, n.mining_cores, fmt8(&m[..8]));
+            } else {
+                let _ = tx.send(trimmed);
             }
         }
     });
@@ -262,7 +260,7 @@ fn main() -> std::io::Result<()> {
         }
 
         // Drain any leftover stdin commands
-        while let Ok(_) = rx.try_recv() {}
+        while rx.try_recv().is_ok() {}
 
         match socket.recv_from(&mut buf) {
             Ok((len, src)) => {

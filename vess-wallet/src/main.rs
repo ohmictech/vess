@@ -101,7 +101,7 @@ fn run_flags(args: &[String]) {
     while i < args.len() {
         match args[i].as_str() {
             "--wallet" => { i += 1; if i < args.len() { wallet_path = args[i].clone(); } }
-            "--password" => { i += 1; if i < args.len() { password = args[i].as_bytes().to_vec(); } }
+            "--password" => { i += 1; if i < args.len() { eprintln!("warning: --password leaks via shell history and process lists; use interactive mode instead"); password = args[i].as_bytes().to_vec(); } }
             "--connect" => { i += 1; if i < args.len() { node_addr = args[i].parse().unwrap_or(node_addr); } }
             "--import" => { action = Some("import".into()); i += 1; if i < args.len() { action_arg = Some(args[i].clone()); } }
             "--import-key" => { action = Some("import-key".into()); i += 1; if i < args.len() { action_arg = Some(args[i].clone()); i += 1; if i < args.len() { action_arg2 = Some(args[i].clone()); } } }
@@ -219,9 +219,7 @@ fn run_flags(args: &[String]) {
 
 fn run_interactive(wallet_path: &str) {
     let wallet = if std::path::Path::new(wallet_path).exists() {
-        print!("password for {}: ", wallet_path);
-        io::stdout().flush().unwrap();
-        let pw = read_line();
+        let pw = rpassword::prompt_password(format!("password for {}: ", wallet_path)).unwrap_or_default();
         match std::fs::read(wallet_path) {
             Ok(data) => match Wallet::load(&data, pw.as_bytes()) {
                 Some(w) => { println!("loaded ({} VESS)", w.balance()); Some(w) }
@@ -250,9 +248,7 @@ fn run_interactive_new() {
 }
 
 fn create_new_wallet(path: &str) -> Wallet {
-    print!("set password (or enter for none): ");
-    io::stdout().flush().unwrap();
-    let pw = read_line();
+    let pw = rpassword::prompt_password("set password (or enter for none): ").unwrap_or_default();
     let w = Wallet::new(pw.as_bytes());
     if pw.is_empty() {
         println!("created {} (no password)", path);

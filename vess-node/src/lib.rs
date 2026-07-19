@@ -82,8 +82,6 @@ pub struct Node {
     pub pending_blocks: Vec<VessBlock>,            // blocks waiting for gossip broadcast
     pub accepted_blocks: u64,                       // increments on every accepted block (mined or received)
     block_seen: HashSet<BlockHash>,                 // deduplicate block relay
-    #[allow(dead_code)]
-    payment_seen: HashMap<PaymentId, u64>,          // deduplicate payment relay with TTL
     orphans: HashMap<BlockHash, VessBlock>,          // blocks waiting for missing parents
     missing_parents: HashMap<BlockHash, Vec<BlockHash>>, // parent → children waiting for it
     // State sync buffer: accumulate chunks here, verify root, then commit.
@@ -135,7 +133,6 @@ impl Node {
             pending_blocks: Vec::new(),
             accepted_blocks: 0,
             block_seen: HashSet::new(),
-            payment_seen: HashMap::new(),
             orphans: HashMap::new(),
             missing_parents: HashMap::new(),
             sync_buffer: HashSet::new(),
@@ -298,19 +295,11 @@ impl Node {
     pub fn inject_session(&mut self, addr: SocketAddr, node_id: NodeId, key: [u8; 32]) {
         if self.network.session_by_addr(&addr).is_none() {
             self.network.sessions.push(vess_network::Session {
-                addr, node_id: Some(node_id), session_key: key, peer_version: PROTOCOL_VERSION,
+                addr, node_id: Some(node_id), out_key: key, in_key: key, peer_version: PROTOCOL_VERSION,
                 reported_addr: Some(addr), nonce_ctr: 0,
             });
         }
         self.peers.insert(addr, node_id);
-    }
-
-    /// Send an introduce request to our introducer, asking them to connect us to target.
-    #[allow(dead_code)]
-    fn request_introduction(&mut self, target_id: NodeId) {
-        if let Some(intro) = self.introducer {
-            self.send(intro, &GossipMessage::IntroduceRequest(target_id));
-        }
     }
 
     /// Send an Introduce message to a target peer (we're the introducer).
@@ -333,7 +322,7 @@ impl Node {
         let raw = self.network.build_handshake_init(a);
         let (tag, payload) = unframe(&raw).unwrap_or((HANDSHAKE_INIT, &[][..]));
         // PoW handshake puzzle: find a 6-cycle. Include the winning header + proof.
-        let base = blake3_hash(&[b"vess-handshake" as &[u8], &self.network.my_node_id(), &a.to_string().as_bytes()].concat());
+        let base = blake3_hash(&[b"vess-handshake" as &[u8], &self.network.my_node_id(), a.to_string().as_bytes()].concat());
         let mut header = base;
         let proof = loop {
             if let Some(p) = cuckoo::solve(&header, cuckoo::HANDSHAKE_CYCLE_LENGTH, cuckoo::HANDSHAKE_EDGE_BITS) {
@@ -401,35 +390,6 @@ impl Node {
     }
 
     // ---- limbo system ----
-
-    /// Burn all inputs and outputs of conflicting payments — from limbo AND LMDB.
-    /// Called when a block includes contested payments.
-    #[allow(dead_code)]
-    fn annihilate(&mut self, payments: &[VessPayment]) {
-        let mut pids = Vec::new();
-        if let Ok(mut w) = self.env.write_txn() {
-            for p in payments {
-                pids.push(p.payment_id);
-                // Remove from limbo if still there
-                self.limbo.remove(&p.payment_id);
-                // Burn all inputs (from limbo tracking + LMDB)
-                for v in &p.inputs {
-                    self.limbo_inputs.remove(&v.vess_id());
-                    let _ = self.vess_index.delete(&mut w, &v.vess_id());
-                }
-                // Burn all outputs (from LMDB — may have been inserted if already finalized)
-                for v in &p.outputs {
-                    let _ = self.vess_index.delete(&mut w, &v.vess_id());
-                }
-            }
-            let _ = w.commit();
-        }
-        // Clean up limbo_inputs for any remaining references to these payments
-        for claims in self.limbo_inputs.values_mut() {
-            claims.retain(|pid| !pids.contains(pid));
-        }
-        self.limbo_inputs.retain(|_, claims| !claims.is_empty());
-    }
 
     // ---- submit ----
 
@@ -777,7 +737,7 @@ impl Node {
 
         // DAA uses the canonical chain only and changes at fixed boundaries.
         let canonical = self.canonical_chain(self.current_tip);
-        if canonical.len() >= DIFFICULTY_WINDOW && canonical.len() % DIFFICULTY_WINDOW == 0 {
+        if canonical.len() >= DIFFICULTY_WINDOW && canonical.len().is_multiple_of(DIFFICULTY_WINDOW) {
             let recent: Vec<u64> = canonical.windows(2)
                 .rev()
                 .take(DIFFICULTY_WINDOW - 1)
@@ -976,7 +936,7 @@ impl Node {
         if payment_ids.windows(2).any(|pair| pair[0] == pair[1]) || merkle_root(&payment_ids) != block.payment_merkle {
             return None;
         }
-        if block.coinbase.inputs.len() != 0 || block.coinbase.outputs.is_empty()
+        if !block.coinbase.inputs.is_empty() || block.coinbase.outputs.is_empty()
             || block.coinbase.outputs.len() > MAX_OUTPUTS
             || block.coinbase.outputs.iter().any(|v| v.variant != VessVariant::Mint) {
             return None;
@@ -1150,15 +1110,15 @@ impl Node {
             self.msg_window_start = self.ticks;
         }
         self.drain_embargo();
-        if self.ticks % 2000 == 0 { self.gossip_roots(); } // ~10s, not every tick
+        if self.ticks.is_multiple_of(2000) { self.gossip_roots(); } // ~10s, not every tick
 
         // ---- NAT traversal ----
         // Every 40 ticks (~200ms), if behind NAT, try to punch through
-        if self.ticks % 40 == 0 && self.is_behind_nat() {
+        if self.ticks.is_multiple_of(40) && self.is_behind_nat() {
             self.nat_cycle();
         }
         // Drain stem relay queue through introducer (rate-limited)
-        if !self.relay_queue.is_empty() && self.ticks % 20 == 0 {
+        if !self.relay_queue.is_empty() && self.ticks.is_multiple_of(20) {
             if let Some(intro) = self.introducer {
                 let to_send: Vec<_> = self.relay_queue.drain(..STEM_RELAY_MAX_PER_TICK).collect();
                 for (target_id, data) in to_send {
@@ -1175,10 +1135,10 @@ impl Node {
             for a in addrs { self.send(a, &m); }
         }
         // Mining is handled by the background mining thread in main.rs
-        if self.ticks % 100 == 0 { self.peer_announce(); } // ~0.5s
-        if self.ticks % 60 == 0 { self.ping_all(); }       // ~0.3s
-        if self.ticks % 30 == 0 { self.reap(); }
-        if (self.needs_sync && self.ticks % 50 == 0) || (self.auto_sync_until > self.ticks && self.ticks % 50 == 0) { self.drive_sync(); }
+        if self.ticks.is_multiple_of(100) { self.peer_announce(); } // ~0.5s
+        if self.ticks.is_multiple_of(60) { self.ping_all(); }       // ~0.3s
+        if self.ticks.is_multiple_of(30) { self.reap(); }
+        if (self.needs_sync && self.ticks.is_multiple_of(50)) || (self.auto_sync_until > self.ticks && self.ticks.is_multiple_of(50)) { self.drive_sync(); }
         std::mem::take(&mut self.outbox)
     }
 
@@ -1261,7 +1221,7 @@ impl Node {
     pub fn merkle(&self) -> MerkleRoot {
         let t = match self.env.read_txn() { Ok(t) => t, Err(_) => return [0u8; 32] };
         let iter = self.vess_index.iter(&t).unwrap().filter_map(|r| r.ok().map(|(k,_)| {
-            let mut a = [0u8; 32]; a.copy_from_slice(&k); a
+            let mut a = [0u8; 32]; a.copy_from_slice(k); a
         }));
         // LMDB B-tree iterates in byte order → streaming merkle, O(log N) RAM
         merkle_root_stream(iter)
@@ -1282,7 +1242,9 @@ impl Node {
 
     fn gossip_roots(&mut self) {
         let r = self.merkle();
-        let m = GossipMessage::Root(self.ticks, r);
+        // Use accepted_blocks, not ticks — ticks are local counters meaningless
+        // across nodes. accepted_blocks is a real chain-length measure.
+        let m = GossipMessage::Root(self.accepted_blocks, r);
         let addrs: Vec<SocketAddr> = self.peers.iter().filter(|(_,id)| **id != [0u8;32]).map(|(a,_)| *a).collect();
         for a in addrs { self.send(a, &m); }
     }
@@ -1300,7 +1262,7 @@ impl Node {
             if !self.packet_reassembly.contains_key(&addr) && self.packet_reassembly.len() >= MAX_REASSEMBLY_PEERS {
                 return None;
             }
-            match self.packet_reassembly.entry(addr).or_insert_with(PacketReassembler::new).push(data, self.ticks) {
+            match self.packet_reassembly.entry(addr).or_default().push(data, self.ticks) {
                 Ok(Some((id, message))) => {
                     let recent = self.completed_packets.entry(addr).or_default();
                     recent.retain(|(_, completed_at)| self.ticks.saturating_sub(*completed_at) < COMPLETED_PACKET_TTL_TICKS);
@@ -1433,15 +1395,18 @@ impl Node {
                         .map(|(a, _)| *a).collect();
                     for a in addrs { self.send(a, &m); }
                 }
-                // If our state merkle didn't match the block's claim, request sync
-                if !matched {
+                // If our state merkle didn't match the block's claim, and we're
+                // actually behind, request sync (with cooldown to avoid spam).
+                if !matched && self.needs_sync {
                     self.send(addr, &GossipMessage::StateSyncReq(self.ticks, 1000));
                 }
             }
-            GossipMessage::Root(peer_ticks, peer_root) => {
-                self.peer_merkle.insert(addr, (*peer_ticks, *peer_root));
-                if let Some((consensus_ticks, consensus_root)) = self.consensus_merkle() {
-                    if consensus_ticks > self.ticks.saturating_add(5) {
+            GossipMessage::Root(peer_height, peer_root) => {
+                self.peer_merkle.insert(addr, (*peer_height, *peer_root));
+                // Use accepted_blocks (chain height) for cross-node comparison.
+                // Ticks are local counters — comparing them across nodes is meaningless.
+                if let Some((consensus_height, consensus_root)) = self.consensus_merkle() {
+                    if consensus_height > self.accepted_blocks {
                         self.send(addr, &GossipMessage::StateSyncReq(self.ticks, 1000));
                     }
                     if self.needs_sync && self.merkle() == consensus_root {
@@ -1655,7 +1620,7 @@ impl Node {
     fn sync_chunk(&mut self, addr: SocketAddr, start: u64, count: u32) {
         let ids: Vec<VessId> = {
             let t = match self.env.read_txn() { Ok(t) => t, Err(_) => return };
-            self.vess_index.iter(&t).unwrap().filter_map(|r| r.ok().map(|(k,_)| { let mut a=[0u8;32]; a.copy_from_slice(&k); a })).skip(start as usize).take(count as usize).collect()
+            self.vess_index.iter(&t).unwrap().filter_map(|r| r.ok().map(|(k,_)| { let mut a=[0u8;32]; a.copy_from_slice(k); a })).skip(start as usize).take(count as usize).collect()
         };
         self.send(addr, &GossipMessage::StateSyncChunk(start, ids));
     }
@@ -1723,8 +1688,8 @@ impl Node {
         }
 
         // If chunk is smaller than requested, the peer finished sending.
-        if (ids.len() as u32) < self.sync_chunk_size {
-            if is_from_sync_peer {
+        if (ids.len() as u32) < self.sync_chunk_size
+            && is_from_sync_peer {
                 // Verify buffered root against quorum consensus before committing.
                 let mut sorted: Vec<VessId> = self.sync_buffer.iter().copied().collect();
                 sorted.sort();
@@ -1764,7 +1729,6 @@ impl Node {
                 }
                 self.sync_buffer.clear();
             }
-        }
     }
 
     fn peer_announce(&mut self) {
@@ -1799,7 +1763,7 @@ impl Node {
                 let _ = w.commit();
             }
         }
-        if self.ticks % 300 == 0 {
+        if self.ticks.is_multiple_of(300) {
             // Only expire stale strikes, don't clear active bans.
             self.fails.retain(|_, strikes| *strikes > 5);
         }

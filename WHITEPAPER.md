@@ -351,7 +351,7 @@ resistance anyone has honestly demonstrated. Proofs are canonical
 and the difficulty target cannot be ground by permutation. Difficulty is
 consensus-enforced against the DAA schedule, not miner-declared; coinbase
 amounts are consensus-enforced against the reward schedule, not
-miner-declared. 
+miner-declared.
 
 **Tiny codebase.** The full node, wallet, crypto, and network stack is on
 the order of six thousand lines of Rust. Every line is load-bearing.
