@@ -149,11 +149,12 @@ mod integration {
         let (pk, sk) = dsa_generate();
         let oh = dsa_pubkey_hash(&pk);
         // Mine and exchange blocks so both nodes converge to the same state.
+        // Mine sequentially and exchange after each block to ensure convergence.
         for _ in 0..3 {
             mine_coins(&mut n1, oh, &pk, &sk);
+            for _ in 0..3 { thread::sleep(Duration::from_millis(10)); cycle_node(&mut n1, &s1); cycle_node(&mut n2, &s2); }
             mine_coins(&mut n2, oh, &pk, &sk);
-            // Exchange blocks between nodes
-            for _ in 0..2 { thread::sleep(Duration::from_millis(10)); cycle_node(&mut n1, &s1); cycle_node(&mut n2, &s2); }
+            for _ in 0..3 { thread::sleep(Duration::from_millis(10)); cycle_node(&mut n1, &s1); cycle_node(&mut n2, &s2); }
         }
         assert!(n1.merkle() != [0u8; 32], "at least one block mined");
         assert_eq!(n1.merkle(), n2.merkle(), "merkle roots match");
@@ -482,6 +483,13 @@ mod integration {
         // Build two competing chains; verify heaviest-chain wins.
         let (mut node, _s) = start_node_at("127.0.0.1:19924", "vess-db-reorg");
 
+        // Mine genesis block first — alt-genesis blocks with empty parents are
+        // rejected once the DAG has any blocks.
+        let (pk_gen, sk_gen) = dsa_generate();
+        let oh_gen = dsa_pubkey_hash(&pk_gen);
+        mine_coins(&mut node, oh_gen, &pk_gen, &sk_gen);
+        let genesis = node.tip_hashes[0];
+
         // Build tip A: one block at diff=9 (work=512)
         let (pk_a, sk_a) = dsa_generate();
         let oh_a = dsa_pubkey_hash(&pk_a);
@@ -490,25 +498,25 @@ mod integration {
         let work_a = node.cumulative_work(&tip_a_hash);
         assert!(work_a > 0, "chain A has work");
 
-        // Build heavier chain B manually (2 blocks, tip at diff=10, work=1024+1024=2048)
+        // Build heavier chain B manually (2 blocks on genesis, tip at diff=10)
         let (pk_b, sk_b) = dsa_generate();
         let oh_b = dsa_pubkey_hash(&pk_b);
         let cb1_out = Vess { variant: VessVariant::Mint, amount: 2, owner_hash: oh_b,
-            timestamp: 0, nonce: 0, salt: random_bytes(), pubkey: pk_b.clone(),
+            timestamp: 1000, nonce: 0, salt: random_bytes(), pubkey: pk_b.clone(),
             spend_key: sk_b.clone(), spend_condition: None };
         let cb1_id = cb1_out.vess_id();
         let mut cb1 = VessPayment { payment_id: [0u8;32], inputs: vec![], outputs: vec![cb1_out.clone()], timestamp: 0, sigs: vec![], preimages: vec![] };
         cb1.compute();
-        let block1 = VessBlock { version: 1, parents: vec![], timestamp: 1000, difficulty_bits: 10, nonce: 0,
+        let block1 = VessBlock { version: 1, parents: vec![genesis], timestamp: 1000, difficulty_bits: 10, nonce: 0,
             payment_merkle: merkle_root(&[cb1.payment_id]), state_merkle: [0u8; 32],
             proof: vec![0u32; cuckoo::CYCLE_LENGTH],
             coinbase: cb1, payments: vec![] };
-        node.process_block(&block1);
+        assert!(node.process_block(&block1), "block1 accepted");
 
         let (pk_b2, sk_b2) = dsa_generate();
         let oh_b2 = dsa_pubkey_hash(&pk_b2);
         let cb2_out = Vess { variant: VessVariant::Mint, amount: 2, owner_hash: oh_b2,
-            timestamp: 0, nonce: 0, salt: random_bytes(), pubkey: pk_b2.clone(),
+            timestamp: 2000, nonce: 0, salt: random_bytes(), pubkey: pk_b2.clone(),
             spend_key: sk_b2.clone(), spend_condition: None };
         let mut cb2 = VessPayment { payment_id: [0u8;32], inputs: vec![], outputs: vec![cb2_out], timestamp: 0, sigs: vec![], preimages: vec![] };
         cb2.compute();
@@ -516,9 +524,9 @@ mod integration {
             payment_merkle: merkle_root(&[cb2.payment_id]), state_merkle: [0u8; 32],
             proof: vec![0u32; cuckoo::CYCLE_LENGTH],
             coinbase: cb2, payments: vec![] };
-        node.process_block(&block2);
+        assert!(node.process_block(&block2), "block2 accepted");
 
-        // Chain B (work=2048) should beat chain A (work=512)
+        // Chain B (work=1024+1024=2048) should beat chain A (work=512)
         let tip_b_work = node.cumulative_work(&block2.header_hash());
         let tip_a_work = node.cumulative_work(&tip_a_hash);
         assert!(tip_b_work > tip_a_work, "chain B has more work");
@@ -879,4 +887,166 @@ mod integration {
         assert_eq!(n1.merkle(), n2.merkle(), "merkle roots converge despite packet loss");
     }
 
+    // ── DAG MERGE TESTS ──
+
+    fn cb_block(parents: Vec<[u8; 32]>, cb_amt: u64, oh: OwnerHash, pk: &[u8], sk: &[u8], payments: Vec<VessPayment>, ts: u64) -> VessBlock {
+        let out = Vess { variant: VessVariant::Mint, amount: cb_amt, owner_hash: oh, timestamp: ts, nonce: 0, salt: random_bytes(), pubkey: pk.to_vec(), spend_key: sk.to_vec(), spend_condition: None };
+        let mut cb = VessPayment { payment_id: [0u8; 32], inputs: vec![], outputs: vec![out], timestamp: 0, sigs: vec![], preimages: vec![] };
+        cb.compute();
+        let mut ids: Vec<[u8; 32]> = vec![cb.payment_id];
+        ids.extend(payments.iter().map(|p| p.payment_id));
+        ids.sort(); ids.dedup();
+        VessBlock { version: 1, parents, timestamp: ts, difficulty_bits: 9, nonce: 0, payment_merkle: merkle_root(&ids), state_merkle: [0u8; 32], proof: vec![], coinbase: cb, payments }
+    }
+
+    #[test]
+    fn test_merge_pays_both_miners() {
+        let (mut node, _s) = start_node_at("127.0.0.1:20001", "vess-db-merge-miners");
+        let (pk, sk) = dsa_generate();
+        let oh = dsa_pubkey_hash(&pk);
+        mine_coins(&mut node, oh, &pk, &sk);
+        let genesis = node.tip_hashes[0];
+
+        let (pk1, sk1) = dsa_generate(); let oh1 = dsa_pubkey_hash(&pk1);
+        let (pk2, sk2) = dsa_generate(); let oh2 = dsa_pubkey_hash(&pk2);
+        let b1 = cb_block(vec![genesis], 1, oh1, &pk1, &sk1, vec![], 1000);
+        let b2 = cb_block(vec![genesis], 1, oh2, &pk2, &sk2, vec![], 1000);
+        assert!(node.process_block(&b1));
+        assert!(node.process_block(&b2));
+        let b1_cb = b1.coinbase.outputs[0].vess_id();
+        let b2_cb = b2.coinbase.outputs[0].vess_id();
+
+        let m = cb_block(vec![b1.header_hash(), b2.header_hash()], 1, oh, &pk, &sk, vec![], 2000);
+        assert!(node.process_block(&m), "merge block accepted");
+        assert!(node.check(&b1_cb), "b1 coinbase present");
+        assert!(node.check(&b2_cb), "b2 coinbase present");
+        assert_eq!(node.tip_hashes, vec![m.header_hash()]);
+    }
+
+    #[test]
+    fn test_merge_vaporizes_cross_branch() {
+        let (mut node, _s) = start_node_at("127.0.0.1:20002", "vess-db-merge-vapor");
+        let (pk, sk) = dsa_generate();
+        let oh = dsa_pubkey_hash(&pk);
+        let coin = mine_coins(&mut node, oh, &pk, &sk);
+        let genesis = node.tip_hashes[0];
+        let coin_id = coin.vess_id();
+
+        let (pk_a, sk_a) = dsa_generate(); let oh_a = dsa_pubkey_hash(&pk_a);
+        let (pk_b, sk_b) = dsa_generate(); let oh_b = dsa_pubkey_hash(&pk_b);
+        let out_a = Vess { variant: VessVariant::Output, amount: coin.amount, owner_hash: oh_a, timestamp: 0, nonce: 0, salt: random_bytes(), pubkey: pk_a.clone(), spend_key: sk_a.clone(), spend_condition: None };
+        let out_b = Vess { variant: VessVariant::Output, amount: coin.amount, owner_hash: oh_b, timestamp: 0, nonce: 0, salt: random_bytes(), pubkey: pk_b.clone(), spend_key: sk_b.clone(), spend_condition: None };
+        let mut pa = VessPayment { payment_id: [0u8; 32], inputs: vec![coin.clone()], outputs: vec![out_a.clone()], timestamp: 0, sigs: vec![], preimages: vec![] };
+        pa.compute(); pa.sigs = vec![dsa_sign(&sk, &pa.payment_id).unwrap()];
+        let mut pb = VessPayment { payment_id: [0u8; 32], inputs: vec![coin.clone()], outputs: vec![out_b.clone()], timestamp: 0, sigs: vec![], preimages: vec![] };
+        pb.compute(); pb.sigs = vec![dsa_sign(&sk, &pb.payment_id).unwrap()];
+        let out_a_id = out_a.vess_id();
+        let out_b_id = out_b.vess_id();
+
+        let (pk1, sk1) = dsa_generate(); let oh1 = dsa_pubkey_hash(&pk1);
+        let b1 = cb_block(vec![genesis], 1, oh1, &pk1, &sk1, vec![pa], 1000);
+        let (pk2, sk2) = dsa_generate(); let oh2 = dsa_pubkey_hash(&pk2);
+        let b2 = cb_block(vec![genesis], 1, oh2, &pk2, &sk2, vec![pb], 1000);
+        assert!(node.process_block(&b1));
+        assert!(node.process_block(&b2));
+
+        let (pk_m, sk_m) = dsa_generate(); let oh_m = dsa_pubkey_hash(&pk_m);
+        let m = cb_block(vec![b1.header_hash(), b2.header_hash()], 1, oh_m, &pk_m, &sk_m, vec![], 2000);
+        assert!(node.process_block(&m), "merge accepted with cross-branch conflict");
+        assert!(!node.check(&coin_id), "double-spent input vaporized");
+        assert!(!node.check(&out_a_id), "conflicting output A never created");
+        assert!(!node.check(&out_b_id), "conflicting output B never created");
+        assert!(node.check(&b1.coinbase.outputs[0].vess_id()), "b1 coinbase intact");
+        assert!(node.check(&b2.coinbase.outputs[0].vess_id()), "b2 coinbase intact");
+    }
+
+    #[test]
+    fn test_merge_dedups_payment() {
+        let (mut node, _s) = start_node_at("127.0.0.1:20003", "vess-db-merge-dedup");
+        let (pk, sk) = dsa_generate();
+        let oh = dsa_pubkey_hash(&pk);
+        let coin = mine_coins(&mut node, oh, &pk, &sk);
+        let genesis = node.tip_hashes[0];
+
+        let (pk_out, sk_out) = dsa_generate(); let oh_out = dsa_pubkey_hash(&pk_out);
+        let out_v = Vess { variant: VessVariant::Output, amount: coin.amount, owner_hash: oh_out, timestamp: 0, nonce: 0, salt: random_bytes(), pubkey: pk_out.clone(), spend_key: sk_out.clone(), spend_condition: None };
+        let mut p = VessPayment { payment_id: [0u8; 32], inputs: vec![coin.clone()], outputs: vec![out_v.clone()], timestamp: 0, sigs: vec![], preimages: vec![] };
+        p.compute(); p.sigs = vec![dsa_sign(&sk, &p.payment_id).unwrap()];
+        let out_id = out_v.vess_id();
+
+        let (pk1, sk1) = dsa_generate(); let oh1 = dsa_pubkey_hash(&pk1);
+        let b1 = cb_block(vec![genesis], 1, oh1, &pk1, &sk1, vec![p.clone()], 1000);
+        let (pk2, sk2) = dsa_generate(); let oh2 = dsa_pubkey_hash(&pk2);
+        let b2 = cb_block(vec![genesis], 1, oh2, &pk2, &sk2, vec![p.clone()], 1000);
+        assert!(node.process_block(&b1));
+        assert!(node.process_block(&b2));
+
+        let (pk_m, sk_m) = dsa_generate(); let oh_m = dsa_pubkey_hash(&pk_m);
+        let m = cb_block(vec![b1.header_hash(), b2.header_hash()], 1, oh_m, &pk_m, &sk_m, vec![], 2000);
+        assert!(node.process_block(&m), "merge accepted with duplicate payment");
+        assert!(!node.check(&coin.vess_id()), "input spent once");
+        assert!(node.check(&out_id), "output created once");
+    }
+
+    #[test]
+    fn test_merge_voids_daisy_chain() {
+        let (mut node, _s) = start_node_at("127.0.0.1:20004", "vess-db-merge-void");
+        let (pk, sk) = dsa_generate();
+        let oh = dsa_pubkey_hash(&pk);
+        let coin = mine_coins(&mut node, oh, &pk, &sk);
+        let genesis = node.tip_hashes[0];
+        let coin_id = coin.vess_id();
+
+        // Also mine a second coin R (bystander). Record which block holds it
+        // so b3 can include it in its ancestor closure.
+        let coin_r = mine_coins(&mut node, oh, &pk, &sk);
+        let coin_r_id = coin_r.vess_id();
+        let coin_r_tip = node.tip_hashes[0];
+
+        // Branch 1: b1 spends coin → Bob
+        let (pk_bob, sk_bob) = dsa_generate(); let oh_bob = dsa_pubkey_hash(&pk_bob);
+        let out_bob = Vess { variant: VessVariant::Output, amount: coin.amount, owner_hash: oh_bob, timestamp: 0, nonce: 0, salt: random_bytes(), pubkey: pk_bob.clone(), spend_key: sk_bob.clone(), spend_condition: None };
+        let mut p_bob = VessPayment { payment_id: [0u8; 32], inputs: vec![coin.clone()], outputs: vec![out_bob.clone()], timestamp: 0, sigs: vec![], preimages: vec![] };
+        p_bob.compute(); p_bob.sigs = vec![dsa_sign(&sk, &p_bob.payment_id).unwrap()];
+
+        // Branch 2: b2 spends coin → Alice
+        let (pk_alice, sk_alice) = dsa_generate(); let oh_alice = dsa_pubkey_hash(&pk_alice);
+        let out_alice = Vess { variant: VessVariant::Output, amount: coin.amount, owner_hash: oh_alice, timestamp: 0, nonce: 0, salt: random_bytes(), pubkey: pk_alice.clone(), spend_key: sk_alice.clone(), spend_condition: None };
+        let mut p_alice = VessPayment { payment_id: [0u8; 32], inputs: vec![coin.clone()], outputs: vec![out_alice.clone()], timestamp: 0, sigs: vec![], preimages: vec![] };
+        p_alice.compute(); p_alice.sigs = vec![dsa_sign(&sk, &p_alice.payment_id).unwrap()];
+        let alice_out_id = out_alice.vess_id();
+
+        let (pk1, sk1) = dsa_generate(); let oh1 = dsa_pubkey_hash(&pk1);
+        let b1 = cb_block(vec![genesis], 1, oh1, &pk1, &sk1, vec![p_bob], 1000);
+        let (pk2, sk2) = dsa_generate(); let oh2 = dsa_pubkey_hash(&pk2);
+        let b2 = cb_block(vec![genesis], 1, oh2, &pk2, &sk2, vec![p_alice], 1000);
+        assert!(node.process_block(&b1));
+        assert!(node.process_block(&b2));
+
+        // b3 (child of b2): spends Alice-output + R (bystander)
+        let mut out_q = out_alice.clone();
+        out_q.pubkey = pk_alice.clone(); out_q.spend_key = sk_alice.clone();
+        let (pk_q, sk_q) = dsa_generate(); let oh_q = dsa_pubkey_hash(&pk_q);
+        let out_q_final = Vess { variant: VessVariant::Output, amount: coin.amount + coin_r.amount, owner_hash: oh_q, timestamp: 0, nonce: 0, salt: random_bytes(), pubkey: pk_q.clone(), spend_key: sk_q.clone(), spend_condition: None };
+        let mut p_q = VessPayment { payment_id: [0u8; 32], inputs: vec![out_q, coin_r.clone()], outputs: vec![out_q_final.clone()], timestamp: 0, sigs: vec![], preimages: vec![] };
+        p_q.compute();
+        p_q.sigs = vec![dsa_sign(&sk_alice, &p_q.payment_id).unwrap(), dsa_sign(&sk, &p_q.payment_id).unwrap()];
+        let q_out_id = out_q_final.vess_id();
+
+        let (pk3, sk3) = dsa_generate(); let oh3 = dsa_pubkey_hash(&pk3);
+        let b3 = cb_block(vec![b2.header_hash(), coin_r_tip], 1, oh3, &pk3, &sk3, vec![p_q], 2000);
+        assert!(node.process_block(&b3));
+
+        // Merge b1 (Bob-spend) + b3 (Alice→Q + R): coin is double-spent, so
+        // Bob-spend and Alice-spend are conflicted, Q is voided, R is safe.
+        let (pk_m, sk_m) = dsa_generate(); let oh_m = dsa_pubkey_hash(&pk_m);
+        let m = cb_block(vec![b1.header_hash(), b3.header_hash()], 1, oh_m, &pk_m, &sk_m, vec![], 3000);
+        assert!(node.process_block(&m), "merge accepted with daisy-chain void");
+
+        assert!(!node.check(&coin_id), "double-spent input vaporized");
+        assert!(!node.check(&alice_out_id), "Alice output never created (conflicted branch)");
+        assert!(!node.check(&q_out_id), "Q output voided (spends conflicted output)");
+        assert!(node.check(&coin_r_id), "bystander R still in state");
+    }
 }
+

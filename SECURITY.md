@@ -10,7 +10,7 @@ We aim to acknowledge reports within 48 hours and provide an initial assessment 
 
 ## Supported Versions
 
-Vess is currently pre-mainnet (testnet). All users should run the latest commit from `main`.
+All users should run the latest commit from `main`.
 
 | Version | Supported          |
 | ------- | ------------------ |
@@ -29,14 +29,6 @@ Vess relies on:
 - **Cuckatoo27** (siphash-2-4 edge generation, 42-cycle) for proof-of-work
 
 All secret key material is handled as 32-byte (ML-DSA) or 64-byte (ML-KEM) seeds. Expanded signing/decapsulation keys are derived deterministically and never serialized. The `zeroize` crate is used to wipe plaintext buffers and secret key material on drop.
-
-## Known Testnet Limitations
-
-- **Reorg replay is O(n²)**: full-genesis replay per tip. Acknowledged testnet limitation; incremental tip-state apply is planned.
-- **No incremental block sync**: nodes >40 blocks behind rely on state sync (UTXO set transfer) rather than block-by-block catch-up. BlockReq/BlockResp provides minimal parent-fetch for orphan resolution.
-- **Handshake PoW** is bound to `blake3("vess-handshake" || initiator_id || responder_addr)` — not yet bound to a Unix minute for anti-replay.
-- **No peer scoring beyond strike/ban**: Sybil resistance is basic. Multi-peer consensus-verified state sync mitigates eclipse attacks on bootstrapping nodes.
-- **UDP amplification**: handshake/holepunch responses are ~4.5× larger than requests. PoW gating and pending-introduction checks address most of the amplification surface.
 
 ## Responsible Disclosure
 

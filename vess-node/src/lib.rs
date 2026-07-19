@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::SocketAddr;
 use rand::Rng;
 use vess_crypto::*;
@@ -21,6 +21,7 @@ const RETRANSMIT_TICKS: u64 = 200;
 const MAX_RETRANSMITS: u8 = 5;
 const COMPLETED_PACKET_TTL_TICKS: u64 = 6000;
 const MAX_COMPLETED_PACKETS_PER_PEER: usize = 256;
+const MAX_PARENTS: usize = 8;
 
 struct ReliableMessage {
     addr: SocketAddr,
@@ -507,28 +508,25 @@ impl Node {
 
     // ---- block mining ----
 
-    /// Compute what the state merkle WILL be after applying a set of payments.
-    fn compute_state_merkle(&self, all_payments: &[VessPayment]) -> MerkleRoot {
+    /// Compute what the state merkle WILL be after applying payments on top
+    /// of the merged state of `parents`. This is fork-aware: during a fork
+    /// the candidate's parents may differ from the current heaviest tip, so
+    /// we compute from the merged parent state rather than the live DB.
+    fn compute_state_merkle(&self, parents: &[BlockHash], all_payments: &[VessPayment]) -> MerkleRoot {
+        let mut state = self.state_for_roots(parents).unwrap_or_default();
         let conflicted = Self::find_conflicts(all_payments);
-        let rt = match self.env.read_txn() { Ok(t) => t, Err(_) => return [0u8; 32] };
-        let mut ids: Vec<VessId> = self.vess_index.iter(&rt).unwrap()
-            .filter_map(|r| r.ok())
-            .map(|(k, _)| { let mut a = [0u8;32]; a.copy_from_slice(&k); a })
-            .collect();
-        drop(rt);
         // Clean payments first (same application order as validate_block).
         for (i, p) in all_payments.iter().enumerate() {
             if conflicted.contains(&i) { continue; }
-            for inp in &p.inputs { ids.retain(|id| id != &inp.vess_id()); }
-            for out in &p.outputs { ids.push(out.vess_id()); }
+            for inp in &p.inputs { state.remove(&inp.vess_id()); }
+            for out in &p.outputs { state.insert(out.vess_id()); }
         }
         // Conflicted payments: inputs burn, no outputs created.
         for (i, p) in all_payments.iter().enumerate() {
             if !conflicted.contains(&i) { continue; }
-            for inp in &p.inputs { ids.retain(|id| id != &inp.vess_id()); }
+            for inp in &p.inputs { state.remove(&inp.vess_id()); }
         }
-        ids.sort(); ids.dedup();
-        merkle_root(&ids)
+        Self::state_root(&state)
     }
 
     /// Test helper: mine a block with coinbase to the given owner. Returns coinbase outputs.
@@ -562,11 +560,12 @@ impl Node {
 
         let mut all_payments: Vec<VessPayment> = vec![coinbase.clone()];
         for p in &clean { all_payments.push(p.clone()); }
-        let state_merkle = self.compute_state_merkle(&all_payments);
+        let parents = self.block_parents();
+        let state_merkle = self.compute_state_merkle(&parents, &all_payments);
         let mut all_ids: Vec<VessId> = all_payments.iter().map(|p| p.payment_id).collect();
         all_ids.sort(); all_ids.dedup();
         let block = VessBlock {
-            version: 1, parents: self.tip_hashes.clone(),
+            version: 1, parents,
             timestamp: 0, difficulty_bits: diff, nonce: 0,
             payment_merkle: merkle_root(&all_ids), state_merkle,
             proof: vec![0u32; cuckoo::CYCLE_LENGTH], // test mode skips PoW verification
@@ -634,7 +633,7 @@ impl Node {
         block_payments.extend(contested_payments);
 
         Some(VessBlock {
-            version: 1, parents: self.tip_hashes.clone(),
+            version: 1, parents: self.block_parents(),
             timestamp,
             difficulty_bits: diff, nonce: 0,
             payment_merkle: merkle_root(&all_ids), state_merkle: [0u8; 32],
@@ -650,7 +649,7 @@ impl Node {
         // Recompute state_merkle with the finalized block
         let mut all_payments: Vec<VessPayment> = vec![block.coinbase.clone()];
         for p in &block.payments { all_payments.push(p.clone()); }
-        block.state_merkle = self.compute_state_merkle(&all_payments);
+        block.state_merkle = self.compute_state_merkle(&block.parents, &all_payments);
 
         let reward = block_reward(block.difficulty_bits);
         let dev_share = dev_reward(reward);
@@ -709,15 +708,19 @@ impl Node {
         if self.blocks.contains_key(&block_hash) { return true; }
 
         // Orphan handling: if any parent is unknown, store the block and fetch
-        // the missing parent. When the parent arrives, the orphan is retried.
-        if let Some(parent_hash) = block.parents.first().copied() {
-            if !self.blocks.contains_key(&parent_hash) && !block.parents.is_empty() {
-                if self.orphans.len() < 256 {
-                    self.orphans.insert(block_hash, block.clone());
-                    self.missing_parents.entry(parent_hash).or_default().push(block_hash);
-                }
-                return false;
+        // the missing parents. When all parents arrive, the orphan is retried.
+        let mut missing = false;
+        for parent_hash in &block.parents {
+            if !self.blocks.contains_key(parent_hash) {
+                missing = true;
+                self.missing_parents.entry(*parent_hash).or_default().push(block_hash);
             }
+        }
+        if missing {
+            if self.orphans.len() < 256 {
+                self.orphans.insert(block_hash, block.clone());
+            }
+            return false;
         }
 
         // Gate difficulty bounds before any expensive verification.
@@ -826,25 +829,116 @@ impl Node {
         conflicted.iter().filter(|&&i| i > 0).map(|&i| i - 1).collect()
     }
 
-    fn state_for_tip(&self, tip: Option<BlockHash>) -> Option<HashSet<VessId>> {
+    /// Build the parent list for a new block: heaviest tip first (DAA spine),
+    /// then other tips (merged work), capped at MAX_PARENTS.
+    fn block_parents(&self) -> Vec<BlockHash> {
+        let mut parents = Vec::new();
+        if let Some(h) = self.heaviest_tip() { parents.push(h); }
+        for h in &self.tip_hashes { if !parents.contains(h) { parents.push(*h); } }
+        parents.truncate(MAX_PARENTS);
+        parents
+    }
+
+    /// Deterministic topological order over the ancestor closure of `roots`
+    /// (parents before children, ready-set ties broken by block hash). Kahn's
+    /// algorithm — no recursion, so long chains can't overflow the stack.
+    fn ancestor_order(&self, roots: &[BlockHash]) -> Option<Vec<BlockHash>> {
+        let mut set = HashSet::new();
+        let mut stack: Vec<BlockHash> = roots.to_vec();
+        while let Some(h) = stack.pop() {
+            if !set.insert(h) { continue; }
+            let b = self.blocks.get(&h)?;
+            for p in &b.parents { stack.push(*p); }
+        }
+        let mut indeg: HashMap<BlockHash, usize> = HashMap::new();
+        let mut children: HashMap<BlockHash, Vec<BlockHash>> = HashMap::new();
+        for h in &set {
+            let b = self.blocks.get(h)?;
+            for p in &b.parents {
+                if set.contains(p) {
+                    *indeg.entry(*h).or_insert(0) += 1;
+                    children.entry(*p).or_default().push(*h);
+                }
+            }
+        }
+        let mut ready: BTreeSet<BlockHash> =
+            set.iter().copied().filter(|h| indeg.get(h).copied().unwrap_or(0) == 0).collect();
+        let mut order = Vec::with_capacity(set.len());
+        while let Some(h) = ready.pop_first() {
+            order.push(h);
+            if let Some(ch) = children.get(&h) {
+                for c in ch {
+                    let d = indeg.entry(*c).or_insert(0);
+                    *d -= 1;
+                    if *d == 0 { ready.insert(*c); }
+                }
+            }
+        }
+        if order.len() != set.len() { return None; } // cycle — impossible for valid blocks
+        Some(order)
+    }
+
+    /// Three-way classification of a merged payment set (already deduped):
+    /// - conflicted: shares an input with another payment → all inputs burn,
+    ///   no outputs are created;
+    /// - voided: spends an output of a conflicted/voided payment → contributes
+    ///   nothing at all; its OTHER inputs are NOT burned. Bystanders are
+    ///   unwound, never punished — the penalty rests on the double-spender.
+    /// Voiding takes precedence over conflicting and propagates to a fixpoint.
+    fn classify_history(payments: &[&VessPayment]) -> (HashSet<PaymentId>, HashSet<PaymentId>) {
+        let mut voided: HashSet<PaymentId> = HashSet::new();
+        loop {
+            let mut owners: HashMap<VessId, Vec<PaymentId>> = HashMap::new();
+            for p in payments {
+                if voided.contains(&p.payment_id) { continue; }
+                for i in &p.inputs { owners.entry(i.vess_id()).or_default().push(p.payment_id); }
+            }
+            let mut conflicted: HashSet<PaymentId> = HashSet::new();
+            for ids in owners.values() {
+                if ids.len() > 1 { for id in ids { conflicted.insert(*id); } }
+            }
+            let bad: HashSet<VessId> = payments.iter()
+                .filter(|p| conflicted.contains(&p.payment_id) || voided.contains(&p.payment_id))
+                .flat_map(|p| p.outputs.iter().map(|o| o.vess_id()))
+                .collect();
+            let new_void: Vec<PaymentId> = payments.iter()
+                .filter(|p| !voided.contains(&p.payment_id))
+                .filter(|p| p.inputs.iter().any(|i| bad.contains(&i.vess_id())))
+                .map(|p| p.payment_id)
+                .collect();
+            if new_void.is_empty() { return (conflicted, voided); }
+            for id in new_void { voided.insert(id); }
+        }
+    }
+
+    /// Merged UTXO state of the full ancestor closure of `roots` — the DAG
+    /// replacement for a single-parent chain replay. Every ancestor coinbase
+    /// pays out (merged work is never orphaned); cross-branch conflicts
+    /// vaporize; payments depending on vaporized outputs are voided.
+    fn state_for_roots(&self, roots: &[BlockHash]) -> Option<HashSet<VessId>> {
+        let order = self.ancestor_order(roots)?;
+        // Dedup payments by id — the same payment may ride multiple branches;
+        // only its first occurrence in topological order applies.
+        let mut seen_p: HashSet<PaymentId> = HashSet::new();
+        let mut payments: Vec<&VessPayment> = Vec::new();
+        for h in &order {
+            for p in &self.blocks[h].payments {
+                if seen_p.insert(p.payment_id) { payments.push(p); }
+            }
+        }
+        let (conflicted, voided) = Self::classify_history(&payments);
         let mut state = HashSet::new();
-        for hash in self.canonical_chain(tip) {
-            let block = self.blocks.get(&hash)?;
-            let conflicted = Self::block_conflicted(block);
-            // Coinbase always creates outputs
-            for output in &block.coinbase.outputs {
-                state.insert(output.vess_id());
-            }
-            // Clean payments first (same application order as validate_block).
-            for (i, payment) in block.payments.iter().enumerate() {
-                if conflicted.contains(&i) { continue; }
-                for input in &payment.inputs { state.remove(&input.vess_id()); }
-                for output in &payment.outputs { state.insert(output.vess_id()); }
-            }
-            // Conflicted payments: inputs burn, no outputs created.
-            for (i, payment) in block.payments.iter().enumerate() {
-                if !conflicted.contains(&i) { continue; }
-                for input in &payment.inputs { state.remove(&input.vess_id()); }
+        let mut applied: HashSet<PaymentId> = HashSet::new();
+        for h in &order {
+            let b = &self.blocks[h];
+            for o in &b.coinbase.outputs { state.insert(o.vess_id()); }
+            for p in &b.payments {
+                if !applied.insert(p.payment_id) { continue; }
+                if voided.contains(&p.payment_id) { continue; }
+                for input in &p.inputs { state.remove(&input.vess_id()); }
+                if !conflicted.contains(&p.payment_id) {
+                    for o in &p.outputs { state.insert(o.vess_id()); }
+                }
             }
         }
         Some(state)
@@ -857,15 +951,18 @@ impl Node {
     }
 
     fn validate_block(&self, block: &VessBlock) -> Option<HashSet<VessId>> {
-        if block.version != 1 || block.difficulty_bits > 60 || block.parents.len() > 1 { return None; }
+        if block.version != 1 || block.difficulty_bits > 60 || block.parents.len() > MAX_PARENTS { return None; }
+        // No alt-genesis: a block with no parents is only valid when the DAG is empty.
+        if block.parents.is_empty() && !self.blocks.is_empty() { return None; }
         // Difficulty must match the DAA-determined value for the current tip.
         // Miners cannot declare arbitrary difficulty — the schedule is deterministic.
         if !self.test_mode && block.difficulty_bits != self.current_difficulty { return None; }
-        let parent = block.parents.first().copied();
-        if let Some(parent_hash) = parent {
-            let parent_block = self.blocks.get(&parent_hash)?;
-            if !self.test_mode && block.timestamp < parent_block.timestamp { return None; }
+        let mut max_parent_ts = 0u64;
+        for parent_hash in &block.parents {
+            let Some(parent_block) = self.blocks.get(parent_hash) else { return None; };
+            max_parent_ts = max_parent_ts.max(parent_block.timestamp);
         }
+        if !self.test_mode && block.timestamp < max_parent_ts { return None; }
         if !self.test_mode {
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_millis() as u64;
             if block.timestamp > now.saturating_add(MAX_FUTURE_BLOCK_TIME_MS) { return None; }
@@ -904,7 +1001,7 @@ impl Node {
         canonical_coinbase.compute();
         if canonical_coinbase.payment_id != block.coinbase.payment_id { return None; }
 
-        let mut state = self.state_for_tip(parent)?;
+        let mut state = self.state_for_roots(&block.parents)?;
         // Chained spends are banned by consensus: every payment input must
         // reference pre-block state — never an output created by this block
         // (including the coinbase). Checked once, before any state mutation.
@@ -967,20 +1064,19 @@ impl Node {
         Some(state)
     }
 
-    /// Cumulative work of a block's ancestor chain (sum of 2^difficulty_bits).
+    /// Cumulative work of a block's full ancestor set (sum of 2^difficulty_bits,
+    /// each ancestor counted once). Multi-parent merge blocks accumulate the
+    /// work of every branch they reference — fork races stop orphaning work.
     pub fn cumulative_work(&self, hash: &BlockHash) -> u64 {
         let mut work = 0u64;
-        let mut current = *hash;
         let mut visited = HashSet::new();
-        loop {
-            if visited.contains(&current) { break; }
-            visited.insert(current);
-            if let Some(b) = self.blocks.get(&current) {
+        let mut stack = vec![*hash];
+        while let Some(h) = stack.pop() {
+            if !visited.insert(h) { continue; }
+            if let Some(b) = self.blocks.get(&h) {
                 work = work.saturating_add(1u64 << b.difficulty_bits as u64);
-                if let Some(parent) = b.parents.first() {
-                    current = *parent;
-                } else { break; }
-            } else { break; }
+                for parent in &b.parents { stack.push(*parent); }
+            }
         }
         work
     }
@@ -998,16 +1094,15 @@ impl Node {
     fn prune_blocks(&mut self) {
         if self.blocks.len() <= 40 { return; }
         let Some(tip) = self.heaviest_tip() else { return; };
-        // Walk back from heaviest tip, keep ancestors, drop the rest
+        // Walk full ancestor closure from heaviest tip (stack DFS like cumulative_work).
+        // Single-parent traversal would prune merged branches, breaking state_for_roots.
         let mut keep = HashSet::new();
-        let mut current = tip;
-        loop {
-            keep.insert(current);
-            if let Some(b) = self.blocks.get(&current) {
-                if let Some(parent) = b.parents.first() {
-                    current = *parent;
-                } else { break; }
-            } else { break; }
+        let mut stack = vec![tip];
+        while let Some(h) = stack.pop() {
+            if !keep.insert(h) { continue; }
+            if let Some(b) = self.blocks.get(&h) {
+                for parent in &b.parents { stack.push(*parent); }
+            }
         }
         self.blocks.retain(|h, _| keep.contains(h));
         if let Ok(mut w) = self.env.write_txn() {
@@ -1023,34 +1118,20 @@ impl Node {
         self.tip_hashes.retain(|h| keep.contains(h));
     }
 
-    /// If the heaviest chain disagrees with our LMDB state, rebuild from common ancestor.
+    /// If the heaviest tip disagrees with our LMDB state, rebuild using the
+    /// merged DAG state. `state_for_roots` handles dedup, conflict closure,
+    /// and void propagation deterministically.
     fn reorg_if_needed(&mut self) {
         let Some(heaviest) = self.heaviest_tip() else { return };
         if self.current_tip == Some(heaviest) { return; }
-        let chain = self.canonical_chain(Some(heaviest));
+        let Some(state) = self.state_for_roots(&[heaviest]) else { return; };
         if let Ok(mut w) = self.env.write_txn() {
             let existing: Vec<VessId> = self.vess_index.iter(&w).ok().into_iter().flatten()
                 .filter_map(|entry| entry.ok())
                 .filter_map(|(id, _)| id.try_into().ok())
                 .collect();
             for id in existing { let _ = self.vess_index.delete(&mut w, &id); }
-            for hash in chain {
-                let Some(block) = self.blocks.get(&hash) else { return; };
-                let conflicted = Self::block_conflicted(block);
-                // Coinbase always creates outputs
-                for output in &block.coinbase.outputs { let _ = self.vess_index.put(&mut w, &output.vess_id(), &()); }
-                // Clean payments first (same application order as validate_block).
-                for (i, payment) in block.payments.iter().enumerate() {
-                    if conflicted.contains(&i) { continue; }
-                    for input in &payment.inputs { let _ = self.vess_index.delete(&mut w, &input.vess_id()); }
-                    for output in &payment.outputs { let _ = self.vess_index.put(&mut w, &output.vess_id(), &()); }
-                }
-                // Conflicted payments: inputs burn, no outputs created.
-                for (i, payment) in block.payments.iter().enumerate() {
-                    if !conflicted.contains(&i) { continue; }
-                    for input in &payment.inputs { let _ = self.vess_index.delete(&mut w, &input.vess_id()); }
-                }
-            }
+            for id in &state { let _ = self.vess_index.put(&mut w, id, &()); }
             if w.commit().is_err() { return; }
             self.current_tip = Some(heaviest);
             self.save_meta();
@@ -1333,10 +1414,10 @@ impl Node {
                 // Deduplicate: only process and relay blocks we haven't seen.
                 // Without this, invalid/rejected blocks circulate forever.
                 if self.block_seen.contains(&hash) { return None; }
-                // If a parent is unknown and genesis is known, request it from sender.
-                if let Some(parent_hash) = block.parents.first().copied() {
-                    if !self.blocks.contains_key(&parent_hash) && !self.blocks.is_empty() {
-                        self.send(addr, &GossipMessage::BlockReq(parent_hash));
+                // If parents are unknown and we have existing blocks, request them.
+                for parent_hash in &block.parents {
+                    if !self.blocks.contains_key(parent_hash) && !self.blocks.is_empty() {
+                        self.send(addr, &GossipMessage::BlockReq(*parent_hash));
                     }
                 }
                 let matched = self.process_block(block);
