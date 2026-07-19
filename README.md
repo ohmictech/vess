@@ -99,17 +99,24 @@ peer 1.2.3.4:9876  # connect to a peer
 status       # show peers, UTXOs, difficulty, mining state
 ```
 
+### NAT and hole-punching
+
+Vess nodes communicate over UDP. You don't need port forwarding, NAT traversal automatically using public introducer peers.
+
+Every node automatically detects whether it's behind NAT by comparing its self-reported address to the address peers see in `PeerAnnounce` messages. The only requirement is that at least one public introducer node exists in the mesh, and any node with an open port on a public IP can serve this role. Bootstrapping to a public seed node is all you need.
+
 ### Running the wallet
 
 ```
-vess-wallet --import vess-db       # import coinbase UTXOs
-vess-wallet --import-key pub sec   # import a raw keypair
-vess-wallet --balance              # check balance
-vess-wallet --sync                 # confirm unclaimed UTXOs against node
-vess-wallet --invoice 100          # generate vess:// invoice
+vess-wallet --connect 127.0.0.1:9876 # connect to a node (required before sync, send, etc.)
+vess-wallet --import vess-db         # import coinbase UTXOs
+vess-wallet --import-key pub sec     # import a raw keypair
+vess-wallet --balance                # check balance
+vess-wallet --sync                   # confirm unclaimed UTXOs against node
+vess-wallet --invoice 100            # generate vess:// invoice
 vess-wallet --pay "vess://..." --out payment.vess
-vess-wallet --receive payment.vess # claim received blob
-vess-wallet --consolidate          # merge small UTXOs
+vess-wallet --receive payment.vess   # claim received blob
+vess-wallet --consolidate            # merge small UTXOs
 ```
 
 Hashlock and expiry on invoices:
