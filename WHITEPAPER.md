@@ -43,6 +43,9 @@ Three consequences fall out of this single rule:
   *the attack's externalities*. In Vess, a failed double-spend destroys the
   attacker's own coins and nothing of anyone else's.
 
+The protocol built on this rule has a name: **DAGARC — a directed acyclic
+graph, armored by retributive consensus.** The DAG carries the blocks;
+retribution keeps them honest; no ordering apparatus is required anywhere.
 The rest of this paper is the engineering required to make that one rule
 sound — and a plain statement of the risks it creates.
 
@@ -171,9 +174,37 @@ reintroduce the exact ordering contention Vess exists to delete.
 
 ## 3. Consensus
 
-**Blocks** carry: parent hash (linear chain; the "DAG" language in early
-docs is dead), timestamp, declared difficulty, payment merkle, **state
-merkle**, coinbase, payments, and a Cuckatoo27 proof.
+**Blocks** carry: parent hashes (1–8), timestamp, declared
+difficulty, payment merkle, **state merkle**, coinbase, payments, and a
+Cuckatoo27 proof.
+
+**DAGARC is a DAG that merges, not a chain that orphans.** A block references every
+live tip it knows: the heaviest first (that edge is the DAA spine), then
+the rest, up to eight. A block's work is the sum over its entire ancestor
+set, each ancestor counted once — so when two miners race in the same
+second, the next block references both, **both coinbases pay, and no work
+is ever orphaned**. The tree of tips collapses back to one tip at the
+merge. This is deliberately the lightest DAG that can exist: no ordering
+auction, no scoring, no cluster analysis. Kaspa needs GHOSTDAG's machinery
+because its conflict rule is "pick a winner," and picking winners across
+branches requires judging. Vess's conflict rule is "both burn," computable
+from the payments alone — so a merge is just: gather the ancestor set,
+order it deterministically (topological, ties by hash), dedup payments,
+compute conflicts over the union, apply. When the judge is fired, the
+courthouse is a closet.
+
+**Merge semantics — three kinds of payments.** Over a merged ancestor set a
+payment is *clean* (applies normally), *conflicted* (shares an input with
+another payment anywhere in the union — both burn, no outputs), or *voided*
+(spends an output of a conflicted or voided payment — contributes nothing,
+and its other inputs are **not** burned: bystanders are unwound, never
+punished). The same payment riding two branches applies exactly once. Every
+ancestor coinbase pays. And branch-hopping a double-spend — one spend on
+each of two racing branches, hoping one "wins" — simply does not work: the
+branches merge, and the union burns both. Finality guidance sharpens
+accordingly: small amounts, one block is enough; serious amounts, wait for
+merge depth — your block referenced by a few later merges, so no unseen
+branch carrying a conflict can still be united with yours.
 
 **The state merkle is the consensus backbone.** Every block commits to the
 root of the entire post-transition UTXO set. Every node recomputes the
@@ -201,7 +232,11 @@ for a parent to confirm before spending its output. That is a good trade
 and this paper recommends other small chains copy it.
 
 **DAA.** Difficulty retargets every 40 blocks via an average of recent block
-deltas toward a 1000 ms target.
+deltas toward a 1000 ms target. Over a DAG there is no unique "recent
+chain," so deltas are taken along the spine — the chain of first (heaviest)
+parents — which every block commits to by construction. The width of the
+DAG is not the DAA's business; widening it would let merge behavior feed
+back into the difficulty schedule, which is an oscillator nobody needs.
 
 **The UTXO set is opaque.** On-disk and in sync, the set is bare 32-byte
 ids — hashes committing to amount, owner, and salt, revealing none of them.
@@ -322,8 +357,7 @@ resistance anyone has honestly demonstrated. Proofs are canonical
 and the difficulty target cannot be ground by permutation. Difficulty is
 consensus-enforced against the DAA schedule, not miner-declared; coinbase
 amounts are consensus-enforced against the reward schedule, not
-miner-declared. (Both enforcements were added after audit found their
-absence. This is what audits are for.)
+miner-declared. 
 
 **Tiny codebase.** The full node, wallet, crypto, and network stack is on
 the order of six thousand lines of Rust. Every line is load-bearing.
@@ -339,8 +373,12 @@ Collected in one place, so nobody has to take our word for any of it:
 
 1. **Claim-latency (§2.2).** Receivers must wait for inclusion. Offline
    verification is real; offline finality is not.
-2. **The backup footgun (§2.4).** Stale-backup restores can vaporize your
-   own coins. Wallet discipline is mandatory.
+2. **The unconfirmed window (§2.4).** Confirmed coins can't be burned by
+   anyone, including you — a stale-backup spend of a confirmed coin is just
+   rejected. But two live spends of the same unconfirmed input — an
+   unclaimed exported blob, or the same wallet file run on two machines —
+   will burn them. One wallet file, one live instance; sync before spending
+   after a restore.
 3. **Empty-block equilibrium (§2.6).** Inclusion is a social equilibrium.
    Measured on testnet; no cryptographic guarantee.
 4. **Volumetric spam defense is engineering, not economics.** No fees means
@@ -348,15 +386,17 @@ Collected in one place, so nobody has to take our word for any of it:
    mempools are what exist; the testnet will show whether they suffice.
 5. **Amounts are public.** One-time keys and OOB transport give unlinkable
    outputs and an invisible payment graph, but amounts in blocks are
-   visible and amount correlation is possible. Vess offers surveillance
+   visible and amount correlation is possible during a temporary window. Vess offers surveillance
    *resistance*, not anonymity. If you need Zcash-grade hiding, use Zcash.
 6. **Elastic supply means elastic price.** A commodity issuance rule is an
    anti-store-of-value. That is the design goal and also the deal-breaker
    for anyone who wants to hold.
-7. **1-second blocks are not free.** Fork races, orphan risk, and
-   propagation sensitivity all worsen at fast intervals; the deterministic
-   tie-break and the seen-dedup relay exist because of it. The testnet
-   measures the actual cost (§8).
+7. **1-second blocks are not free.** Fork races are constant at this
+   interval; merges mean they cost bandwidth, not work, but large payments
+   need merge depth before they're final (§3), and every merge widens the
+   ancestor set validators must recompute. The tie-break, the seen-dedup
+   relay, and the 8-parent cap exist because of it. The testnet measures
+   the actual cost (§8).
 
 ---
 
@@ -368,15 +408,21 @@ belong in the next version of this paper:
 
 - **Vaporization events**: contested payments per day, burns executed,
   and whether any burn hits an honest user (target: zero).
+- **DAG health**: tips in flight over time, average parents per block (the
+  merge rate), and cross-branch burns vs. same-branch burns.
+- **Void events**: payments unwound as daisy-chain dependents of a burn —
+  and whether any void hits a payment with no other defect (target: only
+  the double-spender burns; bystanders always recover their inputs).
 - **Empty-block ratio** per identifiable miner, over time (the goodwill
   equilibrium, §2.6, measured rather than asserted).
-- **Orphan/stale rate** at the 1-second target, and DAA behavior under
+- **Fork/merge rate** at the 1-second target, and DAA behavior under
   hashpower shocks.
 - **Sync convergence**: time for a fresh node and for a node returning
   after N blocks of absence, including across induced partitions.
 - **Spam resistance**: sustained volumetric load against rate limits and
   mempool bounds; what breaks first.
-- **State growth**: LMDB size and sync chunk counts over time.
+- **State growth**: LMDB size, sync chunk counts, and ancestor-set
+  recompute cost as the DAG widens.
 
 If the measurements contradict a claim in this paper, the claim gets
 revised or retracted in the next version. That is the entire point of
