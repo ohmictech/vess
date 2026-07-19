@@ -67,6 +67,8 @@ The base difficulty pays 1 Vess per block. For every bit beyond 8, the reward do
 
 Every node maintains a UTXO set in LMDB. Entries are opaque hashes with no amounts or owner data. When a payment arrives, nodes verify the ML-DSA-65 signatures, check that inputs are unspent, and apply the state change. If two payments spend the same coin, Vess doesn't reorder them: it vaporizes all inputs from both. The attacker loses everything; honest users lose nothing.
 
+Both payments and wallet consolidations have a nearly identical fingerprint, making linkability extremely difficult.
+
 Spending always starts with a `vess://` invoice. The payer's wallet builds a signed `VessPayment` blob and hands it back to the receiver out-of-band. The receiver submits it to any node. Each output uses a fresh one-time ML-DSA-65 keypair — nothing to reuse, link, or track.
 
 ### No seed phrases

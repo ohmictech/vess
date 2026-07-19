@@ -47,7 +47,7 @@ The protocol built on this rule has a name: **DAGARC — a directed acyclic
 graph, armored by retributive consensus.** The DAG carries the blocks;
 retribution keeps them honest; no ordering apparatus is required anywhere.
 The rest of this paper is the engineering required to make that one rule
-sound — and a plain statement of the risks it creates.
+sound, and a plain statement of the risks it creates.
 
 ---
 
@@ -87,8 +87,6 @@ At a ~1 second block target, "wait for inclusion" is a pause, not a delay.
 But be precise about what this means: a receiver can *verify* a blob fully
 offline (signatures, owner binding, sums) but cannot rule out a double-spend
 offline. No bearer design escapes this; Vess simply refuses to lie about it.
-Any documentation or demo showing "fully offline exchange" is describing
-verification, not finality.
 
 ### 2.3 Sabotage is cheap but bounded
 
@@ -110,23 +108,13 @@ a signature from the key whose hash is committed in the output (`owner_hash`
 is checked against the signing key at validation). The attack surface of
 vaporization is confined to what the attacker owns.
 
-### 2.4 The backup question — smaller than it looks
+### 2.4 The backup question
 
 Vess has no seed phrases. Each UTXO has its own independent ML-DSA-65
 keypair; the wallet file stores the 32-byte seeds, encrypted (Argon2id
 64 MiB/3/1 + ChaCha20-Poly1305). The wallet file is the money. This is
 deliberate: no phrase to photograph, no derivation to scan, cold storage is
 a file copy.
-
-A natural worry: doesn't vaporization make restoring a stale backup fatal?
-No — and the mechanics are worth stating precisely, because they bound
-exactly when a burn is even possible. A conflict can only form when **both**
-spends of an input are unconfirmed at the same time and meet inside one
-block. Once a spend is included, the input no longer exists, and every
-later spend of it — from a stale backup, a forgot-you-sent-it re-spend, an
-attacker, anyone — is not burned; it is simply *rejected*, at mempool
-admission and at block validation. Vaporization cannot reach backward in
-time. Confirmed history is untouchable.
 
 The residual hazard is the unconfirmed window (~1 second at target, up to
 the ~60 s mempool TTL in pathological cases): if you export a payment blob
@@ -163,12 +151,6 @@ edge; (b) validation and inclusion are cheap relative to the ~1.3 GB
 memory-hard solve that dominates mining cost; (c) vaporization means an
 empty-block policy cannot censor a payment *profitably* — only delay it.
 Bitcoin itself ran on unpaid inclusion for its first years.
-
-This is a social equilibrium, not a cryptographic one, and the paper says so.
-The testnet measures it (§8). If the measurement shows systematic
-defection, the honest fix is engineering — faster propagation shrinks the
-edge until empty mining buys nothing — not a fee market, which would
-reintroduce the exact ordering contention Vess exists to delete.
 
 ---
 
@@ -216,9 +198,7 @@ implementations of the same code.
 
 **Payments** are fully validated individually whether or not they are
 conflicted: canonical payment id, input sum == output sum (feeless means
-exact), per-input ML-DSA-65 signature, owner binding (the signing key must
-hash to the output's committed `owner_hash` — without this, anyone could
-spend anything, and an early version of this code had exactly that bug), and
+exact), per-input ML-DSA-65 signature, owner binding, and
 spend conditions (§5). Then: clean payments apply; conflicted payments'
 inputs burn.
 
@@ -267,9 +247,23 @@ Two properties follow, and they are the actual economics of the system:
   of production, like a commodity — not hoarded, like a collectible. If you
   want number-go-up tokenomics, every other chain already sells them.
 - **Hoarding has no protocol subsidy.** There is no fixed supply to
-  speculate against. Velocity is not a bug to be fixed; it is the design
-  goal. A currency that circulates is a payment network; a currency that
-  doesn't is a glorified Ponzi.
+  speculate against. Velocity is the design goal. A currency that circulates is a payment network; a currency that doesn't is a glorified Ponzi.
+
+**Supply growth is not dilution when it is bought.** Dilution is new units
+appearing at near-zero cost — seigniorage, premines, foundation unlocks —
+where the issuer pockets the gap between price and a production cost of
+nil, and holders pay it. Vess issuance is production, not printing: the
+reward doubles exactly when the difficulty doubles, so the marginal Vess
+always costs the same amount of expected work, at any hashrate. Every new
+coin entering circulation was *paid for* at full energy rates by the miner
+who minted it, at the same marginal rate as every coin before it. Supply
+expands only as fast as the world is willing to burn real energy to expand
+it — the discipline that keeps copper and gold supply growth honest,
+enforced by arithmetic instead of geology. One caveat, because this paper
+doesn't hide them: a cost-of-production floor disciplines *issuance*, not
+price. If demand vanishes, production throttles down with hashpower — the
+floor props nothing up, and it isn't meant to. What it guarantees is
+narrower and sufficient: no one, anywhere, gets new Vess for free.
 
 **No fee market.** Fees in other systems do two jobs: anti-spam and
 ordering contention. Vess has no ordering contention (§1). Anti-spam is
@@ -286,7 +280,7 @@ the floor binds and the dev share of early issuance is 50%, decaying toward
 1% as difficulty rises past ~15 bits (reward ≥ 100). The floor exists so
 development is funded from block one rather than never; the tradeoff is
 that early issuance is dev-heavy. It is stated here plainly because it is
-consensus and you should evaluate it with eyes open. No premine, no ICO, no
+consensus and you should evaluate it with open eyes. No premine, no ICO, no
 VC — this subsidy is the entire insider allocation the network will ever
 have, and it is paid continuously for ongoing work rather than upfront for
 showing up early.
@@ -388,10 +382,7 @@ Collected in one place, so nobody has to take our word for any of it:
    outputs and an invisible payment graph, but amounts in blocks are
    visible and amount correlation is possible during a temporary window. Vess offers surveillance
    *resistance*, not anonymity. If you need Zcash-grade hiding, use Zcash.
-6. **Elastic supply means elastic price.** A commodity issuance rule is an
-   anti-store-of-value. That is the design goal and also the deal-breaker
-   for anyone who wants to hold.
-7. **1-second blocks are not free.** Fork races are constant at this
+6. **1-second blocks are not free.** Fork races are constant at this
    interval; merges mean they cost bandwidth, not work, but large payments
    need merge depth before they're final (§3), and every merge widens the
    ancestor set validators must recompute. The tie-break, the seen-dedup

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
+use rand::Rng;
 use vess_crypto::*;
 use vess_network::{unframe, GossipMessage, Network, RpcRequest, RpcResponse, HANDSHAKE_RESP, HANDSHAKE_INIT, frame, ENCRYPTED_DATA};
 use vess_network::data_packets::{self, MessageId, PacketReassembler};
@@ -292,10 +293,14 @@ impl Wallet {
         let total_needed: Amount = outputs.iter().map(|(_, a, _)| a).sum();
         let mut selected = Vec::new();
         let mut selected_sum = 0;
-        // Only select from claimed (never pending or unclaimed)
+        // Only select from claimed (never pending or unclaimed).
+        // Use as many inputs as possible (up to MAX_INPUTS) — even after
+        // meeting the amount target, continue pulling in more coins. This
+        // makes every payment look like a consolidation, and every
+        // consolidation indistinguishable from a normal spend.
         let pool: Vec<&Vess> = self.vbank_claimed.iter().collect();
         for v in &pool {
-            if selected_sum >= total_needed { break; }
+            if selected.len() >= MAX_INPUTS { break; }
             selected.push((*v).clone());
             selected_sum += v.amount;
         }
@@ -401,7 +406,30 @@ impl Wallet {
             let chunk: Vec<Vess> = self.vbank_claimed.iter().take(MAX_INPUTS).cloned().collect();
             if chunk.len() < 2 { break; }
             let total: u64 = chunk.iter().map(|v| v.amount).sum();
-            let payment = match self.build_payment(&[(oh, total, None)]) {
+            // Split into 2 self-owned outputs. ~50% of the time, one output
+            // uses a "round" human-looking amount (multiples of 10, 100, or
+            // 1000) so the consolidation resembles a normal payment rather
+            // than an obvious self-transfer. An observer can't link either
+            // output to the original inputs.
+            let outputs: Vec<(OwnerHash, Amount, Option<SpendCondition>)> = if total > 1 {
+                let split = if rand::thread_rng().gen_bool(0.5) {
+                    // Human-looking round amount: pick a granularity and
+                    // a multiple that fits within [1, total-1].
+                    let grain = [10, 100, 1000][rand::thread_rng().gen_range(0..3)];
+                    let max_multi = (total - 1) / grain;
+                    if max_multi > 0 {
+                        rand::thread_rng().gen_range(1..=max_multi) * grain
+                    } else {
+                        rand::thread_rng().gen_range(1..total)
+                    }
+                } else {
+                    rand::thread_rng().gen_range(1..total)
+                };
+                vec![(oh, split, None), (oh, total - split, None)]
+            } else {
+                vec![(oh, total, None)]
+            };
+            let payment = match self.build_payment(&outputs) {
                 Some(p) => p,
                 None => break,
             };
