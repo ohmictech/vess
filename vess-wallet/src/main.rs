@@ -36,10 +36,37 @@ fn main() {
         run_flags(&args);
         return;
     }
-    run_interactive(WALLET_FILE);
+    // No flags: discover wallets or create new.
+    let existing = discover_wallets();
+    if existing.is_empty() {
+        run_interactive_new();
+    } else if existing.len() == 1 {
+        run_interactive(&existing[0]);
+    } else {
+        println!("found {} wallet files:", existing.len());
+        for (i, path) in existing.iter().enumerate() {
+            println!("  [{}] {}", i + 1, path);
+        }
+        print!("select wallet number (or enter for new): ");
+        io::stdout().flush().unwrap();
+        let line = read_line();
+        if let Ok(n) = line.trim().parse::<usize>() {
+            if n >= 1 && n <= existing.len() {
+                run_interactive(&existing[n - 1]);
+                return;
+            }
+        }
+        run_interactive_new();
+    }
 }
 
 fn list_wallets() {
+    let wallets = discover_wallets();
+    if wallets.is_empty() { println!("no wallet files found"); }
+    for path in wallets { println!("{}", path); }
+}
+
+fn discover_wallets() -> Vec<String> {
     let mut wallets: Vec<String> = std::fs::read_dir(".").ok().into_iter().flatten()
         .filter_map(|entry| entry.ok())
         .filter_map(|entry| {
@@ -49,8 +76,7 @@ fn list_wallets() {
         })
         .collect();
     wallets.sort();
-    if wallets.is_empty() { println!("no wallet files found"); }
-    for path in wallets { println!("{}", path); }
+    wallets
 }
 
 fn load_or_create(wallet_path: &str, password: &[u8]) -> Option<Wallet> {
@@ -192,39 +218,52 @@ fn run_flags(args: &[String]) {
 }
 
 fn run_interactive(wallet_path: &str) {
-    let mut wallet: Option<Wallet> = None;
-
-    if std::path::Path::new(wallet_path).exists() {
-        print!("wallet password for {}: ", wallet_path);
+    let wallet = if std::path::Path::new(wallet_path).exists() {
+        print!("password for {}: ", wallet_path);
         io::stdout().flush().unwrap();
         let pw = read_line();
-        if let Ok(data) = std::fs::read(wallet_path) {
-            wallet = Wallet::load(&data, pw.as_bytes());
-            if wallet.is_some() {
-                println!("wallet loaded ({} VESS balance)", wallet.as_ref().unwrap().balance());
-            } else {
-                println!("bad password — use --wallet <new-file> or delete the existing one to start fresh");
-                return;
-            }
+        match std::fs::read(wallet_path) {
+            Ok(data) => match Wallet::load(&data, pw.as_bytes()) {
+                Some(w) => { println!("loaded ({} VESS)", w.balance()); Some(w) }
+                None => { println!("bad password"); return; }
+            },
+            Err(_) => { println!("failed to read {}", wallet_path); return; }
         }
+    } else {
+        // File doesn't exist — create new.
+        Some(create_new_wallet(wallet_path))
+    };
+
+    let Some(mut w) = wallet else { return };
+    interactive_loop(&mut w, wallet_path);
+}
+
+/// No wallets exist at all — prompt for a filename and create.
+fn run_interactive_new() {
+    println!("no wallet files found");
+    print!("new wallet filename [wallet.vess]: ");
+    io::stdout().flush().unwrap();
+    let name = read_line();
+    let path = if name.trim().is_empty() { "wallet.vess".to_string() } else { name.trim().to_string() };
+    let mut w = create_new_wallet(&path);
+    interactive_loop(&mut w, &path);
+}
+
+fn create_new_wallet(path: &str) -> Wallet {
+    print!("set password (or enter for none): ");
+    io::stdout().flush().unwrap();
+    let pw = read_line();
+    let w = Wallet::new(pw.as_bytes());
+    if pw.is_empty() {
+        println!("created {} (no password)", path);
+    } else {
+        println!("created {} (password protected)", path);
     }
+    println!("  use 'connect <addr>' and 'import <db>' to get started");
+    w
+}
 
-    if wallet.is_none() {
-        print!("set wallet password (or enter for none): ");
-        io::stdout().flush().unwrap();
-        let pw = read_line();
-        let pass = pw.as_bytes();
-        wallet = Some(Wallet::new(pass));
-        if pw.is_empty() {
-            println!("empty wallet created (no password set)");
-        } else {
-            println!("empty wallet created (password protected)");
-        }
-        println!("  use 'connect <addr>' and 'import <db>' to get started");
-    }
-
-    let w = wallet.as_mut().unwrap();
-
+fn interactive_loop(w: &mut Wallet, wallet_path: &str) {
     loop {
         print!("> ");
         io::stdout().flush().unwrap();

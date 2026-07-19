@@ -693,25 +693,10 @@ impl Node {
         for owners in input_owners.values() {
             if owners.len() >= 2 { for &i in owners { conflicted.insert(i); } }
         }
-        // Propagate: a payment spending an output of a conflicted payment can
-        // never be satisfied (those outputs are never created), so it is voided
-        // too. Iterate to a fixpoint. In-block chains through CLEAN payments are
-        // fine and must NOT be marked.
-        loop {
-            let mut changed = false;
-            let conflicted_outputs: HashSet<VessId> = payments.iter().enumerate()
-                .filter(|(i, _)| conflicted.contains(i))
-                .flat_map(|(_, p)| p.outputs.iter().map(|v| v.vess_id()))
-                .collect();
-            for (i, p) in payments.iter().enumerate() {
-                if conflicted.contains(&i) { continue; }
-                if p.inputs.iter().any(|v| conflicted_outputs.contains(&v.vess_id())) {
-                    conflicted.insert(i);
-                    changed = true;
-                }
-            }
-            if !changed { break; }
-        }
+        // No propagation needed: chained spends are invalid by consensus (all
+        // inputs must reference pre-block state), so a payment spending a
+        // conflicted payment's output is rejected at the existence check —
+        // conflicts are always direct, shared pre-state inputs.
         conflicted
     }
 
@@ -920,6 +905,14 @@ impl Node {
         if canonical_coinbase.payment_id != block.coinbase.payment_id { return None; }
 
         let mut state = self.state_for_tip(parent)?;
+        // Chained spends are banned by consensus: every payment input must
+        // reference pre-block state — never an output created by this block
+        // (including the coinbase). Checked once, before any state mutation.
+        for payment in &block.payments {
+            for input in &payment.inputs {
+                if !state.contains(&input.vess_id()) { return None; }
+            }
+        }
         for output in &block.coinbase.outputs {
             if !state.insert(output.vess_id()) { return None; }
         }
@@ -964,26 +957,12 @@ impl Node {
             }
         }
         // Pass 3: vaporize conflicted payments. Inputs burn, outputs are NOT
-        // created — the penalty falls entirely on the double-spender. An input
-        // is satisfiable if it still exists (burn it), was already burned by an
-        // earlier conflicted payment (that double-removal IS the conflict), or
-        // is an output of a conflicted payment in this block (void — nothing
-        // to burn, but not a reason to reject the whole block).
-        let conflicted_outputs: HashSet<VessId> = block.payments.iter().enumerate()
-            .filter(|(pi, _)| conflicted.contains(pi))
-            .flat_map(|(_, p)| p.outputs.iter().map(|v| v.vess_id()))
-            .collect();
-        let mut burned: HashSet<VessId> = HashSet::new();
+        // created — the penalty falls entirely on the double-spender. Every
+        // input was already proven to exist in pre-block state above; the
+        // second removal of a shared input simply no-ops — that IS the burn.
         for (pi, payment) in block.payments.iter().enumerate() {
             if !conflicted.contains(&pi) { continue; }
-            for input in &payment.inputs {
-                let id = input.vess_id();
-                if state.remove(&id) {
-                    burned.insert(id);
-                } else if !burned.contains(&id) && !conflicted_outputs.contains(&id) {
-                    return None;
-                }
-            }
+            for input in &payment.inputs { state.remove(&input.vess_id()); }
         }
         Some(state)
     }
@@ -1167,7 +1146,9 @@ impl Node {
         if p.input_sum() != p.output_sum() { return false; }
         if p.sigs.len() != p.inputs.len() { return false; }
         for (i, v) in p.inputs.iter().enumerate() {
-            if !self.check(&v.vess_id()) { return false; }
+            // Chained spends are banned: inputs must be confirmed UTXOs in
+            // LMDB, never outputs of other in-limbo (unconfirmed) payments.
+            if !self.check_direct(&v.vess_id()) { return false; }
 
             // Signature is always required
             if !dsa_verify(&v.pubkey, &p.payment_id, &p.sigs[i]) { return false; }

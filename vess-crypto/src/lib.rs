@@ -109,12 +109,13 @@ pub fn required_difficulty(amount: Amount) -> u32 {
 }
 
 /// Block reward: 1 Vess below MINING_DIFFICULTY, doubles each bit beyond.
-/// Total: saturates at Amount::MAX past 73 bits instead of overflowing the shift
-/// (the ≤60 bits consensus cap lives in vess-node).
+/// Total: saturates at Amount::MAX when the shift would exceed u64, instead of
+/// overflowing (the ≤60 bits consensus cap lives in vess-node).
 pub fn block_reward(difficulty_bits: u32) -> Amount {
     if difficulty_bits < MINING_DIFFICULTY { return 1; }
-    if difficulty_bits > 73 { return Amount::MAX; } // 1 << (bits - 10) would overflow u64
-    1u64 << (difficulty_bits - MINING_DIFFICULTY) as u32
+    let shift = difficulty_bits - MINING_DIFFICULTY;
+    if shift >= 64 { return Amount::MAX; }
+    1u64 << shift
 }
 
 /// Adjust difficulty to target a given block time. Returns new bits.
@@ -842,8 +843,8 @@ mod tests {
         assert_eq!(block_reward(MINING_DIFFICULTY - 1), 1);
         assert_eq!(block_reward(MINING_DIFFICULTY), 1);
         assert_eq!(block_reward(MINING_DIFFICULTY + 1), 2);
-        assert_eq!(block_reward(73), 1u64 << 63);
-        assert_eq!(block_reward(74), Amount::MAX, "saturates instead of overflowing");
+        assert_eq!(block_reward(MINING_DIFFICULTY + 63), 1u64 << 63);
+        assert_eq!(block_reward(MINING_DIFFICULTY + 64), Amount::MAX, "saturates instead of overflowing");
         assert_eq!(block_reward(u32::MAX), Amount::MAX);
     }
 }
