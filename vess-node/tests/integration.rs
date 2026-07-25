@@ -46,8 +46,8 @@ mod integration {
         let (mut n1, s1) = start_node_at(NODE1_ADDR, "vess-db-handshake");
         let (mut n2, s2) = start_node_at(NODE2_ADDR, "vess-db-handshake-2");
         let n2_addr: std::net::SocketAddr = NODE2_ADDR.parse().unwrap();
-        let init = n1.add_peer(n2_addr);
-        s1.send_to(&init, n2_addr).unwrap();
+        let len = n1.add_peer(n2_addr); assert!(len > 0);
+        for (dest, data) in n1.drain_outbox() { s1.send_to(&data, dest).unwrap(); }
         thread::sleep(Duration::from_millis(10));
         cycle_node(&mut n2, &s2);
         cycle_node(&mut n1, &s1);
@@ -142,8 +142,8 @@ mod integration {
         let (mut n1, s1) = start_node_at("127.0.0.1:19880", "vess-db-flow");
         let (mut n2, s2) = start_node_at("127.0.0.1:19881", "vess-db-flow-2");
         let n2_addr: std::net::SocketAddr = "127.0.0.1:19881".parse().unwrap();
-        let init = n1.add_peer(n2_addr);
-        s1.send_to(&init, n2_addr).unwrap();
+        let len = n1.add_peer(n2_addr); assert!(len > 0);
+        for (dest, data) in n1.drain_outbox() { s1.send_to(&data, dest).unwrap(); }
         for _ in 0..4 { thread::sleep(Duration::from_millis(10)); cycle_node(&mut n2, &s2); cycle_node(&mut n1, &s1); }
         n1.needs_sync = false; n2.needs_sync = false;
         let (pk, sk) = dsa_generate();
@@ -230,8 +230,8 @@ mod integration {
         let (mut n1, s1) = start_node_at("127.0.0.1:19900", "vess-db-gossip-1");
         let (mut n2, s2) = start_node_at("127.0.0.1:19901", "vess-db-gossip-2");
         let n2_addr: std::net::SocketAddr = "127.0.0.1:19901".parse().unwrap();
-        let init = n1.add_peer(n2_addr);
-        s1.send_to(&init, n2_addr).unwrap();
+        let len = n1.add_peer(n2_addr); assert!(len > 0);
+        for (dest, data) in n1.drain_outbox() { s1.send_to(&data, dest).unwrap(); }
         thread::sleep(Duration::from_millis(10));
         cycle_node(&mut n2, &s2); cycle_node(&mut n1, &s1);
         thread::sleep(Duration::from_millis(10));
@@ -866,8 +866,8 @@ mod integration {
         let (mut n1, s1) = start_node_at("127.0.0.1:19956", "vess-db-loss1");
         let (mut n2, s2) = start_node_at("127.0.0.1:19957", "vess-db-loss2");
         let n2_addr: std::net::SocketAddr = "127.0.0.1:19957".parse().unwrap();
-        let init = n1.add_peer(n2_addr);
-        s1.send_to(&init, n2_addr).unwrap();
+        let len = n1.add_peer(n2_addr); assert!(len > 0);
+        for (dest, data) in n1.drain_outbox() { s1.send_to(&data, dest).unwrap(); }
         // Cycle to establish session
         for _ in 0..6 { thread::sleep(Duration::from_millis(5)); cycle_node(&mut n2, &s2); cycle_node(&mut n1, &s1); }
         n1.needs_sync = false; n2.needs_sync = false;
@@ -1066,9 +1066,11 @@ mod integration {
         let a3: SocketAddr = "127.0.0.1:20503".parse().unwrap();
 
         // Full mesh handshake.
-        let i12 = n1.add_peer(a2); s1.send_to(&i12, a2).unwrap();
-        let i13 = n1.add_peer(a3); s1.send_to(&i13, a3).unwrap();
-        let i23 = n2.add_peer(a3); s2.send_to(&i23, a3).unwrap();
+        let i12 = n1.add_peer(a2); assert!(i12 > 0);
+        let i13 = n1.add_peer(a3); assert!(i13 > 0);
+        let i23 = n2.add_peer(a3); assert!(i23 > 0);
+        for (dest, data) in n1.drain_outbox() { s1.send_to(&data, dest).unwrap(); }
+        for (dest, data) in n2.drain_outbox() { s2.send_to(&data, dest).unwrap(); }
         for _ in 0..6 {
             thread::sleep(Duration::from_millis(5));
             cycle_node(&mut n1, &s1); cycle_node(&mut n2, &s2); cycle_node(&mut n3, &s3);
@@ -1127,6 +1129,223 @@ mod integration {
         assert!(n1.tip_hashes.contains(&m_hash), "n1 tip is merge");
         assert!(n2.tip_hashes.contains(&m_hash), "n2 tip is merge");
         assert!(n3.tip_hashes.contains(&m_hash), "n3 tip is merge");
+    }
+
+    // ── COMPREHENSIVE MULTI-NODE END-TO-END ──
+
+    #[test]
+    fn test_full_mesh_payments_sync_vaporize() {
+        // Four-node mesh: limbo payment submission, block mining with payment,
+        // cross-branch conflicting spend vaporized via DAG merge, real gossip
+        // relay through encrypted session, and LMDB verification on all nodes.
+        let _ = std::fs::remove_dir_all("vess-db-fm-1"); let _ = std::fs::remove_dir_all("vess-db-fm-2");
+        let _ = std::fs::remove_dir_all("vess-db-fm-3"); let _ = std::fs::remove_dir_all("vess-db-fm-4");
+        let (mut n1, s1) = start_node_at("127.0.0.1:20601", "vess-db-fm-1");
+        let (mut n2, s2) = start_node_at("127.0.0.1:20602", "vess-db-fm-2");
+        let (mut n3, s3) = start_node_at("127.0.0.1:20603", "vess-db-fm-3");
+        let (mut n4, _s4) = start_node_at("127.0.0.1:20604", "vess-db-fm-4");
+        let a1: SocketAddr = "127.0.0.1:20601".parse().unwrap();
+        let a2: SocketAddr = "127.0.0.1:20602".parse().unwrap();
+        let a3: SocketAddr = "127.0.0.1:20603".parse().unwrap();
+
+        // Manual sessions — skip PoW.
+        let key = [0x42u8; 32];
+        let id1 = n1.network.my_node_id(); let id2 = n2.network.my_node_id();
+        let id3 = n3.network.my_node_id(); let id4 = n4.network.my_node_id();
+        n1.inject_session(a2, id2, key); n2.inject_session(a1, id1, key);
+        n1.inject_session(a3, id3, key); n3.inject_session(a1, id1, key);
+        n2.inject_session(a3, id3, key); n3.inject_session(a2, id2, key);
+        n1.needs_sync = false; n2.needs_sync = false; n3.needs_sync = false; n4.needs_sync = false;
+
+        let (pk, sk) = dsa_generate(); let oh = dsa_pubkey_hash(&pk);
+
+        // Phase 1: mine genesis + two spendable coins. Track each block.
+        mine_coins(&mut n1, oh, &pk, &sk);
+        let block_gen = n1.pending_blocks.last().cloned().unwrap();
+        mine_coins(&mut n1, oh, &pk, &sk);
+        let block_coin_a = n1.pending_blocks.last().cloned().unwrap();
+        mine_coins(&mut n1, oh, &pk, &sk);
+        let block_coin_b = n1.pending_blocks.last().cloned().unwrap();
+        let coin_a = block_coin_a.coinbase.outputs.iter().find(|v| v.owner_hash == oh).unwrap().clone();
+        let coin_b = block_coin_b.coinbase.outputs.iter().find(|v| v.owner_hash == oh).unwrap().clone();
+        // Inject all three into n2, n3, n4.
+        for n in [&mut n2, &mut n3, &mut n4] {
+            assert!(n.process_block(&block_gen));
+            assert!(n.process_block(&block_coin_a));
+            assert!(n.process_block(&block_coin_b));
+        }
+
+        // Phase 2: submit a payment spending coin_a, mine it, inject into all.
+        let (pk_recv, sk_recv) = dsa_generate(); let oh_recv = dsa_pubkey_hash(&pk_recv);
+        let out_r = Vess { variant: VessVariant::Output, amount: coin_a.amount, owner_hash: oh_recv,
+            timestamp: 0, nonce: 0, salt: random_bytes(), pubkey: pk_recv.clone(),
+            spend_key: sk_recv.clone(), spend_condition: None };
+        let mut pay1 = VessPayment { payment_id: [0u8; 32], inputs: vec![coin_a.clone()],
+            outputs: vec![out_r], timestamp: 0, sigs: vec![], preimages: vec![] };
+        pay1.compute(); pay1.sigs = vec![dsa_sign(&sk, &pay1.payment_id).unwrap()];
+        assert!(n1.submit(pay1), "payment enters limbo");
+        let pay_block = n1.prepare_block().expect("block with payment");
+        n1.apply_mined_block(pay_block, 0, vec![]);
+        let block_pay = n1.pending_blocks.last().cloned().unwrap();
+        for n in [&mut n2, &mut n3, &mut n4] { assert!(n.process_block(&block_pay)); }
+
+        // Phase 3: conflicting double-spend of coin_b.
+        let (pk_a, sk_a) = dsa_generate(); let oh_a = dsa_pubkey_hash(&pk_a);
+        let (pk_b, sk_b) = dsa_generate(); let oh_b = dsa_pubkey_hash(&pk_b);
+        let out_a = Vess { variant: VessVariant::Output, amount: coin_b.amount, owner_hash: oh_a,
+            timestamp: 0, nonce: 0, salt: random_bytes(), pubkey: pk_a.clone(),
+            spend_key: sk_a.clone(), spend_condition: None };
+        let out_b = Vess { variant: VessVariant::Output, amount: coin_b.amount, owner_hash: oh_b,
+            timestamp: 0, nonce: 0, salt: random_bytes(), pubkey: pk_b.clone(),
+            spend_key: sk_b.clone(), spend_condition: None };
+        let mut p_a = VessPayment { payment_id: [0u8; 32], inputs: vec![coin_b.clone()],
+            outputs: vec![out_a.clone()], timestamp: 0, sigs: vec![], preimages: vec![] };
+        p_a.compute(); p_a.sigs = vec![dsa_sign(&sk, &p_a.payment_id).unwrap()];
+        let mut p_b = VessPayment { payment_id: [0u8; 32], inputs: vec![coin_b.clone()],
+            outputs: vec![out_b.clone()], timestamp: 0, sigs: vec![], preimages: vec![] };
+        p_b.compute(); p_b.sigs = vec![dsa_sign(&sk, &p_b.payment_id).unwrap()];
+        let out_a_id = out_a.vess_id(); let out_b_id = out_b.vess_id();
+        let cb_id = coin_b.vess_id();
+        assert!(n1.submit(p_a.clone())); assert!(n2.submit(p_b.clone()));
+        assert!(n3.submit(p_a)); assert!(n3.submit(p_b));
+
+        // Phase 4: fork — n1 mines p_a, n2 mines p_b. Inject into all.
+        let b1 = n1.prepare_block().expect("b1"); let b2 = n2.prepare_block().expect("b2");
+        n1.apply_mined_block(b1, 0, vec![]); n2.apply_mined_block(b2, 0, vec![]);
+        let block_b1 = n1.pending_blocks.last().cloned().unwrap();
+        let block_b2 = n2.pending_blocks.last().cloned().unwrap();
+        let b1h = block_b1.header_hash(); let b2h = block_b2.header_hash();
+        for n in [&mut n2, &mut n3, &mut n4] { assert!(n.process_block(&block_b1)); }
+        for n in [&mut n1, &mut n3, &mut n4] { assert!(n.process_block(&block_b2)); }
+
+        // Phase 5: n3 mines merge. Relay through real gossip: n3 → socket → n1.
+        let (pk_m, sk_m) = dsa_generate(); let oh_m = dsa_pubkey_hash(&pk_m);
+        let m = cb_block(vec![b1h, b2h], 1, oh_m, &pk_m, &sk_m, vec![], 3000);
+        let mh = m.header_hash();
+        assert!(n3.process_block(&m), "n3 accepts merge");
+        // Real gossip relay: n3 sends merge to n1 through encrypted session.
+        n3.send(a1, &GossipMessage::Block(m.clone()));
+        for (dst, data) in n3.cycle() {
+            if dst == a1 { s1.send_to(&data, a1).unwrap(); }
+        }
+        cycle_node(&mut n1, &s1);
+        assert!(n1.process_block(&m), "n1 idempotent-accepts merge (gossip + direct)");
+        assert!(n2.process_block(&m)); assert!(n4.process_block(&m));
+        assert!(n2.process_block(&m)); assert!(n4.process_block(&m));
+
+        // Phase 6: verify vaporization + merkle convergence on ALL FOUR nodes.
+        for node in [&n1, &n2, &n3, &n4] {
+            assert!(!node.check(&cb_id), "coin vaporized");
+            assert!(!node.check(&out_a_id), "out A vaporized");
+            assert!(!node.check(&out_b_id), "out B vaporized");
+        }
+        let r = n1.merkle();
+        for n in [&n2, &n3, &n4] { assert_eq!(n.merkle(), r, "merkle convergence"); }
+
+        // LMDB state matches across all nodes.
+        let count = n1.utxo_count();
+        assert!(count > 0);
+        for n in [&n2, &n3, &n4] { assert_eq!(n.utxo_count(), count, "LMDB UTXO count matches"); }
+    }
+
+    /// White-box: verify that fragmented handshake messages are tracked
+    /// and retried after the retransmit interval elapses.
+    #[test]
+    fn test_handshake_fragment_retry() {
+        let _ = std::fs::remove_dir_all("vess-db-hs-retry");
+        let (mut n1, _s1) = start_node_at("127.0.0.1:20701", "vess-db-hs-retry");
+        let a2: SocketAddr = "127.0.0.1:20702".parse().unwrap();
+
+        // Initiate handshake — fragments go to outbox.
+        let len = n1.add_peer(a2);
+        assert!(len > 0, "handshake init should produce bytes");
+
+        // Drain initial fragments.
+        let initial: Vec<_> = n1.drain_outbox();
+        let fragment_count = initial.len();
+        assert!(
+            fragment_count > 1,
+            "handshake init should be multi-fragment, got {}",
+            fragment_count
+        );
+        assert!(
+            initial.iter().all(|(addr, _)| *addr == a2),
+            "all fragments should target the peer"
+        );
+
+        // Outbox should be empty after drain.
+        assert!(n1.drain_outbox().is_empty());
+
+        // Advance ticks past the retry threshold.
+        n1.ticks += vess_node::HANDSHAKE_RETRANSMIT_TICKS + 1;
+
+        // cycle() calls retry_handshakes() which should re-queue fragments.
+        let retried = n1.cycle();
+        assert!(!retried.is_empty(), "retry should re-queue fragments");
+        assert_eq!(
+            retried.len(),
+            fragment_count,
+            "retry should re-send same number of fragments"
+        );
+        assert!(retried.iter().all(|(addr, _)| *addr == a2));
+
+        // Outbox should be empty after cycle drain.
+        assert!(n1.drain_outbox().is_empty());
+    }
+
+    /// Integration: handshake completes even when one fragment is lost,
+    /// because the retry mechanism re-sends it on the next cycle.
+    #[test]
+    fn test_handshake_survives_fragment_loss() {
+        let _ = std::fs::remove_dir_all("vess-db-hs-loss1");
+        let _ = std::fs::remove_dir_all("vess-db-hs-loss2");
+        let (mut n1, s1) = start_node_at("127.0.0.1:20711", "vess-db-hs-loss1");
+        let (mut n2, s2) = start_node_at("127.0.0.1:20712", "vess-db-hs-loss2");
+        let a2: SocketAddr = "127.0.0.1:20712".parse().unwrap();
+
+        // Initiate handshake — fragments are queued in n1's outbox.
+        let len = n1.add_peer(a2);
+        assert!(len > 0);
+
+        // Simulate fragment loss: drop the first fragment, send the rest.
+        let mut fragments: Vec<_> = n1.drain_outbox();
+        assert!(fragments.len() > 1, "expected multi-fragment handshake init");
+        let _dropped = fragments.remove(0); // simulate loss
+        for (dest, data) in &fragments {
+            s1.send_to(data, *dest).unwrap();
+        }
+
+        // n2 receives incomplete fragments — reassembly stalls.
+        for _ in 0..4 {
+            thread::sleep(Duration::from_millis(5));
+            cycle_node(&mut n2, &s2);
+        }
+        assert!(
+            !n2.has_session_for(&n1.addr),
+            "n2 should NOT have a session yet (fragment missing)"
+        );
+
+        // Advance n1's ticks past the retry threshold and cycle.
+        // retry_handshakes() re-queues all fragments to the outbox.
+        n1.ticks += vess_node::HANDSHAKE_RETRANSMIT_TICKS + 1;
+        let retried = n1.cycle();
+        assert!(!retried.is_empty(), "retry should re-queue the missing fragment");
+        for (dest, data) in &retried {
+            s1.send_to(data, *dest).unwrap();
+        }
+
+        // n2 now gets the missing fragment → reassembly completes →
+        // process() handles INIT → RESP fragments go to outbox →
+        // cycle() drains outbox and sends RESP to n1.
+        cycle_node(&mut n2, &s2);
+
+        // n1 receives RESP fragments → handshake completes.
+        cycle_node(&mut n1, &s1);
+
+        assert!(
+            n1.has_session_for(&a2),
+            "handshake should complete after fragment retry"
+        );
     }
 }
 

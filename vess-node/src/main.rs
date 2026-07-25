@@ -92,18 +92,18 @@ fn main() -> std::io::Result<()> {
         let mut n = node.lock().unwrap();
         for bs in &resolved {
             eprintln!("bootstrapping to {} (solving handshake PoW)...", bs);
-            let init = n.add_peer(*bs);
-            if !init.is_empty() {
-                send_datagrams(&socket, *bs, &init);
-                eprintln!("  handshake init sent ({} bytes)", init.len());
+            let len = n.add_peer(*bs);
+            if len > 0 {
+                eprintln!("  handshake init sent ({} bytes)", len);
             }
         }
-        let reconnects = n.reconnect_peers();
-        if !reconnects.is_empty() {
-            eprintln!("reconnecting to {} known peers...", reconnects.len());
-            for (addr, init) in reconnects {
-                send_datagrams(&socket, addr, &init);
-            }
+        let count = n.reconnect_peers();
+        if count > 0 {
+            eprintln!("reconnecting to {} known peers...", count);
+        }
+        // Drain handshake datagrams queued during bootstrap.
+        for (addr, data) in n.drain_outbox() {
+            send_datagrams(&socket, addr, &data);
         }
     }
 
@@ -128,7 +128,7 @@ fn main() -> std::io::Result<()> {
             permitted_mining_cores(n.mining_cores)
         };
         if cores == 0 {
-            std::thread::sleep(Duration::from_millis(200));
+            std::thread::sleep(Duration::from_millis(100));
             continue;
         }
         let candidate = {
@@ -136,7 +136,7 @@ fn main() -> std::io::Result<()> {
             if n.mining_cores == 0 { continue; }
             match n.prepare_block() {
                 Some(b) => b,
-                None => { std::thread::sleep(Duration::from_millis(200)); continue; }
+                None => { std::thread::sleep(Duration::from_millis(50)); continue; }
             }
         };
         let started_at = block_count_miner.load(std::sync::atomic::Ordering::Relaxed);
@@ -247,15 +247,15 @@ fn main() -> std::io::Result<()> {
         // Apply mined blocks from background thread
         while let Ok((block, nonce, proof)) = block_rx.try_recv() {
             node.lock().unwrap().apply_mined_block(block, nonce, proof);
+            last_status = 0; // force status on next cycle
         }
 
         // Check for peer connection requests
         while let Ok(peer_addr) = prx.try_recv() {
             eprintln!("connecting to {} (solving handshake PoW)...", peer_addr);
-            let init = node.lock().unwrap().add_peer(peer_addr);
-            if !init.is_empty() {
-                send_datagrams(&socket, peer_addr, &init);
-                eprintln!("  handshake init sent ({} bytes)", init.len());
+            let len = node.lock().unwrap().add_peer(peer_addr);
+            if len > 0 {
+                eprintln!("  handshake init sent ({} bytes)", len);
             }
         }
 
@@ -264,9 +264,7 @@ fn main() -> std::io::Result<()> {
 
         match socket.recv_from(&mut buf) {
             Ok((len, src)) => {
-                if let Some(resp) = node.lock().unwrap().process(src, &buf[..len]) {
-                    send_datagrams(&socket, src, &resp);
-                }
+                let _ = node.lock().unwrap().process(src, &buf[..len]);
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(ref e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
@@ -278,7 +276,7 @@ fn main() -> std::io::Result<()> {
             // Sync block counter so the mining pool detects new blocks (mined or received).
             block_count_main.store(n.accepted_blocks, std::sync::atomic::Ordering::Relaxed);
             // Status — do it here while we hold the lock, no second acquisition
-            if n.ticks.saturating_sub(last_status) >= 2000 {
+            if n.ticks.saturating_sub(last_status) >= 400 {
                 last_status = n.ticks;
                 let m = n.merkle();
                 if n.mining_cores > 0 {

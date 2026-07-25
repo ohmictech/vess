@@ -30,6 +30,17 @@ struct ReliableMessage {
     retries: u8,
 }
 
+/// A handshake message (INIT or RESP) being retried until the session is
+/// established or the retry budget is exhausted.
+struct PendingHandshake {
+    packets: Vec<Vec<u8>>,
+    last_sent: u64,
+    retries: u8,
+}
+
+pub const HANDSHAKE_RETRANSMIT_TICKS: u64 = 200; // ~1 s
+pub const MAX_HANDSHAKE_RETRANSMITS: u8 = 10;    // 10 retries ≈ 10 s
+
 /// NAT reachability classification.
 #[derive(PartialEq, Clone, Copy, Debug)]
 pub enum NatType {
@@ -94,6 +105,8 @@ pub struct Node {
     packet_reassembly: HashMap<SocketAddr, PacketReassembler>,
     reliable_messages: HashMap<data_packets::MessageId, ReliableMessage>,
     completed_packets: HashMap<SocketAddr, Vec<(data_packets::MessageId, u64)>>,
+    // Handshake retry: keyed by peer address so a re-init replaces the old entry.
+    pending_handshakes: HashMap<SocketAddr, PendingHandshake>,
     // State sync
     sync_peer: Option<SocketAddr>,               // peer we're syncing UTXOs from
     sync_offset: u64,                             // how many UTXO IDs received so far
@@ -143,6 +156,7 @@ impl Node {
             packet_reassembly: HashMap::new(),
             reliable_messages: HashMap::new(),
             completed_packets: HashMap::new(),
+            pending_handshakes: HashMap::new(),
             sync_peer: None,
             sync_offset: 0,
             sync_target_root: None,
@@ -286,7 +300,7 @@ impl Node {
     pub fn try_punch_handshake(&mut self, addr: SocketAddr) {
         if !self.has_session_for(&addr) {
             let init = self.network.build_handshake_init(addr);
-            self.outbox.push((addr, init));
+            self.send_handshake(addr, init);
         }
     }
 
@@ -317,8 +331,8 @@ impl Node {
     fn relay_through_introducer(&mut self, target_id: NodeId, gossip_bytes: Vec<u8>) {
         self.relay_queue.push((target_id, gossip_bytes));
     }
-    pub fn add_peer(&mut self, a: SocketAddr) -> Vec<u8> {
-        if self.peer_count() >= self.max_peers { return Vec::new(); }
+    pub fn add_peer(&mut self, a: SocketAddr) -> usize {
+        if self.peer_count() >= self.max_peers { return 0; }
         let raw = self.network.build_handshake_init(a);
         let (tag, payload) = unframe(&raw).unwrap_or((HANDSHAKE_INIT, &[][..]));
         // PoW handshake puzzle: find a 6-cycle. Include the winning header + proof.
@@ -333,7 +347,10 @@ impl Node {
         let mut payload_with_pow = payload.to_vec();
         payload_with_pow.extend_from_slice(&proof.0); // 32-byte header hash
         for n in &proof.1 { payload_with_pow.extend_from_slice(&n.to_le_bytes()); }
-        frame(tag, &payload_with_pow)
+        let framed = frame(tag, &payload_with_pow);
+        let len = framed.len();
+        self.send_handshake(a, framed);
+        len
     }
 
     /// Persist a peer address so we can reconnect on restart.
@@ -355,8 +372,9 @@ impl Node {
     }
 
     /// Attempt to reconnect to all known-but-unconnected peers.
-    /// Returns list of (addr, handshake_init_bytes) to be sent via socket.
-    pub fn reconnect_peers(&mut self) -> Vec<(std::net::SocketAddr, Vec<u8>)> {
+    /// Returns the number of handshakes initiated; the actual datagrams
+    /// are queued in the outbox.
+    pub fn reconnect_peers(&mut self) -> usize {
         let unconnected: Vec<std::net::SocketAddr> = self.peers.iter()
             .filter(|(a, id)| {
                 **id == [0u8; 32] &&               // not yet handshaked
@@ -365,15 +383,13 @@ impl Node {
             })
             .map(|(a, _)| *a)
             .collect();
-        let mut out = Vec::new();
+        let mut count = 0usize;
         for addr in unconnected {
             if self.peer_count() >= self.max_peers { break; }
-            let init = self.add_peer(addr);
-            if !init.is_empty() {
-                out.push((addr, init));
-            }
+            let len = self.add_peer(addr);
+            if len > 0 { count += 1; }
         }
-        out
+        count
     }
     pub fn check_direct(&self, id: &VessId) -> bool {
         self.env.read_txn().ok()
@@ -546,7 +562,7 @@ impl Node {
 
         let has_work = !clean.is_empty() || !self.contested.is_empty();
         let genesis = self.blocks.is_empty();
-        let periodic = self.ticks.saturating_sub(self.last_mine_tick) >= 4000;
+        let periodic = self.ticks.saturating_sub(self.last_mine_tick) >= 60;
         if !has_work && !genesis && !periodic { return None; }
         self.last_mine_tick = self.ticks;
 
@@ -626,6 +642,25 @@ impl Node {
     /// Returns None if cancelled before finding a solution.
     pub fn mine_pow(block: &VessBlock, start_nonce: u64, step: u64, cancel: &std::sync::atomic::AtomicBool, counter: &std::sync::atomic::AtomicU64) -> Option<(u64, Vec<u32>)> {
         let diff = block.difficulty_bits;
+        // Difficulty 0: blake3-only mining, no Cuckatoo solver. Any nonce
+        // passes check_difficulty, so return immediately with a dummy proof.
+        if diff == 0 {
+            let mut bh = block.clone(); bh.nonce = start_nonce;
+            if check_difficulty(&bh.header_hash(), diff) {
+                return Some((start_nonce, vec![0u32; cuckoo::CYCLE_LENGTH]));
+            }
+            // Fallback: increment nonce (should never hit this — diff 0 always passes).
+            let mut nonce = start_nonce.wrapping_add(step);
+            loop {
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) { return None; }
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let mut bh = block.clone(); bh.nonce = nonce;
+                if check_difficulty(&bh.header_hash(), diff) {
+                    return Some((nonce, vec![0u32; cuckoo::CYCLE_LENGTH]));
+                }
+                nonce = nonce.wrapping_add(step);
+            }
+        }
         let mut nonce = start_nonce;
         loop {
             if cancel.load(std::sync::atomic::Ordering::Relaxed) { return None; }
@@ -686,8 +721,11 @@ impl Node {
         // Gate difficulty bounds before any expensive verification.
         if block.difficulty_bits > 60 { return false; }
 
-        // Verify Cuckatoo27 PoW on the block header (skip in test mode)
-        if !self.test_mode {
+        // Cuckatoo27 PoW is required at difficulty ≥ 1. Difficulty 0 blocks
+        // skip the solver entirely — blake3 header_hash is the only work.
+        // This lets the network boot on commodity hardware; memory-hard PoW
+        // kicks in as difficulty ramps up. Test mode skips all PoW.
+        if !self.test_mode && block.difficulty_bits > 0 {
             if block.proof.len() != cuckoo::CYCLE_LENGTH { return false; }
             let header_hash = block.header_hash();
             if !cuckoo::verify(&header_hash, &block.proof, cuckoo::CYCLE_LENGTH, cuckoo::EDGE_BITS) {
@@ -1104,6 +1142,7 @@ impl Node {
         self.ticks = self.ticks.wrapping_add(1);
         self.evict_limbo();
         self.retry_reliable_messages();
+        self.retry_handshakes();
         // Reset per-second rate limiter every ~1s (200 ticks at 5ms)
         if self.ticks.saturating_sub(self.msg_window_start) >= 200 {
             self.peer_msg_count.clear();
@@ -1310,7 +1349,14 @@ impl Node {
                     self.persist_peer(addr);
                 }
             }
-            return resp;
+            if let Some(handshake_data) = resp {
+                self.send_handshake(addr, handshake_data);
+            }
+            // On RESP, our INIT arrived — stop retrying it.
+            if tag == HANDSHAKE_RESP {
+                self.pending_handshakes.remove(&addr);
+            }
+            return None;
         }
         // HolePunch is a raw frame — no encryption session required.
         // Only pass through to route() if the sender is plausibly known
@@ -1529,6 +1575,50 @@ impl Node {
         }
     }
 
+    /// Fragment and enqueue a handshake message for reliable delivery.
+    /// Multi-fragment messages are tracked in `pending_handshakes` and
+    /// retried until the session is established or the budget runs out.
+    fn send_handshake(&mut self, addr: SocketAddr, data: Vec<u8>) {
+        let Some(fragmented) = data_packets::fragment_with_id(&data) else {
+            return;
+        };
+        if fragmented.id.is_some() {
+            self.pending_handshakes.insert(addr, PendingHandshake {
+                packets: fragmented.packets.clone(),
+                last_sent: self.ticks,
+                retries: 0,
+            });
+        }
+        for packet in fragmented.packets {
+            self.outbox.push((addr, packet));
+        }
+    }
+
+    /// Retry handshake fragments that haven't been acknowledged.
+    fn retry_handshakes(&mut self) {
+        let mut retry = Vec::new();
+        let mut done = Vec::new();
+        for (addr, hs) in &self.pending_handshakes {
+            if self.ticks.saturating_sub(hs.last_sent) < HANDSHAKE_RETRANSMIT_TICKS { continue; }
+            if hs.retries >= MAX_HANDSHAKE_RETRANSMITS { done.push(*addr); } else { retry.push(*addr); }
+        }
+        for addr in done { self.pending_handshakes.remove(&addr); }
+        for addr in retry {
+            if let Some(hs) = self.pending_handshakes.get_mut(&addr) {
+                hs.retries += 1;
+                hs.last_sent = self.ticks;
+                for packet in &hs.packets {
+                    self.outbox.push((addr, packet.clone()));
+                }
+            }
+        }
+    }
+
+    /// Drain the outbox without advancing ticks (for use before the main loop).
+    pub fn drain_outbox(&mut self) -> Vec<(SocketAddr, Vec<u8>)> {
+        std::mem::take(&mut self.outbox)
+    }
+
     fn rpc(&mut self, tag: u8, payload: &[u8]) -> Option<Vec<u8>> {
         let req = RpcRequest::decode(tag, payload)?;
         Some(match req {
@@ -1536,12 +1626,8 @@ impl Node {
             RpcRequest::Submit(p) => RpcResponse::Submit(self.submit(p)),
             RpcRequest::GetPeers => RpcResponse::GetPeers(self.get_peers()),
             RpcRequest::ConnectPeer(addr) => {
-                let init = self.add_peer(addr);
-                let ok = !init.is_empty();
-                if ok {
-                    self.outbox.push((addr, init));
-                }
-                RpcResponse::ConnectPeer(ok)
+                let len = self.add_peer(addr);
+                RpcResponse::ConnectPeer(len > 0)
             }
         }.encode())
     }

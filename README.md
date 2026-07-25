@@ -75,7 +75,7 @@ Spending always starts with a `vess://` invoice. The payer's wallet builds a sig
 
 Vess has no BIP39, no HD derivation, no master seed. Each UTXO contains its own independent ML-DSA-65 keypair, stored directly in your encrypted `wallet.vess` file. Your wallet file is your money.
 
-No phrase to leak. No derivation paths, no gap limits, no chain scanning. Cold storage is copying `wallet.vess` to a USB drive. Backup is copy. Lose all copies and those coins are gone.
+No phrase to leak. No derivation paths, no gap limits, no chain scanning. Cold storage is copying `wallet.vess` to a USB drive or cloud storage. Backup is copy. Lose all copies and those coins are gone.
 
 ### Spend conditions: hashlock and expiry
 

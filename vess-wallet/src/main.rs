@@ -241,10 +241,11 @@ fn run_interactive_new() {
     println!("no wallet files found");
     print!("new wallet filename [wallet.vess]: ");
     io::stdout().flush().unwrap();
-    let name = read_line();
-    let path = if name.trim().is_empty() { "wallet.vess".to_string() } else { name.trim().to_string() };
-    let mut w = create_new_wallet(&path);
-    interactive_loop(&mut w, &path);
+    let raw = read_line();
+    let mut name = if raw.trim().is_empty() { "wallet.vess".to_string() } else { raw.trim().to_string() };
+    if !name.ends_with(".vess") { name.push_str(".vess"); }
+    let mut w = create_new_wallet(&name);
+    interactive_loop(&mut w, &name);
 }
 
 fn create_new_wallet(path: &str) -> Wallet {
