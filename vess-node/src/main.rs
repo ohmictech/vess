@@ -31,23 +31,27 @@ fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let mut listen = "0.0.0.0:9876".to_string();
     let mut bootstrap: Vec<String> = Vec::new();
+    let mut max_peers: usize = 32;
 
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
             "--listen" => { i += 1; if i < args.len() { listen = args[i].clone(); } }
             "--bootstrap" => { i += 1; if i < args.len() { bootstrap.push(args[i].clone()); } }
+            "--max-peers" => { i += 1; if i < args.len() { max_peers = args[i].parse().unwrap_or(32); } }
             _ => { eprintln!("unknown arg: {}", args[i]); }
         }
         i += 1;
     }
 
     let addr: std::net::SocketAddr = listen.parse().expect("invalid --listen address");
-    let node = Arc::new(Mutex::new(Node::new(addr)));
+    let mut node_inner = Node::new(addr);
+    node_inner.max_peers = max_peers;
+    let node = Arc::new(Mutex::new(node_inner));
     let socket = UdpSocket::bind(addr)?;
     socket.set_nonblocking(true)?;
 
-    eprintln!("vess-node {} peers={}", addr, bootstrap.len());
+    eprintln!("vess-node {} peers={} max-peers={}", addr, bootstrap.len(), max_peers);
 
     // Bootstrap connections
     let mut resolved: Vec<std::net::SocketAddr> = Vec::new();
@@ -264,7 +268,9 @@ fn main() -> std::io::Result<()> {
 
         match socket.recv_from(&mut buf) {
             Ok((len, src)) => {
-                let _ = node.lock().unwrap().process(src, &buf[..len]);
+                if let Some(resp) = node.lock().unwrap().process(src, &buf[..len]) {
+                    send_datagrams(&socket, src, &resp);
+                }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(ref e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}

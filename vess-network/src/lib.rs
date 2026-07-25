@@ -45,7 +45,7 @@ pub const MAX_SESSIONS: usize = 64;
 pub enum GossipMessage {
     Payment(VessPayment),
     Block(VessBlock),
-    Root(u64, MerkleRoot),
+    Root(u64, MerkleRoot, u32),  // height, merkle, difficulty_bits
     PeerAnnounce(NodeId, SocketAddr),
     Ping(u32),
     Pong(u32),
@@ -106,10 +106,11 @@ impl GossipMessage {
         match self {
             GossipMessage::Payment(p) => frame(TAG_PAYMENT, &p.encode()),
             GossipMessage::Block(b) => frame(TAG_BLOCK, &b.encode()),
-            GossipMessage::Root(v, r) => {
+            GossipMessage::Root(v, r, d) => {
                 let mut p = Vec::new();
                 write_u64(&mut p, *v);
                 write_fixed(&mut p, r);
+                write_u32(&mut p, *d);
                 frame(TAG_ROOT, &p)
             }
             GossipMessage::PeerAnnounce(id, addr) => {
@@ -167,7 +168,10 @@ impl GossipMessage {
             TAG_PAYMENT => VessPayment::decode(payload, &mut pos).map(GossipMessage::Payment),
             TAG_BLOCK => VessBlock::decode(payload, &mut pos).map(GossipMessage::Block),
             TAG_ROOT => {
-                Some(GossipMessage::Root(read_u64(payload, &mut pos)?, read_fixed(payload, &mut pos)?))
+                let h = read_u64(payload, &mut pos)?;
+                let r = read_fixed(payload, &mut pos)?;
+                let d = if payload.len() >= pos + 4 { read_u32(payload, &mut pos)? } else { 0 };
+                Some(GossipMessage::Root(h, r, d))
             }
             TAG_PEER_ANNOUNCE => {
                 let id = read_fixed(payload, &mut pos)?;
@@ -408,7 +412,7 @@ impl Network {
     pub fn handle_handshake(&mut self, addr: SocketAddr, tag: u8, payload: &[u8]) -> Option<Vec<u8>> {
         match tag {
             HANDSHAKE_INIT => {
-                // Format: node_id(32) + version(4) + dsa_pk(variable) + kem_pk(800)
+                // Format: node_id(32) + version(4) + dsa_pk(variable) + kem_pk(800) + sig(variable)
                 if payload.len() <= 36 { return None; }
                 let peer_id: NodeId = payload[..32].try_into().ok()?;
                 let peer_ver = u32::from_le_bytes(payload[32..36].try_into().ok()?);
@@ -417,7 +421,19 @@ impl Network {
                 let peer_pk = read_bytes(payload, &mut pos)?;
                 // Verify the peer_id is a valid commitment to the pubkey
                 if node_id(&peer_pk) != peer_id { return None; }
-                let ekem_raw = &payload[pos..];
+                // Read fixed-size kem_pk so we can parse the sig that follows.
+                if payload.len() < pos + KEM_PK_BYTES { return None; }
+                let ekem_raw = &payload[pos..pos + KEM_PK_BYTES];
+                pos += KEM_PK_BYTES;
+                let init_sig = read_bytes(payload, &mut pos)?;
+                if pos != payload.len() { return None; }
+                // Verify the initiator owns the DSA key BEFORE creating any
+                // session state. Without this, an attacker can spoof the
+                // source address, supply their own KEM key, and inject
+                // encrypted gossip "from" the victim — including strikes
+                // and bans that land on the victim's address.
+                let init_transcript = blake3_hash_multi(&[b"vess-hs-init", &peer_pk, ekem_raw]);
+                if !dsa_verify(&peer_pk, &init_transcript, &init_sig) { return None; }
                 let (ct_bytes, ss_bytes) = kem_encapsulate(ekem_raw)?;
                 // Sign the full transcript: both node ids + initiator pubkey + KEM pk + ciphertext.
                 let my_id = self.my_node_id();

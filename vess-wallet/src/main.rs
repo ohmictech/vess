@@ -117,6 +117,15 @@ fn run_flags(args: &[String]) {
         i += 1;
     }
 
+    // Refuse empty password — silently encrypting with a publicly-known
+    // key means anyone can decrypt the wallet file.
+    if password.is_empty() {
+        eprintln!("fatal: --password is required in flag mode for wallet encryption");
+        eprintln!("       an empty password makes the wallet readable by anyone");
+        eprintln!("       use interactive mode (no flags) for prompted password entry");
+        return;
+    }
+
     let mut w = match load_or_create(&wallet_path, &password) {
         Some(w) => w,
         None => { eprintln!("error: wrong password or corrupt wallet file"); return; }
@@ -322,6 +331,10 @@ fn interactive_loop(w: &mut Wallet, wallet_path: &str) {
                     Some((oh, amount, sc)) => {
                         match w.build_payment(&[(oh, amount, sc)]) {
                             Some(payment) => {
+                                // Move spent inputs to pending immediately —
+                                // prevents self-immolation if the user runs
+                                // `pay` again before the first confirms.
+                                w.move_inputs_to_pending(&payment);
                                 let data = payment.encode();
                                 let hex4: String = payment.payment_id[..4].iter().map(|b| format!("{:02x}", b)).collect();
                                 println!("payment built: {} bytes, id={}", data.len(), hex4);
@@ -383,7 +396,7 @@ fn interactive_loop(w: &mut Wallet, wallet_path: &str) {
                                 if w.claim_payment(&payment) {
                                     println!("payment claimed: {} VESS, id={:?}…",
                                         payment.output_sum(), &payment.payment_id[..8]);
-                                    println!("balance: {} VESS ({} claimed, {} unclaimed)",
+                                    println!("balance: {} VESS ({} confirmed, {} unconfirmed — wait for block inclusion)",
                                         w.balance(), w.vbank_claimed.len(), w.vbank_unclaimed.len());
                                     let _ = w.save_to_path(wallet_path);
                                 } else {

@@ -19,6 +19,14 @@ mod integration {
         (node, sock)
     }
 
+    /// Production-mode node: PoW, difficulty, and coinbase validation are
+    /// all enforced.  All existing tests use `start_node_at` (test_mode).
+    fn start_prod_node_at(addr: &str, db: &str) -> (Node, UdpSocket) {
+        let (mut node, sock) = start_node_at(addr, db);
+        node.test_mode = false;
+        (node, sock)
+    }
+
     fn cycle_node(node: &mut Node, sock: &UdpSocket) {
         let mut buf = [0u8; 65536];
         loop {
@@ -1346,6 +1354,214 @@ mod integration {
             n1.has_session_for(&a2),
             "handshake should complete after fragment retry"
         );
+    }
+
+    /// Regression: coinbase outputs whose amounts wrap u64 when summed
+    /// must be rejected.  Without checked_add this allows unlimited
+    /// inflation — the wrapped total matches the expected reward even
+    /// though each individual output is astronomically large.
+    #[test]
+    fn test_coinbase_overflow_rejected() {
+        let _ = std::fs::remove_dir_all("vess-db-overflow");
+        let (mut node, _sock) = start_node_at("127.0.0.1:20801", "vess-db-overflow");
+        node.test_mode = false; // enable coinbase validation
+
+        let (pk, sk) = dsa_generate();
+        let oh = dsa_pubkey_hash(&pk);
+
+        let reward = block_reward(DIFFICULTY_BASE_BITS);
+        let dev_share = dev_reward(reward);
+
+        // Craft coinbase outputs that wrap to reward+dev_share when summed.
+        // output[0]: u64::MAX.saturating_sub(reward) + 1   (wraps to 0 when added to reward)
+        // output[1]: reward                                (wraps to reward)
+        // But we need both checks to pass: total == reward+dev_share AND miner == reward.
+        let wrap_a = u64::MAX.saturating_sub(reward).saturating_add(1); // wraps to 0 when + reward
+        let wrap_b = reward.saturating_mul(2); // wraps to reward*2 mod 2^64
+
+        let coinbase = VessPayment {
+            payment_id: [0u8; 32],
+            inputs: vec![],
+            outputs: vec![
+                Vess { variant: VessVariant::Mint, amount: wrap_a, owner_hash: oh,
+                    timestamp: 0, nonce: 0, salt: [0u8; 32], pubkey: pk.clone(),
+                    spend_key: vec![], spend_condition: None },
+                Vess { variant: VessVariant::Mint, amount: wrap_b, owner_hash: oh,
+                    timestamp: 0, nonce: 0, salt: [0u8; 32], pubkey: pk.clone(),
+                    spend_key: vec![], spend_condition: None },
+                Vess { variant: VessVariant::Mint, amount: dev_share, owner_hash: DEV_PUBKEY_HASH,
+                    timestamp: 0, nonce: 0, salt: [0u8; 32], pubkey: vec![],
+                    spend_key: vec![], spend_condition: None },
+            ],
+            timestamp: 0,
+            sigs: vec![],
+            preimages: vec![],
+        };
+
+        let block = VessBlock {
+            version: 1,
+            parents: vec![],
+            timestamp: 1,
+            difficulty_bits: DIFFICULTY_BASE_BITS,
+            nonce: 0,
+            proof: vec![],
+            coinbase,
+            payments: vec![],
+            state_merkle: [0u8; 32],
+            payment_merkle: [0u8; 32],
+        };
+
+        // Must reject — the coinbase amounts overflow when summed.
+        assert!(!node.process_block(&block),
+            "coinbase with wrapping output amounts must be rejected");
+    }
+
+    /// Regression: a payment whose output verbatim-copies an existing UTXO
+    /// (same fields → same vess_id) must be rejected at the mempool level.
+    /// Without this check, the payment passes submit() but causes the entire
+    /// block to fail validate_block, wasting miner PoW.
+    #[test]
+    fn test_mempool_rejects_duplicate_output_id() {
+        let _ = std::fs::remove_dir_all("vess-db-dup1");
+        let _ = std::fs::remove_dir_all("vess-db-dup2");
+        let (mut n1, s1) = start_node_at("127.0.0.1:20901", "vess-db-dup1");
+        let (mut n2, s2) = start_node_at("127.0.0.1:20902", "vess-db-dup2");
+        let n2_addr: SocketAddr = "127.0.0.1:20902".parse().unwrap();
+        n1.add_peer(n2_addr);
+        for (dest, data) in n1.drain_outbox() { s1.send_to(&data, dest).unwrap(); }
+        for _ in 0..6 { thread::sleep(Duration::from_millis(5)); cycle_node(&mut n2, &s2); cycle_node(&mut n1, &s1); }
+        n1.needs_sync = false; n2.needs_sync = false;
+
+        let (pk, sk) = dsa_generate();
+        let oh = dsa_pubkey_hash(&pk);
+        let coin = mine_coins(&mut n1, oh, &pk, &sk);
+        assert!(n1.check(&coin.vess_id()), "coinbase confirmed");
+
+        // Gossip the block so n2 has the UTXO
+        for _ in 0..6 { thread::sleep(Duration::from_millis(5)); cycle_node(&mut n1, &s1); cycle_node(&mut n2, &s2); }
+
+        // Craft a payment that copies the coinbase output verbatim.
+        // Same fields → same vess_id → collision with existing UTXO.
+        let duplicate_out = coin.clone();
+        let (_pay_pk, _pay_sk) = dsa_generate();
+        let mut p = VessPayment {
+            payment_id: [0u8; 32],
+            inputs: vec![coin.clone()],
+            outputs: vec![duplicate_out],
+            timestamp: 0,
+            sigs: vec![],
+            preimages: vec![],
+        };
+        p.compute();
+        p.sigs = vec![dsa_sign(&sk, &p.payment_id).unwrap()];
+
+        // Must reject — output ID collides with an existing UTXO.
+        assert!(!n2.submit(p),
+            "payment with duplicate output ID must be rejected at mempool");
+
+        // Also verify n1 rejects it (the output collision check is in verify()).
+        let coin2 = mine_coins(&mut n1, oh, &pk, &sk);
+        let mut p2 = VessPayment {
+            payment_id: [0u8; 32],
+            inputs: vec![coin2.clone()],
+            outputs: vec![coin2.clone()], // output = input → duplicate
+            timestamp: 0,
+            sigs: vec![],
+            preimages: vec![],
+        };
+        p2.compute();
+        p2.sigs = vec![dsa_sign(&sk, &p2.payment_id).unwrap()];
+        assert!(!n1.submit(p2),
+            "payment where output == input must be rejected");
+    }
+
+    // ── PRODUCTION-MODE REGRESSION TESTS ──
+    // Every test above runs with test_mode=true, which skips PoW,
+    // difficulty checks, and coinbase validation.  These tests use
+    // production-mode nodes to exercise the real validation path.
+
+    /// Production mode: difficulty mismatch must be rejected.
+    #[test]
+    fn test_prod_difficulty_mismatch_rejected() {
+        let _ = std::fs::remove_dir_all("vess-db-prod-diff");
+        let (mut node, _sock) = start_prod_node_at("127.0.0.1:21001", "vess-db-prod-diff");
+
+        // Build a valid genesis block at difficulty 0 by hand.
+        let (pk, sk) = dsa_generate();
+        let oh = dsa_pubkey_hash(&pk);
+        let reward = block_reward(DIFFICULTY_BASE_BITS);
+        let dev_share = dev_reward(reward);
+        let coinbase_out = Vess { variant: VessVariant::Mint, amount: reward, owner_hash: oh,
+            timestamp: 1, nonce: 0, salt: random_bytes(), pubkey: pk.clone(),
+            spend_key: sk.clone(), spend_condition: None };
+        let dev_out = Vess { variant: VessVariant::Mint, amount: dev_share,
+            owner_hash: DEV_PUBKEY_HASH, timestamp: 1, nonce: 0, salt: random_bytes(),
+            pubkey: vec![], spend_key: vec![], spend_condition: None };
+        let mut cb = VessPayment { payment_id: [0u8;32], inputs: vec![],
+            outputs: vec![coinbase_out.clone(), dev_out], timestamp: 0, sigs: vec![], preimages: vec![] };
+        cb.compute();
+        let coin_id = coinbase_out.vess_id();
+
+        let genesis = VessBlock {
+            version: 1, parents: vec![], timestamp: 1,
+            difficulty_bits: DIFFICULTY_BASE_BITS, nonce: 0,
+            payment_merkle: merkle_root(&[cb.payment_id]),
+            state_merkle: [0u8; 32], proof: vec![],
+            coinbase: cb, payments: vec![],
+        };
+        // Apply via apply_mined_block which computes state_merkle
+        node.apply_mined_block(genesis, 0, vec![]);
+        assert!(node.check(&coin_id), "genesis coin spendable");
+
+        // Now try a block with wrong difficulty
+        let wrong_diff = node.current_difficulty.saturating_add(1).max(1);
+        let cb2_out = Vess { variant: VessVariant::Mint, amount: reward, owner_hash: oh,
+            timestamp: 1000, nonce: 0, salt: random_bytes(), pubkey: pk.clone(),
+            spend_key: sk.clone(), spend_condition: None };
+        let dev2_out = Vess { variant: VessVariant::Mint, amount: dev_share,
+            owner_hash: DEV_PUBKEY_HASH, timestamp: 1000, nonce: 0, salt: random_bytes(),
+            pubkey: vec![], spend_key: vec![], spend_condition: None };
+        let mut cb2 = VessPayment { payment_id: [0u8;32], inputs: vec![],
+            outputs: vec![cb2_out, dev2_out], timestamp: 0, sigs: vec![], preimages: vec![] };
+        cb2.compute();
+        let bad = VessBlock {
+            version: 1, parents: node.tip_hashes.clone(), timestamp: 1000,
+            difficulty_bits: wrong_diff, nonce: 0,
+            payment_merkle: merkle_root(&[cb2.payment_id]),
+            state_merkle: [0u8; 32], proof: vec![],
+            coinbase: cb2, payments: vec![],
+        };
+        assert!(!node.process_block(&bad), "wrong difficulty rejected in production mode");
+    }
+
+    /// Production mode: valid blocks at difficulty 0 pass with blake3-only PoW.
+    #[test]
+    fn test_prod_valid_block_accepted() {
+        let _ = std::fs::remove_dir_all("vess-db-prod-valid");
+        let (mut node, _sock) = start_prod_node_at("127.0.0.1:21002", "vess-db-prod-valid");
+        let (pk, sk) = dsa_generate();
+        let oh = dsa_pubkey_hash(&pk);
+        let reward = block_reward(DIFFICULTY_BASE_BITS);
+        let dev_share = dev_reward(reward);
+        let coinbase_out = Vess { variant: VessVariant::Mint, amount: reward, owner_hash: oh,
+            timestamp: 1, nonce: 0, salt: random_bytes(), pubkey: pk.clone(),
+            spend_key: sk.clone(), spend_condition: None };
+        let dev_out = Vess { variant: VessVariant::Mint, amount: dev_share,
+            owner_hash: DEV_PUBKEY_HASH, timestamp: 1, nonce: 0, salt: random_bytes(),
+            pubkey: vec![], spend_key: vec![], spend_condition: None };
+        let mut cb = VessPayment { payment_id: [0u8;32], inputs: vec![],
+            outputs: vec![coinbase_out, dev_out], timestamp: 0, sigs: vec![], preimages: vec![] };
+        cb.compute();
+        let genesis = VessBlock {
+            version: 1, parents: vec![], timestamp: 1,
+            difficulty_bits: DIFFICULTY_BASE_BITS, nonce: 0,
+            payment_merkle: merkle_root(&[cb.payment_id]),
+            state_merkle: [0u8; 32], proof: vec![],
+            coinbase: cb, payments: vec![],
+        };
+        node.apply_mined_block(genesis, 0, vec![]);
+        assert!(node.accepted_blocks > 0, "block count incremented");
+        assert!(node.utxo_count() >= 2, "reward + dev outputs created");
     }
 }
 

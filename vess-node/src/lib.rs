@@ -69,6 +69,7 @@ pub struct Node {
     pub env: heed::Env,
     pub vess_index: heed::Database<heed::types::Bytes, heed::types::Unit>,
     ban_list: heed::Database<heed::types::Bytes, heed::types::Unit>,
+    banned_ips: HashSet<std::net::IpAddr>,              // per-IP bans (survives port changes)
     meta: heed::Database<heed::types::Str, heed::types::Bytes>,
     mined_keys: heed::Database<heed::types::Bytes, heed::types::Bytes>, // owner_hash → pubkey||spend_key
     peers_db: heed::Database<heed::types::Bytes, heed::types::Unit>,   // persisted peer addresses
@@ -83,7 +84,7 @@ pub struct Node {
     pub fails: HashMap<SocketAddr, u32>,
     peer_msg_count: HashMap<SocketAddr, u32>,
     msg_window_start: u64,
-    peer_merkle: HashMap<SocketAddr, (u64, MerkleRoot)>,
+    peer_merkle: HashMap<SocketAddr, (u64, MerkleRoot, u32)>,  // height, root, difficulty_bits
     blocks: HashMap<BlockHash, VessBlock>,    // recent blocks by hash
     pub tip_hashes: Vec<BlockHash>,               // DAG tips for parent selection
     current_tip: Option<BlockHash>,           // tip our LMDB state corresponds to
@@ -107,13 +108,15 @@ pub struct Node {
     completed_packets: HashMap<SocketAddr, Vec<(data_packets::MessageId, u64)>>,
     // Handshake retry: keyed by peer address so a re-init replaces the old entry.
     pending_handshakes: HashMap<SocketAddr, PendingHandshake>,
+    // Peers discovered via GetPeers exchange — paced connection queue.
+    discovered_peers: Vec<SocketAddr>,
     // State sync
     sync_peer: Option<SocketAddr>,               // peer we're syncing UTXOs from
     sync_offset: u64,                             // how many UTXO IDs received so far
     sync_target_root: Option<MerkleRoot>,         // target merkle root we're aiming for
     sync_chunk_size: u32,                         // IDs per SyncReq chunk
     auto_sync_until: u64,                         // keep driving sync until this tick
-    test_mode: bool,
+    pub test_mode: bool,
 }
 
 impl Node {
@@ -135,7 +138,7 @@ impl Node {
         wtxn.commit().unwrap();
 
         let (saved_ticks, saved_diff) = Self::load_meta(&env, &meta);
-        let mut node = Self { addr, network: Network::new(), peers: HashMap::new(), max_peers: 32, needs_sync: true, env, vess_index: db, ban_list, meta, mined_keys, peers_db,
+        let mut node = Self { addr, network: Network::new(), peers: HashMap::new(), max_peers: 32, needs_sync: true, env, vess_index: db, ban_list, banned_ips: HashSet::new(), meta, mined_keys, peers_db,
             blocks_db, limbo: HashMap::new(), limbo_inputs: HashMap::new(), contested: HashSet::new(),
             outbox: Vec::new(), ticks: saved_ticks, fails: HashMap::new(),
             peer_msg_count: HashMap::new(), msg_window_start: 0, peer_merkle: HashMap::new(),
@@ -157,6 +160,7 @@ impl Node {
             reliable_messages: HashMap::new(),
             completed_packets: HashMap::new(),
             pending_handshakes: HashMap::new(),
+            discovered_peers: Vec::new(),
             sync_peer: None,
             sync_offset: 0,
             sync_target_root: None,
@@ -184,21 +188,23 @@ impl Node {
             .map(|(hash, _)| *hash)
             .collect();
         node.reorg_if_needed();
-        // Load persisted bans — key = port_le(2) + ip(4 or 16)
+        // Load persisted bans — key = ip bytes (4 or 16), no port.
         if let Ok(t) = node.env.read_txn() {
             if let Ok(iter) = node.ban_list.iter(&t) {
                 for entry in iter {
                     if let Ok((key, _)) = entry {
-                        if key.len() >= 6 {
-                            let port = u16::from_le_bytes([key[0], key[1]]);
-                            let ip = &key[2..];
-                            if ip.len() >= 4 {
-                                let ip_addr = std::net::IpAddr::V4(std::net::Ipv4Addr::new(
-                                    ip[0], ip[1], ip[2], ip[3]));
-                                let addr = SocketAddr::new(ip_addr, port);
-                                node.fails.insert(addr, 100); // Already banned
-                            }
-                        }
+                        let ip: Option<std::net::IpAddr> = if key.len() == 4 {
+                            Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(key[0], key[1], key[2], key[3])))
+                        } else if key.len() == 16 {
+                            let mut octets = [0u8; 16]; octets.copy_from_slice(key);
+                            Some(std::net::IpAddr::V6(std::net::Ipv6Addr::from(octets)))
+                        } else if key.len() >= 6 {
+                            // Legacy: port_le(2) + ip
+                            if key.len() >= 6 {
+                                Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(key[2], key[3], key[4], key[5])))
+                            } else { None }
+                        } else { None };
+                        if let Some(ip) = ip { node.banned_ips.insert(ip); }
                     }
                 }
             }
@@ -299,8 +305,27 @@ impl Node {
     /// Try to handshake with a hole-punched address (bypasses max_peers).
     pub fn try_punch_handshake(&mut self, addr: SocketAddr) {
         if !self.has_session_for(&addr) {
-            let init = self.network.build_handshake_init(addr);
-            self.send_handshake(addr, init);
+            // Hole-punched handshakes use the full INIT with sig + PoW.
+            // The PoW is lightweight (6-cycle, 14-bit edges) and prevents
+            // the same INIT-spoofing attack that the sig fixes.
+            let raw = self.network.build_handshake_init(addr);
+            let (tag, payload) = unframe(&raw).unwrap_or((HANDSHAKE_INIT, &[][..]));
+            let base = blake3_hash(&[b"vess-handshake" as &[u8], &self.network.my_node_id(), addr.to_string().as_bytes()].concat());
+            let mut header = base;
+            let proof = loop {
+                if let Some(p) = cuckoo::solve(&header, cuckoo::HANDSHAKE_CYCLE_LENGTH, cuckoo::HANDSHAKE_EDGE_BITS) {
+                    break (header, p);
+                }
+                header = blake3_hash(&header);
+            };
+            let mut payload_full = payload.to_vec();
+            let sig_input = blake3_hash_multi(&[b"vess-hs-init", &self.network.dsa_pk, &self.network.kem_pk]);
+            let init_sig = dsa_sign(&self.network.dsa_sk, &sig_input)
+                .expect("DSA signing must not fail");
+            write_bytes(&mut payload_full, &init_sig);
+            payload_full.extend_from_slice(&proof.0);
+            for n in &proof.1 { payload_full.extend_from_slice(&n.to_le_bytes()); }
+            self.send_handshake(addr, frame(tag, &payload_full));
         }
     }
 
@@ -345,6 +370,14 @@ impl Node {
             header = blake3_hash(&header);
         };
         let mut payload_with_pow = payload.to_vec();
+        // Generate initiator signature: proves we own the DSA key for our
+        // claimed node_id. Without this, a spoofed INIT can create a live
+        // session on the responder keyed to our chosen KEM key, letting us
+        // inject encrypted gossip "from" any address.
+        let sig_input = blake3_hash_multi(&[b"vess-hs-init", &self.network.dsa_pk, &self.network.kem_pk]);
+        let init_sig = dsa_sign(&self.network.dsa_sk, &sig_input)
+            .expect("DSA signing must not fail");
+        write_bytes(&mut payload_with_pow, &init_sig);
         payload_with_pow.extend_from_slice(&proof.0); // 32-byte header hash
         for n in &proof.1 { payload_with_pow.extend_from_slice(&n.to_le_bytes()); }
         let framed = frame(tag, &payload_with_pow);
@@ -517,7 +550,10 @@ impl Node {
         }
         coinbase_outputs.push(Vess { variant: VessVariant::Mint, amount: dev_reward(reward), owner_hash: DEV_PUBKEY_HASH,
             timestamp: mint_timestamp, nonce: 0, salt: random_bytes(), pubkey: vec![], spend_key: vec![], spend_condition: None });
-        // Persist coinbase to treasure chest (mined_keys) for wallet import — local storage, includes seeds
+        // Treasure chest: stores miner seeds in LMDB for wallet import.
+        // SECURITY: these seeds are NOT encrypted at rest — anyone with
+        // filesystem access to the vess-db directory can steal all mined
+        // coins.  Wallet users should import and delete periodically.
         for v in &coinbase_outputs {
             if let Ok(mut w) = self.env.write_txn() {
                 let _ = self.mined_keys.put(&mut w, &v.vess_id(), &v.encode_with_secrets());
@@ -554,13 +590,16 @@ impl Node {
 
     /// Prepare a block candidate (fast — reads state, no PoW). Returns None if no work.
     pub fn prepare_block(&mut self) -> Option<VessBlock> {
-        let clean: Vec<VessPayment> = self.limbo.iter()
+        // Collect candidate payments — verify already rejects outputs that
+        // collide with UTXO state, but we also need to guard against
+        // cross-payment collisions within the block.
+        let candidates: Vec<VessPayment> = self.limbo.iter()
             .filter(|(pid, _)| !self.contested.contains(*pid))
             .map(|(_, (p, _))| p.clone())
             .filter(|p| self.verify(p))
             .collect();
 
-        let has_work = !clean.is_empty() || !self.contested.is_empty();
+        let has_work = !candidates.is_empty() || !self.contested.is_empty();
         let genesis = self.blocks.is_empty();
         let periodic = self.ticks.saturating_sub(self.last_mine_tick) >= 60;
         if !has_work && !genesis && !periodic { return None; }
@@ -585,7 +624,11 @@ impl Node {
             coinbase_outputs.push(Vess { variant: VessVariant::Mint, amount: 0, owner_hash: DEV_PUBKEY_HASH,
             timestamp, nonce: 0, salt: random_bytes(), pubkey: vec![], spend_key: vec![], spend_condition: None });
         }
-        // Treasure chest is local storage — keep the seeds for wallet import
+        // Track output IDs to prevent cross-payment collisions.
+        let mut block_output_ids: HashSet<VessId> = coinbase_outputs.iter()
+            .map(|v| v.vess_id()).collect();
+        // Treasure chest: stores miner seeds for wallet import.
+        // (Same security note: unencrypted on disk.)
         for v in &coinbase_outputs {
             if let Ok(mut w) = self.env.write_txn() {
                 let _ = self.mined_keys.put(&mut w, &v.vess_id(), &v.encode_with_secrets());
@@ -594,6 +637,16 @@ impl Node {
         }
         let mut coinbase = VessPayment { payment_id: [0u8;32], inputs: vec![], outputs: coinbase_outputs, timestamp: 0, sigs: vec![], preimages: vec![] };
         coinbase.compute();
+
+        // Filter: drop payments whose output IDs collide with the coinbase
+        // or with a previously-selected payment.
+        let mut clean = Vec::new();
+        for p in candidates {
+            let outputs_ok = p.outputs.iter().all(|v| block_output_ids.insert(v.vess_id()));
+            if outputs_ok {
+                clean.push(p);
+            }
+        }
 
         // Contested payments go into the block body so the burn is committed
         // in both payment_merkle and state_merkle. Each is individually validated;
@@ -607,6 +660,20 @@ impl Node {
 
         let mut block_payments = clean;
         block_payments.extend(contested_payments);
+
+        // Cap total payments so the encoded block stays well under the
+        // 1 MB wire limit.  A block that exceeds MAX_MESSAGE_SIZE is
+        // accepted locally but silently dropped by send() — the miner
+        // forks itself off and builds on its own heavier chain.
+        let max_payments = 200usize;
+        if block_payments.len() > max_payments {
+            block_payments.truncate(max_payments);
+            // Rebuild the id list with the truncated set.
+            all_ids.clear();
+            all_ids.push(coinbase.payment_id);
+            for p in &block_payments { all_ids.push(p.payment_id); }
+            all_ids.sort(); all_ids.dedup();
+        }
 
         Some(VessBlock {
             version: 1, parents: self.block_parents(),
@@ -914,32 +981,46 @@ impl Node {
     /// pays out (merged work is never orphaned); cross-branch conflicts
     /// vaporize; payments depending on vaporized outputs are voided.
     fn state_for_roots(&self, roots: &[BlockHash]) -> Option<HashSet<VessId>> {
-        let order = self.ancestor_order(roots)?;
-        // Dedup payments by id — the same payment may ride multiple branches;
-        // only its first occurrence in topological order applies.
-        let mut seen_p: HashSet<PaymentId> = HashSet::new();
-        let mut payments: Vec<&VessPayment> = Vec::new();
-        for h in &order {
-            for p in &self.blocks[h].payments {
-                if seen_p.insert(p.payment_id) { payments.push(p); }
-            }
-        }
-        let (conflicted, voided) = Self::classify_history(&payments);
-        let mut state = HashSet::new();
-        let mut applied: HashSet<PaymentId> = HashSet::new();
-        for h in &order {
-            let b = &self.blocks[h];
-            for o in &b.coinbase.outputs { state.insert(o.vess_id()); }
-            for p in &b.payments {
-                if !applied.insert(p.payment_id) { continue; }
-                if voided.contains(&p.payment_id) { continue; }
-                for input in &p.inputs { state.remove(&input.vess_id()); }
-                if !conflicted.contains(&p.payment_id) {
-                    for o in &p.outputs { state.insert(o.vess_id()); }
+        // Normal path: walk block ancestor closure to compute merged state.
+        if let Some(order) = self.ancestor_order(roots) {
+            let mut seen_p: HashSet<PaymentId> = HashSet::new();
+            let mut payments: Vec<&VessPayment> = Vec::new();
+            for h in &order {
+                for p in &self.blocks[h].payments {
+                    if seen_p.insert(p.payment_id) { payments.push(p); }
                 }
             }
+            let (conflicted, voided) = Self::classify_history(&payments);
+            let mut state = HashSet::new();
+            let mut applied: HashSet<PaymentId> = HashSet::new();
+            for h in &order {
+                let b = &self.blocks[h];
+                for o in &b.coinbase.outputs { state.insert(o.vess_id()); }
+                for p in &b.payments {
+                    if !applied.insert(p.payment_id) { continue; }
+                    if voided.contains(&p.payment_id) { continue; }
+                    for input in &p.inputs { state.remove(&input.vess_id()); }
+                    if !conflicted.contains(&p.payment_id) {
+                        for o in &p.outputs { state.insert(o.vess_id()); }
+                    }
+                }
+            }
+            return Some(state);
         }
-        Some(state)
+        // Fallback: after a fresh state sync the node has a verified UTXO
+        // set but zero block history.  New blocks that reference the
+        // consensus tip must validate against the LMDB state directly —
+        // ancestor walking is impossible without the intermediate blocks.
+        if self.blocks.is_empty() {
+            let t = self.env.read_txn().ok()?;
+            let state: HashSet<VessId> = self.vess_index.iter(&t).ok()?
+                .filter_map(|r| r.ok().map(|(k,_)| {
+                    let mut a = [0u8; 32]; a.copy_from_slice(k); a
+                }))
+                .collect();
+            return Some(state);
+        }
+        None
     }
 
     fn state_root(state: &HashSet<VessId>) -> MerkleRoot {
@@ -957,8 +1038,14 @@ impl Node {
         if !self.test_mode && block.difficulty_bits != self.current_difficulty { return None; }
         let mut max_parent_ts = 0u64;
         for parent_hash in &block.parents {
-            let Some(parent_block) = self.blocks.get(parent_hash) else { return None; };
-            max_parent_ts = max_parent_ts.max(parent_block.timestamp);
+            if let Some(parent_block) = self.blocks.get(parent_hash) {
+                max_parent_ts = max_parent_ts.max(parent_block.timestamp);
+            } else if !self.blocks.is_empty() {
+                // Missing parent in a node that has block history → reject.
+                // On fresh-sync nodes (no blocks yet) we allow unknown
+                // parents — the synced UTXO set serves as the ancestor state.
+                return None;
+            }
         }
         if !self.test_mode && block.timestamp < max_parent_ts { return None; }
         if !self.test_mode {
@@ -986,13 +1073,17 @@ impl Node {
             let reward = block_reward(block.difficulty_bits);
             let dev_share = dev_reward(reward);
             let expected_total = reward.saturating_add(dev_share);
-            let actual_total: Amount = block.coinbase.outputs.iter().map(|v| v.amount).sum();
+            // try_fold with checked_add: overflow → None → block rejected.
+            // Prevents wrap-around inflation via crafted coinbase outputs.
+            let actual_total: Amount = block.coinbase.outputs.iter()
+                .try_fold(0u64, |acc, v| acc.checked_add(v.amount))?;
             if actual_total != expected_total { return None; }
             // Verify the dev output goes to the correct dev key
             let dev_output = block.coinbase.outputs.iter().find(|v| v.owner_hash == DEV_PUBKEY_HASH);
             if dev_output.map(|v| v.amount).unwrap_or(0) != dev_share { return None; }
             let miner_outputs: Amount = block.coinbase.outputs.iter()
-                .filter(|v| v.owner_hash != DEV_PUBKEY_HASH).map(|v| v.amount).sum();
+                .filter(|v| v.owner_hash != DEV_PUBKEY_HASH)
+                .try_fold(0u64, |acc, v| acc.checked_add(v.amount))?;
             if miner_outputs != reward { return None; }
         }
         let mut canonical_coinbase = block.coinbase.clone();
@@ -1166,6 +1257,19 @@ impl Node {
             }
         }
 
+        // Drain discovered peers one at a time (paced, ~0.5s between attempts).
+        if self.ticks.is_multiple_of(100) {
+            // Cap the queue to prevent unbounded growth from peer-list spam.
+            if self.discovered_peers.len() > 500 {
+                self.discovered_peers.truncate(500);
+            }
+            if let Some(addr) = self.discovered_peers.pop() {
+                if self.peer_count() < self.max_peers && !self.has_session_for(&addr) {
+                    self.add_peer(addr);
+                }
+            }
+        }
+
         // Broadcast any pending blocks (self-mined or received) to peers
         let pending: Vec<VessBlock> = self.pending_blocks.drain(..).collect();
         for block in pending {
@@ -1244,14 +1348,31 @@ impl Node {
                         && blake3_hash(&p.preimages[i].unwrap()) == cond.hashlock;
                     if !preimage_ok { return false; }
                 }
-                // Expiry: output expires, can't spend after (if set)
+                // Expiry: output expires, can't spend after (if set).
+                // Use a 120 s margin below the deadline — verify() uses
+                // wall clock but validate_block uses block.timestamp/1000.
+                // A payment within 2 min of expiry could pass mempool but
+                // fail block inclusion, creating a narrow variant of the
+                // duplicate-output attack (wasted miner PoW).
                 if cond.expires_at > 0 {
-                    let expired = std::time::SystemTime::now()
+                    let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs() >= cond.expires_at)
-                        .unwrap_or(false);
-                    if expired { return false; }
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    if now.saturating_add(120) >= cond.expires_at { return false; }
                 }
+            }
+        }
+        // Output collision prevention: no output may duplicate an existing
+        // UTXO or collide with another output in the same payment.
+        // Without this, a payment with a duplicate output passes mempool
+        // checks but causes the entire block to be rejected in validate_block,
+        // wasting miner PoW.
+        let mut seen = HashSet::new();
+        for v in &p.outputs {
+            let id = v.vess_id();
+            if self.check_direct(&id) || !seen.insert(id) {
+                return false;
             }
         }
         true
@@ -1268,11 +1389,11 @@ impl Node {
 
     /// Returns (ticks, merkle_root) that a quorum of peers agree on.
     /// Requires ≥2 peers to agree — never trusts a single peer.
-    fn consensus_merkle(&self) -> Option<(u64, MerkleRoot)> {
-        let roots: Vec<(u64, MerkleRoot)> = self.peer_merkle.values().copied().collect();
+    fn consensus_merkle(&self) -> Option<(u64, MerkleRoot, u32)> {
+        let roots: Vec<(u64, MerkleRoot, u32)> = self.peer_merkle.values().copied().collect();
         if roots.len() < 2 { return None; }
-        // Count votes for each (ticks, root) pair; need ≥2 matching
-        let mut counts: HashMap<(u64, MerkleRoot), usize> = HashMap::new();
+        // Count votes for each (ticks, root, diff) pair; need ≥2 matching
+        let mut counts: HashMap<(u64, MerkleRoot, u32), usize> = HashMap::new();
         for &r in &roots { *counts.entry(r).or_insert(0) += 1; }
         counts.into_iter().find(|&(_, c)| c >= 2).map(|(r, _)| r)
     }
@@ -1283,7 +1404,7 @@ impl Node {
         let r = self.merkle();
         // Use accepted_blocks, not ticks — ticks are local counters meaningless
         // across nodes. accepted_blocks is a real chain-length measure.
-        let m = GossipMessage::Root(self.accepted_blocks, r);
+        let m = GossipMessage::Root(self.accepted_blocks, r, self.current_difficulty);
         let addrs: Vec<SocketAddr> = self.peers.iter().filter(|(_,id)| **id != [0u8;32]).map(|(a,_)| *a).collect();
         for a in addrs { self.send(a, &m); }
     }
@@ -1293,7 +1414,8 @@ impl Node {
     }
 
     pub fn process(&mut self, addr: SocketAddr, data: &[u8]) -> Option<Vec<u8>> {
-        // Reject banned peers immediately
+        // Reject banned IPs immediately — per-IP ban survives port changes.
+        if self.banned_ips.contains(&addr.ip()) { return None; }
         if self.fails.get(&addr).copied().unwrap_or(0) > 5 { return None; }
         let assembled;
         let completed_id;
@@ -1327,17 +1449,40 @@ impl Node {
         if tag == HANDSHAKE_INIT || tag == HANDSHAKE_RESP {
             // Verify PoW handshake puzzle on INIT
             if tag == HANDSHAKE_INIT {
+                // Rate-limit handshake attempts per address — handshakes
+                // skip the 50 msg/s limiter and are otherwise unbounded.
+                let count = self.peer_msg_count.get(&addr).copied().unwrap_or(0);
+                if count >= 5 { return None; } // max 5 handshake msgs/sec per IP
+                self.peer_msg_count.insert(addr, count + 1);
+
                 let proof_len = 32 + cuckoo::HANDSHAKE_CYCLE_LENGTH * 4;
                 if payload.len() < proof_len { self.strike(addr); return None; }
                 let split = payload.len() - proof_len;
                 let pow_bytes = &payload[split..];
                 let pow_header: [u8; 32] = pow_bytes[..32].try_into().unwrap();
+                // Re-derive the expected PoW header — the initiator MUST use
+                // blake3("vess-handshake" || node_id || target_addr).
+                // The PoW binds to OUR address (the responder), not the
+                // source address (which is spoofable over UDP).
+                // Without this check, one PoW solve is replayable against
+                // every node forever (the attacker supplies any pow_header).
+                let expected_header = blake3_hash(
+                    &[b"vess-handshake" as &[u8], &payload[..32], self.addr.to_string().as_bytes()].concat()
+                );
+                if pow_header != expected_header { self.strike(addr); return None; }
                 let mut proof = Vec::with_capacity(cuckoo::HANDSHAKE_CYCLE_LENGTH);
                 for i in 0..cuckoo::HANDSHAKE_CYCLE_LENGTH {
                     proof.push(u32::from_le_bytes(pow_bytes[32+i*4..32+(i+1)*4].try_into().unwrap()));
                 }
                 if !cuckoo::verify(&pow_header, &proof, cuckoo::HANDSHAKE_CYCLE_LENGTH, cuckoo::HANDSHAKE_EDGE_BITS) {
                     self.strike(addr);
+                    return None;
+                }
+                // Cap inbound half-open sessions — MAX_SESSIONS in
+                // build_handshake_init only caps outbound; inbound was
+                // unbounded, letting an attacker fill session memory
+                // by flooding INITs from many spoofed addresses.
+                if self.network.sessions.len() >= MAX_SESSIONS {
                     return None;
                 }
                 payload = &payload[..split];
@@ -1347,14 +1492,18 @@ impl Node {
                 if s.node_id.is_some() {
                     self.peers.insert(addr, s.node_id.unwrap());
                     self.persist_peer(addr);
+                    // Exchange peer lists — learn about the network through
+                    // this new peer and let them learn about ours.
+                    self.send_get_peers_request(addr);
                 }
             }
             if let Some(handshake_data) = resp {
                 self.send_handshake(addr, handshake_data);
             }
-            // On RESP, our INIT arrived — stop retrying it.
+            // On RESP, our INIT arrived — stop retrying it, and exchange peers.
             if tag == HANDSHAKE_RESP {
                 self.pending_handshakes.remove(&addr);
+                self.send_get_peers_request(addr);
             }
             return None;
         }
@@ -1397,9 +1546,16 @@ impl Node {
     pub fn route(&mut self, addr: SocketAddr, plain: &[u8]) -> Option<Vec<u8>> {
         let (tag, payload) = match unframe(plain) { Some(v) => v, None => { self.strike(addr); return None; } };
         if (0x10..=0x19).contains(&tag) {
-            let r = match self.rpc(tag, payload) { Some(r) => r, None => { self.strike(addr); return None; } };
-            let s = match self.network.session_by_addr_mut(&addr) { Some(s) => s, None => { self.strike(addr); return None; } };
-            return Some(s.encrypt(&r));
+            // Even tags (0x10, 0x14, …) are requests — handle and respond.
+            // Odd tags (0x11, 0x15, …) are responses to our own requests.
+            if tag % 2 == 0 {
+                let r = match self.rpc(tag, payload) { Some(r) => r, None => { self.strike(addr); return None; } };
+                let s = match self.network.session_by_addr_mut(&addr) { Some(s) => s, None => { self.strike(addr); return None; } };
+                return Some(s.encrypt(&r));
+            } else {
+                self.handle_rpc_response(tag, payload);
+                return None;
+            }
         }
         let m = match GossipMessage::decode(tag, payload) {
             Some(m) => m,
@@ -1447,11 +1603,11 @@ impl Node {
                     self.send(addr, &GossipMessage::StateSyncReq(self.ticks, 1000));
                 }
             }
-            GossipMessage::Root(peer_height, peer_root) => {
-                self.peer_merkle.insert(addr, (*peer_height, *peer_root));
+            GossipMessage::Root(peer_height, peer_root, peer_diff) => {
+                self.peer_merkle.insert(addr, (*peer_height, *peer_root, *peer_diff));
                 // Use accepted_blocks (chain height) for cross-node comparison.
                 // Ticks are local counters — comparing them across nodes is meaningless.
-                if let Some((consensus_height, consensus_root)) = self.consensus_merkle() {
+                if let Some((consensus_height, consensus_root, _)) = self.consensus_merkle() {
                     if consensus_height > self.accepted_blocks {
                         self.send(addr, &GossipMessage::StateSyncReq(self.ticks, 1000));
                     }
@@ -1467,12 +1623,28 @@ impl Node {
                 }
                 // NAT self-detection: if someone announces OUR NodeId with a
                 // different address, that address is our public face.
-                if *pid == self.network.my_node_id() && *a != self.addr {
+                // Only trust this from peers with an established session —
+                // otherwise any attacker can poison our NAT type.
+                if *pid == self.network.my_node_id() && *a != self.addr
+                    && self.network.session_by_addr(&addr)
+                        .map(|s| s.node_id.is_some())
+                        .unwrap_or(false)
+                {
                     self.nat_type = NatType::BehindNat;
                     // The announced address is our public mapping — use it
                     // in future PeerAnnounce messages.
                 }
-                if self.peer_count() < self.max_peers { self.peers.entry(*a).or_insert([0u8;32]); }
+                if self.peer_count() < self.max_peers && self.peers.entry(*a).or_insert([0u8;32]) == &[0u8;32] {
+                    // Cap the total peer map to prevent memory exhaustion
+                    // from PeerAnnounce spam.  peer_count() only counts
+                    // handshaked entries; the raw map can grow unbounded.
+                    if self.peers.len() >= self.max_peers * 4 { return None; }
+                    // New peer — queue for connection but do NOT persist
+                    // until the handshake succeeds.  Persisting unverified
+                    // addresses lets an attacker flood the peer DB via
+                    // PeerAnnounce spam.
+                    self.discovered_peers.push(*a);
+                }
             }
             GossipMessage::Ping(n) => { self.send(addr, &GossipMessage::Pong(*n)); }
             GossipMessage::StateSyncReq(s, c) => { self.sync_chunk(addr, *s, *c); }
@@ -1524,8 +1696,16 @@ impl Node {
             }
             GossipMessage::StemRelay(target_id, data) => {
                 if *target_id == self.network.my_node_id() {
-                    // This relay is for us — process the inner gossip message
-                    self.route(addr, data);
+                    // This relay is for us — only accept payments through
+                    // the relay path.  Blocks, PeerAnnounce, and other
+                    // gossip must arrive directly from an authenticated
+                    // session; otherwise an attacker can route strikes
+                    // onto the introducer.
+                    if let Some((tag, _inner_payload)) = unframe(data) {
+                        if tag == TAG_PAYMENT {
+                            self.route(addr, data);
+                        }
+                    }
                 } else if self.is_public() {
                     // We're the introducer — forward to target if we know them
                     let target_addr = self.peers.iter()
@@ -1619,6 +1799,16 @@ impl Node {
         std::mem::take(&mut self.outbox)
     }
 
+    /// Send a GetPeers RPC request through the encrypted session.
+    /// Called automatically when a handshake completes so both sides
+    /// discover each other's known peers.
+    fn send_get_peers_request(&mut self, addr: SocketAddr) {
+        let req = RpcRequest::GetPeers.encode();
+        if let Some(s) = self.network.session_by_addr_mut(&addr) {
+            self.outbox.push((addr, frame(ENCRYPTED_DATA, &s.encrypt(&req))));
+        }
+    }
+
     fn rpc(&mut self, tag: u8, payload: &[u8]) -> Option<Vec<u8>> {
         let req = RpcRequest::decode(tag, payload)?;
         Some(match req {
@@ -1630,6 +1820,26 @@ impl Node {
                 RpcResponse::ConnectPeer(len > 0)
             }
         }.encode())
+    }
+
+    /// Process an RPC response from a peer (e.g. GetPeers reply).
+    fn handle_rpc_response(&mut self, tag: u8, payload: &[u8]) {
+        if let Some(resp) = RpcResponse::decode(tag, payload) {
+            match resp {
+                RpcResponse::GetPeers(peers) => {
+                    for (_node_id, addr) in peers {
+                        if addr != self.addr && self.peer_count() < self.max_peers {
+                            if self.peers.entry(addr).or_insert([0u8; 32]) == &[0u8; 32] {
+                                // Queue for connection; persist only after
+                                // successful handshake (not here).
+                                self.discovered_peers.push(addr);
+                            }
+                        }
+                    }
+                }
+                _ => {} // Check, Submit, ConnectPeer — no-op for gossip
+            }
+        }
     }
 
     fn relay(&mut self, p: &VessPayment) {
@@ -1679,10 +1889,11 @@ impl Node {
                 return;
             };
             if let Some(id) = fragmented.id {
-                let bytes: usize = fragmented.packets.iter().map(Vec::len).sum();
-                let in_flight: usize = self.reliable_messages.values()
-                    .map(|message| message.packets.iter().map(Vec::len).sum::<usize>())
-                    .sum();
+                let bytes: usize = fragmented.packets.iter()
+                    .fold(0usize, |acc, p| acc.saturating_add(p.len()));
+                let in_flight: usize = self.reliable_messages.values().fold(0usize, |acc, m| {
+                    acc.saturating_add(m.packets.iter().fold(0usize, |a, p| a.saturating_add(p.len())))
+                });
                 if self.reliable_messages.len() >= MAX_RELIABLE_MESSAGES
                     || in_flight.saturating_add(bytes) > MAX_RELIABLE_BYTES { return; }
                 self.reliable_messages.insert(id, ReliableMessage {
@@ -1717,8 +1928,8 @@ impl Node {
         if self.sync_peer.is_none() {
             let best = self.peer_merkle.iter()
                 .filter(|(addr, _)| self.has_session_for(addr))
-                .max_by_key(|(_, (ticks, _))| *ticks)
-                .map(|(addr, (_, root))| (*addr, *root));
+                .max_by_key(|(_, (ticks, _, _))| *ticks)
+                .map(|(addr, (_, root, _))| (*addr, *root));
             if let Some((addr, root)) = best {
                 self.sync_peer = Some(addr);
                 self.sync_target_root = Some(root);
@@ -1733,9 +1944,9 @@ impl Node {
             None => return,
         };
 
-        // If we've matched target merkle, we're done
-        if let Some(target) = self.sync_target_root {
-            if self.merkle() == target {
+        // If our merkle already matches the consensus root, we're done.
+        if let Some((_, consensus_root, _)) = self.consensus_merkle() {
+            if self.merkle() == consensus_root {
                 self.needs_sync = false;
                 self.sync_peer = None;
                 self.sync_target_root = None;
@@ -1764,30 +1975,56 @@ impl Node {
     fn handle_sync_chunk(&mut self, addr: SocketAddr, start: u64, ids: &[VessId]) {
         let is_from_sync_peer = self.sync_peer == Some(addr);
 
+        // Only accept chunks from the designated sync peer — junk chunks
+        // from any other peer would permanently sabotage the sync by
+        // guaranteeing a root mismatch.
+        if !is_from_sync_peer { return; }
+
         if !ids.is_empty() {
+            // Cap the sync buffer to prevent memory exhaustion from an
+            // unbounded stream of chunks.
+            if self.sync_buffer.len().saturating_add(ids.len()) > 50_000_000 {
+                // Buffer full — abort sync, try a different peer.
+                self.sync_peer = None;
+                self.sync_target_root = None;
+                self.sync_offset = 0;
+                self.sync_buffer.clear();
+                return;
+            }
             // Buffer — do NOT insert into LMDB yet.
             for id in ids { self.sync_buffer.insert(*id); }
 
-            if is_from_sync_peer {
-                self.sync_offset = start.saturating_add(ids.len() as u64);
-            }
+            self.sync_offset = start.saturating_add(ids.len() as u64);
         }
 
         // If chunk is smaller than requested, the peer finished sending.
-        if (ids.len() as u32) < self.sync_chunk_size
-            && is_from_sync_peer {
+        if (ids.len() as u32) < self.sync_chunk_size {
                 // Verify buffered root against quorum consensus before committing.
                 let mut sorted: Vec<VessId> = self.sync_buffer.iter().copied().collect();
                 sorted.sort();
                 let buffered_root = merkle_root(&sorted);
 
-                let committed = if let Some(target) = self.sync_target_root {
-                    buffered_root == target
-                } else {
-                    // Fallback: require ≥2 peers to agree on this root.
-                    self.consensus_merkle()
-                        .map(|(_, r)| r == buffered_root)
-                        .unwrap_or(false)
+                let committed = {
+                    // Require quorum: ≥2 peers must agree on the same
+                    // (height, root) pair.  The sync_target_root is a
+                    // hint for *which* peer to pull data from, not the
+                    // source of truth — an eclipsed bootstrapping node
+                    // would otherwise accept a fully fabricated UTXO set
+                    // from a single attacker-controlled peer.
+                    let quorum_ok = self.consensus_merkle()
+                        .map(|(_, r, _)| r == buffered_root)
+                        .unwrap_or(false);
+                    if quorum_ok {
+                        true
+                    } else if self.blocks.is_empty() && self.peer_merkle.len() == 1 {
+                        // Single-peer genesis fallback: only on first
+                        // boot with no blocks and exactly one peer.
+                        self.sync_target_root
+                            .map(|r| r == buffered_root)
+                            .unwrap_or(false)
+                    } else {
+                        false
+                    }
                 };
 
                 if committed {
@@ -1807,6 +2044,15 @@ impl Node {
                     self.sync_peer = None;
                     self.sync_target_root = None;
                     self.sync_offset = 0;
+                    // Adopt consensus difficulty and height so new blocks
+                    // pass validation. Without this, a freshly-synced node
+                    // rejects every incoming block because current_difficulty
+                    // is still the base/default value.
+                    if let Some((height, _, diff)) = self.consensus_merkle() {
+                        self.accepted_blocks = height;
+                        self.current_difficulty = diff;
+                        self.save_meta();
+                    }
                 } else {
                     // Root didn't verify — restart sync from a different peer.
                     self.sync_peer = None;
@@ -1830,7 +2076,8 @@ impl Node {
     }
 
     fn reap(&mut self) {
-        // Auto-ban peers with >5 rejected payments. Persist bans to LMDB.
+        // Auto-ban peers with >5 strikes.  Ban per IP (not ip:port —
+        // a new UDP source port is a new identity otherwise).
         let to_ban: Vec<SocketAddr> = self.peers.iter()
             .filter(|(a, _)| self.fails.get(a).copied().unwrap_or(0) > 5)
             .map(|(a, _)| *a)
@@ -1838,20 +2085,41 @@ impl Node {
 
         for a in to_ban {
             self.peers.remove(&a);
-            // Persist ban: key = port_bytes + ip_bytes
-            let mut key = a.port().to_le_bytes().to_vec();
-            match a.ip() {
-                std::net::IpAddr::V4(ip) => key.extend_from_slice(&ip.octets()),
-                std::net::IpAddr::V6(ip) => key.extend_from_slice(&ip.octets()),
-            }
+            self.banned_ips.insert(a.ip());
+            // Persist ban: key = ip_bytes only (port omitted so a new
+            // source port doesn't evade the ban).
+            let key = match a.ip() {
+                std::net::IpAddr::V4(ip) => ip.octets().to_vec(),
+                std::net::IpAddr::V6(ip) => ip.octets().to_vec(),
+            };
             if let Ok(mut w) = self.env.write_txn() {
                 let _ = self.ban_list.put(&mut w, &key, &());
                 let _ = w.commit();
             }
         }
-        if self.ticks.is_multiple_of(300) {
-            // Only expire stale strikes, don't clear active bans.
-            self.fails.retain(|_, strikes| *strikes > 5);
+        // Decay strikes slowly — hours, not seconds.  A spammer sending
+        // one invalid message every 2s would previously never be banned
+        // because strikes reset at 1.5s intervals.
+        if self.ticks.is_multiple_of(72_000) { // ~6 min at 5ms ticks
+            for strikes in self.fails.values_mut() {
+                *strikes = strikes.saturating_sub(1);
+            }
+            self.fails.retain(|_, s| *s > 0);
+        }
+
+        // Clean up unbounded maps.
+        // missing_parents: entries for evicted orphans persist forever.
+        // Prune entries whose children are no longer in the orphan cache.
+        if self.ticks.is_multiple_of(6000) { // ~30 s
+            self.missing_parents.retain(|_, children| {
+                children.retain(|h| self.orphans.contains_key(h));
+                !children.is_empty()
+            });
+        }
+        // introduced_peers: only cleaned in nat_cycle (behind-NAT path).
+        // Public nodes accumulate these forever.  Cull stale entries.
+        if self.ticks.is_multiple_of(12_000) { // ~60 s
+            self.introduced_peers.retain(|_, info| info.retries < HOLE_PUNCH_MAX_RETRIES);
         }
     }
 }

@@ -290,9 +290,10 @@ impl Wallet {
     }
 
     pub fn build_payment(&mut self, outputs: &[(OwnerHash, Amount, Option<SpendCondition>)]) -> Option<VessPayment> {
-        let total_needed: Amount = outputs.iter().map(|(_, a, _)| a).sum();
+        let total_needed: Amount = outputs.iter()
+            .try_fold(0u64, |acc, (_, a, _)| acc.checked_add(*a))?;
         let mut selected = Vec::new();
-        let mut selected_sum = 0;
+        let mut selected_sum: Amount = 0;
         // Only select from claimed (never pending or unclaimed).
         // Use as many inputs as possible (up to MAX_INPUTS) — even after
         // meeting the amount target, continue pulling in more coins. This
@@ -302,7 +303,7 @@ impl Wallet {
         for v in &pool {
             if selected.len() >= MAX_INPUTS { break; }
             selected.push((*v).clone());
-            selected_sum += v.amount;
+            selected_sum = selected_sum.checked_add(v.amount)?;
         }
         if selected_sum < total_needed { return None; }
         let change = selected_sum - total_needed;
@@ -337,22 +338,29 @@ impl Wallet {
             }
         }
         self.pbank_built.push(payment.clone());
+        // Cap history vectors.
+        if self.pbank_built.len() > 500 { self.pbank_built.drain(..100); }
         Some(payment)
     }
 
-    /// Build and encode a payment for OOB delivery. Moves used inputs to pending.
-    /// The receiver calls `claim_payment` to submit; until then these coins are locked.
+    /// Build and encode a payment for OOB delivery. Moves used inputs to pending.    /// The receiver calls `claim_payment` to submit; until then these coins are locked.
     pub fn export_payment(&mut self, outputs: &[(OwnerHash, Amount, Option<SpendCondition>)]) -> Option<Vec<u8>> {
         let payment = self.build_payment(outputs)?;
-        // Move spent inputs to pending — don't delete until confirmed gone by sync
+        self.move_inputs_to_pending(&payment);
+        Some(payment.encode())
+    }
+
+    /// Move a payment's inputs from claimed/unclaimed to pending so they
+    /// aren't re-selected by a second `build_payment` call.
+    pub fn move_inputs_to_pending(&mut self, payment: &VessPayment) {
         for v in &payment.inputs {
             let id = v.vess_id();
             if let Some(pos) = self.vbank_claimed.iter().position(|x| x.vess_id() == id) {
                 self.vbank_pending.push(self.vbank_claimed.remove(pos));
+            } else if let Some(pos) = self.vbank_unclaimed.iter().position(|x| x.vess_id() == id) {
+                self.vbank_pending.push(self.vbank_unclaimed.remove(pos));
             }
         }
-        self.pbank_built.push(payment.clone());
-        Some(payment.encode())
     }
 
     pub fn send(&mut self, payment: &VessPayment) -> bool {
@@ -390,31 +398,32 @@ impl Wallet {
             }
         }
         self.pbank_received.push(payment.clone());
+        // Cap history vectors — they're for debugging, not consensus.
+        if self.pbank_built.len() > 500 { self.pbank_built.drain(..100); }
+        if self.pbank_received.len() > 500 { self.pbank_received.drain(..100); }
         true
     }
 
-    /// Consolidate all claimed UTXOs by merging up to 5 at a time into single outputs.
+    /// Consolidate all claimed UTXOs by merging up to 5 at a time into single
+    /// outputs.  Each output uses a fresh keypair to avoid address reuse.
     /// Returns the number of consolidation payments made.
     pub fn consolidate(&mut self) -> usize {
         if self.vbank_claimed.len() < 2 { return 0; }
-        let oh = match self.keypairs.keys().next() {
-            Some(k) => *k,
-            None => return 0,
-        };
         let mut count = 0;
         while self.vbank_claimed.len() > 1 {
             let chunk: Vec<Vess> = self.vbank_claimed.iter().take(MAX_INPUTS).cloned().collect();
             if chunk.len() < 2 { break; }
-            let total: u64 = chunk.iter().map(|v| v.amount).sum();
-            // Split into 2 self-owned outputs. ~50% of the time, one output
-            // uses a "round" human-looking amount (multiples of 10, 100, or
-            // 1000) so the consolidation resembles a normal payment rather
-            // than an obvious self-transfer. An observer can't link either
-            // output to the original inputs.
+            let total: u64 = chunk.iter()
+                .try_fold(0u64, |acc, v| acc.checked_add(v.amount))
+                .unwrap_or(0);
+            // Fresh keypair per output — avoids address reuse and makes
+            // consolidation outputs indistinguishable from normal payments.
+            let (pk1, _sk1) = dsa_generate();
+            let oh1 = dsa_pubkey_hash(&pk1);
+            let (pk2, _sk2) = dsa_generate();
+            let oh2 = dsa_pubkey_hash(&pk2);
             let outputs: Vec<(OwnerHash, Amount, Option<SpendCondition>)> = if total > 1 {
                 let split = if rand::thread_rng().gen_bool(0.5) {
-                    // Human-looking round amount: pick a granularity and
-                    // a multiple that fits within [1, total-1].
                     let grain = [10, 100, 1000][rand::thread_rng().gen_range(0..3)];
                     let max_multi = (total - 1) / grain;
                     if max_multi > 0 {
@@ -425,9 +434,9 @@ impl Wallet {
                 } else {
                     rand::thread_rng().gen_range(1..total)
                 };
-                vec![(oh, split, None), (oh, total - split, None)]
+                vec![(oh1, split, None), (oh2, total - split, None)]
             } else {
-                vec![(oh, total, None)]
+                vec![(oh1, total, None)]
             };
             let payment = match self.build_payment(&outputs) {
                 Some(p) => p,

@@ -103,7 +103,8 @@ pub extern "C" fn vess_wallet_load(data: *const u8, data_len: u32, password: *co
 pub extern "C" fn vess_wallet_save(wallet: *mut Wallet, out_len: *mut u32) -> *mut u8 {
     if out_len.is_null() { return std::ptr::null_mut(); }
     let w = wallet_ref!(wallet, std::ptr::null_mut());
-    let data = w.save();
+    let mut data = w.save();
+    data.shrink_to_fit(); // capacity == len, safe for vess_free_bytes
     unsafe { *out_len = data.len() as u32; }
     let ptr = data.as_ptr();
     std::mem::forget(data);
@@ -192,7 +193,8 @@ pub extern "C" fn vess_wallet_build_payment(
         let w = wallet_mut!(wallet, std::ptr::null_mut());
         let Some(outputs) = outputs_from_ffi(hashes, amounts, hashlock_preimages, expires_ats, count) else { return std::ptr::null_mut(); };
         if let Some(p) = w.build_payment(&outputs) {
-            let data = p.encode();
+            let mut data = p.encode();
+            data.shrink_to_fit();
             unsafe { *out_len = data.len() as u32; }
             let ptr = data.as_ptr();
             std::mem::forget(data);
@@ -212,7 +214,8 @@ pub extern "C" fn vess_wallet_export_payment(
     if out_len.is_null() { return std::ptr::null_mut(); }
     let w = wallet_mut!(wallet, std::ptr::null_mut());
     let Some(outputs) = outputs_from_ffi(hashes, amounts, hashlock_preimages, expires_ats, count) else { return std::ptr::null_mut(); };
-    if let Some(data) = w.export_payment(&outputs) {
+    if let Some(mut data) = w.export_payment(&outputs) {
+        data.shrink_to_fit();
         unsafe { *out_len = data.len() as u32; }
         let ptr = data.as_ptr();
         std::mem::forget(data);
@@ -239,7 +242,7 @@ pub extern "C" fn vess_wallet_receive(wallet: *mut Wallet, payment: *const u8, l
     let Some(bytes) = byte_slice(payment, len) else { return VESS_ERR_INVALID; };
     let mut pos = 0;
     match VessPayment::decode(bytes, &mut pos) {
-        Some(p) => { w.receive(p); VESS_OK }
+        Some(p) => { if w.receive(p) { VESS_OK } else { VESS_ERR_INVALID } }
         None => VESS_ERR_INVALID,
     }
 }

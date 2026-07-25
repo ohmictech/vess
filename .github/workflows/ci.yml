@@ -13,6 +13,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y liblmdb-dev
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Lint
@@ -22,6 +24,4 @@ jobs:
       - name: Release build
         run: cargo build --release --workspace
       - name: Security audit
-        run: |
-          cargo install cargo-audit
-          cargo audit
+        uses: actions-rust-lang/audit@v1

@@ -209,6 +209,10 @@ pub fn kem_generate() -> (Vec<u8>, Vec<u8>) {
     (arr_bytes(&ek.to_bytes()), arr_bytes(&dk.to_bytes()))
 }
 
+/// ML-KEM-512 wire sizes — used for fixed-length parsing in the handshake.
+pub const KEM_PK_BYTES: usize = 800;
+pub const KEM_CT_BYTES: usize = 768;
+
 /// Encapsulate against an untrusted peer encapsulation key. Validates the key;
 /// returns (ciphertext, shared_secret) or None if the key is malformed.
 pub fn kem_encapsulate(ek_bytes: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {

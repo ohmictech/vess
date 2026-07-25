@@ -4,6 +4,9 @@ on:
   push:
     tags: ["v*"]
 
+permissions:
+  contents: write
+
 jobs:
   build:
     strategy:
@@ -28,6 +31,10 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Install system deps (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y liblmdb-dev
+
       - name: Build release
         run: cargo build --release --target ${{ matrix.target }}
 
@@ -39,13 +46,15 @@ jobs:
 
       - name: Package (Windows)
         if: matrix.os == 'windows-latest'
+        shell: pwsh
         run: |
-          cd target/${{ matrix.target }}/release
-          7z a ../../../vess-${{ github.ref_name }}-${{ matrix.target }}.zip vess-node.exe vess-wallet-cli.exe
+          $dst = "vess-${{ github.ref_name }}-${{ matrix.target }}.zip"
+          Compress-Archive -Path target/${{ matrix.target }}/release/vess-node.exe, target/${{ matrix.target }}/release/vess-wallet-cli.exe -DestinationPath $dst
 
       - name: Upload to release
         uses: softprops/action-gh-release@v2
         with:
           files: vess-${{ github.ref_name }}-${{ matrix.target }}.*
+          generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
