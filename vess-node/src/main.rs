@@ -266,6 +266,20 @@ fn main() -> std::io::Result<()> {
         // Drain any leftover stdin commands
         while rx.try_recv().is_ok() {}
 
+        // Drain discovered peers — solve PoW outside the lock so the
+        // 1-3s cuckatoo solve doesn't stall the main loop.
+        let pending: Vec<std::net::SocketAddr> = {
+            let mut n = node.lock().unwrap();
+            std::mem::take(&mut n.pending_discovered)
+        };
+        for peer_addr in pending {
+            eprintln!("connecting to {} (solving handshake PoW)...", peer_addr);
+            let len = node.lock().unwrap().add_peer(peer_addr);
+            if len > 0 {
+                eprintln!("  handshake init sent ({} bytes)", len);
+            }
+        }
+
         match socket.recv_from(&mut buf) {
             Ok((len, src)) => {
                 if let Some(resp) = node.lock().unwrap().process(src, &buf[..len]) {

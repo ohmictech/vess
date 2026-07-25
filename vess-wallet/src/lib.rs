@@ -418,10 +418,15 @@ impl Wallet {
                 .unwrap_or(0);
             // Fresh keypair per output — avoids address reuse and makes
             // consolidation outputs indistinguishable from normal payments.
-            let (pk1, _sk1) = dsa_generate();
+            let (pk1, sk1) = dsa_generate();
             let oh1 = dsa_pubkey_hash(&pk1);
-            let (pk2, _sk2) = dsa_generate();
+            let (pk2, sk2) = dsa_generate();
             let oh2 = dsa_pubkey_hash(&pk2);
+            // Store keys BEFORE building the payment — otherwise the
+            // consolidated outputs are sent to owner hashes the wallet
+            // cannot sign for, permanently destroying the coins.
+            self.keypairs.insert(oh1, Keypair { dsa_pk: pk1, dsa_sk: sk1 });
+            self.keypairs.insert(oh2, Keypair { dsa_pk: pk2, dsa_sk: sk2 });
             let outputs: Vec<(OwnerHash, Amount, Option<SpendCondition>)> = if total > 1 {
                 let split = if rand::thread_rng().gen_bool(0.5) {
                     let grain = [10, 100, 1000][rand::thread_rng().gen_range(0..3)];

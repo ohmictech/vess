@@ -86,6 +86,7 @@ pub struct Node {
     msg_window_start: u64,
     peer_merkle: HashMap<SocketAddr, (u64, MerkleRoot, u32)>,  // height, root, difficulty_bits
     blocks: HashMap<BlockHash, VessBlock>,    // recent blocks by hash
+    block_work: HashMap<BlockHash, u64>,       // cached cumulative work per block
     pub tip_hashes: Vec<BlockHash>,               // DAG tips for parent selection
     current_tip: Option<BlockHash>,           // tip our LMDB state corresponds to
     pub mining_cores: u32,                     // 0 = off, 1+ = mining with that many threads
@@ -110,6 +111,9 @@ pub struct Node {
     pending_handshakes: HashMap<SocketAddr, PendingHandshake>,
     // Peers discovered via GetPeers exchange — paced connection queue.
     discovered_peers: Vec<SocketAddr>,
+    // Discovered peers that need PoW solving — drained by main.rs outside
+    // the node lock so the 1-3s cuckatoo solve doesn't stall the main loop.
+    pub pending_discovered: Vec<SocketAddr>,
     // State sync
     sync_peer: Option<SocketAddr>,               // peer we're syncing UTXOs from
     sync_offset: u64,                             // how many UTXO IDs received so far
@@ -144,6 +148,7 @@ impl Node {
             peer_msg_count: HashMap::new(), msg_window_start: 0, peer_merkle: HashMap::new(),
             stems: HashMap::new(), fluff_embargo: HashMap::new(),
             blocks: HashMap::new(), tip_hashes: Vec::new(), current_tip: None, mining_cores: 0,
+            block_work: HashMap::new(),
             last_mine_tick: 0,
             current_difficulty: saved_diff,
             pending_blocks: Vec::new(),
@@ -161,6 +166,7 @@ impl Node {
             completed_packets: HashMap::new(),
             pending_handshakes: HashMap::new(),
             discovered_peers: Vec::new(),
+            pending_discovered: Vec::new(),
             sync_peer: None,
             sync_offset: 0,
             sync_target_root: None,
@@ -335,7 +341,7 @@ impl Node {
         if self.network.session_by_addr(&addr).is_none() {
             self.network.sessions.push(vess_network::Session {
                 addr, node_id: Some(node_id), out_key: key, in_key: key, peer_version: PROTOCOL_VERSION,
-                reported_addr: Some(addr), nonce_ctr: 0,
+                reported_addr: Some(addr), nonce_ctr: 0, proven_rx: true, // test-only: skip rx proof
             });
         }
         self.peers.insert(addr, node_id);
@@ -771,11 +777,16 @@ impl Node {
 
         // Orphan handling: if any parent is unknown, store the block and fetch
         // the missing parents. When all parents arrive, the orphan is retried.
+        // Skip this gate when the node has no blocks at all — a state-synced
+        // node has a verified UTXO set but zero history; new blocks must
+        // validate against LMDB directly (state_for_roots fallback).
         let mut missing = false;
-        for parent_hash in &block.parents {
-            if !self.blocks.contains_key(parent_hash) {
-                missing = true;
-                self.missing_parents.entry(*parent_hash).or_default().push(block_hash);
+        if !self.blocks.is_empty() {
+            for parent_hash in &block.parents {
+                if !self.blocks.contains_key(parent_hash) {
+                    missing = true;
+                    self.missing_parents.entry(*parent_hash).or_default().push(block_hash);
+                }
             }
         }
         if missing {
@@ -826,6 +837,12 @@ impl Node {
 
         // Store block, update tips
         self.blocks.insert(block_hash, block.clone());
+        // Cache cumulative work — avoids O(history) DAG walk on every call.
+        let work = block.parents.iter()
+            .filter_map(|p| self.block_work.get(p))
+            .max().unwrap_or(&0)
+            .saturating_add(1u64 << block.difficulty_bits as u64);
+        self.block_work.insert(block_hash, work);
         if let Ok(mut w) = self.env.write_txn() {
             if self.blocks_db.put(&mut w, &block_hash, &block.encode()).is_err() || w.commit().is_err() {
                 self.blocks.remove(&block_hash);
@@ -1157,6 +1174,10 @@ impl Node {
     /// each ancestor counted once). Multi-parent merge blocks accumulate the
     /// work of every branch they reference — fork races stop orphaning work.
     pub fn cumulative_work(&self, hash: &BlockHash) -> u64 {
+        // Cached: work is computed once when the block is accepted and
+        // stored in block_work.  Avoids O(history) DAG walk on every call.
+        if let Some(&w) = self.block_work.get(hash) { return w; }
+        // Fallback for blocks loaded from disk on restart: walk ancestors.
         let mut work = 0u64;
         let mut visited = HashSet::new();
         let mut stack = vec![*hash];
@@ -1194,6 +1215,8 @@ impl Node {
             }
         }
         self.blocks.retain(|h, _| keep.contains(h));
+        self.block_work.retain(|h, _| keep.contains(h));
+        self.block_seen.retain(|h| keep.contains(h));
         if let Ok(mut w) = self.env.write_txn() {
             let persisted: Vec<BlockHash> = self.blocks_db.iter(&w).ok().into_iter().flatten()
                 .filter_map(|entry| entry.ok())
@@ -1265,7 +1288,9 @@ impl Node {
             }
             if let Some(addr) = self.discovered_peers.pop() {
                 if self.peer_count() < self.max_peers && !self.has_session_for(&addr) {
-                    self.add_peer(addr);
+                    // Defer to main.rs — PoW solving takes 1-3s and must
+                    // not hold the node lock (blocks the main loop).
+                    self.pending_discovered.push(addr);
                 }
             }
         }
@@ -1410,6 +1435,17 @@ impl Node {
     }
 
     fn strike(&mut self, addr: SocketAddr) {
+        // Only credit strikes against addresses whose session has proven
+        // receipt of at least one valid encrypted message.  A spoofed
+        // INIT creates a session immediately but the real owner of that
+        // address never receives the RESP — strike accumulation would
+        // otherwise get the victim IP banned network-wide.
+        if self.network.session_by_addr(&addr)
+            .map(|s| !s.proven_rx)
+            .unwrap_or(true)
+        {
+            return;
+        }
         *self.fails.entry(addr).or_insert(0) += 1;
     }
 
@@ -1623,11 +1659,12 @@ impl Node {
                 }
                 // NAT self-detection: if someone announces OUR NodeId with a
                 // different address, that address is our public face.
-                // Only trust this from peers with an established session —
-                // otherwise any attacker can poison our NAT type.
+                // Only trust this when the session's own node_id matches
+                // the announced pid — otherwise any connected peer can
+                // poison our NAT type by claiming to be us.
                 if *pid == self.network.my_node_id() && *a != self.addr
                     && self.network.session_by_addr(&addr)
-                        .map(|s| s.node_id.is_some())
+                        .map(|s| s.node_id == Some(*pid))
                         .unwrap_or(false)
                 {
                     self.nat_type = NatType::BehindNat;

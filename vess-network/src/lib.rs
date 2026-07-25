@@ -329,6 +329,9 @@ pub struct Session {
     /// If this matches the observed source, the peer is publicly reachable.
     pub reported_addr: Option<SocketAddr>,
     pub nonce_ctr: u64,
+    /// True once the peer has sent at least one valid encrypted message,
+    /// proving they received our handshake RESP at this address.
+    pub proven_rx: bool,
 }
 
 impl Session {
@@ -351,7 +354,11 @@ impl Session {
         if data.len() < 8 { return None; }
         let mut nonce = [0u8; 12];
         nonce[..8].copy_from_slice(&data[..8]);
-        chacha_decrypt(&self.in_key, &nonce, &data[8..])
+        let plain = chacha_decrypt(&self.in_key, &nonce, &data[8..])?;
+        // First successful decrypt proves the peer received our RESP
+        // at this address — from now on, strikes apply.
+        self.proven_rx = true;
+        Some(plain)
     }
 
     /// A peer is publicly reachable if their self-reported address matches
@@ -405,7 +412,7 @@ impl Network {
         p.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
         write_bytes(&mut p, &self.dsa_pk);  // needed for signature verification
         p.extend_from_slice(&self.kem_pk);
-        self.sessions.push(Session { addr, node_id: None, out_key: [0u8; 32], in_key: [0u8; 32], peer_version: 0, reported_addr: None, nonce_ctr: 0 });
+        self.sessions.push(Session { addr, node_id: None, out_key: [0u8; 32], in_key: [0u8; 32], peer_version: 0, reported_addr: None, nonce_ctr: 0, proven_rx: false });
         frame(HANDSHAKE_INIT, &p)
     }
 
@@ -456,7 +463,7 @@ impl Network {
                 write_bytes(&mut resp, &self.dsa_pk);
                 write_bytes(&mut resp, &sig);
                 write_bytes(&mut resp, &ct_bytes);
-                self.sessions.push(Session { addr, node_id: Some(peer_id), out_key, in_key, peer_version: peer_ver, reported_addr: None, nonce_ctr: 0 });
+                self.sessions.push(Session { addr, node_id: Some(peer_id), out_key, in_key, peer_version: peer_ver, reported_addr: None, nonce_ctr: 0, proven_rx: false });
                 Some(frame(HANDSHAKE_RESP, &resp))
             }
             HANDSHAKE_RESP => {

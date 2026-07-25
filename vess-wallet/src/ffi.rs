@@ -103,12 +103,11 @@ pub extern "C" fn vess_wallet_load(data: *const u8, data_len: u32, password: *co
 pub extern "C" fn vess_wallet_save(wallet: *mut Wallet, out_len: *mut u32) -> *mut u8 {
     if out_len.is_null() { return std::ptr::null_mut(); }
     let w = wallet_ref!(wallet, std::ptr::null_mut());
-    let mut data = w.save();
-    data.shrink_to_fit(); // capacity == len, safe for vess_free_bytes
+    let data = w.save();
     unsafe { *out_len = data.len() as u32; }
-    let ptr = data.as_ptr();
-    std::mem::forget(data);
-    ptr as *mut u8
+    // into_boxed_slice guarantees capacity == len → safe for vess_free_bytes
+    let boxed: Box<[u8]> = data.into_boxed_slice();
+    Box::into_raw(boxed) as *mut u8
 }
 
 // ---- network ----
@@ -193,12 +192,9 @@ pub extern "C" fn vess_wallet_build_payment(
         let w = wallet_mut!(wallet, std::ptr::null_mut());
         let Some(outputs) = outputs_from_ffi(hashes, amounts, hashlock_preimages, expires_ats, count) else { return std::ptr::null_mut(); };
         if let Some(p) = w.build_payment(&outputs) {
-            let mut data = p.encode();
-            data.shrink_to_fit();
+            let data: Box<[u8]> = p.encode().into_boxed_slice();
             unsafe { *out_len = data.len() as u32; }
-            let ptr = data.as_ptr();
-            std::mem::forget(data);
-            ptr as *mut u8
+            Box::into_raw(data) as *mut u8
         } else {
             std::ptr::null_mut()
         }
@@ -214,12 +210,10 @@ pub extern "C" fn vess_wallet_export_payment(
     if out_len.is_null() { return std::ptr::null_mut(); }
     let w = wallet_mut!(wallet, std::ptr::null_mut());
     let Some(outputs) = outputs_from_ffi(hashes, amounts, hashlock_preimages, expires_ats, count) else { return std::ptr::null_mut(); };
-    if let Some(mut data) = w.export_payment(&outputs) {
-        data.shrink_to_fit();
-        unsafe { *out_len = data.len() as u32; }
-        let ptr = data.as_ptr();
-        std::mem::forget(data);
-        ptr as *mut u8
+    if let Some(data) = w.export_payment(&outputs) {
+        let boxed: Box<[u8]> = data.into_boxed_slice();
+        unsafe { *out_len = boxed.len() as u32; }
+        Box::into_raw(boxed) as *mut u8
     } else {
         std::ptr::null_mut()
     }
