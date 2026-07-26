@@ -201,19 +201,25 @@ impl Node {
             .collect();
         // Rebuild cumulative work cache using the max-over-parents GHOST-lite
         // rule (matching what process_block computes on acceptance).
-        // Order by height/depth so parents are cached before children.
-        let mut ordered: Vec<(BlockHash, VessBlock)> = node.blocks.iter()
-            .map(|(h, b)| (*h, b.clone())).collect();
-        ordered.sort_by_key(|(_, b)| {
-            // Approximate depth by timestamp for cache ordering.
-            b.timestamp
+        // Must use topological order so parents are always cached before
+        // children — timestamp sort can invert this when parent/child have
+        // equal timestamps (allowed: ts >= parent) and HashMap iteration
+        // order is non-deterministic.
+        let order = node.ancestor_order(&node.tip_hashes).unwrap_or_else(|| {
+            // Fallback: sort by timestamp (rare, only if DAG has cycles).
+            let mut v: Vec<(BlockHash, VessBlock)> = node.blocks.iter()
+                .map(|(h, b)| (*h, b.clone())).collect();
+            v.sort_by_key(|(_, b)| b.timestamp);
+            v.into_iter().map(|(h, _)| h).collect()
         });
-        for (hash, block) in &ordered {
-            let parent_max = block.parents.iter()
-                .filter_map(|p| node.block_work.get(p))
-                .max().unwrap_or(&0);
-            node.block_work.insert(*hash,
-                parent_max.saturating_add(1u64 << block.difficulty_bits as u64));
+        for hash in &order {
+            if let Some(block) = node.blocks.get(hash) {
+                let parent_max = block.parents.iter()
+                    .filter_map(|p| node.block_work.get(p))
+                    .max().unwrap_or(&0);
+                node.block_work.insert(*hash,
+                    parent_max.saturating_add(1u64 << block.difficulty_bits as u64));
+            }
         }
         node.reorg_if_needed();
         // Load persisted bans — key = ip bytes (4 or 16), no port.
@@ -897,21 +903,25 @@ impl Node {
         }
         self.tip_hashes.retain(|h| !block.parents.contains(h));
         self.tip_hashes.push(block_hash);
-        // Commit the validated state directly — don't defer to
-        // reorg_if_needed which would recompute from the DAG and
-        // fail on unknown ancestors (fresh-synced nodes hit this).
-        // The state from validate_block IS the authoritative post-state.
-        if let Ok(mut w) = self.env.write_txn() {
-            let existing: Vec<VessId> = self.vess_index.iter(&w).ok().into_iter().flatten()
-                .filter_map(|entry| entry.ok())
-                .filter_map(|(id, _)| id.try_into().ok())
-                .collect();
-            for id in existing { let _ = self.vess_index.delete(&mut w, &id); }
-            for id in &state { let _ = self.vess_index.put(&mut w, id, &()); }
-            if w.commit().is_ok() {
-                self.current_tip = Some(block_hash);
-                self.accepted_blocks = self.accepted_blocks.saturating_add(1);
-                self.save_meta();
+        // Only commit state to LMDB when this block is the heaviest tip.
+        // Accepting a lighter fork would revert the UTXO view to a
+        // non-canonical branch — every flap rewrites the full UTXO set.
+        // Non-heaviest valid blocks stay in the DAG; a child that makes
+        // them heaviest triggers the commit via reorg_if_needed later.
+        let is_heaviest = self.heaviest_tip() == Some(block_hash);
+        if is_heaviest {
+            if let Ok(mut w) = self.env.write_txn() {
+                let existing: Vec<VessId> = self.vess_index.iter(&w).ok().into_iter().flatten()
+                    .filter_map(|entry| entry.ok())
+                    .filter_map(|(id, _)| id.try_into().ok())
+                    .collect();
+                for id in existing { let _ = self.vess_index.delete(&mut w, &id); }
+                for id in &state { let _ = self.vess_index.put(&mut w, id, &()); }
+                if w.commit().is_ok() {
+                    self.current_tip = Some(block_hash);
+                    self.accepted_blocks = self.accepted_blocks.saturating_add(1);
+                    self.save_meta();
+                }
             }
         }
         self.prune_blocks();
@@ -1598,6 +1608,14 @@ impl Node {
                 if s.node_id.is_some() {
                     self.peers.insert(addr, s.node_id.unwrap());
                     self.persist_peer(addr);
+                    // NAT self-detection: the responder observed our source
+                    // address and echoed it in HANDSHAKE_RESP. If it differs
+                    // from our self-reported address, we're behind a NAT.
+                    if tag == HANDSHAKE_RESP && s.reported_addr.is_some()
+                        && s.reported_addr != Some(self.addr)
+                    {
+                        self.nat_type = NatType::BehindNat;
+                    }
                     // Exchange peer lists — learn about the network through
                     // this new peer and let them learn about ours.
                     self.send_get_peers_request(addr);
@@ -1842,7 +1860,12 @@ impl Node {
                 }
             }
             GossipMessage::BlockResp(Some(block)) => {
-                let _ = self.process_block(block);
+                if self.process_block(block) {
+                    // Pulled blocks must propagate onward — otherwise they
+                    // stop at tier-2 nodes.  Push through the same two-tier
+                    // broadcast as directly-gossiped blocks.
+                    self.pending_blocks.push((block.clone(), Some(addr)));
+                }
             }
             GossipMessage::BlockResp(None) => {}
         }
@@ -2001,12 +2024,11 @@ impl Node {
             .filter(|(a, _)| exclude.map_or(true, |e| *a != e))
             .map(|(a, _)| (*a, self.peer_rtt.get(a).copied().unwrap_or(u64::MAX)))
             .collect();
-        // Shuffle with bias toward low RTT: sort by (random_u64 >> 3) + (rtt >> 1).
-        // This gives strong preference to low-RTT peers without making the
-        // selection deterministic or fully RTT-ordered.
+        // Shuffle with bias toward low RTT: score = rtt * 1000 + (random % 500).
+        // Low-RTT peers get a clear advantage without determinism.
         for (_, rtt) in &mut candidates {
             let r: u64 = rand::thread_rng().gen();
-            *rtt = (r >> 3).saturating_add(*rtt >> 1);
+            *rtt = rtt.saturating_mul(1000).saturating_add(r % 500);
         }
         candidates.sort_by_key(|(_, v)| *v);
         candidates.truncate(n.min(candidates.len()));

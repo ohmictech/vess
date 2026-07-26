@@ -445,7 +445,7 @@ impl Network {
         self.ticks = self.ticks.saturating_add(1);
         let now = self.ticks;
         self.sessions.retain(|s| {
-            s.proven_rx || now.saturating_sub(s.created_at) < 300
+            s.proven_rx || now.saturating_sub(s.created_at) < 1200
         });
     }
 
@@ -500,9 +500,14 @@ impl Network {
                 let init_transcript = blake3_hash_multi(&[b"vess-hs-init", &peer_pk, ekem_raw]);
                 if !dsa_verify(&peer_pk, &init_transcript, &init_sig) { return None; }
                 let (ct_bytes, ss_bytes) = kem_encapsulate(ekem_raw)?;
-                // Sign the full transcript: both node ids + initiator pubkey + KEM pk + ciphertext.
+                // Encode the observed source address for NAT detection and
+                // include it in the signed transcript — an on-path attacker
+                // can rewrite it otherwise.
+                let observed_addr_bytes = encode_socket_addr(&addr);
+                // Sign the full transcript: both node ids + initiator pubkey +
+                // KEM pk + ciphertext + observed source address.
                 let my_id = self.my_node_id();
-                let transcript = blake3_hash_multi(&[&peer_id, &my_id, &peer_pk, ekem_raw, &ct_bytes]);
+                let transcript = blake3_hash_multi(&[&peer_id, &my_id, &peer_pk, ekem_raw, &ct_bytes, &observed_addr_bytes]);
                 let sig = dsa_sign(&self.dsa_sk, &transcript)?;
                 // Canonical ordering: both sides derive the same base key, then
                 // split into directional out/in keys so initiator→responder and
@@ -530,7 +535,7 @@ impl Network {
                 Some(frame(HANDSHAKE_RESP, &resp))
             }
             HANDSHAKE_RESP => {
-                // Format: node_id(32) + version(4) + dsa_pk(variable) + sig(variable) + ct(768)
+                // Format: node_id(32) + version(4) + dsa_pk(variable) + sig(variable) + ct(768) + observed_addr
                 if payload.len() < 36 { return None; }
                 let peer_id: NodeId = payload[..32].try_into().ok()?;
                 let peer_ver = u32::from_le_bytes(payload[32..36].try_into().ok()?);
@@ -543,10 +548,15 @@ impl Network {
                 let ct_bytes = read_bytes(payload, &mut pos)?;
                 // Parse the responder-observed source address for NAT detection.
                 let observed_addr = read_socket_addr(payload, &mut pos);
+                // Re-encode the observed address bytes as they appear in the
+                // payload to include in the signed transcript.
+                let obs_bytes = observed_addr.as_ref()
+                    .map(|a| encode_socket_addr(a))
+                    .unwrap_or_default();
                 // Verify the responder's signature over the full transcript.
                 let ss_bytes = kem_decapsulate(&ct_bytes, &self.kem_sk)?;
                 let my_id = self.my_node_id();
-                let transcript = blake3_hash_multi(&[&my_id, &peer_id, &self.dsa_pk, &self.kem_pk, &ct_bytes]);
+                let transcript = blake3_hash_multi(&[&my_id, &peer_id, &self.dsa_pk, &self.kem_pk, &ct_bytes, &obs_bytes]);
                 if !dsa_verify(&peer_pk, &transcript, &sig) { return None; }
                 let (a, b) = if peer_id < my_id { (peer_id, my_id) } else { (my_id, peer_id) };
                 let base = blake3_hash_multi(&[&ss_bytes, &a, &b]);
