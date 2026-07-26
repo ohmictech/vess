@@ -77,6 +77,7 @@ pub struct Node {
     mined_keys: heed::Database<heed::types::Bytes, heed::types::Bytes>, // owner_hash → pubkey||spend_key
     peers_db: heed::Database<heed::types::Bytes, heed::types::Unit>,   // persisted peer addresses
     blocks_db: heed::Database<heed::types::Bytes, heed::types::Bytes>, // block_hash → encoded block
+    undo_db: heed::Database<heed::types::Bytes, heed::types::Bytes>,   // block_hash → encode(removed_ids, inserted_ids)
     limbo: HashMap<PaymentId, (VessPayment, u64)>,       // payment → (data, entry_tick)
     limbo_inputs: HashMap<VessId, Vec<PaymentId>>,       // which limbo payments claim each input
     contested: HashSet<PaymentId>,                        // payments with conflicting inputs (burn on block inclusion)
@@ -126,6 +127,10 @@ pub struct Node {
     sync_chunk_size: u32,                         // IDs per SyncReq chunk
     auto_sync_until: u64,                         // keep driving sync until this tick
     pub test_mode: bool,
+    // Finality: the deepest-anchored block that cannot be reorged.
+    finalized_tip: Option<BlockHash>,
+    fin_work: u64,                                // cumulative work at finalized_tip (base for block_work)
+    fin_root: MerkleRoot,                         // state merkle at finalized_tip
 }
 
 impl Node {
@@ -136,7 +141,7 @@ impl Node {
 
     fn new_inner(addr: SocketAddr, db_path: &str, test_mode: bool) -> Self {
         let _ = std::fs::create_dir(db_path);
-        let env = unsafe { heed::EnvOpenOptions::new().map_size(1_073_741_824).max_dbs(6).open(db_path) }.unwrap();
+        let env = unsafe { heed::EnvOpenOptions::new().map_size(1_073_741_824).max_dbs(7).open(db_path) }.unwrap();
         let mut wtxn = env.write_txn().unwrap();
         let db: heed::Database<heed::types::Bytes, heed::types::Unit> = env.create_database(&mut wtxn, Some("vess")).unwrap();
         let ban_list: heed::Database<heed::types::Bytes, heed::types::Unit> = env.create_database(&mut wtxn, Some("bans")).unwrap();
@@ -144,11 +149,12 @@ impl Node {
         let mined_keys: heed::Database<heed::types::Bytes, heed::types::Bytes> = env.create_database(&mut wtxn, Some("keys")).unwrap();
         let peers_db: heed::Database<heed::types::Bytes, heed::types::Unit> = env.create_database(&mut wtxn, Some("peers")).unwrap();
         let blocks_db: heed::Database<heed::types::Bytes, heed::types::Bytes> = env.create_database(&mut wtxn, Some("blocks")).unwrap();
+        let undo_db: heed::Database<heed::types::Bytes, heed::types::Bytes> = env.create_database(&mut wtxn, Some("undo")).unwrap();
         wtxn.commit().unwrap();
 
-        let (saved_ticks, saved_diff) = Self::load_meta(&env, &meta);
+        let (saved_ticks, saved_diff, saved_tip, saved_fin_tip, saved_fin_work, saved_fin_root) = Self::load_meta(&env, &meta);
         let mut node = Self { addr, network: Network::new(), peers: HashMap::new(), max_peers: 16, needs_sync: true, env, vess_index: db, ban_list, banned_ips: HashSet::new(), meta, mined_keys, peers_db,
-            blocks_db, limbo: HashMap::new(), limbo_inputs: HashMap::new(), contested: HashSet::new(),
+            blocks_db, undo_db, limbo: HashMap::new(), limbo_inputs: HashMap::new(), contested: HashSet::new(),
             outbox: Vec::new(), ticks: saved_ticks, fails: HashMap::new(),
             peer_msg_count: HashMap::new(), msg_window_start: 0, peer_merkle: HashMap::new(),
             stems: HashMap::new(), fluff_embargo: HashMap::new(),
@@ -178,7 +184,11 @@ impl Node {
             sync_target_root: None,
             sync_chunk_size: 10_000,
             auto_sync_until: 0,
-            test_mode };
+            test_mode,
+            finalized_tip: saved_fin_tip,
+            fin_work: saved_fin_work,
+            fin_root: saved_fin_root,
+        };
         // Recover the block graph before serving or mining. The UTXO index is
         // rebuilt from its canonical tip below, rather than trusted directly.
         if let Ok(t) = node.env.read_txn() {
@@ -212,8 +222,14 @@ impl Node {
             v.sort_by_key(|(_, b)| b.timestamp);
             v.into_iter().map(|(h, _)| h).collect()
         });
+        // Seed block_work from the finalized tip's persisted work value.
+        if let Some(ft) = node.finalized_tip {
+            node.block_work.insert(ft, node.fin_work);
+        }
         for hash in &order {
             if let Some(block) = node.blocks.get(hash) {
+                // Skip if already seeded from finalized_tip
+                if node.block_work.contains_key(hash) { continue; }
                 let parent_max = block.parents.iter()
                     .filter_map(|p| node.block_work.get(p))
                     .max().unwrap_or(&0);
@@ -221,7 +237,20 @@ impl Node {
                     parent_max.saturating_add(1u64 << block.difficulty_bits as u64));
             }
         }
-        node.reorg_if_needed();
+        // Set current_tip from saved meta — LMDB state already matches it.
+        // No full replay needed; the undo log handles in-window reorgs.
+        node.current_tip = saved_tip;
+        // Sanity-check: if we have a tip, the live merkle should match.
+        // On mismatch (corruption), fall back to sync.
+        if node.current_tip.is_some() && node.utxo_count() > 0 {
+            let live_root = node.merkle();
+            if saved_fin_root != [0u8; 32] && live_root != saved_fin_root
+                && live_root != [0u8; 32]
+            {
+                eprintln!("WARNING: live UTXO merkle mismatch — triggering sync");
+                node.needs_sync = true;
+            }
+        }
         // Load persisted bans — key = ip bytes (4 or 16), no port.
         if let Ok(t) = node.env.read_txn() {
             if let Ok(iter) = node.ban_list.iter(&t) {
@@ -266,20 +295,59 @@ impl Node {
         node
     }
 
-    fn load_meta(env: &heed::Env, meta: &heed::Database<heed::types::Str, heed::types::Bytes>) -> (u64, u32) {
-        let t = match env.read_txn() { Ok(t) => t, Err(_) => return (0, DIFFICULTY_BASE_BITS) };
+    fn load_meta(env: &heed::Env, meta: &heed::Database<heed::types::Str, heed::types::Bytes>) -> (u64, u32, Option<BlockHash>, Option<BlockHash>, u64, MerkleRoot) {
+        let t = match env.read_txn() { Ok(t) => t, Err(_) => return (0, DIFFICULTY_BASE_BITS, None, None, 0, [0u8; 32]) };
         let ticks = meta.get(&t, "ticks").ok().flatten().and_then(|b| if b.len()>=8 { Some(u64::from_le_bytes(b[..8].try_into().unwrap())) } else { None }).unwrap_or(0);
         let diff = meta.get(&t, "diff").ok().flatten().and_then(|b| if b.len()>=4 { Some(u32::from_le_bytes(b[..4].try_into().unwrap())) } else { None }).unwrap_or(DIFFICULTY_BASE_BITS);
-        (ticks, diff)
+        let tip = meta.get(&t, "tip").ok().flatten().and_then(|b| if b.len()==32 { let mut a=[0u8;32]; a.copy_from_slice(b); Some(a) } else { None });
+        let fin_tip = meta.get(&t, "fin_tip").ok().flatten().and_then(|b| if b.len()==32 { let mut a=[0u8;32]; a.copy_from_slice(b); Some(a) } else { None });
+        let fin_work = meta.get(&t, "fin_work").ok().flatten().and_then(|b| if b.len()>=8 { Some(u64::from_le_bytes(b[..8].try_into().unwrap())) } else { None }).unwrap_or(0);
+        let fin_root = meta.get(&t, "fin_root").ok().flatten().and_then(|b| if b.len()==32 { let mut a=[0u8;32]; a.copy_from_slice(b); Some(a) } else { None }).unwrap_or([0u8; 32]);
+        (ticks, diff, tip, fin_tip, fin_work, fin_root)
     }
 
     fn save_meta(&self) {
         if let Ok(mut w) = self.env.write_txn() {
             let _ = self.meta.put(&mut w, "ticks", &self.ticks.to_le_bytes());
             let _ = self.meta.put(&mut w, "diff", &self.current_difficulty.to_le_bytes());
-            // Best-effort commit; meta loss is recoverable
+            if let Some(tip) = self.current_tip { let _ = self.meta.put(&mut w, "tip", &tip); }
+            if let Some(ft) = self.finalized_tip { let _ = self.meta.put(&mut w, "fin_tip", &ft); }
+            let _ = self.meta.put(&mut w, "fin_work", &self.fin_work.to_le_bytes());
+            let _ = self.meta.put(&mut w, "fin_root", &self.fin_root);
             let _ = w.commit();
         }
+    }
+
+    /// Encode an undo record: 4-byte count of removed ids, then each 32-byte id,
+    /// then 4-byte count of inserted ids, then each 32-byte id.
+    fn encode_undo(removed: &HashSet<VessId>, inserted: &HashSet<VessId>) -> Vec<u8> {
+        let mut v = Vec::with_capacity(8 + (removed.len() + inserted.len()) * 32);
+        v.extend_from_slice(&(removed.len() as u32).to_le_bytes());
+        for id in removed { v.extend_from_slice(id); }
+        v.extend_from_slice(&(inserted.len() as u32).to_le_bytes());
+        for id in inserted { v.extend_from_slice(id); }
+        v
+    }
+
+    /// Decode an undo record → (removed, inserted).
+    fn decode_undo(data: &[u8]) -> Option<(HashSet<VessId>, HashSet<VessId>)> {
+        if data.len() < 8 { return None; }
+        let r_count = u32::from_le_bytes(data[..4].try_into().ok()?) as usize;
+        let mut pos = 4;
+        if data.len() < pos + r_count * 32 + 4 { return None; }
+        let mut removed = HashSet::with_capacity(r_count);
+        for _ in 0..r_count {
+            let mut id = [0u8; 32]; id.copy_from_slice(&data[pos..pos+32]); pos += 32;
+            removed.insert(id);
+        }
+        let i_count = u32::from_le_bytes(data[pos..pos+4].try_into().ok()?) as usize; pos += 4;
+        if data.len() < pos + i_count * 32 { return None; }
+        let mut inserted = HashSet::with_capacity(i_count);
+        for _ in 0..i_count {
+            let mut id = [0u8; 32]; id.copy_from_slice(&data[pos..pos+32]); pos += 32;
+            inserted.insert(id);
+        }
+        Some((removed, inserted))
     }
 
     pub fn my_node_id(&self) -> NodeId { self.network.my_node_id() }
@@ -911,22 +979,31 @@ impl Node {
         let is_heaviest = self.heaviest_tip() == Some(block_hash);
         if is_heaviest {
             if let Ok(mut w) = self.env.write_txn() {
-                let existing: Vec<VessId> = self.vess_index.iter(&w).ok().into_iter().flatten()
+                // Compute the delta: which IDs are removed/inserted relative
+                // to the current live LMDB state.
+                let existing: HashSet<VessId> = self.vess_index.iter(&w).ok().into_iter().flatten()
                     .filter_map(|entry| entry.ok())
                     .filter_map(|(id, _)| id.try_into().ok())
                     .collect();
-                for id in existing { let _ = self.vess_index.delete(&mut w, &id); }
-                for id in &state { let _ = self.vess_index.put(&mut w, id, &()); }
+                let removed: HashSet<VessId> = existing.difference(&state).copied().collect();
+                let inserted: HashSet<VessId> = state.difference(&existing).copied().collect();
+                // Apply the delta incrementally.
+                for id in &removed { let _ = self.vess_index.delete(&mut w, id); }
+                for id in &inserted { let _ = self.vess_index.put(&mut w, id, &()); }
+                // Persist the undo record for in-window reorgs.
+                let _ = self.undo_db.put(&mut w, &block_hash, &Self::encode_undo(&removed, &inserted));
                 if w.commit().is_ok() {
                     self.current_tip = Some(block_hash);
                     self.accepted_blocks = self.accepted_blocks.saturating_add(1);
                     self.save_meta();
                 }
             }
+            // Advance finality and prune old history.
+            self.advance_finality();
         }
-        self.prune_blocks();
+        self.save_meta();
 
-        // DAA uses the canonical chain only and changes at fixed boundaries.
+        // Resolve orphans: any block waiting for THIS block as its parent
         let canonical = self.canonical_chain(self.current_tip);
         if canonical.len() >= DIFFICULTY_WINDOW && canonical.len().is_multiple_of(DIFFICULTY_WINDOW) {
             let recent: Vec<u64> = canonical.windows(2)
@@ -1267,22 +1344,60 @@ impl Node {
             .map(|(h, _)| h)
     }
 
-    fn prune_blocks(&mut self) {
-        if self.blocks.len() <= 40 { return; }
-        let Some(tip) = self.heaviest_tip() else { return; };
-        // Walk full ancestor closure from heaviest tip (stack DFS like cumulative_work).
-        // Single-parent traversal would prune merged branches, breaking state_for_roots.
+    /// Advance the finalized tip FINALITY_DEPTH blocks behind current_tip
+    /// along the first-parent spine, then prune everything older.
+    fn advance_finality(&mut self) {
+        let Some(tip) = self.current_tip else { return };
+        // Walk the first-parent spine FINALITY_DEPTH steps back.
+        let mut cursor = Some(tip);
+        for _ in 0..FINALITY_DEPTH {
+            cursor = match cursor {
+                Some(h) => self.blocks.get(&h).and_then(|b| b.parents.first().copied()),
+                None => break,
+            };
+        }
+        let new_finalized = match cursor {
+            Some(h) if self.finalized_tip != Some(h) => {
+                // Update fin_work and fin_root.
+                self.fin_work = self.block_work.get(&h).copied().unwrap_or(self.fin_work);
+                self.fin_root = Self::state_root(&self.state_for_roots(&[h]).unwrap_or_default());
+                self.finalized_tip = Some(h);
+                self.save_meta();
+                true
+            }
+            _ => self.finalized_tip.is_some() == cursor.is_some(),
+        };
+        if new_finalized || self.blocks.len() > FINALITY_DEPTH + 200 {
+            self.prune_to_finality();
+        }
+    }
+
+    /// Prune all blocks not in the descendant closure of finalized_tip,
+    /// keeping the DAG bounded to the finality window.
+    fn prune_to_finality(&mut self) {
+        let Some(ft) = self.finalized_tip else { return; };
+        // Walk forward from finalized_tip through all descendants.
         let mut keep = HashSet::new();
-        let mut stack = vec![tip];
+        let mut stack: Vec<BlockHash> = self.tip_hashes.clone();
+        // Also include finalized_tip itself.
+        stack.push(ft);
         while let Some(h) = stack.pop() {
             if !keep.insert(h) { continue; }
-            if let Some(b) = self.blocks.get(&h) {
-                for parent in &b.parents { stack.push(*parent); }
+            // Find children (blocks whose parents include h).
+            for (child_hash, child) in &self.blocks {
+                if child.parents.contains(&h) && !keep.contains(child_hash) {
+                    stack.push(*child_hash);
+                }
             }
         }
+        // Remove everything not in keep.
         self.blocks.retain(|h, _| keep.contains(h));
         self.block_work.retain(|h, _| keep.contains(h));
         self.block_seen.retain(|h| keep.contains(h));
+        self.tip_hashes.retain(|h| keep.contains(h));
+        // Also prune orphans/missing_parents referencing pruned blocks.
+        self.orphans.retain(|h, _| keep.contains(h));
+        self.missing_parents.retain(|h, _| keep.contains(h));
         if let Ok(mut w) = self.env.write_txn() {
             let persisted: Vec<BlockHash> = self.blocks_db.iter(&w).ok().into_iter().flatten()
                 .filter_map(|entry| entry.ok())
@@ -1290,10 +1405,10 @@ impl Node {
                 .collect();
             for hash in persisted.into_iter().filter(|hash| !keep.contains(hash)) {
                 let _ = self.blocks_db.delete(&mut w, &hash);
+                let _ = self.undo_db.delete(&mut w, &hash);
             }
             let _ = w.commit();
         }
-        self.tip_hashes.retain(|h| keep.contains(h));
     }
 
     /// If the heaviest tip disagrees with our LMDB state, rebuild using the
@@ -1609,12 +1724,17 @@ impl Node {
                     self.peers.insert(addr, s.node_id.unwrap());
                     self.persist_peer(addr);
                     // NAT self-detection: the responder observed our source
-                    // address and echoed it in HANDSHAKE_RESP. If it differs
-                    // from our self-reported address, we're behind a NAT.
-                    if tag == HANDSHAKE_RESP && s.reported_addr.is_some()
-                        && s.reported_addr != Some(self.addr)
-                    {
-                        self.nat_type = NatType::BehindNat;
+                    // address and echoed it in HANDSHAKE_RESP. Compare the
+                    // parts NAT actually changes — port (always) and IP
+                    // (only when we're not bound to a wildcard).
+                    // Comparing the full SocketAddr against 0.0.0.0:9876
+                    // would classify every default-configured node as NAT'd.
+                    if tag == HANDSHAKE_RESP && s.reported_addr.is_some() {
+                        let behind = s.reported_addr.map_or(false, |oa| {
+                            oa.port() != self.addr.port()
+                                || (!self.addr.ip().is_unspecified() && oa.ip() != self.addr.ip())
+                        });
+                        if behind { self.nat_type = NatType::BehindNat; }
                     }
                     // Exchange peer lists — learn about the network through
                     // this new peer and let them learn about ours.
@@ -1800,11 +1920,13 @@ impl Node {
             GossipMessage::HolePunch(nonce) => {
                 // Gate holepunch responses: if we're public, only respond to peers
                 // we're expecting (pending introductions with matching nonce).
-                // Behind NAT, accept any holepunch since our introducer may
-                // arrange connections we didn't anticipate.
-                let is_known = self.has_session_for(&addr)
-                    || self.introduced_peers.values().any(|ip| ip.observed_addr == addr && ip.punch_nonce == *nonce)
-                    || self.is_behind_nat();
+                // Behind NAT, also require the address to be in introduced_peers
+                // — otherwise any spoofed HolePunch packet triggers a 1-3s
+                // locked-cpu handshake PoW solve and turns us into an unwilling
+                // reflector.
+                let is_introduced = self.introduced_peers.values()
+                    .any(|ip| ip.observed_addr == addr && ip.punch_nonce == *nonce);
+                let is_known = self.has_session_for(&addr) || is_introduced;
                 if !is_known {
                     self.strike(addr);
                     return None;

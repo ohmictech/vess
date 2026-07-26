@@ -27,6 +27,9 @@ pub const VESS_HEADER_V1: &[u8] = b"VESS_HEADER_V1";
 pub const DIFFICULTY_BASE_BITS: u32 = 0;  // start at 0; DAA adjusts upward
 pub const MINING_DIFFICULTY: u32 = 8;
 pub const DIFFICULTY_WINDOW: usize = 40; // adjust every 40 blocks, matches prune window
+/// Number of blocks behind the canonical spine tip before a block is
+/// final (no reorg across it). 1024 blocks ≈ 17 minutes at 1 s/block.
+pub const FINALITY_DEPTH: usize = 1024;
 pub const MAX_INPUTS: usize = 5;
 pub const MAX_OUTPUTS: usize = 5;
 pub const MAX_BLOCK_PAYMENTS: usize = 10_000; // decode cap; consensus caps far lower
