@@ -82,7 +82,7 @@ mod integration {
         let (pk, sk) = dsa_generate();
         let oh = dsa_pubkey_hash(&pk);
         let coin = mine_coins(&mut node, oh, &pk, &sk);
-        let block = node.pending_blocks.last().cloned().expect("mined block recorded for gossip");
+        let block = node.pending_blocks.last().map(|(b,_)| b.clone()).expect("mined block recorded for gossip");
         let count_before = node.utxo_count();
         let root_before = node.merkle();
 
@@ -1169,11 +1169,11 @@ mod integration {
 
         // Phase 1: mine genesis + two spendable coins. Track each block.
         mine_coins(&mut n1, oh, &pk, &sk);
-        let block_gen = n1.pending_blocks.last().cloned().unwrap();
+        let block_gen = n1.pending_blocks.last().map(|(b,_)| b.clone()).unwrap();
         mine_coins(&mut n1, oh, &pk, &sk);
-        let block_coin_a = n1.pending_blocks.last().cloned().unwrap();
+        let block_coin_a = n1.pending_blocks.last().map(|(b,_)| b.clone()).unwrap();
         mine_coins(&mut n1, oh, &pk, &sk);
-        let block_coin_b = n1.pending_blocks.last().cloned().unwrap();
+        let block_coin_b = n1.pending_blocks.last().map(|(b,_)| b.clone()).unwrap();
         let coin_a = block_coin_a.coinbase.outputs.iter().find(|v| v.owner_hash == oh).unwrap().clone();
         let coin_b = block_coin_b.coinbase.outputs.iter().find(|v| v.owner_hash == oh).unwrap().clone();
         // Inject all three into n2, n3, n4.
@@ -1194,7 +1194,7 @@ mod integration {
         assert!(n1.submit(pay1), "payment enters limbo");
         let pay_block = n1.prepare_block().expect("block with payment");
         n1.apply_mined_block(pay_block, 0, vec![]);
-        let block_pay = n1.pending_blocks.last().cloned().unwrap();
+        let block_pay = n1.pending_blocks.last().map(|(b,_)| b.clone()).unwrap();
         for n in [&mut n2, &mut n3, &mut n4] { assert!(n.process_block(&block_pay)); }
 
         // Phase 3: conflicting double-spend of coin_b.
@@ -1220,8 +1220,8 @@ mod integration {
         // Phase 4: fork — n1 mines p_a, n2 mines p_b. Inject into all.
         let b1 = n1.prepare_block().expect("b1"); let b2 = n2.prepare_block().expect("b2");
         n1.apply_mined_block(b1, 0, vec![]); n2.apply_mined_block(b2, 0, vec![]);
-        let block_b1 = n1.pending_blocks.last().cloned().unwrap();
-        let block_b2 = n2.pending_blocks.last().cloned().unwrap();
+        let block_b1 = n1.pending_blocks.last().map(|(b,_)| b.clone()).unwrap();
+        let block_b2 = n2.pending_blocks.last().map(|(b,_)| b.clone()).unwrap();
         let b1h = block_b1.header_hash(); let b2h = block_b2.header_hash();
         for n in [&mut n2, &mut n3, &mut n4] { assert!(n.process_block(&block_b1)); }
         for n in [&mut n1, &mut n3, &mut n4] { assert!(n.process_block(&block_b2)); }

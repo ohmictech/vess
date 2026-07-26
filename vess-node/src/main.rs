@@ -2,7 +2,7 @@ use std::io::BufRead;
 use std::net::UdpSocket;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
-use vess_crypto::VessBlock;
+use vess_crypto::{VessBlock, blake3_hash, cuckoo};
 use vess_network::data_packets;
 use vess_node::Node;
 
@@ -31,7 +31,7 @@ fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let mut listen = "0.0.0.0:9876".to_string();
     let mut bootstrap: Vec<String> = Vec::new();
-    let mut max_peers: usize = 32;
+    let mut max_peers: usize = 16;
 
     let mut i = 1;
     while i < args.len() {
@@ -263,7 +263,7 @@ fn main() -> std::io::Result<()> {
             }
         }
 
-        // Drain any leftover stdin commands
+    // Drain any leftover stdin commands
         while rx.try_recv().is_ok() {}
 
         // Drain discovered peers — solve PoW outside the lock so the
@@ -274,9 +274,30 @@ fn main() -> std::io::Result<()> {
         };
         for peer_addr in pending {
             eprintln!("connecting to {} (solving handshake PoW)...", peer_addr);
-            let len = node.lock().unwrap().add_peer(peer_addr);
+            // Solve PoW without holding the node lock.
+            let base = blake3_hash(&[
+                b"vess-handshake" as &[u8],
+                &node.lock().unwrap().network.my_node_id(),
+                peer_addr.to_string().as_bytes(),
+            ].concat());
+            let mut hdr = base;
+            let proof = loop {
+                if let Some(p) = cuckoo::solve(&hdr,
+                    cuckoo::HANDSHAKE_CYCLE_LENGTH,
+                    cuckoo::HANDSHAKE_EDGE_BITS)
+                {
+                    break (hdr, p);
+                }
+                hdr = blake3_hash(&hdr);
+            };
+            let len = node.lock().unwrap().add_peer_with_pow(peer_addr, proof.0, proof.1);
             if len > 0 {
                 eprintln!("  handshake init sent ({} bytes)", len);
+            }
+            // Drain handshake fragments immediately.
+            let outbox = node.lock().unwrap().drain_outbox();
+            for (dest, data) in outbox {
+                send_datagrams(&socket, dest, &data);
             }
         }
 

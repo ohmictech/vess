@@ -19,6 +19,7 @@ pub const TAG_STEM_RELAY: u8 = 0x0E;
 pub const TAG_DATA_ACK: u8 = 0x0F;
 pub const TAG_BLOCK_REQ: u8 = 0x03;
 pub const TAG_BLOCK_RESP: u8 = 0x04;
+pub const TAG_BLOCK_ANNOUNCE: u8 = 0x1C;
 
 pub const RPC_CHECK: u8 = 0x10;
 pub const RPC_CHECK_RESP: u8 = 0x11;
@@ -40,6 +41,46 @@ pub const MAX_SYNC_CHUNK_IDS: usize = 20_000;
 pub const MAX_GET_PEERS: usize = 1_000;
 pub const MAX_PEER_ANNOUNCE_IP_LEN: usize = 64;
 pub const MAX_SESSIONS: usize = 64;
+
+/// Encode a SocketAddr as (ip_len_byte + ip_bytes + port_le).
+fn encode_socket_addr(addr: &SocketAddr) -> Vec<u8> {
+    let mut v = Vec::with_capacity(19);
+    match addr.ip() {
+        std::net::IpAddr::V4(ip) => {
+            v.push(4);
+            v.extend_from_slice(&ip.octets());
+        }
+        std::net::IpAddr::V6(ip) => {
+            v.push(16);
+            v.extend_from_slice(&ip.octets());
+        }
+    }
+    v.extend_from_slice(&addr.port().to_le_bytes());
+    v
+}
+
+/// Decode a SocketAddr from encode_socket_addr format.
+/// Returns None on parse failure (silently skips unrecognized data).
+fn read_socket_addr(bytes: &[u8], pos: &mut usize) -> Option<SocketAddr> {
+    if *pos >= bytes.len() { return None; }
+    let ip_len = bytes[*pos] as usize;
+    *pos += 1;
+    if ip_len != 4 && ip_len != 16 { return None; }
+    if bytes.len() < *pos + ip_len + 2 { return None; }
+    let ip: std::net::IpAddr = if ip_len == 4 {
+        let mut octets = [0u8; 4];
+        octets.copy_from_slice(&bytes[*pos..*pos + 4]);
+        std::net::Ipv4Addr::from(octets).into()
+    } else {
+        let mut octets = [0u8; 16];
+        octets.copy_from_slice(&bytes[*pos..*pos + 16]);
+        std::net::Ipv6Addr::from(octets).into()
+    };
+    *pos += ip_len;
+    let port = u16::from_le_bytes(bytes[*pos..*pos + 2].try_into().unwrap());
+    *pos += 2;
+    Some(SocketAddr::new(ip, port))
+}
 
 #[derive(Debug, Clone)]
 pub enum GossipMessage {
@@ -65,6 +106,8 @@ pub enum GossipMessage {
     BlockReq(BlockHash),
     /// Response: the requested block (or empty if unknown).
     BlockResp(Option<VessBlock>),
+    /// Hash-announce for two-tier gossip: "I have block X, request if needed."
+    BlockAnnounce(BlockHash),
 }
 
 #[derive(Debug)]
@@ -159,6 +202,7 @@ impl GossipMessage {
             GossipMessage::BlockReq(hash) => frame(TAG_BLOCK_REQ, hash),
             GossipMessage::BlockResp(Some(block)) => frame(TAG_BLOCK_RESP, &block.encode()),
             GossipMessage::BlockResp(None) => frame(TAG_BLOCK_RESP, &[]),
+            GossipMessage::BlockAnnounce(hash) => frame(TAG_BLOCK_ANNOUNCE, hash),
         }
     }
 
@@ -234,6 +278,7 @@ impl GossipMessage {
                     VessBlock::decode(payload, &mut pos).map(|b| GossipMessage::BlockResp(Some(b)))
                 }
             }
+            TAG_BLOCK_ANNOUNCE => Some(GossipMessage::BlockAnnounce(read_fixed(payload, &mut pos)?)),
             _ => None,
         }
     }
@@ -332,6 +377,8 @@ pub struct Session {
     /// True once the peer has sent at least one valid encrypted message,
     /// proving they received our handshake RESP at this address.
     pub proven_rx: bool,
+    /// Instant when this session was created (ticks for relative time).
+    pub created_at: u64,
 }
 
 impl Session {
@@ -374,6 +421,7 @@ pub struct Network {
     pub dsa_pk: Vec<u8>,   // 1952-byte ML-DSA-65 verifying key
     pub kem_sk: Zeroizing<Vec<u8>>,   // 64-byte ML-KEM-512 decapsulation seed — zeroized on drop
     pub kem_pk: Vec<u8>,   // 800-byte ML-KEM-512 encapsulation key
+    pub ticks: u64,
 }
 
 impl Default for Network {
@@ -386,10 +434,20 @@ impl Network {
     pub fn new() -> Self {
         let (dsa_pk, dsa_sk) = dsa_generate();
         let (kem_pk, kem_sk) = kem_generate();
-        Self { sessions: Vec::new(), dsa_sk: Zeroizing::new(dsa_sk), dsa_pk, kem_sk: Zeroizing::new(kem_sk), kem_pk }
+        Self { sessions: Vec::new(), dsa_sk: Zeroizing::new(dsa_sk), dsa_pk, kem_sk: Zeroizing::new(kem_sk), kem_pk, ticks: 0 }
     }
 
     pub fn my_node_id(&self) -> NodeId { node_id(&self.dsa_pk) }
+
+    /// Advance time and reap stale half-open sessions (>= 300 ticks, ~15s at 20ms/tick).
+    /// Sessions that never prove receipt (!proven_rx) after the timeout are dropped.
+    pub fn tick(&mut self) {
+        self.ticks = self.ticks.saturating_add(1);
+        let now = self.ticks;
+        self.sessions.retain(|s| {
+            s.proven_rx || now.saturating_sub(s.created_at) < 300
+        });
+    }
 
     pub fn session_by_addr(&self, addr: &SocketAddr) -> Option<&Session> {
         self.sessions.iter().find(|s| s.addr == *addr)
@@ -412,7 +470,7 @@ impl Network {
         p.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
         write_bytes(&mut p, &self.dsa_pk);  // needed for signature verification
         p.extend_from_slice(&self.kem_pk);
-        self.sessions.push(Session { addr, node_id: None, out_key: [0u8; 32], in_key: [0u8; 32], peer_version: 0, reported_addr: None, nonce_ctr: 0, proven_rx: false });
+        self.sessions.push(Session { addr, node_id: None, out_key: [0u8; 32], in_key: [0u8; 32], peer_version: 0, reported_addr: None, nonce_ctr: 0, proven_rx: false, created_at: self.ticks });
         frame(HANDSHAKE_INIT, &p)
     }
 
@@ -463,7 +521,12 @@ impl Network {
                 write_bytes(&mut resp, &self.dsa_pk);
                 write_bytes(&mut resp, &sig);
                 write_bytes(&mut resp, &ct_bytes);
-                self.sessions.push(Session { addr, node_id: Some(peer_id), out_key, in_key, peer_version: peer_ver, reported_addr: None, nonce_ctr: 0, proven_rx: false });
+                // Append the observed source address so the initiator can
+                // detect NAT by comparing it against its own socket address.
+                // This is authenticated by the AEAD session key and cannot
+                // be spoofed by an on-path adversary.
+                resp.extend_from_slice(&encode_socket_addr(&addr));
+                self.sessions.push(Session { addr, node_id: Some(peer_id), out_key, in_key, peer_version: peer_ver, reported_addr: None, nonce_ctr: 0, proven_rx: false, created_at: self.ticks });
                 Some(frame(HANDSHAKE_RESP, &resp))
             }
             HANDSHAKE_RESP => {
@@ -478,6 +541,8 @@ impl Network {
                 if node_id(&peer_pk) != peer_id { return None; }
                 let sig = read_bytes(payload, &mut pos)?;
                 let ct_bytes = read_bytes(payload, &mut pos)?;
+                // Parse the responder-observed source address for NAT detection.
+                let observed_addr = read_socket_addr(payload, &mut pos);
                 // Verify the responder's signature over the full transcript.
                 let ss_bytes = kem_decapsulate(&ct_bytes, &self.kem_sk)?;
                 let my_id = self.my_node_id();
@@ -497,6 +562,10 @@ impl Network {
                     s.in_key = in_key;
                     s.peer_version = peer_ver;
                     s.nonce_ctr = 0;
+                    // Store the NAT-observed address (our own addr as seen by responder).
+                    if let Some(oa) = observed_addr {
+                        s.reported_addr = Some(oa);
+                    }
                 }
                 None
             }

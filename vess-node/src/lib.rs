@@ -11,6 +11,9 @@ const DANDELION_EMBARGO_TICKS: u64 = 40; // ~200ms embargo before fluff broadcas
 const HOLE_PUNCH_MAX_RETRIES: u8 = 3;
 const STEM_RELAY_MAX_PER_TICK: usize = 2;
 const MAX_FRAME_SIZE: usize = data_packets::MAX_MESSAGE_SIZE;
+/// Maximum encoded block size.  Blocks exceeding this are rejected at
+/// validation (can't enter the DAG) and skipped during prepare_block.
+const MAX_BLOCK_BYTES: usize = 768 * 1024;  // 768 KB
 const MAX_FUTURE_BLOCK_TIME_MS: u64 = 120_000;
 const MAX_LIMBO_PAYMENTS: usize = 10_000;
 const LIMBO_TTL_TICKS: u64 = 12_000;
@@ -92,9 +95,11 @@ pub struct Node {
     pub mining_cores: u32,                     // 0 = off, 1+ = mining with that many threads
     last_mine_tick: u64,                       // last tick we attempted mining (for periodic spacing)
     pub current_difficulty: u32,               // adjusts via DAA every DIFFICULTY_WINDOW blocks
-    pub pending_blocks: Vec<VessBlock>,            // blocks waiting for gossip broadcast
+    pub pending_blocks: Vec<(VessBlock, Option<SocketAddr>)>,  // (block, origin_sender_or_None_if_local)
     pub accepted_blocks: u64,                       // increments on every accepted block (mined or received)
     block_seen: HashSet<BlockHash>,                 // deduplicate block relay
+    /// Per-peer round-trip time in ticks, updated from Ping/Pong.
+    peer_rtt: HashMap<SocketAddr, u64>,
     orphans: HashMap<BlockHash, VessBlock>,          // blocks waiting for missing parents
     missing_parents: HashMap<BlockHash, Vec<BlockHash>>, // parent → children waiting for it
     // State sync buffer: accumulate chunks here, verify root, then commit.
@@ -142,7 +147,7 @@ impl Node {
         wtxn.commit().unwrap();
 
         let (saved_ticks, saved_diff) = Self::load_meta(&env, &meta);
-        let mut node = Self { addr, network: Network::new(), peers: HashMap::new(), max_peers: 32, needs_sync: true, env, vess_index: db, ban_list, banned_ips: HashSet::new(), meta, mined_keys, peers_db,
+        let mut node = Self { addr, network: Network::new(), peers: HashMap::new(), max_peers: 16, needs_sync: true, env, vess_index: db, ban_list, banned_ips: HashSet::new(), meta, mined_keys, peers_db,
             blocks_db, limbo: HashMap::new(), limbo_inputs: HashMap::new(), contested: HashSet::new(),
             outbox: Vec::new(), ticks: saved_ticks, fails: HashMap::new(),
             peer_msg_count: HashMap::new(), msg_window_start: 0, peer_merkle: HashMap::new(),
@@ -154,6 +159,7 @@ impl Node {
             pending_blocks: Vec::new(),
             accepted_blocks: 0,
             block_seen: HashSet::new(),
+            peer_rtt: HashMap::new(),
             orphans: HashMap::new(),
             missing_parents: HashMap::new(),
             sync_buffer: HashSet::new(),
@@ -193,6 +199,22 @@ impl Node {
             .filter(|(hash, _)| !node.blocks.values().any(|other| other.parents.contains(hash)))
             .map(|(hash, _)| *hash)
             .collect();
+        // Rebuild cumulative work cache using the max-over-parents GHOST-lite
+        // rule (matching what process_block computes on acceptance).
+        // Order by height/depth so parents are cached before children.
+        let mut ordered: Vec<(BlockHash, VessBlock)> = node.blocks.iter()
+            .map(|(h, b)| (*h, b.clone())).collect();
+        ordered.sort_by_key(|(_, b)| {
+            // Approximate depth by timestamp for cache ordering.
+            b.timestamp
+        });
+        for (hash, block) in &ordered {
+            let parent_max = block.parents.iter()
+                .filter_map(|p| node.block_work.get(p))
+                .max().unwrap_or(&0);
+            node.block_work.insert(*hash,
+                parent_max.saturating_add(1u64 << block.difficulty_bits as u64));
+        }
         node.reorg_if_needed();
         // Load persisted bans — key = ip bytes (4 or 16), no port.
         if let Ok(t) = node.env.read_txn() {
@@ -342,6 +364,7 @@ impl Node {
             self.network.sessions.push(vess_network::Session {
                 addr, node_id: Some(node_id), out_key: key, in_key: key, peer_version: PROTOCOL_VERSION,
                 reported_addr: Some(addr), nonce_ctr: 0, proven_rx: true, // test-only: skip rx proof
+                created_at: self.network.ticks,
             });
         }
         self.peers.insert(addr, node_id);
@@ -362,30 +385,37 @@ impl Node {
     fn relay_through_introducer(&mut self, target_id: NodeId, gossip_bytes: Vec<u8>) {
         self.relay_queue.push((target_id, gossip_bytes));
     }
+    /// Solve handshake PoW and send INIT.  Holds the lock for 1-3s while
+    /// solving cuckatoo-14; prefer `add_peer_with_pow` when PoW is
+    /// pre-solved outside the lock (e.g. from pending_discovered).
     pub fn add_peer(&mut self, a: SocketAddr) -> usize {
+        if self.peer_count() >= self.max_peers { return 0; }
+        let base = blake3_hash(&[b"vess-handshake" as &[u8], &self.network.my_node_id(), a.to_string().as_bytes()].concat());
+        let (proof_header, proof_cycles) = {
+            let mut hdr = base;
+            loop {
+                if let Some(p) = cuckoo::solve(&hdr, cuckoo::HANDSHAKE_CYCLE_LENGTH, cuckoo::HANDSHAKE_EDGE_BITS) {
+                    break (hdr, p);
+                }
+                hdr = blake3_hash(&hdr);
+            }
+        };
+        self.add_peer_with_pow(a, proof_header, proof_cycles)
+    }
+
+    /// Send handshake INIT with a pre-solved PoW (header + cycles).
+    /// Returns the framed message length, or 0 if at capacity.
+    pub fn add_peer_with_pow(&mut self, a: SocketAddr, proof_header: [u8; 32], proof_cycles: Vec<u32>) -> usize {
         if self.peer_count() >= self.max_peers { return 0; }
         let raw = self.network.build_handshake_init(a);
         let (tag, payload) = unframe(&raw).unwrap_or((HANDSHAKE_INIT, &[][..]));
-        // PoW handshake puzzle: find a 6-cycle. Include the winning header + proof.
-        let base = blake3_hash(&[b"vess-handshake" as &[u8], &self.network.my_node_id(), a.to_string().as_bytes()].concat());
-        let mut header = base;
-        let proof = loop {
-            if let Some(p) = cuckoo::solve(&header, cuckoo::HANDSHAKE_CYCLE_LENGTH, cuckoo::HANDSHAKE_EDGE_BITS) {
-                break (header, p);
-            }
-            header = blake3_hash(&header);
-        };
         let mut payload_with_pow = payload.to_vec();
-        // Generate initiator signature: proves we own the DSA key for our
-        // claimed node_id. Without this, a spoofed INIT can create a live
-        // session on the responder keyed to our chosen KEM key, letting us
-        // inject encrypted gossip "from" any address.
         let sig_input = blake3_hash_multi(&[b"vess-hs-init", &self.network.dsa_pk, &self.network.kem_pk]);
         let init_sig = dsa_sign(&self.network.dsa_sk, &sig_input)
             .expect("DSA signing must not fail");
         write_bytes(&mut payload_with_pow, &init_sig);
-        payload_with_pow.extend_from_slice(&proof.0); // 32-byte header hash
-        for n in &proof.1 { payload_with_pow.extend_from_slice(&n.to_le_bytes()); }
+        payload_with_pow.extend_from_slice(&proof_header);
+        for n in &proof_cycles { payload_with_pow.extend_from_slice(&n.to_le_bytes()); }
         let framed = frame(tag, &payload_with_pow);
         let len = framed.len();
         self.send_handshake(a, framed);
@@ -589,7 +619,7 @@ impl Node {
             proof: vec![0u32; cuckoo::CYCLE_LENGTH], // test mode skips PoW verification
             coinbase, payments: clean,
         };
-        self.pending_blocks.push(block.clone());
+        self.pending_blocks.push((block.clone(), None));
         self.process_block(&block);
         coinbase_outputs
     }
@@ -660,24 +690,37 @@ impl Node {
         let contested_payments: Vec<VessPayment> = self.contested.iter()
             .filter_map(|pid| self.limbo.get(pid).map(|(p, _)| p.clone()))
             .collect();
+
+        // Select payments up to the block byte cap, skipping (not truncating!)
+        // individual fat payments so a single 27KB monster doesn't underfill
+        // the block — smaller payments still get in after it.
+        let coinbase_encoded = coinbase.encode();
+        let header_overhead = 256; // version + parents + timestamp + diff + nonce + merkle + proof (estimate)
+        let mut size = coinbase_encoded.len().saturating_add(header_overhead);
+        let mut sized_payments = Vec::new();
+        for p in clean {
+            let p_len = p.encode().len();
+            if size.saturating_add(p_len) > MAX_BLOCK_BYTES { continue; }
+            size = size.saturating_add(p_len);
+            sized_payments.push(p);
+        }
+        // Add contested payments (burns) — they're small and must be committed.
+        for p in contested_payments {
+            let p_len = p.encode().len();
+            if size.saturating_add(p_len) > MAX_BLOCK_BYTES { break; }
+            size = size.saturating_add(p_len);
+            sized_payments.push(p);
+        }
         let mut all_ids: Vec<VessId> = vec![coinbase.payment_id];
-        for p in clean.iter().chain(contested_payments.iter()) { all_ids.push(p.payment_id); }
+        for p in &sized_payments { all_ids.push(p.payment_id); }
         all_ids.sort(); all_ids.dedup();
 
-        let mut block_payments = clean;
-        block_payments.extend(contested_payments);
-
-        // Cap total payments so the encoded block stays well under the
-        // 1 MB wire limit.  A block that exceeds MAX_MESSAGE_SIZE is
-        // accepted locally but silently dropped by send() — the miner
-        // forks itself off and builds on its own heavier chain.
-        let max_payments = 200usize;
-        if block_payments.len() > max_payments {
-            block_payments.truncate(max_payments);
-            // Rebuild the id list with the truncated set.
+        // Hard cap at 200 payments as a safety backstop for the byte-size loop.
+        if sized_payments.len() > 200 {
+            sized_payments.truncate(200);
             all_ids.clear();
             all_ids.push(coinbase.payment_id);
-            for p in &block_payments { all_ids.push(p.payment_id); }
+            for p in &sized_payments { all_ids.push(p.payment_id); }
             all_ids.sort(); all_ids.dedup();
         }
 
@@ -687,7 +730,7 @@ impl Node {
             difficulty_bits: diff, nonce: 0,
             payment_merkle: merkle_root(&all_ids), state_merkle: [0u8; 32],
             proof: Vec::new(), // filled in by apply_mined_block once PoW is found
-            coinbase, payments: block_payments,
+            coinbase, payments: sized_payments,
         })
     }
 
@@ -702,7 +745,7 @@ impl Node {
 
         let reward = block_reward(block.difficulty_bits);
         let dev_share = dev_reward(reward);
-        self.pending_blocks.push(block.clone());
+        self.pending_blocks.push((block.clone(), None));
         self.process_block(&block);
 
         let block_hash = block.header_hash();
@@ -854,7 +897,23 @@ impl Node {
         }
         self.tip_hashes.retain(|h| !block.parents.contains(h));
         self.tip_hashes.push(block_hash);
-        self.reorg_if_needed();
+        // Commit the validated state directly — don't defer to
+        // reorg_if_needed which would recompute from the DAG and
+        // fail on unknown ancestors (fresh-synced nodes hit this).
+        // The state from validate_block IS the authoritative post-state.
+        if let Ok(mut w) = self.env.write_txn() {
+            let existing: Vec<VessId> = self.vess_index.iter(&w).ok().into_iter().flatten()
+                .filter_map(|entry| entry.ok())
+                .filter_map(|(id, _)| id.try_into().ok())
+                .collect();
+            for id in existing { let _ = self.vess_index.delete(&mut w, &id); }
+            for id in &state { let _ = self.vess_index.put(&mut w, id, &()); }
+            if w.commit().is_ok() {
+                self.current_tip = Some(block_hash);
+                self.accepted_blocks = self.accepted_blocks.saturating_add(1);
+                self.save_meta();
+            }
+        }
         self.prune_blocks();
 
         // DAA uses the canonical chain only and changes at fixed boundaries.
@@ -873,7 +932,6 @@ impl Node {
         }
 
         self.save_meta();
-        self.accepted_blocks = self.accepted_blocks.wrapping_add(1);
 
         // Resolve orphans: any block waiting for THIS block as its parent
         // can now be retried.
@@ -998,8 +1056,10 @@ impl Node {
     /// pays out (merged work is never orphaned); cross-branch conflicts
     /// vaporize; payments depending on vaporized outputs are voided.
     fn state_for_roots(&self, roots: &[BlockHash]) -> Option<HashSet<VessId>> {
-        // Normal path: walk block ancestor closure to compute merged state.
-        if let Some(order) = self.ancestor_order(roots) {
+        // Try to walk the block ancestor closure.
+        let order = self.ancestor_order(roots);
+        if let Some(order) = order {
+            // Normal path: full ancestor closure available.
             let mut seen_p: HashSet<PaymentId> = HashSet::new();
             let mut payments: Vec<&VessPayment> = Vec::new();
             for h in &order {
@@ -1024,20 +1084,16 @@ impl Node {
             }
             return Some(state);
         }
-        // Fallback: after a fresh state sync the node has a verified UTXO
-        // set but zero block history.  New blocks that reference the
-        // consensus tip must validate against the LMDB state directly —
-        // ancestor walking is impossible without the intermediate blocks.
-        if self.blocks.is_empty() {
-            let t = self.env.read_txn().ok()?;
-            let state: HashSet<VessId> = self.vess_index.iter(&t).ok()?
-                .filter_map(|r| r.ok().map(|(k,_)| {
-                    let mut a = [0u8; 32]; a.copy_from_slice(k); a
-                }))
-                .collect();
-            return Some(state);
-        }
-        None
+        // Fallback: ancestor walk failed (missing blocks — typical after
+        // a state sync where history wasn't transferred).  Use the LMDB
+        // UTXO set directly as the base state.
+        let t = self.env.read_txn().ok()?;
+        let state: HashSet<VessId> = self.vess_index.iter(&t).ok()?
+            .filter_map(|r| r.ok().map(|(k,_)| {
+                let mut a = [0u8; 32]; a.copy_from_slice(k); a
+            }))
+            .collect();
+        Some(state)
     }
 
     fn state_root(state: &HashSet<VessId>) -> MerkleRoot {
@@ -1048,6 +1104,11 @@ impl Node {
 
     fn validate_block(&self, block: &VessBlock) -> Option<HashSet<VessId>> {
         if block.version != 1 || block.difficulty_bits > 60 || block.parents.len() > MAX_PARENTS { return None; }
+        // Reject blocks that exceed the wire size cap.  This is nearly free
+        // (one encode) and prevents a malicious miner from crafting a valid
+        // but undeliverable block on purpose — "valid" and "transmissible"
+        // are the same set.
+        if block.encode().len() > MAX_BLOCK_BYTES { return None; }
         // No alt-genesis: a block with no parents is only valid when the DAG is empty.
         if block.parents.is_empty() && !self.blocks.is_empty() { return None; }
         // Difficulty must match the DAA-determined value for the current tip.
@@ -1174,21 +1235,16 @@ impl Node {
     /// each ancestor counted once). Multi-parent merge blocks accumulate the
     /// work of every branch they reference — fork races stop orphaning work.
     pub fn cumulative_work(&self, hash: &BlockHash) -> u64 {
-        // Cached: work is computed once when the block is accepted and
-        // stored in block_work.  Avoids O(history) DAG walk on every call.
         if let Some(&w) = self.block_work.get(hash) { return w; }
-        // Fallback for blocks loaded from disk on restart: walk ancestors.
-        let mut work = 0u64;
-        let mut visited = HashSet::new();
-        let mut stack = vec![*hash];
-        while let Some(h) = stack.pop() {
-            if !visited.insert(h) { continue; }
-            if let Some(b) = self.blocks.get(&h) {
-                work = work.saturating_add(1u64 << b.difficulty_bits as u64);
-                for parent in &b.parents { stack.push(*parent); }
-            }
+        // Cache miss (shouldn't happen after startup rebuild) — compute
+        // using the same max-over-parents GHOST-lite rule.
+        if let Some(b) = self.blocks.get(hash) {
+            let parent_max = b.parents.iter()
+                .filter_map(|p| self.block_work.get(p))
+                .max().unwrap_or(&0);
+            return parent_max.saturating_add(1u64 << b.difficulty_bits as u64);
         }
-        work
+        0
     }
 
     /// The tip with the most cumulative work — defines canonical state.
@@ -1254,6 +1310,7 @@ impl Node {
 
     pub fn cycle(&mut self) -> Vec<(SocketAddr, Vec<u8>)> {
         self.ticks = self.ticks.wrapping_add(1);
+        self.network.tick(); // advance network clock + reap stale half-open sessions
         self.evict_limbo();
         self.retry_reliable_messages();
         self.retry_handshakes();
@@ -1295,12 +1352,25 @@ impl Node {
             }
         }
 
-        // Broadcast any pending blocks (self-mined or received) to peers
-        let pending: Vec<VessBlock> = self.pending_blocks.drain(..).collect();
-        for block in pending {
-            let m = GossipMessage::Block(block);
-            let addrs: Vec<SocketAddr> = self.peers.iter().filter(|(_,id)| **id != [0u8;32]).map(|(a,_)| *a).collect();
-            for a in addrs { self.send(a, &m); }
+        // Two-tier block gossip: push full block to 3-4 random peers
+        // (Tier 1), hash-announce to the rest (Tier 2). Peers pull via
+        // BlockReq if they haven't seen the block. Excludes the origin
+        // peer who already has the block.
+        let pending: Vec<(VessBlock, Option<SocketAddr>)> = self.pending_blocks.drain(..).collect();
+        for (block, origin) in pending {
+            let hash = block.header_hash();
+            let tier1 = self.select_tier1_peers(4, origin.as_ref());
+            let tier1_set: HashSet<SocketAddr> = tier1.iter().copied().collect();
+            let full = GossipMessage::Block(block);
+            let announce = GossipMessage::BlockAnnounce(hash);
+            // Collect tier-2 peers before any mutable borrow.
+            let tier2: Vec<SocketAddr> = self.peers.iter()
+                .filter(|(_, id)| **id != [0u8; 32])
+                .map(|(a, _)| *a)
+                .filter(|a| !tier1_set.contains(a) && origin.as_ref() != Some(a))
+                .collect();
+            for a in &tier1 { self.send_unreliable(*a, &full); }
+            for a in &tier2 { self.send_unreliable(*a, &announce); }
         }
         // Mining is handled by the background mining thread in main.rs
         if self.ticks.is_multiple_of(100) { self.peer_announce(); } // ~0.5s
@@ -1623,15 +1693,8 @@ impl Node {
                 let matched = self.process_block(block);
                 self.block_seen.insert(hash);
                 if matched {
-                    self.pending_blocks.push(block.clone());
-                }
-                // Only re-gossip newly-accepted blocks to prevent infinite circulation.
-                if matched {
-                    let m = GossipMessage::Block(block.clone());
-                    let addrs: Vec<SocketAddr> = self.peers.iter()
-                        .filter(|(a, id)| **id != [0u8; 32] && *a != &addr)
-                        .map(|(a, _)| *a).collect();
-                    for a in addrs { self.send(a, &m); }
+                    // Defer to cycle() for two-tier broadcast (push + announce).
+                    self.pending_blocks.push((block.clone(), Some(addr)));
                 }
                 // If our state merkle didn't match the block's claim, and we're
                 // actually behind, request sync (with cooldown to avoid spam).
@@ -1684,6 +1747,12 @@ impl Node {
                 }
             }
             GossipMessage::Ping(n) => { self.send(addr, &GossipMessage::Pong(*n)); }
+            GossipMessage::Pong(n) => {
+                // Track RTT in ticks for tier-1 peer selection.
+                let sent = *n as u64;
+                let rtt = self.ticks.saturating_sub(sent);
+                self.peer_rtt.insert(addr, rtt);
+            }
             GossipMessage::StateSyncReq(s, c) => { self.sync_chunk(addr, *s, *c); }
             GossipMessage::StateSyncChunk(start, ids) => {
                 self.handle_sync_chunk(addr, *start, ids);
@@ -1759,6 +1828,12 @@ impl Node {
                     self.reliable_messages.remove(id);
                 }
             }
+            GossipMessage::BlockAnnounce(hash) => {
+                // Tier-2 hash announce: pull the full block if we haven't seen it.
+                if !self.block_seen.contains(hash) && !self.blocks.contains_key(&hash[..]) {
+                    self.send(addr, &GossipMessage::BlockReq(*hash));
+                }
+            }
             GossipMessage::BlockReq(hash) => {
                 if let Some(block) = self.blocks.get(&hash[..]) {
                     self.send(addr, &GossipMessage::BlockResp(Some(block.clone())));
@@ -1770,7 +1845,6 @@ impl Node {
                 let _ = self.process_block(block);
             }
             GossipMessage::BlockResp(None) => {}
-            _ => {}
         }
         None
     }
@@ -1910,9 +1984,52 @@ impl Node {
             .collect();
         for pid in ready {
             if let Some((p, _)) = self.fluff_embargo.remove(&pid) {
+                // Fluff to a random subset (~8 peers) instead of all peers,
+                // avoiding a full-network broadcast storm per payment.
                 let m = GossipMessage::Payment(p);
-                let addrs: Vec<SocketAddr> = self.peers.iter().filter(|(_,id)| **id != [0u8;32]).map(|(a,_)| *a).collect();
-                for a in addrs { self.send(a, &m); }
+                let tier1 = self.select_tier1_peers(8, None);
+                for a in &tier1 { self.send(*a, &m); }
+            }
+        }
+    }
+
+    /// Select up to `n` handshaked peers at random, preferring low-RTT peers.
+    /// If `exclude` is provided, that peer is never selected.
+    fn select_tier1_peers(&self, n: usize, exclude: Option<&SocketAddr>) -> Vec<SocketAddr> {
+        let mut candidates: Vec<(SocketAddr, u64)> = self.peers.iter()
+            .filter(|(_, id)| **id != [0u8; 32])
+            .filter(|(a, _)| exclude.map_or(true, |e| *a != e))
+            .map(|(a, _)| (*a, self.peer_rtt.get(a).copied().unwrap_or(u64::MAX)))
+            .collect();
+        // Shuffle with bias toward low RTT: sort by (random_u64 >> 3) + (rtt >> 1).
+        // This gives strong preference to low-RTT peers without making the
+        // selection deterministic or fully RTT-ordered.
+        for (_, rtt) in &mut candidates {
+            let r: u64 = rand::thread_rng().gen();
+            *rtt = (r >> 3).saturating_add(*rtt >> 1);
+        }
+        candidates.sort_by_key(|(_, v)| *v);
+        candidates.truncate(n.min(candidates.len()));
+        candidates.into_iter().map(|(a, _)| a).collect()
+    }
+
+    /// Send a message without reliable retransmission tracking.
+    /// Use for blocks (fire-and-forget — redundancy handles loss) and
+    /// hash-announces (re-requested if dropped).
+    pub fn send_unreliable(&mut self, addr: SocketAddr, msg: &GossipMessage) {
+        let encoded = msg.encode();
+        if let Some(s) = self.network.session_by_addr_mut(&addr) {
+            let packet = frame(ENCRYPTED_DATA, &s.encrypt(&encoded));
+            if let Some(fragmented) = data_packets::fragment_with_id(&packet) {
+                for fragment in fragmented.packets { self.outbox.push((addr, fragment)); }
+            } else {
+                eprintln!("dropping oversized logical message ({} bytes)", encoded.len());
+            }
+        } else if self.is_behind_nat() && self.introducer.is_some() {
+            if let Some(target_id) = self.peers.get(&addr).copied() {
+                if target_id != [0u8; 32] {
+                    self.relay_through_introducer(target_id, encoded);
+                }
             }
         }
     }
