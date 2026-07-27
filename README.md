@@ -51,15 +51,7 @@ The format is just bytes. Any app can generate an invoice, any wallet can sign a
 
 Mining is Cuckatoo27: find a 42-cycle in a graph with 2^27 edges, which takes about 1.3 GB of RAM and runs single-threaded. The 42 sorted nonces are embedded in the block header, and a block's difficulty is the number of leading zero bits on the Blake3 hash of that proof — bound to the header by the cycle itself. Sorting is consensus-enforced, so one cycle yields exactly one valid proof and the difficulty target can't be ground by permutation. Nodes verify the proof in microseconds. Difficulty adjusts every 40 blocks via a rolling average of recent block intervals toward a 1-second target.
 
-The base difficulty pays 1 Vess per block. For every bit beyond 8, the reward doubles:
-
-| Difficulty | Reward |
-|---|---|
-| 8 | 1 VESS |
-| 9 | 2 VESS |
-| 10 | 4 VESS |
-| 11 | 8 VESS |
-| n | 2^(n−8) VESS |
+The base difficulty pays 1 Vess per block. For every bit beyond, the reward doubles, resulting in a linear emissions scale.
 
 1% of each block reward (minimum 1 Vess) goes to a hardcoded dev key. No premine, no ICO.
 

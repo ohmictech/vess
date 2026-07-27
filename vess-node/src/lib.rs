@@ -427,7 +427,7 @@ impl Node {
             // the same INIT-spoofing attack that the sig fixes.
             let raw = self.network.build_handshake_init(addr);
             let (tag, payload) = unframe(&raw).unwrap_or((HANDSHAKE_INIT, &[][..]));
-            let base = blake3_hash(&[b"vess-handshake" as &[u8], &self.network.my_node_id(), addr.to_string().as_bytes()].concat());
+            let base = blake3_hash(&[b"vess-handshake" as &[u8], &self.network.my_node_id()].concat());
             let mut header = base;
             let proof = loop {
                 if let Some(p) = cuckoo::solve(&header, cuckoo::HANDSHAKE_CYCLE_LENGTH, cuckoo::HANDSHAKE_EDGE_BITS) {
@@ -479,7 +479,7 @@ impl Node {
     /// pre-solved outside the lock (e.g. from pending_discovered).
     pub fn add_peer(&mut self, a: SocketAddr) -> usize {
         if self.peer_count() >= self.max_peers { return 0; }
-        let base = blake3_hash(&[b"vess-handshake" as &[u8], &self.network.my_node_id(), a.to_string().as_bytes()].concat());
+        let base = blake3_hash(&[b"vess-handshake" as &[u8], &self.network.my_node_id()].concat());
         let (proof_header, proof_cycles) = {
             let mut hdr = base;
             loop {
@@ -1674,6 +1674,8 @@ impl Node {
     }
 
     fn strike(&mut self, addr: SocketAddr) {
+        // Never strike localhost — dev wallets shouldn't get banned.
+        if addr.ip().is_loopback() { return; }
         // Only credit strikes against addresses whose session has proven
         // receipt of at least one valid encrypted message.  A spoofed
         // INIT creates a session immediately but the real owner of that
@@ -1690,7 +1692,7 @@ impl Node {
 
     pub fn process(&mut self, addr: SocketAddr, data: &[u8]) -> Option<Vec<u8>> {
         // Reject banned IPs immediately — per-IP ban survives port changes.
-        if self.banned_ips.contains(&addr.ip()) { return None; }
+        if self.banned_ips.contains(&addr.ip()) && !addr.ip().is_loopback() { return None; }
         if self.fails.get(&addr).copied().unwrap_or(0) > 5 { return None; }
         let assembled;
         let completed_id;
@@ -1736,15 +1738,28 @@ impl Node {
                 let pow_bytes = &payload[split..];
                 let pow_header: [u8; 32] = pow_bytes[..32].try_into().unwrap();
                 // Re-derive the expected PoW header — the initiator MUST use
-                // blake3("vess-handshake" || node_id || target_addr).
-                // The PoW binds to OUR address (the responder), not the
-                // source address (which is spoofable over UDP).
-                // Without this check, one PoW solve is replayable against
-                // every node forever (the attacker supplies any pow_header).
+                // blake3("vess-handshake" || node_id).
+                // Bound to the initiator's identity (authenticated by the sig
+                // below): one solve per identity, not replayable across
+                // identities. The target address CANNOT be used here — over
+                // UDP the responder cannot know which address string the
+                // initiator typed (127.0.0.1 vs 0.0.0.0 vs public IP all
+                // reach the same socket), so an address binding rejects
+                // every legitimate handshake.
                 let expected_header = blake3_hash(
-                    &[b"vess-handshake" as &[u8], &payload[..32], self.addr.to_string().as_bytes()].concat()
+                    &[b"vess-handshake" as &[u8], &payload[..32]].concat()
                 );
-                if pow_header != expected_header { self.strike(addr); return None; }
+                // The initiator's solver retries by iterating blake3 on the
+                // base header until a cycle is found, and appends the WINNING
+                // header — so accept any header within a short chain of the
+                // base (64 recomputations are trivially cheap).
+                let mut chained = expected_header;
+                let header_ok = (0..64).any(|_| {
+                    if chained == pow_header { return true; }
+                    chained = blake3_hash(&chained);
+                    false
+                });
+                if !header_ok { self.strike(addr); return None; }
                 let mut proof = Vec::with_capacity(cuckoo::HANDSHAKE_CYCLE_LENGTH);
                 for i in 0..cuckoo::HANDSHAKE_CYCLE_LENGTH {
                     proof.push(u32::from_le_bytes(pow_bytes[32+i*4..32+(i+1)*4].try_into().unwrap()));
@@ -2426,6 +2441,7 @@ impl Node {
             .collect();
 
         for a in to_ban {
+            if a.ip().is_loopback() { continue; } // never ban localhost
             self.peers.remove(&a);
             self.banned_ips.insert(a.ip());
             // Persist ban: key = ip_bytes only (port omitted so a new

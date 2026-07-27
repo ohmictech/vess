@@ -415,7 +415,8 @@ fn interactive_loop(w: &mut Wallet, wallet_path: &str) {
                     println!("consolidated with {} payment{} ({} UTXOs remain)",
                         n, if n > 1 { "s" } else { "" }, w.vbank_claimed.len());
                 } else {
-                    println!("nothing to consolidate (need ≥2 UTXOs)");
+                    println!("nothing to consolidate (claimed={}, pending={})",
+                        w.vbank_claimed.len(), w.vbank_pending.len());
                 }
             }
             "import" | "imp" => {

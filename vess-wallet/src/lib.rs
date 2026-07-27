@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{SocketAddr, UdpSocket};
 use rand::Rng;
 use vess_crypto::*;
@@ -150,14 +150,14 @@ impl Wallet {
 
     /// Full connect: solve PoW, send handshake init, wait for response.
     pub fn connect_full(&mut self, addr: SocketAddr) -> bool {
-        if self.bind().is_err() { return false; }
+        if self.bind().is_err() { eprintln!("connect_full: bind failed"); return false; }
         self.node_addr = Some(addr);
         let inner = self.network.build_handshake_init(addr);
         let (tag, payload) = match unframe(&inner) {
             Some((t, p)) if t == HANDSHAKE_INIT => (t, p),
-            _ => return false,
+            _ => { eprintln!("connect_full: build_handshake_init failed"); return false; }
         };
-        let base = blake3_hash(&[b"vess-handshake" as &[u8], &self.network.my_node_id(), &addr.to_string().as_bytes()].concat());
+        let base = blake3_hash(&[b"vess-handshake" as &[u8], &self.network.my_node_id()].concat());
         let mut header = base;
         let proof = loop {
             if let Some(p) = cuckoo::solve(&header, cuckoo::HANDSHAKE_CYCLE_LENGTH, cuckoo::HANDSHAKE_EDGE_BITS) {
@@ -165,30 +165,42 @@ impl Wallet {
             }
             header = blake3_hash(&header);
         };
+        eprintln!("connect_full: PoW solved, sending INIT...");
         let mut payload_with_pow = payload.to_vec();
+        let init_sig = dsa_sign(&self.network.dsa_sk,
+            &blake3_hash_multi(&[b"vess-hs-init", &self.network.dsa_pk, &self.network.kem_pk]))
+            .expect("DSA signing must not fail");
+        write_bytes(&mut payload_with_pow, &init_sig);
         payload_with_pow.extend_from_slice(&proof.0);
         for n in &proof.1 { payload_with_pow.extend_from_slice(&n.to_le_bytes()); }
         let init_with_pow = frame(tag, &payload_with_pow);
 
-        let socket = match &self.socket { Some(s) => match s.try_clone() { Ok(s) => s, Err(_) => return false }, None => return false };
-        let Some(fragments) = data_packets::fragment_message(&init_with_pow) else { return false; };
+        let socket = match &self.socket { Some(s) => match s.try_clone() { Ok(s) => s, Err(e) => { eprintln!("connect_full: try_clone failed: {:?}", e); return false; }}, None => { eprintln!("connect_full: no socket"); return false; }};
+        let Some(fragments) = data_packets::fragment_message(&init_with_pow) else { eprintln!("connect_full: fragment failed"); return false; };
         for fragment in fragments {
-            if socket.send_to(&fragment, addr).is_err() { return false; }
+            if socket.send_to(&fragment, addr).is_err() { eprintln!("connect_full: send_to failed"); return false; }
         }
+        eprintln!("connect_full: INIT sent, waiting for RESP...");
         socket.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok();
         let mut buf = [0u8; 65536];
         loop {
             match socket.recv_from(&mut buf) {
                 Ok((len, _src)) => match self.reassemble_packet(&buf[..len]) {
-                    Some(Some((id, packet))) => {
-                        let connected = self.handshake_complete(&packet);
-                        if connected { if let Some(id) = id { self.acknowledge_packet(id); } }
-                        return connected;
+                    Some(Some((_id, packet))) => {
+                        // The node queues an encrypted GetPeers RPC request
+                        // (and later Ping/announce gossip) BEFORE the RESP —
+                        // those packets can arrive first. Skip anything that
+                        // isn't a handshake response instead of bailing out.
+                        if self.handshake_complete(&packet) {
+                            eprintln!("connect_full: handshake complete ✓");
+                            return true;
+                        }
+                        continue;
                     }
                     Some(None) => continue,
-                    None => return false,
+                    None => { eprintln!("connect_full: reassemble_packet failed"); return false; }
                 },
-                Err(_) => return false,
+                Err(e) => { eprintln!("connect_full: recv_from failed: {:?}", e); return false; }
             }
         }
     }
@@ -295,11 +307,12 @@ impl Wallet {
         let mut selected = Vec::new();
         let mut selected_sum: Amount = 0;
         // Only select from claimed (never pending or unclaimed).
-        // Use as many inputs as possible (up to MAX_INPUTS) — even after
-        // meeting the amount target, continue pulling in more coins. This
-        // makes every payment look like a consolidation, and every
-        // consolidation indistinguishable from a normal spend.
-        let pool: Vec<&Vess> = self.vbank_claimed.iter().collect();
+        // Sort largest-first so a payment can maximize value within the
+        // 5-input limit — without this, 5300× 1-Vess outputs can only
+        // spend 5 Vess at a time.
+        let mut pool: Vec<Vess> = self.vbank_claimed.clone();
+        pool.sort_by_key(|v| v.amount);
+        pool.reverse();
         for v in &pool {
             if selected.len() >= MAX_INPUTS { break; }
             selected.push((*v).clone());
@@ -411,6 +424,9 @@ impl Wallet {
         if self.vbank_claimed.len() < 2 { return 0; }
         let mut count = 0;
         while self.vbank_claimed.len() > 1 {
+            // Sort largest-first so we consolidate the biggest UTXOs first.
+            self.vbank_claimed.sort_by_key(|v| v.amount);
+            self.vbank_claimed.reverse();
             let chunk: Vec<Vess> = self.vbank_claimed.iter().take(MAX_INPUTS).cloned().collect();
             if chunk.len() < 2 { break; }
             let total: u64 = chunk.iter()
@@ -447,13 +463,29 @@ impl Wallet {
                 Some(p) => p,
                 None => break,
             };
-            // Retry a few times — node may be busy mining
+            // build_payment moved inputs to pending.  On send failure,
+            // restore them so they aren't orphaned.
             let mut sent = false;
             for _ in 0..3 {
                 if self.send(&payment) { sent = true; break; }
                 std::thread::sleep(std::time::Duration::from_millis(500));
             }
-            if !sent { break; }
+            if !sent {
+                // Restore orphaned inputs from pending back to claimed.
+                let input_ids: HashSet<VessId> = payment.inputs.iter().map(|v| v.vess_id()).collect();
+                let mut recovered = 0usize;
+                self.vbank_pending.retain(|v| {
+                    if input_ids.contains(&v.vess_id()) {
+                        self.vbank_claimed.push(v.clone());
+                        recovered += 1;
+                        false
+                    } else { true }
+                });
+                if recovered > 0 {
+                    eprintln!("consolidate: send failed, recovered {} inputs to claimed", recovered);
+                }
+                break;
+            }
             count += 1;
             std::thread::sleep(std::time::Duration::from_millis(200));
         }
@@ -559,7 +591,7 @@ impl Wallet {
     /// Import coinbase Vess objects from a node's treasure chest (LMDB "keys" database).
     /// Adds to vbank_claimed (they're confirmed on-chain). Skips duplicates.
     pub fn import_treasure(&mut self, db_path: &str) -> usize {
-        let env = match unsafe { heed::EnvOpenOptions::new().map_size(1_073_741_824).max_dbs(5).open(db_path) } {
+        let env = match unsafe { heed::EnvOpenOptions::new().map_size(1_073_741_824).max_dbs(7).open(db_path) } {
             Ok(e) => e, Err(_) => return 0,
         };
         let t = match env.read_txn() { Ok(t) => t, Err(_) => return 0 };
@@ -576,9 +608,10 @@ impl Wallet {
             .chain(self.vbank_unclaimed.iter())
             .map(|v| v.vess_id())
             .collect();
+        let mut to_delete: Vec<Vec<u8>> = Vec::new();
         if let Ok(iter) = keys_db.iter(&t) {
             for entry in iter {
-                if let Ok((_key, bytes)) = entry {
+                if let Ok((key, bytes)) = entry {
                     if let Some(v) = Vess::decode_with_secrets(&bytes, &mut 0) {
                         if v.variant == VessVariant::Mint {
                             if !known.contains(&v.vess_id()) {
@@ -594,12 +627,21 @@ impl Wallet {
                                 // Accept if we have the keypair (from import-key or embedded in Vess)
                                 if self.keypairs.contains_key(&v.owner_hash) {
                                     self.vbank_claimed.push(v);
+                                    to_delete.push(key.to_vec());
                                     count += 1;
                                 }
                             }
                         }
                     }
                 }
+            }
+        }
+        drop(t);
+        // Delete imported keys so they only exist in the wallet file.
+        if !to_delete.is_empty() {
+            if let Ok(mut w) = env.write_txn() {
+                for k in &to_delete { let _ = keys_db.delete(&mut w, k); }
+                let _ = w.commit();
             }
         }
         count

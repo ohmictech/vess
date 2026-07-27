@@ -50,7 +50,7 @@ fn main() -> std::io::Result<()> {
     // Default bootstrap: GitHub Gist with seed peer list.
     // Override with --bootstrap to use a different source or --bootstrap <addr> for a direct peer.
     if bootstrap.is_empty() {
-        bootstrap.push("https://gist.githubusercontent.com/your-username/raw/seed-peers.txt".to_string());
+        bootstrap.push("https://gist.githubusercontent.com/ohmictech/7a19904d5825d92d9778ef30cb475ef2/raw/8ffe1b462ba21788ace9f75a6ba9dc9331e70287/seed.txt".to_string());
     }
     let mut node_inner = Node::new(addr);
     node_inner.max_peers = max_peers;
@@ -286,7 +286,6 @@ fn main() -> std::io::Result<()> {
             let base = blake3_hash(&[
                 b"vess-handshake" as &[u8],
                 &node.lock().unwrap().network.my_node_id(),
-                peer_addr.to_string().as_bytes(),
             ].concat());
             let mut hdr = base;
             let proof = loop {
