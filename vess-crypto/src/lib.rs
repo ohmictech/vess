@@ -25,7 +25,7 @@ pub const VESS_PAYMENT_V1: &[u8] = b"vess-payment-v1";
 pub const VESS_MINT_ID_V1: &[u8] = b"vess-mint-id-v1";
 pub const VESS_HEADER_V1: &[u8] = b"VESS_HEADER_V1";
 pub const DIFFICULTY_BASE_BITS: u32 = 0;  // start at 0; DAA adjusts upward
-pub const MINING_DIFFICULTY: u32 = 8;
+pub const MINING_DIFFICULTY: u32 = 0;
 pub const DIFFICULTY_WINDOW: usize = 40; // adjust every 40 blocks, matches prune window
 /// Number of blocks behind the canonical spine tip before a block is
 /// final (no reorg across it). 1024 blocks ≈ 17 minutes at 1 s/block.
@@ -111,13 +111,12 @@ pub fn required_difficulty(amount: Amount) -> u32 {
     DIFFICULTY_BASE_BITS + amount.ilog2()
 }
 
-/// Block reward: 1 Vess below MINING_DIFFICULTY, doubles each bit beyond.
-/// Total: saturates at Amount::MAX when the shift would exceed u64, instead of
-/// overflowing (the ≤60 bits consensus cap lives in vess-node).
+/// Block reward: 1 Vess at difficulty 0, doubles each bit beyond.
+/// Caps at 32 bits consensus; 2^32 Vess max per block.
 pub fn block_reward(difficulty_bits: u32) -> Amount {
     if difficulty_bits < MINING_DIFFICULTY { return 1; }
     let shift = difficulty_bits - MINING_DIFFICULTY;
-    if shift >= 64 { return Amount::MAX; }
+    if shift >= 32 { return Amount::MAX; }
     1u64 << shift
 }
 
@@ -847,11 +846,9 @@ mod tests {
     #[test]
     fn test_block_reward_bounds() {
         assert_eq!(block_reward(0), 1);
-        assert_eq!(block_reward(MINING_DIFFICULTY - 1), 1);
-        assert_eq!(block_reward(MINING_DIFFICULTY), 1);
-        assert_eq!(block_reward(MINING_DIFFICULTY + 1), 2);
-        assert_eq!(block_reward(MINING_DIFFICULTY + 63), 1u64 << 63);
-        assert_eq!(block_reward(MINING_DIFFICULTY + 64), Amount::MAX, "saturates instead of overflowing");
+        assert_eq!(block_reward(1), 2);
+        assert_eq!(block_reward(31), 1u64 << 31);
+        assert_eq!(block_reward(32), Amount::MAX, "saturates at 32 bits");
         assert_eq!(block_reward(u32::MAX), Amount::MAX);
     }
 }

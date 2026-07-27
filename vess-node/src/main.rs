@@ -32,6 +32,7 @@ fn main() -> std::io::Result<()> {
     let mut listen = "0.0.0.0:9876".to_string();
     let mut bootstrap: Vec<String> = Vec::new();
     let mut max_peers: usize = 16;
+    let mut dev_mode = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -39,14 +40,21 @@ fn main() -> std::io::Result<()> {
             "--listen" => { i += 1; if i < args.len() { listen = args[i].clone(); } }
             "--bootstrap" => { i += 1; if i < args.len() { bootstrap.push(args[i].clone()); } }
             "--max-peers" => { i += 1; if i < args.len() { max_peers = args[i].parse().unwrap_or(32); } }
+            "--dev" => { dev_mode = true; }
             _ => { eprintln!("unknown arg: {}", args[i]); }
         }
         i += 1;
     }
 
     let addr: std::net::SocketAddr = listen.parse().expect("invalid --listen address");
+    // Default bootstrap: GitHub Gist with seed peer list.
+    // Override with --bootstrap to use a different source or --bootstrap <addr> for a direct peer.
+    if bootstrap.is_empty() {
+        bootstrap.push("https://gist.githubusercontent.com/your-username/raw/seed-peers.txt".to_string());
+    }
     let mut node_inner = Node::new(addr);
     node_inner.max_peers = max_peers;
+    node_inner.dev_mode = dev_mode;
     let node = Arc::new(Mutex::new(node_inner));
     let socket = UdpSocket::bind(addr)?;
     socket.set_nonblocking(true)?;

@@ -127,6 +127,9 @@ pub struct Node {
     sync_chunk_size: u32,                         // IDs per SyncReq chunk
     auto_sync_until: u64,                         // keep driving sync until this tick
     pub test_mode: bool,
+    /// When true, mined blocks include the dev subsidy output.  Off by
+    /// default — only the node operator with the dev key should enable it.
+    pub dev_mode: bool,
     // Finality: the deepest-anchored block that cannot be reorged.
     finalized_tip: Option<BlockHash>,
     fin_work: u64,                                // cumulative work at finalized_tip (base for block_work)
@@ -153,6 +156,7 @@ impl Node {
         wtxn.commit().unwrap();
 
         let (saved_ticks, saved_diff, saved_tip, saved_fin_tip, saved_fin_work, saved_fin_root) = Self::load_meta(&env, &meta);
+        let saved_height = Self::load_accepted_blocks(&env, &meta);
         let mut node = Self { addr, network: Network::new(), peers: HashMap::new(), max_peers: 16, needs_sync: true, env, vess_index: db, ban_list, banned_ips: HashSet::new(), meta, mined_keys, peers_db,
             blocks_db, undo_db, limbo: HashMap::new(), limbo_inputs: HashMap::new(), contested: HashSet::new(),
             outbox: Vec::new(), ticks: saved_ticks, fails: HashMap::new(),
@@ -163,7 +167,7 @@ impl Node {
             last_mine_tick: 0,
             current_difficulty: saved_diff,
             pending_blocks: Vec::new(),
-            accepted_blocks: 0,
+            accepted_blocks: saved_height,
             block_seen: HashSet::new(),
             peer_rtt: HashMap::new(),
             orphans: HashMap::new(),
@@ -188,6 +192,7 @@ impl Node {
             finalized_tip: saved_fin_tip,
             fin_work: saved_fin_work,
             fin_root: saved_fin_root,
+            dev_mode: false,
         };
         // Recover the block graph before serving or mining. The UTXO index is
         // rebuilt from its canonical tip below, rather than trusted directly.
@@ -240,11 +245,15 @@ impl Node {
         // Set current_tip from saved meta — LMDB state already matches it.
         // No full replay needed; the undo log handles in-window reorgs.
         node.current_tip = saved_tip;
-        // Sanity-check: if we have a tip, the live merkle should match.
-        // On mismatch (corruption), fall back to sync.
+        // Sanity-check: if we have a tip, the live merkle should match
+        // the block's own state_merkle commitment.
         if node.current_tip.is_some() && node.utxo_count() > 0 {
             let live_root = node.merkle();
-            if saved_fin_root != [0u8; 32] && live_root != saved_fin_root
+            let expected = node.current_tip
+                .and_then(|tip| node.blocks.get(&tip))
+                .map(|b| b.state_merkle)
+                .unwrap_or([0u8; 32]);
+            if expected != [0u8; 32] && live_root != expected
                 && live_root != [0u8; 32]
             {
                 eprintln!("WARNING: live UTXO merkle mismatch — triggering sync");
@@ -306,10 +315,16 @@ impl Node {
         (ticks, diff, tip, fin_tip, fin_work, fin_root)
     }
 
+    fn load_accepted_blocks(env: &heed::Env, meta: &heed::Database<heed::types::Str, heed::types::Bytes>) -> u64 {
+        let t = match env.read_txn() { Ok(t) => t, Err(_) => return 0 };
+        meta.get(&t, "height").ok().flatten().and_then(|b| if b.len()>=8 { Some(u64::from_le_bytes(b[..8].try_into().unwrap())) } else { None }).unwrap_or(0)
+    }
+
     fn save_meta(&self) {
         if let Ok(mut w) = self.env.write_txn() {
             let _ = self.meta.put(&mut w, "ticks", &self.ticks.to_le_bytes());
             let _ = self.meta.put(&mut w, "diff", &self.current_difficulty.to_le_bytes());
+            let _ = self.meta.put(&mut w, "height", &self.accepted_blocks.to_le_bytes());
             if let Some(tip) = self.current_tip { let _ = self.meta.put(&mut w, "tip", &tip); }
             if let Some(ft) = self.finalized_tip { let _ = self.meta.put(&mut w, "fin_tip", &ft); }
             let _ = self.meta.put(&mut w, "fin_work", &self.fin_work.to_le_bytes());
@@ -661,10 +676,10 @@ impl Node {
         coinbase_outputs.push(Vess { variant: VessVariant::Mint, amount: dev_reward(reward), owner_hash: DEV_PUBKEY_HASH,
             timestamp: mint_timestamp, nonce: 0, salt: random_bytes(), pubkey: vec![], spend_key: vec![], spend_condition: None });
         // Treasure chest: stores miner seeds in LMDB for wallet import.
-        // SECURITY: these seeds are NOT encrypted at rest — anyone with
-        // filesystem access to the vess-db directory can steal all mined
-        // coins.  Wallet users should import and delete periodically.
+        // Dev outputs exist in the block for consensus but are only saved
+        // locally when --dev is on.
         for v in &coinbase_outputs {
+            if v.owner_hash == DEV_PUBKEY_HASH && !self.dev_mode { continue; }
             if let Ok(mut w) = self.env.write_txn() {
                 let _ = self.mined_keys.put(&mut w, &v.vess_id(), &v.encode_with_secrets());
                 let _ = w.commit();
@@ -723,7 +738,7 @@ impl Node {
         let mut coinbase_outputs = Vec::new();
         if reward > 0 {
             coinbase_outputs.push(Vess { variant: VessVariant::Mint, amount: reward, owner_hash: miner_oh,
-                timestamp, nonce: 0, salt: random_bytes(), pubkey: pk, spend_key: sk, spend_condition: None });
+                timestamp, nonce: 0, salt: random_bytes(), pubkey: pk.clone(), spend_key: sk.clone(), spend_condition: None });
         }
         let dev_share = dev_reward(reward);
         if dev_share > 0 {
@@ -731,15 +746,17 @@ impl Node {
             timestamp, nonce: 0, salt: random_bytes(), pubkey: vec![], spend_key: vec![], spend_condition: None });
         }
         if coinbase_outputs.is_empty() {
-            coinbase_outputs.push(Vess { variant: VessVariant::Mint, amount: 0, owner_hash: DEV_PUBKEY_HASH,
-            timestamp, nonce: 0, salt: random_bytes(), pubkey: vec![], spend_key: vec![], spend_condition: None });
+            coinbase_outputs.push(Vess { variant: VessVariant::Mint, amount: 0, owner_hash: miner_oh,
+            timestamp, nonce: 0, salt: random_bytes(), pubkey: pk.clone(), spend_key: sk.clone(), spend_condition: None });
         }
         // Track output IDs to prevent cross-payment collisions.
         let mut block_output_ids: HashSet<VessId> = coinbase_outputs.iter()
             .map(|v| v.vess_id()).collect();
         // Treasure chest: stores miner seeds for wallet import.
-        // (Same security note: unencrypted on disk.)
+        // Dev outputs exist in the block for consensus but are only saved
+        // locally when --dev is on (the operator holds the dev key).
         for v in &coinbase_outputs {
+            if v.owner_hash == DEV_PUBKEY_HASH && !self.dev_mode { continue; }
             if let Ok(mut w) = self.env.write_txn() {
                 let _ = self.mined_keys.put(&mut w, &v.vess_id(), &v.encode_with_secrets());
                 let _ = w.commit();
@@ -913,8 +930,29 @@ impl Node {
             return false;
         }
 
+        // Finality reject rule: a block whose ancestors don't include the
+        // finalized tip diverges before finality and cannot be validated
+        // (pre-finality history is pruned).  Skipped in test mode — test
+        // chains are shorter than FINALITY_DEPTH.
+        if !self.test_mode {
+            if let Some(ft) = self.finalized_tip {
+                let mut reaches_finality = false;
+                let mut visited = HashSet::new();
+                let mut stack: Vec<BlockHash> = block.parents.clone();
+                while let Some(h) = stack.pop() {
+                    if h == ft { reaches_finality = true; break; }
+                    if !visited.insert(h) { continue; }
+                    if visited.len() > FINALITY_DEPTH { break; }
+                    if let Some(b) = self.blocks.get(&h) {
+                        for p in &b.parents { stack.push(*p); }
+                    }
+                }
+                if !reaches_finality { return false; }
+            }
+        }
+
         // Gate difficulty bounds before any expensive verification.
-        if block.difficulty_bits > 60 { return false; }
+        if block.difficulty_bits > 32 { return false; }
 
         // Cuckatoo27 PoW is required at difficulty ≥ 1. Difficulty 0 blocks
         // skip the solver entirely — blake3 header_hash is the only work.
@@ -1190,7 +1228,7 @@ impl Node {
     }
 
     fn validate_block(&self, block: &VessBlock) -> Option<HashSet<VessId>> {
-        if block.version != 1 || block.difficulty_bits > 60 || block.parents.len() > MAX_PARENTS { return None; }
+        if block.version != 1 || block.difficulty_bits > 32 || block.parents.len() > MAX_PARENTS { return None; }
         // Reject blocks that exceed the wire size cap.  This is nearly free
         // (one encode) and prevents a malicious miner from crafting a valid
         // but undeliverable block on purpose — "valid" and "transmissible"
@@ -1359,8 +1397,14 @@ impl Node {
         let new_finalized = match cursor {
             Some(h) if self.finalized_tip != Some(h) => {
                 // Update fin_work and fin_root.
+                // Use the block's own state_merkle — it was verified on
+                // acceptance.  state_for_roots would silently fall back to
+                // the live LMDB state (ancestors are already pruned at
+                // finality depth), storing the current root as the
+                // finalized one — indistinguishable from correct, but
+                // breaks sync-from-finalized.
                 self.fin_work = self.block_work.get(&h).copied().unwrap_or(self.fin_work);
-                self.fin_root = Self::state_root(&self.state_for_roots(&[h]).unwrap_or_default());
+                self.fin_root = self.blocks.get(&h).map(|b| b.state_merkle).unwrap_or(self.fin_root);
                 self.finalized_tip = Some(h);
                 self.save_meta();
                 true
