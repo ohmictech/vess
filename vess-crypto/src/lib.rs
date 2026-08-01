@@ -37,9 +37,9 @@ pub const MAX_BLOCK_PAYMENTS: usize = 10_000; // decode cap; consensus caps far 
 // pubkey_hash = 810f484b565a3ba3a5a5bdfe2d437b26dea459b33a4ff6fca355bc50dec3469f
 pub const DEV_PUBKEY_HASH: OwnerHash = [0x81, 0x0f, 0x48, 0x4b, 0x56, 0x5a, 0x3b, 0xa3, 0xa5, 0xa5, 0xbd, 0xfe, 0x2d, 0x43, 0x7b, 0x26, 0xde, 0xa4, 0x59, 0xb3, 0x3a, 0x4f, 0xf6, 0xfc, 0xa3, 0x55, 0xbc, 0x50, 0xde, 0xc3, 0x46, 0x9f];
 
-/// Dev subsidy: 1% of block reward, minimum 1 Vess.
+/// Dev subsidy: 2% of block reward, minimum 1 Vess.
 pub fn dev_reward(miner_reward: Amount) -> Amount {
-    (miner_reward / 100).max(1)
+    (miner_reward / 50).max(1)
 }
 pub const DANDELION_MAX_STEM: u8 = 4;
 pub const DANDELION_BUFFER_MS: u64 = 200;

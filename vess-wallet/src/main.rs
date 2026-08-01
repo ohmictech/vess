@@ -319,11 +319,12 @@ fn interactive_loop(w: &mut Wallet, wallet_path: &str) {
             "pay" | "p" => {
                 let url = parts.get(1).unwrap_or(&"");
                 if url.is_empty() {
-                    println!("usage: pay <vess://...> [--out <file>] [--send]");
+                    println!("usage: pay <vess://...> [<outfile> | --out <file>] [--send]");
                     continue;
                 }
                 let out_file = parts.iter().position(|&s| s == "--out")
                     .and_then(|i| parts.get(i + 1).copied())
+                    .or_else(|| parts.get(2).filter(|s| !s.starts_with("--")).copied())
                     .unwrap_or("payment.vess");
                 let do_send = parts.contains(&"--send");
 
@@ -348,7 +349,7 @@ fn interactive_loop(w: &mut Wallet, wallet_path: &str) {
                                         false => println!("submit failed — connect to node first"),
                                     }
                                 } else {
-                                    println!("not submitted — receiver runs 'submit {}' to claim", out_file);
+                                    println!("not submitted — receiver runs 'receive {}' to claim", out_file);
                                 }
                                 let _ = w.save_to_path(wallet_path);
                             }

@@ -569,8 +569,12 @@ impl Node {
 
     pub fn submit(&mut self, p: VessPayment) -> bool {
         self.evict_limbo();
-        // Don't accept payments while catching up; isolated nodes are always "synced"
-        if self.needs_sync && self.peer_count() > 0 { return false; }
+        // Don't accept payments while catching up; isolated nodes are always
+        // "synced".  Gate on peers that actually offer chain state (Root
+        // gossip) — NOT raw peer count, which includes attached wallets:
+        // an isolated mining node with one wallet connected would otherwise
+        // reject every payment forever.
+        if self.needs_sync && !self.peer_merkle.is_empty() { return false; }
         if self.limbo.len() >= MAX_LIMBO_PAYMENTS { return false; }
         if self.limbo.contains_key(&p.payment_id) { return false; }
         if !self.verify(&p) { return false; }
@@ -2373,9 +2377,14 @@ impl Node {
                         .unwrap_or(false);
                     if quorum_ok {
                         true
-                    } else if self.blocks.is_empty() && self.peer_merkle.len() == 1 {
-                        // Single-peer genesis fallback: only on first
-                        // boot with no blocks and exactly one peer.
+                    } else if self.peer_merkle.len() == 1 {
+                        // Single-peer trust (baby-network stage): with exactly
+                        // one chain-state peer there IS no quorum — requiring
+                        // one would leave the node stuck in needs_sync
+                        // forever, read-only.  Trust that peer's root, but
+                        // ONLY when it is our sole source of chain state.
+                        // NOTE: this is eclipse-able by design at this stage;
+                        // it must tighten back to quorum as the network grows.
                         self.sync_target_root
                             .map(|r| r == buffered_root)
                             .unwrap_or(false)
@@ -2401,11 +2410,37 @@ impl Node {
                     self.sync_peer = None;
                     self.sync_target_root = None;
                     self.sync_offset = 0;
+                    // Discard any local fork blocks: they diverge from the
+                    // state we just committed and would wedge the orphan
+                    // gate (blocks non-empty → every network block orphaned
+                    // forever).  The synced state is the new anchor; new
+                    // blocks validate against it via the fresh-sync path.
+                    self.blocks.clear();
+                    self.tip_hashes.clear();
+                    self.block_work.clear();
+                    self.block_seen.clear();
+                    self.orphans.clear();
+                    self.missing_parents.clear();
+                    self.current_tip = None;
+                    if let Ok(mut w) = self.env.write_txn() {
+                        let hashes: Vec<BlockHash> = self.blocks_db.iter(&w).ok().into_iter().flatten()
+                            .filter_map(|e| e.ok())
+                            .filter_map(|(h, _)| <[u8; 32]>::try_from(h).ok())
+                            .collect();
+                        for h in &hashes {
+                            let _ = self.blocks_db.delete(&mut w, h);
+                            let _ = self.undo_db.delete(&mut w, h);
+                        }
+                        let _ = w.commit();
+                    }
                     // Adopt consensus difficulty and height so new blocks
                     // pass validation. Without this, a freshly-synced node
                     // rejects every incoming block because current_difficulty
-                    // is still the base/default value.
-                    if let Some((height, _, diff)) = self.consensus_merkle() {
+                    // is still the base/default value.  Falls back to the
+                    // single peer's values when there is no quorum.
+                    let adopted = self.consensus_merkle()
+                        .or_else(|| self.peer_merkle.values().next().copied());
+                    if let Some((height, _, diff)) = adopted {
                         self.accepted_blocks = height;
                         self.current_difficulty = diff;
                         self.save_meta();
