@@ -23,8 +23,12 @@ pub const TAG_BLOCK_ANNOUNCE: u8 = 0x1C;
 
 pub const RPC_CHECK: u8 = 0x10;
 pub const RPC_CHECK_RESP: u8 = 0x11;
+pub const RPC_CHECK_BATCH: u8 = 0x12;
+pub const RPC_CHECK_BATCH_RESP: u8 = 0x13;
 pub const RPC_SUBMIT: u8 = 0x14;
 pub const RPC_SUBMIT_RESP: u8 = 0x15;
+pub const RPC_SUBMIT_BATCH: u8 = 0x16;
+pub const RPC_SUBMIT_BATCH_RESP: u8 = 0x17;
 pub const RPC_CONNECT_PEER: u8 = 0x1A;
 pub const RPC_CONNECT_PEER_RESP: u8 = 0x1B;
 pub const RPC_GET_PEERS: u8 = 0x18;
@@ -41,6 +45,12 @@ pub const MAX_SYNC_CHUNK_IDS: usize = 20_000;
 pub const MAX_GET_PEERS: usize = 1_000;
 pub const MAX_PEER_ANNOUNCE_IP_LEN: usize = 64;
 pub const MAX_SESSIONS: usize = 64;
+/// Max half-open (unproven) sessions.  A spoofed-INIT flood can only occupy
+/// this small fast-reaping pool, never the established 64-slot table.
+pub const MAX_HALF_OPEN_SESSIONS: usize = 16;
+/// Half-open sessions (never proved rx) are reaped after this many ticks
+/// (~2 s at 5 ms/tick) — fast, so spoofed INITs can't squat slots.
+pub const HALF_OPEN_REAP_TICKS: u64 = 400;
 
 /// Encode a SocketAddr as (ip_len_byte + ip_bytes + port_le).
 fn encode_socket_addr(addr: &SocketAddr) -> Vec<u8> {
@@ -113,7 +123,9 @@ pub enum GossipMessage {
 #[derive(Debug)]
 pub enum RpcRequest {
     Check(VessId),
+    CheckBatch(Vec<VessId>),
     Submit(VessPayment),
+    SubmitBatch(Vec<VessPayment>),
     GetPeers,
     ConnectPeer(std::net::SocketAddr),
 }
@@ -121,7 +133,9 @@ pub enum RpcRequest {
 #[derive(Debug)]
 pub enum RpcResponse {
     Check(bool),
+    CheckBatch(Vec<bool>),
     Submit(bool),
+    SubmitBatch(Vec<bool>),
     GetPeers(Vec<(NodeId, SocketAddr)>),
     ConnectPeer(bool),
 }
@@ -288,7 +302,19 @@ impl RpcRequest {
     pub fn encode(&self) -> Vec<u8> {
         match self {
             RpcRequest::Check(id) => frame(RPC_CHECK, id),
+            RpcRequest::CheckBatch(ids) => {
+                let mut p = Vec::with_capacity(4 + ids.len() * 32);
+                write_u32(&mut p, ids.len() as u32);
+                for id in ids { write_fixed(&mut p, id); }
+                frame(RPC_CHECK_BATCH, &p)
+            }
             RpcRequest::Submit(p) => frame(RPC_SUBMIT, &p.encode()),
+            RpcRequest::SubmitBatch(payments) => {
+                let mut p = Vec::new();
+                write_u32(&mut p, payments.len() as u32);
+                for payment in payments { p.extend_from_slice(&payment.encode()); }
+                frame(RPC_SUBMIT_BATCH, &p)
+            }
             RpcRequest::GetPeers => frame(RPC_GET_PEERS, &[]),
             RpcRequest::ConnectPeer(addr) => {
                 let mut p = Vec::new();
@@ -303,7 +329,23 @@ impl RpcRequest {
         let mut pos = 0;
         match tag {
             RPC_CHECK => Some(RpcRequest::Check(read_fixed(payload, &mut pos)?)),
+            RPC_CHECK_BATCH => {
+                let count = read_u32(payload, &mut pos)? as usize;
+                if count > 5000 { return None; } // cap for DoS
+                let mut ids = Vec::with_capacity(count);
+                for _ in 0..count { ids.push(read_fixed(payload, &mut pos)?); }
+                Some(RpcRequest::CheckBatch(ids))
+            }
             RPC_SUBMIT => VessPayment::decode(payload, &mut pos).map(RpcRequest::Submit),
+            RPC_SUBMIT_BATCH => {
+                let count = read_u32(payload, &mut pos)? as usize;
+                if count > 200 { return None; } // cap
+                let mut payments = Vec::with_capacity(count);
+                for _ in 0..count {
+                    payments.push(VessPayment::decode(payload, &mut pos)?);
+                }
+                Some(RpcRequest::SubmitBatch(payments))
+            }
             RPC_GET_PEERS => Some(RpcRequest::GetPeers),
             RPC_CONNECT_PEER => {
                 let port = u16::from_le_bytes(payload.get(..2)?.try_into().ok()?);
@@ -322,7 +364,19 @@ impl RpcResponse {
     pub fn encode(&self) -> Vec<u8> {
         match self {
             RpcResponse::Check(b) => frame(RPC_CHECK_RESP, &[*b as u8]),
+            RpcResponse::CheckBatch(results) => {
+                let mut p = Vec::with_capacity(4 + results.len());
+                write_u32(&mut p, results.len() as u32);
+                for &b in results { p.push(b as u8); }
+                frame(RPC_CHECK_BATCH_RESP, &p)
+            }
             RpcResponse::Submit(b) => frame(RPC_SUBMIT_RESP, &[*b as u8]),
+            RpcResponse::SubmitBatch(results) => {
+                let mut p = Vec::with_capacity(4 + results.len());
+                write_u32(&mut p, results.len() as u32);
+                for &b in results { p.push(b as u8); }
+                frame(RPC_SUBMIT_BATCH_RESP, &p)
+            }
             RpcResponse::ConnectPeer(b) => frame(RPC_CONNECT_PEER_RESP, &[*b as u8]),
             RpcResponse::GetPeers(peers) => {
                 let mut p = Vec::new();
@@ -340,7 +394,21 @@ impl RpcResponse {
         let mut pos = 0;
         match tag {
             RPC_CHECK_RESP => Some(RpcResponse::Check(payload.first()? != &0)),
+            RPC_CHECK_BATCH_RESP => {
+                if payload.is_empty() { return None; }
+                let count = u32::from_le_bytes(payload[..4].try_into().ok()?) as usize;
+                if count > 5000 || payload.len() < 4 + count { return None; }
+                let results: Vec<bool> = payload[4..4+count].iter().map(|&b| b != 0).collect();
+                Some(RpcResponse::CheckBatch(results))
+            }
             RPC_SUBMIT_RESP => Some(RpcResponse::Submit(payload.first()? != &0)),
+            RPC_SUBMIT_BATCH_RESP => {
+                if payload.is_empty() { return None; }
+                let count = u32::from_le_bytes(payload[..4].try_into().ok()?) as usize;
+                if count > 200 || payload.len() < 4 + count { return None; }
+                let results: Vec<bool> = payload[4..4+count].iter().map(|&b| b != 0).collect();
+                Some(RpcResponse::SubmitBatch(results))
+            }
             RPC_GET_PEERS_RESP => {
                 let count = read_u32(payload, &mut pos)? as usize;
                 if count > MAX_GET_PEERS { return None; }
@@ -387,7 +455,10 @@ impl Session {
     pub fn encrypt(&mut self, plaintext: &[u8]) -> Vec<u8> {
         let mut nonce = [0u8; 12];
         nonce[..8].copy_from_slice(&self.nonce_ctr.to_le_bytes());
-        self.nonce_ctr = self.nonce_ctr.wrapping_add(1);
+        // Saturating, not wrapping — wrapping at 2^64 would silently reuse
+        // a (key, nonce) pair, catastrophic for ChaCha20-Poly1305.  Hitting
+        // u64::MAX across one session is unreachable, but be explicit.
+        self.nonce_ctr = self.nonce_ctr.saturating_add(1);
         let ct = chacha_encrypt(&self.out_key, &nonce, plaintext);
         let mut out = Vec::with_capacity(8 + ct.len());
         out.extend_from_slice(&nonce[..8]);
@@ -439,14 +510,20 @@ impl Network {
 
     pub fn my_node_id(&self) -> NodeId { node_id(&self.dsa_pk) }
 
-    /// Advance time and reap stale half-open sessions (>= 300 ticks, ~15s at 20ms/tick).
-    /// Sessions that never prove receipt (!proven_rx) after the timeout are dropped.
+    /// Advance time and reap stale half-open sessions.
+    /// Established sessions persist; unproven ones are reaped fast (~2 s)
+    /// so a spoofed-INIT flood can't squat slots.
     pub fn tick(&mut self) {
         self.ticks = self.ticks.saturating_add(1);
         let now = self.ticks;
         self.sessions.retain(|s| {
-            s.proven_rx || now.saturating_sub(s.created_at) < 1200
+            s.proven_rx || now.saturating_sub(s.created_at) < HALF_OPEN_REAP_TICKS
         });
+    }
+
+    /// Number of half-open (unproven rx) sessions.
+    pub fn half_open_count(&self) -> usize {
+        self.sessions.iter().filter(|s| !s.proven_rx).count()
     }
 
     pub fn session_by_addr(&self, addr: &SocketAddr) -> Option<&Session> {
@@ -458,12 +535,17 @@ impl Network {
     }
 
     pub fn build_handshake_init(&mut self, addr: SocketAddr) -> Vec<u8> {
-        // Prune stale half-open sessions (no node_id after handshake completion)
-        // and enforce a hard cap to prevent unbounded Vec growth.
+        // Prune stale half-open sessions and enforce caps.
         self.sessions.retain(|s| s.node_id.is_some());
         if self.sessions.len() >= MAX_SESSIONS {
             // Drop the oldest completed session to make room.
             self.sessions.remove(0);
+        }
+        // Half-open cap: don't let unproven sessions pile up unbounded.
+        if self.half_open_count() >= MAX_HALF_OPEN_SESSIONS {
+            if let Some(pos) = self.sessions.iter().position(|s| !s.proven_rx) {
+                self.sessions.remove(pos);
+            }
         }
         let mut p = Vec::new();
         p.extend_from_slice(&self.my_node_id());

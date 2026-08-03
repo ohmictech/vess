@@ -282,7 +282,9 @@ fn main() -> std::io::Result<()> {
         };
         for peer_addr in pending {
             eprintln!("connecting to {} (solving handshake PoW)...", peer_addr);
-            // Solve PoW without holding the node lock.
+            // Solve PoW without holding the node lock.  Header is
+            // address-free: blake3("vess-handshake" || node_id) — the
+            // responder can't know which address string we typed.
             let base = blake3_hash(&[
                 b"vess-handshake" as &[u8],
                 &node.lock().unwrap().network.my_node_id(),
@@ -302,6 +304,34 @@ fn main() -> std::io::Result<()> {
                 eprintln!("  handshake init sent ({} bytes)", len);
             }
             // Drain handshake fragments immediately.
+            let outbox = node.lock().unwrap().drain_outbox();
+            for (dest, data) in outbox {
+                send_datagrams(&socket, dest, &data);
+            }
+        }
+
+        // Drain hole-punch handshakes the same way (bypasses max_peers).
+        let punches: Vec<std::net::SocketAddr> = {
+            let mut n = node.lock().unwrap();
+            std::mem::take(&mut n.pending_punches)
+        };
+        for peer_addr in punches {
+            eprintln!("hole-punching {} (solving handshake PoW)...", peer_addr);
+            let base = blake3_hash(&[
+                b"vess-handshake" as &[u8],
+                &node.lock().unwrap().network.my_node_id(),
+            ].concat());
+            let mut hdr = base;
+            let proof = loop {
+                if let Some(p) = cuckoo::solve(&hdr,
+                    cuckoo::HANDSHAKE_CYCLE_LENGTH,
+                    cuckoo::HANDSHAKE_EDGE_BITS)
+                {
+                    break (hdr, p);
+                }
+                hdr = blake3_hash(&hdr);
+            };
+            node.lock().unwrap().add_punch_with_pow(peer_addr, proof.0, proof.1);
             let outbox = node.lock().unwrap().drain_outbox();
             for (dest, data) in outbox {
                 send_datagrams(&socket, dest, &data);

@@ -215,6 +215,10 @@ fn run_flags(args: &[String]) {
         Some("sync") => {
             let (moved, remaining) = w.sync();
             println!("sync: {} confirmed, {} still unclaimed ({} total balance)", moved, remaining, w.balance());
+            let phantom = w.phantom_claimed();
+            if phantom > 0 {
+                println!("warning: {} claimed UTXOs not found on node (spent, burned, or stranded on a dead fork)", phantom);
+            }
         }
         _ => {
             println!("usage: vess-wallet --import <db> | --import-key <pub> <sec> | --balance | --consolidate | --invoice <n> | --pay <url> --out <file> | --receive <file> | --sync");
@@ -364,6 +368,10 @@ fn interactive_loop(w: &mut Wallet, wallet_path: &str) {
                     (moved, remaining) => {
                         println!("sync: {} confirmed, {} still unclaimed ({} total balance)",
                             moved, remaining, w.balance());
+                        let phantom = w.phantom_claimed();
+                        if phantom > 0 {
+                            println!("warning: {} claimed UTXOs not found on node (spent, burned, or stranded on a dead fork)", phantom);
+                        }
                         if moved > 0 {
                             let _ = w.save_to_path(wallet_path);
                         }

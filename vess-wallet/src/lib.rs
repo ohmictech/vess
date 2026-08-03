@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
 use rand::Rng;
 use vess_crypto::*;
@@ -340,6 +340,15 @@ impl Wallet {
         let preimages: Vec<Option<[u8; 32]>> = selected.iter().map(|v| {
             self.preimages.get(&v.vess_id()).copied()
         }).collect();
+        // A hashlocked input without a stored preimage would build a payment
+        // the node rejects — fail fast instead of producing a useless blob.
+        for (i, v) in selected.iter().enumerate() {
+            if let Some(cond) = &v.spend_condition {
+                if cond.hashlock != [0u8; 32] && preimages[i].is_none() {
+                    return None;
+                }
+            }
+        }
         let mut payment = VessPayment { payment_id: [0u8; 32], inputs: selected, outputs: out_vess, timestamp: 0, sigs: Vec::new(), preimages };
         payment.compute();
 
@@ -356,10 +365,13 @@ impl Wallet {
         Some(payment)
     }
 
-    /// Build and encode a payment for OOB delivery. Moves used inputs to pending.    /// The receiver calls `claim_payment` to submit; until then these coins are locked.
+    /// Build and encode a payment for OOB delivery. Moves used inputs to pending.
+    /// The receiver calls `claim_payment` to submit; until then these coins are locked.
+    /// Also registers our change/outputs as unclaimed so they aren't lost.
     pub fn export_payment(&mut self, outputs: &[(OwnerHash, Amount, Option<SpendCondition>)]) -> Option<Vec<u8>> {
         let payment = self.build_payment(outputs)?;
         self.move_inputs_to_pending(&payment);
+        self.register_outputs(&payment);
         Some(payment.encode())
     }
 
@@ -419,77 +431,104 @@ impl Wallet {
 
     /// Consolidate all claimed UTXOs by merging up to 5 at a time into single
     /// outputs.  Each output uses a fresh keypair to avoid address reuse.
-    /// Returns the number of consolidation payments made.
+    /// Builds payments in batches and submits them via one RPC each.
+    /// Returns the number of consolidation payments accepted by the node.
     pub fn consolidate(&mut self) -> usize {
         if self.vbank_claimed.len() < 2 { return 0; }
-        let mut count = 0;
-        while self.vbank_claimed.len() > 1 {
-            // Sort largest-first so we consolidate the biggest UTXOs first.
+        let mut count = 0usize;
+        // Build payments in batches of 20; submit each batch in one RPC.
+        loop {
             self.vbank_claimed.sort_by_key(|v| v.amount);
             self.vbank_claimed.reverse();
-            let chunk: Vec<Vess> = self.vbank_claimed.iter().take(MAX_INPUTS).cloned().collect();
-            if chunk.len() < 2 { break; }
-            let total: u64 = chunk.iter()
-                .try_fold(0u64, |acc, v| acc.checked_add(v.amount))
-                .unwrap_or(0);
-            // Fresh keypair per output — avoids address reuse and makes
-            // consolidation outputs indistinguishable from normal payments.
-            let (pk1, sk1) = dsa_generate();
-            let oh1 = dsa_pubkey_hash(&pk1);
-            let (pk2, sk2) = dsa_generate();
-            let oh2 = dsa_pubkey_hash(&pk2);
-            // Store keys BEFORE building the payment — otherwise the
-            // consolidated outputs are sent to owner hashes the wallet
-            // cannot sign for, permanently destroying the coins.
-            self.keypairs.insert(oh1, Keypair { dsa_pk: pk1, dsa_sk: sk1 });
-            self.keypairs.insert(oh2, Keypair { dsa_pk: pk2, dsa_sk: sk2 });
-            let outputs: Vec<(OwnerHash, Amount, Option<SpendCondition>)> = if total > 1 {
-                let split = if rand::thread_rng().gen_bool(0.5) {
-                    let grain = [10, 100, 1000][rand::thread_rng().gen_range(0..3)];
-                    let max_multi = (total - 1) / grain;
-                    if max_multi > 0 {
-                        rand::thread_rng().gen_range(1..=max_multi) * grain
+            let mut batch: Vec<VessPayment> = Vec::new();
+            while batch.len() < 20 && self.vbank_claimed.len() > 1 {
+                let chunk: Vec<Vess> = self.vbank_claimed.iter().take(MAX_INPUTS).cloned().collect();
+                if chunk.len() < 2 { break; }
+                let total: u64 = chunk.iter()
+                    .try_fold(0u64, |acc, v| acc.checked_add(v.amount))
+                    .unwrap_or(0);
+                // Fresh keypair per output — avoids address reuse and makes
+                // consolidation outputs indistinguishable from normal payments.
+                let (pk1, sk1) = dsa_generate();
+                let oh1 = dsa_pubkey_hash(&pk1);
+                let (pk2, sk2) = dsa_generate();
+                let oh2 = dsa_pubkey_hash(&pk2);
+                // Store keys BEFORE building the payment — otherwise the
+                // consolidated outputs are sent to owner hashes the wallet
+                // cannot sign for, permanently destroying the coins.
+                self.keypairs.insert(oh1, Keypair { dsa_pk: pk1, dsa_sk: sk1 });
+                self.keypairs.insert(oh2, Keypair { dsa_pk: pk2, dsa_sk: sk2 });
+                let outputs: Vec<(OwnerHash, Amount, Option<SpendCondition>)> = if total > 1 {
+                    let split = if rand::thread_rng().gen_bool(0.5) {
+                        let grain = [10, 100, 1000][rand::thread_rng().gen_range(0..3)];
+                        let max_multi = (total - 1) / grain;
+                        if max_multi > 0 {
+                            rand::thread_rng().gen_range(1..=max_multi) * grain
+                        } else {
+                            rand::thread_rng().gen_range(1..total)
+                        }
                     } else {
                         rand::thread_rng().gen_range(1..total)
-                    }
+                    };
+                    vec![(oh1, split, None), (oh2, total - split, None)]
                 } else {
-                    rand::thread_rng().gen_range(1..total)
+                    vec![(oh1, total, None)]
                 };
-                vec![(oh1, split, None), (oh2, total - split, None)]
-            } else {
-                vec![(oh1, total, None)]
-            };
-            let payment = match self.build_payment(&outputs) {
-                Some(p) => p,
-                None => break,
-            };
-            // build_payment moved inputs to pending.  On send failure,
-            // restore them so they aren't orphaned.
-            let mut sent = false;
-            for _ in 0..3 {
-                if self.send(&payment) { sent = true; break; }
-                std::thread::sleep(std::time::Duration::from_millis(500));
-            }
-            if !sent {
-                // Restore orphaned inputs from pending back to claimed.
-                let input_ids: HashSet<VessId> = payment.inputs.iter().map(|v| v.vess_id()).collect();
-                let mut recovered = 0usize;
-                self.vbank_pending.retain(|v| {
-                    if input_ids.contains(&v.vess_id()) {
-                        self.vbank_claimed.push(v.clone());
-                        recovered += 1;
-                        false
-                    } else { true }
-                });
-                if recovered > 0 {
-                    eprintln!("consolidate: send failed, recovered {} inputs to claimed", recovered);
+                // build_payment selects (clones) inputs but does NOT move
+                // them — we must move accepted inputs to pending ourselves.
+                match self.build_payment(&outputs) {
+                    Some(p) => batch.push(p),
+                    None => break,
                 }
-                break;
             }
-            count += 1;
-            std::thread::sleep(std::time::Duration::from_millis(200));
+            if batch.is_empty() { break; }
+            // Submit the whole batch in one RPC call.
+            match self.submit_batch(&batch) {
+                Some(results) => {
+                    let mut accepted = 0usize;
+                    let mut all_ok = true;
+                    for (i, &ok) in results.iter().enumerate() {
+                        if ok {
+                            accepted += 1;
+                            // Lock the spent inputs so the next batch
+                            // doesn't re-select them.
+                            self.move_inputs_to_pending(&batch[i]);
+                            self.register_outputs(&batch[i]);
+                        } else { all_ok = false; }
+                    }
+                    if accepted == 0 && !all_ok {
+                        eprintln!("consolidate: batch submit rejected by node");
+                    }
+                    count += accepted;
+                    // If nothing was accepted, stop — node is rejecting.
+                    if accepted == 0 { break; }
+                }
+                None => {
+                    eprintln!("consolidate: batch RPC failed (node unreachable?) — stopping");
+                    break;
+                }
+            }
         }
         count
+    }
+
+    /// Register a payment's outputs we own as unclaimed (post-submit).
+    fn register_outputs(&mut self, payment: &VessPayment) {
+        for v in &payment.outputs {
+            if let Some(kp) = self.keypairs.get(&v.owner_hash) {
+                let mut owned = v.clone();
+                owned.pubkey = kp.dsa_pk.clone();
+                owned.spend_key = kp.dsa_sk.clone();
+                self.vbank_unclaimed.push(owned);
+            }
+        }
+    }
+
+    fn submit_batch(&mut self, payments: &[VessPayment]) -> Option<Vec<bool>> {
+        match self.call_rpc(RpcRequest::SubmitBatch(payments.to_vec()))? {
+            RpcResponse::SubmitBatch(results) => Some(results),
+            _ => None,
+        }
     }
 
     /// Import a payment (OOB receive path). Verifies signatures, idempotency,
@@ -544,17 +583,52 @@ impl Wallet {
     /// Pending UTXOs are NOT dropped here — use `prune_pending()` explicitly.
     pub fn sync(&mut self) -> (usize, usize) {
         let ids: Vec<VessId> = self.vbank_unclaimed.iter().map(|v| v.vess_id()).collect();
+        let total = ids.len();
+        if total == 0 { return (0, 0); }
         let mut moved = 0usize;
-        for id in &ids {
-            if self.check(id).unwrap_or(false) {
-                if let Some(pos) = self.vbank_unclaimed.iter().position(|v| &v.vess_id() == id) {
-                    let v = self.vbank_unclaimed.remove(pos);
-                    self.vbank_claimed.push(v);
-                    moved += 1;
+        // Batch in groups of 1000 for reasonable UDP payload size.
+        for chunk in ids.chunks(1000) {
+            let results = match self.check_batch(chunk) {
+                Some(r) => r,
+                None => {
+                    eprintln!("sync: batch check failed (node unreachable?)");
+                    break;
+                }
+            };
+            for (id, &present) in chunk.iter().zip(results.iter()) {
+                if present {
+                    if let Some(pos) = self.vbank_unclaimed.iter().position(|v| &v.vess_id() == id) {
+                        let v = self.vbank_unclaimed.remove(pos);
+                        self.vbank_claimed.push(v);
+                        moved += 1;
+                    }
                 }
             }
+            eprintln!("sync: {}/{} checked, {} confirmed...",
+                (moved + self.vbank_unclaimed.len()).min(total), total, moved);
         }
         (moved, self.vbank_unclaimed.len())
+    }
+
+    fn check_batch(&mut self, ids: &[VessId]) -> Option<Vec<bool>> {
+        match self.call_rpc(RpcRequest::CheckBatch(ids.to_vec()))? {
+            RpcResponse::CheckBatch(results) => Some(results),
+            _ => None,
+        }
+    }
+
+    /// Count claimed UTXOs the connected node does NOT report as existing.
+    /// These are phantom coins: spent, vaporized in a conflict, or stranded
+    /// on a dead fork the node has synced away from.  REPORTED ONLY — never
+    /// deleted here, since the node itself may be stale or eclipsed.
+    /// RPC failure counts as "present" to avoid scaring the user on timeouts.
+    pub fn phantom_claimed(&mut self) -> usize {
+        let ids: Vec<VessId> = self.vbank_claimed.iter().map(|v| v.vess_id()).collect();
+        let mut missing = 0usize;
+        for id in &ids {
+            if !self.check(id).unwrap_or(true) { missing += 1; }
+        }
+        missing
     }
 
     /// Explicitly prune pending UTXOs that are no longer on the network

@@ -112,11 +112,11 @@ pub fn required_difficulty(amount: Amount) -> u32 {
 }
 
 /// Block reward: 1 Vess at difficulty 0, doubles each bit beyond.
-/// Caps at 32 bits consensus; 2^32 Vess max per block.
+/// Caps at 2^32 Vess (difficulty 32) — matching the 32-bit consensus cap.
 pub fn block_reward(difficulty_bits: u32) -> Amount {
     if difficulty_bits < MINING_DIFFICULTY { return 1; }
     let shift = difficulty_bits - MINING_DIFFICULTY;
-    if shift >= 32 { return Amount::MAX; }
+    if shift >= 32 { return 1u64 << 32; }
     1u64 << shift
 }
 
@@ -571,10 +571,15 @@ impl VessPayment {
         let payment_id = read_fixed(bytes, pos)?;
         let timestamp = read_u64(bytes, pos)?;
         let in_len = read_u32(bytes, pos)? as usize;
-        let mut inputs = Vec::with_capacity(in_len.min(MAX_INPUTS));
+        // Hard cap counts at decode time — same as sig_len below — so an
+        // untrusted payment can't force a large allocation before consensus
+        // validation rejects it.
+        if in_len > MAX_INPUTS { return None; }
+        let mut inputs = Vec::with_capacity(in_len);
         for _ in 0..in_len { inputs.push(Vess::decode(bytes, pos)?); }
         let out_len = read_u32(bytes, pos)? as usize;
-        let mut outputs = Vec::with_capacity(out_len.min(MAX_OUTPUTS));
+        if out_len > MAX_OUTPUTS { return None; }
+        let mut outputs = Vec::with_capacity(out_len);
         for _ in 0..out_len { outputs.push(Vess::decode(bytes, pos)?); }
         let sig_len = read_u32(bytes, pos)? as usize;
         if sig_len > MAX_INPUTS { return None; } // never pre-allocate from untrusted lengths
@@ -848,7 +853,7 @@ mod tests {
         assert_eq!(block_reward(0), 1);
         assert_eq!(block_reward(1), 2);
         assert_eq!(block_reward(31), 1u64 << 31);
-        assert_eq!(block_reward(32), Amount::MAX, "saturates at 32 bits");
-        assert_eq!(block_reward(u32::MAX), Amount::MAX);
+        assert_eq!(block_reward(32), 1u64 << 32, "caps at 2^32");
+        assert_eq!(block_reward(u32::MAX), 1u64 << 32);
     }
 }

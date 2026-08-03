@@ -5,12 +5,44 @@ use vess_crypto::*;
 use vess_network::*;
 use vess_network::data_packets::{self, PacketReassembler};
 
+/// Count distinct subnets among a set of peer IPs.  IPv4 uses /24 (first 3
+/// octets); IPv6 uses /48 (first 6 bytes).  Used by consensus_merkle so a
+/// single attacker host can't manufacture both quorum votes.
+fn distinct_subnets(ips: &[std::net::IpAddr]) -> usize {
+    let mut subnets = std::collections::HashSet::new();
+    for ip in ips {
+        // 7-byte key: marker + 6 subnet bytes (v4 /24 padded, v6 /48).
+        let mut key = [0u8; 7];
+        match ip {
+            std::net::IpAddr::V4(v4) => {
+                let o = v4.octets();
+                key[0] = 0;
+                key[1..4].copy_from_slice(&o[..3]);
+            }
+            std::net::IpAddr::V6(v6) => {
+                let o = v6.octets();
+                key[0] = 1;
+                key[1..7].copy_from_slice(&o[..6]);
+            }
+        }
+        subnets.insert(key);
+    }
+    subnets.len()
+}
+
 const DANDELION_MAX_STEM: u8 = 4;
 const DANDELION_FLUFF_PROB: f64 = 0.10; // 10% chance per hop to switch to fluff
 const DANDELION_EMBARGO_TICKS: u64 = 40; // ~200ms embargo before fluff broadcast
 const HOLE_PUNCH_MAX_RETRIES: u8 = 3;
 const STEM_RELAY_MAX_PER_TICK: usize = 2;
 const MAX_FRAME_SIZE: usize = data_packets::MAX_MESSAGE_SIZE;
+/// Trusted state checkpoints: (block height, state_merkle root).
+/// A syncing node refuses any sync whose committed root doesn't match a
+/// checkpoint at or below the target height — the PoW-anchored antidote to
+/// state-sync eclipse.  EMPTY until the testnet has a trusted genesis; a
+/// node operator can pin their own checkpoint here or via meta after
+/// launch.  When non-empty, sync is pinned to it regardless of quorum.
+const CHECKPOINTS: &[(u64, MerkleRoot)] = &[];
 /// Maximum encoded block size.  Blocks exceeding this are rejected at
 /// validation (can't enter the DAG) and skipped during prepare_block.
 const MAX_BLOCK_BYTES: usize = 768 * 1024;  // 768 KB
@@ -79,6 +111,10 @@ pub struct Node {
     blocks_db: heed::Database<heed::types::Bytes, heed::types::Bytes>, // block_hash → encoded block
     undo_db: heed::Database<heed::types::Bytes, heed::types::Bytes>,   // block_hash → encode(removed_ids, inserted_ids)
     limbo: HashMap<PaymentId, (VessPayment, u64)>,       // payment → (data, entry_tick)
+    /// Payments verified on submit.  Cleared whenever a block lands (state
+    /// changed), so the miner doesn't re-run expensive ML-DSA verification
+    /// on every candidate — only re-checks after each block.
+    verified_limbo: HashSet<PaymentId>,
     limbo_inputs: HashMap<VessId, Vec<PaymentId>>,       // which limbo payments claim each input
     contested: HashSet<PaymentId>,                        // payments with conflicting inputs (burn on block inclusion)
     outbox: Vec<(SocketAddr, Vec<u8>)>,
@@ -120,6 +156,10 @@ pub struct Node {
     // Discovered peers that need PoW solving — drained by main.rs outside
     // the node lock so the 1-3s cuckatoo solve doesn't stall the main loop.
     pub pending_discovered: Vec<SocketAddr>,
+    // Hole-punch handshakes queued for async PoW solving (drained by
+    // main.rs outside the lock — the solve takes 1-3s and must not hold
+    // the node lock or the main loop drops every datagram meanwhile).
+    pub pending_punches: Vec<SocketAddr>,
     // State sync
     sync_peer: Option<SocketAddr>,               // peer we're syncing UTXOs from
     sync_offset: u64,                             // how many UTXO IDs received so far
@@ -158,7 +198,7 @@ impl Node {
         let (saved_ticks, saved_diff, saved_tip, saved_fin_tip, saved_fin_work, saved_fin_root) = Self::load_meta(&env, &meta);
         let saved_height = Self::load_accepted_blocks(&env, &meta);
         let mut node = Self { addr, network: Network::new(), peers: HashMap::new(), max_peers: 16, needs_sync: true, env, vess_index: db, ban_list, banned_ips: HashSet::new(), meta, mined_keys, peers_db,
-            blocks_db, undo_db, limbo: HashMap::new(), limbo_inputs: HashMap::new(), contested: HashSet::new(),
+            blocks_db, undo_db, limbo: HashMap::new(), verified_limbo: HashSet::new(), limbo_inputs: HashMap::new(), contested: HashSet::new(),
             outbox: Vec::new(), ticks: saved_ticks, fails: HashMap::new(),
             peer_msg_count: HashMap::new(), msg_window_start: 0, peer_merkle: HashMap::new(),
             stems: HashMap::new(), fluff_embargo: HashMap::new(),
@@ -183,6 +223,7 @@ impl Node {
             pending_handshakes: HashMap::new(),
             discovered_peers: Vec::new(),
             pending_discovered: Vec::new(),
+            pending_punches: Vec::new(),
             sync_peer: None,
             sync_offset: 0,
             sync_target_root: None,
@@ -333,10 +374,14 @@ impl Node {
         }
     }
 
-    /// Encode an undo record: 4-byte count of removed ids, then each 32-byte id,
-    /// then 4-byte count of inserted ids, then each 32-byte id.
-    fn encode_undo(removed: &HashSet<VessId>, inserted: &HashSet<VessId>) -> Vec<u8> {
-        let mut v = Vec::with_capacity(8 + (removed.len() + inserted.len()) * 32);
+    /// Encode an undo record: prev_tip(32) + removed_count(4) + removed ids
+    /// + inserted_count(4) + inserted ids.  `prev_tip` is the previous
+    /// current_tip before this block's commit — it lets a rewind follow the
+    /// TRUE commit chain (which differs from block parentage whenever a
+    /// heaviest-tip switch commits a sibling).
+    fn encode_undo(prev_tip: &BlockHash, removed: &HashSet<VessId>, inserted: &HashSet<VessId>) -> Vec<u8> {
+        let mut v = Vec::with_capacity(40 + (removed.len() + inserted.len()) * 32);
+        v.extend_from_slice(prev_tip);
         v.extend_from_slice(&(removed.len() as u32).to_le_bytes());
         for id in removed { v.extend_from_slice(id); }
         v.extend_from_slice(&(inserted.len() as u32).to_le_bytes());
@@ -344,11 +389,12 @@ impl Node {
         v
     }
 
-    /// Decode an undo record → (removed, inserted).
-    fn decode_undo(data: &[u8]) -> Option<(HashSet<VessId>, HashSet<VessId>)> {
-        if data.len() < 8 { return None; }
-        let r_count = u32::from_le_bytes(data[..4].try_into().ok()?) as usize;
-        let mut pos = 4;
+    /// Decode an undo record → (prev_tip, removed, inserted).
+    fn decode_undo(data: &[u8]) -> Option<(BlockHash, HashSet<VessId>, HashSet<VessId>)> {
+        if data.len() < 40 { return None; }
+        let mut prev_tip = [0u8; 32]; prev_tip.copy_from_slice(&data[..32]);
+        let mut pos = 32;
+        let r_count = u32::from_le_bytes(data[pos..pos+4].try_into().ok()?) as usize; pos += 4;
         if data.len() < pos + r_count * 32 + 4 { return None; }
         let mut removed = HashSet::with_capacity(r_count);
         for _ in 0..r_count {
@@ -362,7 +408,7 @@ impl Node {
             let mut id = [0u8; 32]; id.copy_from_slice(&data[pos..pos+32]); pos += 32;
             inserted.insert(id);
         }
-        Some((removed, inserted))
+        Some((prev_tip, removed, inserted))
     }
 
     pub fn my_node_id(&self) -> NodeId { self.network.my_node_id() }
@@ -420,30 +466,53 @@ impl Node {
     }
 
     /// Try to handshake with a hole-punched address (bypasses max_peers).
+    /// In production the 1-3s PoW solve is deferred to main.rs via
+    /// `pending_punches` so it never runs while holding the node lock.
+    /// In test_mode we solve synchronously (tests call this directly and
+    /// expect immediate handshake traffic).
     pub fn try_punch_handshake(&mut self, addr: SocketAddr) {
-        if !self.has_session_for(&addr) {
-            // Hole-punched handshakes use the full INIT with sig + PoW.
-            // The PoW is lightweight (6-cycle, 14-bit edges) and prevents
-            // the same INIT-spoofing attack that the sig fixes.
-            let raw = self.network.build_handshake_init(addr);
-            let (tag, payload) = unframe(&raw).unwrap_or((HANDSHAKE_INIT, &[][..]));
-            let base = blake3_hash(&[b"vess-handshake" as &[u8], &self.network.my_node_id()].concat());
-            let mut header = base;
-            let proof = loop {
-                if let Some(p) = cuckoo::solve(&header, cuckoo::HANDSHAKE_CYCLE_LENGTH, cuckoo::HANDSHAKE_EDGE_BITS) {
-                    break (header, p);
-                }
-                header = blake3_hash(&header);
-            };
-            let mut payload_full = payload.to_vec();
-            let sig_input = blake3_hash_multi(&[b"vess-hs-init", &self.network.dsa_pk, &self.network.kem_pk]);
-            let init_sig = dsa_sign(&self.network.dsa_sk, &sig_input)
-                .expect("DSA signing must not fail");
-            write_bytes(&mut payload_full, &init_sig);
-            payload_full.extend_from_slice(&proof.0);
-            for n in &proof.1 { payload_full.extend_from_slice(&n.to_le_bytes()); }
-            self.send_handshake(addr, frame(tag, &payload_full));
+        if self.has_session_for(&addr) { return; }
+        if self.test_mode {
+            let (hdr, proof) = self.solve_handshake_pow(addr);
+            self.add_punch_with_pow(addr, hdr, proof);
+        } else if !self.pending_punches.contains(&addr)
+            && self.pending_punches.len() < 16
+        {
+            self.pending_punches.push(addr);
         }
+    }
+
+    /// Solve the handshake PoW.  The header is address-free —
+    /// blake3("vess-handshake" || node_id) — because the responder cannot
+    /// know which address string the initiator typed (0.0.0.0 vs 127.0.0.1
+    /// vs public IP all reach the same socket).  Matches the responder's
+    /// verification, which accepts the base or any header within a 64-chain.
+    fn solve_handshake_pow(&self, addr: SocketAddr) -> ([u8; 32], Vec<u32>) {
+        let _ = addr; // header is deliberately not bound to the address
+        let base = blake3_hash(&[b"vess-handshake" as &[u8], &self.network.my_node_id()].concat());
+        let mut header = base;
+        loop {
+            if let Some(p) = cuckoo::solve(&header, cuckoo::HANDSHAKE_CYCLE_LENGTH, cuckoo::HANDSHAKE_EDGE_BITS) {
+                return (header, p);
+            }
+            header = blake3_hash(&header);
+        }
+    }
+
+    /// Send hole-punch handshake INIT with a pre-solved PoW, bypassing the
+    /// max_peers cap (used by main.rs for drained `pending_punches`).
+    pub fn add_punch_with_pow(&mut self, a: SocketAddr, proof_header: [u8; 32], proof_cycles: Vec<u32>) {
+        if self.has_session_for(&a) { return; }
+        let raw = self.network.build_handshake_init(a);
+        let (tag, payload) = unframe(&raw).unwrap_or((HANDSHAKE_INIT, &[][..]));
+        let mut payload_full = payload.to_vec();
+        let sig_input = blake3_hash_multi(&[b"vess-hs-init", &self.network.dsa_pk, &self.network.kem_pk]);
+        let init_sig = dsa_sign(&self.network.dsa_sk, &sig_input)
+            .expect("DSA signing must not fail");
+        write_bytes(&mut payload_full, &init_sig);
+        payload_full.extend_from_slice(&proof_header);
+        for n in &proof_cycles { payload_full.extend_from_slice(&n.to_le_bytes()); }
+        self.send_handshake(a, frame(tag, &payload_full));
     }
 
     /// Manually establish a session with a known key (for testing).
@@ -598,6 +667,7 @@ impl Node {
             self.limbo_inputs.entry(v.vess_id()).or_default().push(p.payment_id);
         }
         self.limbo.insert(p.payment_id, (p.clone(), self.ticks));
+        self.verified_limbo.insert(p.payment_id);
         self.relay(&p);
         self.trigger_auto_sync();
         true
@@ -613,6 +683,7 @@ impl Node {
         if expired.is_empty() { return; }
         self.limbo.retain(|id, _| !expired.contains(id));
         self.contested.retain(|id| !expired.contains(id));
+        self.verified_limbo.retain(|id| !expired.contains(id));
         for claims in self.limbo_inputs.values_mut() {
             claims.retain(|id| !expired.contains(id));
         }
@@ -722,10 +793,13 @@ impl Node {
         // Collect candidate payments — verify already rejects outputs that
         // collide with UTXO state, but we also need to guard against
         // cross-payment collisions within the block.
+        // Use the verified-on-submit cache: skip re-running ML-DSA verify on
+        // every candidate.  The cache is cleared on each block, so payments
+        // are re-verified only when the state actually changes.
         let candidates: Vec<VessPayment> = self.limbo.iter()
             .filter(|(pid, _)| !self.contested.contains(*pid))
             .map(|(_, (p, _))| p.clone())
-            .filter(|p| self.verify(p))
+            .filter(|p| !p.is_mint() && (self.verified_limbo.contains(&p.payment_id) || self.verify(p)))
             .collect();
 
         let has_work = !candidates.is_empty() || !self.contested.is_empty();
@@ -993,6 +1067,9 @@ impl Node {
             for v in &p.inputs { self.limbo_inputs.remove(&v.vess_id()); }
             self.contested.remove(&p.payment_id);
         }
+        // State changed — any cached verification of remaining limbo
+        // payments is stale (inputs may now be spent, outputs may collide).
+        self.verified_limbo.clear();
 
         // Store block, update tips
         self.blocks.insert(block_hash, block.clone());
@@ -1032,8 +1109,12 @@ impl Node {
                 // Apply the delta incrementally.
                 for id in &removed { let _ = self.vess_index.delete(&mut w, id); }
                 for id in &inserted { let _ = self.vess_index.put(&mut w, id, &()); }
-                // Persist the undo record for in-window reorgs.
-                let _ = self.undo_db.put(&mut w, &block_hash, &Self::encode_undo(&removed, &inserted));
+                // Persist the undo record for in-window reorgs.  prev_tip is
+                // the current_tip BEFORE this commit — it lets a rewind
+                // follow the commit chain (not block parentage, which
+                // diverges on heaviest-tip switches).
+                let prev_tip = self.current_tip.unwrap_or(block_hash);
+                let _ = self.undo_db.put(&mut w, &block_hash, &Self::encode_undo(&prev_tip, &removed, &inserted));
                 if w.commit().is_ok() {
                     self.current_tip = Some(block_hash);
                     self.accepted_blocks = self.accepted_blocks.saturating_add(1);
@@ -1225,6 +1306,130 @@ impl Node {
         Some(state)
     }
 
+    /// The current live LMDB UTXO set (the state of `current_tip`).
+    fn live_state(&self) -> Option<HashSet<VessId>> {
+        let t = self.env.read_txn().ok()?;
+        let state: HashSet<VessId> = self.vess_index.iter(&t).ok()?
+            .filter_map(|r| r.ok().map(|(k,_)| {
+                let mut a = [0u8; 32]; a.copy_from_slice(k); a
+            }))
+            .collect();
+        Some(state)
+    }
+
+    /// Parent state for validating a block.  Fast path (§3.2): when the
+    /// parents are exactly [current_tip], the live LMDB state IS the parent
+    /// state — O(1), no replay.  Slow path (§3.3): rewind along the COMMIT
+    /// CHAIN via undo records to the merge base, then replay the divergent
+    /// segment forward (O(window)).  Falls back to the full replay when undo
+    /// history is incomplete.
+    fn state_for_parents(&self, parents: &[BlockHash]) -> Option<HashSet<VessId>> {
+        if parents.len() == 1 && self.current_tip == Some(parents[0]) {
+            return self.live_state();
+        }
+        if let Some(state) = self.state_for_parents_bounded(parents) {
+            return Some(state);
+        }
+        self.state_for_roots(parents)
+    }
+
+    /// Bounded slow path: rewind the live state to the merge base by
+    /// reverse-applying undo records along the commit chain (each undo
+    /// record's prev_tip links the true commit sequence, which differs from
+    /// block parentage on heaviest-tip switches), then replay the divergent
+    /// segment forward.  Returns None (→ fall back to full replay) if undo
+    /// history is missing or the DAG isn't within the finality window.
+    fn state_for_parents_bounded(&self, parents: &[BlockHash]) -> Option<HashSet<VessId>> {
+        let tip = self.current_tip?;
+        if self.blocks.is_empty() || parents.is_empty() { return None; }
+        // Union + intersection of the parents' ancestor closures.
+        let mut parent_anc: HashSet<BlockHash> = HashSet::new();
+        let mut common: Option<HashSet<BlockHash>> = None;
+        for p in parents {
+            let mut anc: HashSet<BlockHash> = HashSet::new();
+            let mut stack = vec![*p];
+            while let Some(h) = stack.pop() {
+                if !anc.insert(h) { continue; }
+                if anc.len() > FINALITY_DEPTH * 2 { return None; }
+                let b = self.blocks.get(&h)?;
+                for gp in &b.parents { stack.push(*gp); }
+            }
+            parent_anc.extend(anc.iter().copied());
+            common = Some(match common {
+                None => anc,
+                Some(c) => c.intersection(&anc).copied().collect(),
+            });
+        }
+        let common = common?;
+        // Walk the COMMIT CHAIN from tip via undo.prev_tip.
+        let mut chain: Vec<BlockHash> = Vec::new();
+        let mut cur = tip;
+        loop {
+            chain.push(cur);
+            if chain.len() > FINALITY_DEPTH { return None; }
+            let t = self.env.read_txn().ok()?;
+            let data = self.undo_db.get(&t, &cur).ok().flatten()?;
+            let (prev_tip, _, _) = Self::decode_undo(&data)?;
+            drop(t);
+            if prev_tip == cur { break; } // genesis / no prior commit
+            cur = prev_tip;
+        }
+        // Merge base: DEEPEST commit-chain block that is an ancestor of every
+        // parent.  Using the shallowest (the tip) would put a sibling fork
+        // outside the segment and miss cross-branch vaporization.
+        let merge_base = chain.iter().rev().find(|h| common.contains(*h)).copied()?;
+        // Rewind from tip down to (exclusive) merge_base, reversing undo
+        // records.  Each reversal of undo[h] yields prev_tip(h)'s state —
+        // correct even across heaviest-tip switches.
+        let mut state = self.live_state()?;
+        for &h in &chain {
+            if h == merge_base { break; }
+            let t = self.env.read_txn().ok()?;
+            let data = self.undo_db.get(&t, &h).ok().flatten()?;
+            let (_, removed, inserted) = Self::decode_undo(&data)?;
+            drop(t);
+            for id in &removed { state.insert(*id); }
+            for id in &inserted { state.remove(id); }
+        }
+        // Segment blocks: parents' ancestors minus the merge base's own
+        // ancestry — every divergent block (both sides of a fork/merge)
+        // gets replayed and classified together.
+        let mut base_anc: HashSet<BlockHash> = HashSet::new();
+        let mut bstack = vec![merge_base];
+        while let Some(h) = bstack.pop() {
+            if !base_anc.insert(h) { continue; }
+            if let Some(b) = self.blocks.get(&h) {
+                for p in &b.parents { bstack.push(*p); }
+            }
+        }
+        let segment: Vec<BlockHash> = parent_anc.difference(&base_anc).copied().collect();
+        if segment.is_empty() { return Some(state); }
+        // Topological order restricted to the segment.
+        let order: Vec<BlockHash> = self.ancestor_order(&segment)?
+            .into_iter().filter(|h| segment.contains(h)).collect();
+        // Dedup + classify the segment's payments, then apply.
+        let mut seen_p: HashSet<PaymentId> = HashSet::new();
+        let mut payments: Vec<&VessPayment> = Vec::new();
+        for h in &order {
+            for p in &self.blocks[h].payments {
+                if seen_p.insert(p.payment_id) { payments.push(p); }
+            }
+        }
+        let (conflicted, voided) = Self::classify_history(&payments);
+        for h in &order {
+            let b = &self.blocks[h];
+            for o in &b.coinbase.outputs { state.insert(o.vess_id()); }
+            for p in &b.payments {
+                if voided.contains(&p.payment_id) { continue; }
+                for input in &p.inputs { state.remove(&input.vess_id()); }
+                if !conflicted.contains(&p.payment_id) {
+                    for o in &p.outputs { state.insert(o.vess_id()); }
+                }
+            }
+        }
+        Some(state)
+    }
+
     fn state_root(state: &HashSet<VessId>) -> MerkleRoot {
         let mut ids: Vec<VessId> = state.iter().copied().collect();
         ids.sort();
@@ -1297,7 +1502,7 @@ impl Node {
         canonical_coinbase.compute();
         if canonical_coinbase.payment_id != block.coinbase.payment_id { return None; }
 
-        let mut state = self.state_for_roots(&block.parents)?;
+        let mut state = self.state_for_parents(&block.parents)?;
         // Chained spends are banned by consensus: every payment input must
         // reference pre-block state — never an output created by this block
         // (including the coinbase). Checked once, before any state mutation.
@@ -1648,7 +1853,8 @@ impl Node {
 
     pub fn merkle(&self) -> MerkleRoot {
         let t = match self.env.read_txn() { Ok(t) => t, Err(_) => return [0u8; 32] };
-        let iter = self.vess_index.iter(&t).unwrap().filter_map(|r| r.ok().map(|(k,_)| {
+        let Ok(iter) = self.vess_index.iter(&t) else { return [0u8; 32] };
+        let iter = iter.filter_map(|r| r.ok().map(|(k,_)| {
             let mut a = [0u8; 32]; a.copy_from_slice(k); a
         }));
         // LMDB B-tree iterates in byte order → streaming merkle, O(log N) RAM
@@ -1656,14 +1862,20 @@ impl Node {
     }
 
     /// Returns (ticks, merkle_root) that a quorum of peers agree on.
-    /// Requires ≥2 peers to agree — never trusts a single peer.
+    /// Requires agreement across ≥2 distinct /24 networks — a single host
+    /// (or one /24) can no longer manufacture both votes for a fabricated
+    /// root, even with many sockets.
     fn consensus_merkle(&self) -> Option<(u64, MerkleRoot, u32)> {
-        let roots: Vec<(u64, MerkleRoot, u32)> = self.peer_merkle.values().copied().collect();
-        if roots.len() < 2 { return None; }
-        // Count votes for each (ticks, root, diff) pair; need ≥2 matching
-        let mut counts: HashMap<(u64, MerkleRoot, u32), usize> = HashMap::new();
-        for &r in &roots { *counts.entry(r).or_insert(0) += 1; }
-        counts.into_iter().find(|&(_, c)| c >= 2).map(|(r, _)| r)
+        // Group peers by the root they advertise, tracking distinct /24s.
+        // peer_merkle: SocketAddr -> (height, root, diff).
+        let mut per_root: HashMap<(u64, MerkleRoot, u32), Vec<std::net::IpAddr>> = HashMap::new();
+        for (addr, r) in &self.peer_merkle {
+            per_root.entry(*r).or_default().push(addr.ip());
+        }
+        if per_root.len() < 2 { return None; }
+        per_root.into_iter().find(|(_, ips)| {
+            distinct_subnets(ips) >= 2
+        }).map(|(r, _)| r)
     }
 
     // ---- gossip, relay ----
@@ -1772,11 +1984,12 @@ impl Node {
                     self.strike(addr);
                     return None;
                 }
-                // Cap inbound half-open sessions — MAX_SESSIONS in
-                // build_handshake_init only caps outbound; inbound was
-                // unbounded, letting an attacker fill session memory
-                // by flooding INITs from many spoofed addresses.
-                if self.network.sessions.len() >= MAX_SESSIONS {
+                // Cap inbound sessions: total table + a tighter cap on
+                // half-open (unproven) sessions so a spoofed-INIT flood
+                // can only occupy the small fast-reaping pool.
+                if self.network.sessions.len() >= MAX_SESSIONS
+                    || self.network.half_open_count() >= MAX_HALF_OPEN_SESSIONS
+                {
                     return None;
                 }
                 payload = &payload[..split];
@@ -2132,11 +2345,27 @@ impl Node {
         let req = RpcRequest::decode(tag, payload)?;
         Some(match req {
             RpcRequest::Check(id) => RpcResponse::Check(self.check(&id)),
+            RpcRequest::CheckBatch(ids) => {
+                let results: Vec<bool> = ids.iter().map(|id| self.check(id)).collect();
+                RpcResponse::CheckBatch(results)
+            }
             RpcRequest::Submit(p) => RpcResponse::Submit(self.submit(p)),
+            RpcRequest::SubmitBatch(payments) => {
+                let results: Vec<bool> = payments.iter().map(|p| self.submit(p.clone())).collect();
+                RpcResponse::SubmitBatch(results)
+            }
             RpcRequest::GetPeers => RpcResponse::GetPeers(self.get_peers()),
             RpcRequest::ConnectPeer(addr) => {
-                let len = self.add_peer(addr);
-                RpcResponse::ConnectPeer(len > 0)
+                // Defer the PoW solve to main.rs — add_peer would hold the
+                // lock for 1-3s while solving cuckatoo, stalling the node.
+                if addr != self.addr
+                    && !self.has_session_for(&addr)
+                    && !self.pending_discovered.contains(&addr)
+                    && self.pending_discovered.len() < 32
+                {
+                    self.pending_discovered.push(addr);
+                }
+                RpcResponse::ConnectPeer(true)
             }
         }.encode())
     }
@@ -2276,9 +2505,15 @@ impl Node {
     }
 
     fn sync_chunk(&mut self, addr: SocketAddr, start: u64, count: u32) {
+        // Cap the requested chunk size and the seek offset so an
+        // authenticated peer can't force an O(N) skip or an entire-UTXO-set
+        // dump in one chunk (CPU/bandwidth DoS).
+        let count = count.min(MAX_SYNC_CHUNK_IDS as u32);
+        let start = start.min(self.utxo_count() as u64);
         let ids: Vec<VessId> = {
             let t = match self.env.read_txn() { Ok(t) => t, Err(_) => return };
-            self.vess_index.iter(&t).unwrap().filter_map(|r| r.ok().map(|(k,_)| { let mut a=[0u8;32]; a.copy_from_slice(k); a })).skip(start as usize).take(count as usize).collect()
+            let Ok(iter) = self.vess_index.iter(&t) else { return };
+            iter.filter_map(|r| r.ok().map(|(k,_)| { let mut a=[0u8;32]; a.copy_from_slice(k); a })).skip(start as usize).take(count as usize).collect()
         };
         self.send(addr, &GossipMessage::StateSyncChunk(start, ids));
     }
@@ -2342,9 +2577,10 @@ impl Node {
         if !is_from_sync_peer { return; }
 
         if !ids.is_empty() {
-            // Cap the sync buffer to prevent memory exhaustion from an
+            // Cap the sync buffer (5M ids ≈ 160 MB raw; HashSet overhead
+            // multiplies it) to prevent memory exhaustion from an
             // unbounded stream of chunks.
-            if self.sync_buffer.len().saturating_add(ids.len()) > 50_000_000 {
+            if self.sync_buffer.len().saturating_add(ids.len()) > 5_000_000 {
                 // Buffer full — abort sync, try a different peer.
                 self.sync_peer = None;
                 self.sync_target_root = None;
@@ -2366,30 +2602,39 @@ impl Node {
                 let buffered_root = merkle_root(&sorted);
 
                 let committed = {
-                    // Require quorum: ≥2 peers must agree on the same
-                    // (height, root) pair.  The sync_target_root is a
-                    // hint for *which* peer to pull data from, not the
-                    // source of truth — an eclipsed bootstrapping node
-                    // would otherwise accept a fully fabricated UTXO set
-                    // from a single attacker-controlled peer.
-                    let quorum_ok = self.consensus_merkle()
-                        .map(|(_, r, _)| r == buffered_root)
-                        .unwrap_or(false);
-                    if quorum_ok {
-                        true
-                    } else if self.peer_merkle.len() == 1 {
-                        // Single-peer trust (baby-network stage): with exactly
-                        // one chain-state peer there IS no quorum — requiring
-                        // one would leave the node stuck in needs_sync
-                        // forever, read-only.  Trust that peer's root, but
-                        // ONLY when it is our sole source of chain state.
-                        // NOTE: this is eclipse-able by design at this stage;
-                        // it must tighten back to quorum as the network grows.
-                        self.sync_target_root
-                            .map(|r| r == buffered_root)
-                            .unwrap_or(false)
-                    } else {
+                    // Checkpoint anchor: a pinned (height, root) that sync
+                    // must match, regardless of quorum.  PoW-anchored — a
+                    // fresh node trusts the pinned root, not the peers.
+                    let checkpoint_ok = CHECKPOINTS.is_empty() || {
+                        let height = self.consensus_merkle().map(|(h, _, _)| h).unwrap_or(0);
+                        CHECKPOINTS.iter()
+                            .filter(|(h, _)| *h <= height)
+                            .all(|(_, r)| *r == buffered_root)
+                    };
+                    if !checkpoint_ok {
                         false
+                    } else {
+                        // Require quorum: ≥2 distinct /24 networks agree on
+                        // the same (height, root) pair.  The sync_target_root
+                        // is a hint for *which* peer to pull data from, not
+                        // the source of truth.
+                        let quorum_ok = self.consensus_merkle()
+                            .map(|(_, r, _)| r == buffered_root)
+                            .unwrap_or(false);
+                        if quorum_ok {
+                            true
+                        } else if self.peer_merkle.len() == 1 {
+                            // Single-peer trust (baby-network stage): with exactly
+                            // one chain-state peer there IS no quorum — requiring
+                            // one would leave the node stuck in needs_sync
+                            // forever, read-only.  Trust that peer's root, but
+                            // ONLY when it is our sole source of chain state.
+                            self.sync_target_root
+                                .map(|r| r == buffered_root)
+                                .unwrap_or(false)
+                        } else {
+                            false
+                        }
                     }
                 };
 
