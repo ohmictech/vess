@@ -1,2 +1,10 @@
 /target/
 /vess-pool/
+
+# Secrets — never commit
+sepolia.key
+*.key
+miner.key
+miner.json
+miner.address
+miner.toml
