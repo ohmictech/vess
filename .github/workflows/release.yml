@@ -3,6 +3,15 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      network:
+        description: "Deploy to which network?"
+        type: choice
+        default: "sepolia"
+        options:
+          - sepolia
+          - mainnet
 
 permissions:
   contents: write
@@ -58,5 +67,42 @@ jobs:
         with:
           files: vess-${{ github.ref_name }}-${{ matrix.target }}.*
           generate_release_notes: true
+
+  deploy-contract:
+    runs-on: ubuntu-latest
+    environment: deploy
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust + wasm target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install cargo-stylus
+        run: cargo install cargo-stylus --locked
+
+      - name: Build contract WASM
+        run: cargo build --target wasm32-unknown-unknown -p vess-contract --release
+
+      - name: Check contract
+        env:
+          RPC_URL: ${{ github.event.inputs.network == 'mainnet' && secrets.MAINNET_RPC_URL || secrets.SEPOLIA_RPC_URL }}
+        run: |
+          cargo stylus check \
+            --wasm-file target/wasm32-unknown-unknown/release/vess_contract.wasm \
+            --rpc-url "$RPC_URL"
+
+      - name: Deploy contract
+        env:
+          PRIVATE_KEY: ${{ secrets.DEPLOYER_PRIVATE_KEY }}
+          RPC_URL: ${{ github.event.inputs.network == 'mainnet' && secrets.MAINNET_RPC_URL || secrets.SEPOLIA_RPC_URL }}
+        run: |
+          cargo stylus deploy \
+            --wasm-file target/wasm32-unknown-unknown/release/vess_contract.wasm \
+            --private-key "$PRIVATE_KEY" \
+            --rpc-url "$RPC_URL" \
+            --no-verify
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
