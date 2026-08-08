@@ -106,4 +106,5 @@ jobs:
             --wasm-file target/wasm32-unknown-unknown/release/vess_contract.wasm \
             --private-key "$PRIVATE_KEY" \
             --endpoint "$RPC_URL" \
+            --max-fee-per-gas-gwei 1 \
             --no-verify

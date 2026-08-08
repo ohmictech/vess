@@ -1,12 +1,7 @@
-# Stylus contract configuration (used by cargo-stylus check/deploy)
+# Stylus workspace configuration (used by cargo-stylus check/deploy)
+# cargo-stylus 0.10 reads network endpoints and the max fee flag from here / CLI.
 [workspace.networks.sepolia]
 endpoint = "https://sepolia-rollup.arbitrum.io/rpc"
 
 [workspace.networks.mainnet]
 endpoint = "https://arb1.arbitrum.io/rpc"
-
-[contract]
-crate-type = "cdylib"
-
-[deploy]
-max-fee-per-gas-gwei = 0.1
