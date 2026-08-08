@@ -1,0 +1,6 @@
+# Stylus contract configuration (used by cargo-stylus check/deploy)
+[contract]
+crate-type = "cdylib"
+
+[deploy]
+max-fee-per-gas-gwei = 0.1
