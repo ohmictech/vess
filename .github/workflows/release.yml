@@ -36,20 +36,22 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y liblmdb-dev
 
       - name: Build release
-        run: cargo build --release --target ${{ matrix.target }}
+        # Only the miner ships as a binary; vess-contract is a wasm cdylib
+        # and does not link natively.
+        run: cargo build --release -p vess-miner --target ${{ matrix.target }}
 
       - name: Package (Unix)
         if: matrix.os != 'windows-latest'
         run: |
           cd target/${{ matrix.target }}/release
-          tar czf ../../../vess-${{ github.ref_name }}-${{ matrix.target }}.tar.gz vess-node vess-wallet-cli
+          tar czf ../../../vess-${{ github.ref_name }}-${{ matrix.target }}.tar.gz vess-miner
 
       - name: Package (Windows)
         if: matrix.os == 'windows-latest'
         shell: pwsh
         run: |
           $dst = "vess-${{ github.ref_name }}-${{ matrix.target }}.zip"
-          Compress-Archive -Path target/${{ matrix.target }}/release/vess-node.exe, target/${{ matrix.target }}/release/vess-wallet-cli.exe -DestinationPath $dst
+          Compress-Archive -Path target/${{ matrix.target }}/release/vess-miner.exe -DestinationPath $dst
 
       - name: Upload to release
         uses: softprops/action-gh-release@v2

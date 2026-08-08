@@ -14,7 +14,7 @@ use stylus_sdk::{
 
 use alloy_sol_types::sol;
 
-use vess_crypto::{cuckoo, check_difficulty, block_reward, blake3_hash};
+use vess_crypto::{blake3_hash, block_reward, check_difficulty, cuckoo};
 
 sol! {
     event Transfer(address indexed from, address indexed to, uint256 value);
@@ -77,7 +77,11 @@ impl Vess {
     pub fn approve(&mut self, spender: Address, value: U256) -> Result<bool, Vec<u8>> {
         let sender = self.vm().msg_sender();
         self.allowances.setter(sender).setter(spender).set(value);
-        self.vm().log(Approval { owner: sender, spender, value });
+        self.vm().log(Approval {
+            owner: sender,
+            spender,
+            value,
+        });
         Ok(true)
     }
 
@@ -102,7 +106,10 @@ impl Vess {
             return Err("insufficient allowance".into());
         }
         // Unchecked sub is safe due to check above
-        self.allowances.setter(from).setter(spender).set(allowed - value);
+        self.allowances
+            .setter(from)
+            .setter(spender)
+            .set(allowed - value);
         self._transfer(from, to, value)
     }
 
@@ -139,24 +146,18 @@ impl Vess {
         }
 
         // ── preimage + nullifier key ────────────────────────────────────
-        let header = cuckoo::mint_header(
-            &chain_hash.0,
-            diff_bits,
-            &address.0,
-            timestamp,
-            nonce,
-        );
+        let header = cuckoo::mint_header(&chain_hash.0, diff_bits, &address.0, timestamp, nonce);
         let nullifier_key = U256::from_be_bytes(blake3_hash(&header));
 
         // ── nullifier check ──────────────────────────────────────────────
         let now = self.vm().block_timestamp();
         let existing = self.nullifiers.getter(nullifier_key).get();
-        if !existing.is_zero() {
-            if U256::from(now) < existing {
-                return Err("already minted".into());
-            }
-            self.nullifiers.setter(nullifier_key).set(U256::ZERO);
+        if !existing.is_zero() && U256::from(now) < existing {
+            return Err("already minted".into());
         }
+        // An expired nullifier (now >= existing) can never mint again anyway:
+        // the preimage timestamp is the stored expiry, so the staleness check
+        // below rejects it. No need to clear it.
 
         // ── timestamp validity ───────────────────────────────────────────
         if timestamp <= now || timestamp > now + MAX_FUTURE_SECS {
@@ -180,7 +181,9 @@ impl Vess {
         }
 
         // ── nullifier insert ─────────────────────────────────────────────
-        self.nullifiers.setter(nullifier_key).set(U256::from(timestamp));
+        self.nullifiers
+            .setter(nullifier_key)
+            .set(U256::from(timestamp));
 
         // ── reward ──────────────────────────────────────────────────────
         let reward = block_reward(diff_bits);
@@ -193,6 +196,9 @@ impl Vess {
 
     pub fn transfer_ownership(&mut self, new_owner: Address) -> Result<bool, Vec<u8>> {
         self._ensure_owner()?;
+        if new_owner == Address::ZERO {
+            return Err("zero address".into());
+        }
         self.owner.set(FixedBytes::from(new_owner.into_array()));
         Ok(true)
     }
@@ -222,7 +228,11 @@ impl Vess {
         self.total_supply.set(supply + value);
         let bal = self.balances.getter(to).get();
         self.balances.setter(to).set(bal + value);
-        self.vm().log(Transfer { from: Address::ZERO, to, value });
+        self.vm().log(Transfer {
+            from: Address::ZERO,
+            to,
+            value,
+        });
     }
 
     fn _transfer(&mut self, from: Address, to: Address, value: U256) -> Result<bool, Vec<u8>> {

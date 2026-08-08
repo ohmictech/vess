@@ -30,7 +30,7 @@ The contract is minimal: `init()`, `mint()`, plus standard ERC-20 `transfer`/`ap
 ## How minting works
 
 1. Miner builds a preimage: `blake3("vess-id-v1" || chain_hash || diff_bits || address || timestamp || nonce)`
-2. Finds a 42-cycle Cuckatoo27 proof matching that preimage (1.3 GB RAM, single-threaded)
+2. Finds a 42-cycle Cuckatoo27 proof matching that preimage (~1.5 GB RAM per solver thread)
 3. Submits `mint(chain_hash, diff_bits, address, timestamp, nonce, proof)` to the contract
 4. Contract verifies the Cuckatoo proof, checks difficulty, checks nullifier, credits the reward address
 
@@ -39,6 +39,8 @@ The contract is minimal: `init()`, `mint()`, plus standard ERC-20 `transfer`/`ap
 **Chain binding.** The preimage commits to `blake3(chain_name)`, set at contract init. A proof solved for "arbitrum" won't verify on a contract deployed for "ethereum" or any other chain.
 
 **No sender check.** Anyone can submit a valid proof to credit any address — the proof is bound to the reward address in the preimage, so paying gas to give someone else free tokens is the only possible "attack."
+
+**Deployment note.** `init()` is permissionless and one-time. Call it atomically with the deployment (same transaction or multicall) — if someone front-runs it with a different `chain_name`, the contract is permanently bound to the wrong chain hash and must be redeployed.
 
 ---
 
@@ -52,6 +54,8 @@ vess-miner --config /path/config.toml
 
 The miner is a multi-threaded Cuckatoo27 solver that submits proofs directly to Arbitrum RPC.
 
+It mines on **1 core by default**. Set `cores = N` in `miner.toml` to scale up — each solver thread allocates ~1.5 GB RAM, so keep `N × 1.5 GB` within your free memory. Difficulty-passing proofs are handed to a single submitter thread, which serializes transactions (no nonce races), waits for receipts, and retries transient RPC failures.
+
 **Security model:** The miner uses a separate gas-payer key (auto-generated, stored in `miner.key`). Your reward address — set in `miner.toml` — is a public wallet that never touches the miner machine. Fund the gas address with a small amount of ETH; if the machine is compromised, the attacker gets an empty gas key and no access to your Vess.
 
 On first run the miner generates `miner.key` and `miner.address`. Fund the address in `miner.address` with ETH, set your `reward_address` in `miner.toml`, and start mining.
@@ -64,7 +68,7 @@ The miner saves progress to `miner.json` every 30 seconds. On restart it resumes
 
 | Crate | Purpose |
 |-------|---------|
-| `vess-crypto` | Blake3, Cuckatoo27 solver/verifier, difficulty, shared types (no_std compatible) |
+| `vess-crypto` | Blake3, Cuckatoo27 solver/verifier, difficulty, shared types (`verify` feature builds only the verifier, for the contract) |
 | `vess-contract` | Arbitrum Stylus ERC-20 token with Cuckatoo minting |
 | `vess-miner` | Multi-threaded miner with alloy RPC, state persistence, auto key generation |
 

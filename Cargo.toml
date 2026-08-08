@@ -16,3 +16,8 @@ opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
+
+# Stylus contract: optimize for wasm size. Profiles only take effect at the
+# workspace root, so this per-package override lives here.
+[profile.release.package.vess-contract]
+opt-level = "z"
