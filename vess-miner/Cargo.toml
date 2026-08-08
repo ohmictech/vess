@@ -1,0 +1,25 @@
+[package]
+name = "vess-miner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+vess-crypto = { path = "../vess-crypto", features = ["full"] }
+alloy = { version = "1", features = ["full"] }
+alloy-provider = "1"
+alloy-transport-http = "1"
+alloy-signer = "1"
+alloy-signer-local = "1"
+alloy-network = "1"
+alloy-primitives = "1"
+alloy-sol-types = "1"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+anyhow = "1"
+hex = "0.4"
+clap = { version = "4", features = ["derive"] }
+chrono = "0.4"
+indicatif = "0.17"

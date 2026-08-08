@@ -1,127 +1,74 @@
 # Vess
 
-**Vess is a post-quantum, feeless, work-tethered, decentralized crypto payment protocol.**
-
-What this network achieves:
-
-- Quantum resistant from the ground up
-- ~1 second block time
-- Good surveillance resistance
-- No orphaned blocks
-- Bandwidth limited throughput
-- Zero transaction fees
-- Low state bloat and hardware requirements
-- Payment transport agnosticism (OOB)
-- Memory hard, ASIC resistant mining
-- No pre-mine or VC
-- Commodity rather than artificial scarcity
-- Tiny codebase
+**Vess is a decentralized compute oracle, platform-agnostic (currently living on Arbitrum). Emission is tied directly to inputted work, no speculation, no gambling, pure commodity.**
 
 ---
 
-The reason for its existence overlaps precisely zero with almost the entirety of DeFi. If you're interested in making a quick buck, move along.
+## Philosophy
 
-Vess is intended as a thermodynamic currency, rather than a speculative asset to hold and sell for more later on. There are no arbitrary tokenomics or programmatic deflation schedules. Mine it, spend it, move it around. Create velocity rather than stagnation, using it as an actual payment method. Issuance tracks expected work directly: every Vess ever minted represents the same marginal unit of computation, whatever the hashrate. Elastic, not scarce.
+Every Vess ever created represents the same marginal unit of computation. Not staking, not locking, not "owning to earn" — just raw CPU cycles converted into money at a fixed ratio.
 
----
+Vess inverts the usual token model. Most coins create artificial scarcity: fixed supply, halvings, deflation schedules designed to pump the chart. Vess is elastic — issuance responds directly to hashrate. If more miners join, more Vess is minted. If miners leave, less enters circulation. The *per-unit* cost of creation stays flat. Like any commodity — oil, copper, electricity — price is set by the market that uses it, not by a pre-programmed supply curve.
 
-It allows feelessness because unlike traditional consensus, it does not passively and politely reorder malicious data. Millions of lines of code have been written in the past two decades to solidify distributed ledgers that agree on which version of a spend is the correct one. Blocks, PoW, PoS, DAGs. Their entire architectural purpose outside of agreement on a set of data is to respectfully resolve conflicts.
-
-Unfortunately, historical cryptocurrency offloads the cost of malice onto honest node operators. You pay for adversarial resistance with fees, state bloat, throughput blockages, all in the name of protection. Vess understands a double spend for what it actually is: a willful, malicious attempt to extract value and sabotage a network.
-
-So, a conflict in Vess is resolved with appropriate force: a total vaporization of all associated UTXOs. If a node sees a conflicting set of payments, it simply deletes all associated inputs. The penalty for dishonesty in Vess rests completely on the attackers.
-
-**This is retributive consensus: agreement by punishment, not by reordering.**
+**0 bits = 1 Vess (every valid proof earns). 1 bit = 2 Vess. 2 bits = 4 Vess.** That's it. No DAA, no epoch adjustments, no governance. The miner picks their target difficulty, solves a Cuckatoo proof at that difficulty, and submits it. The contract verifies the proof and credits the reward address. Compute → emission, 1:1.
 
 ---
 
-## Everything is out-of-band
+## Why Arbitrum Stylus
 
-Vess payments never touch the node network until the receiver decides to submit them. A `vess://` invoice and its signed `VessPayment` blob travel between payer and payee through whatever channel they already use: a messaging app, a QR code, an email, a USB drive, a printed piece of paper. The network only sees the blob when the receiver claims it. Until then, the bytes are inert.
+Vess originally ran on its own L1 (source retained in this repo). The pivot to an Arbitrum Stylus contract is pragmatic:
 
-This scatters the payment graph across carriers the network has no visibility into. An analyst who reconstructs every on-chain event still doesn't know whether the blob traveled through Signal or a sticker on a coffee shop counter. You can't eclipse-attack a payment that doesn't touch the mesh. You can't DDoS a transaction out of a mempool that isn't involved until the receiver is ready.
+- **Gas is externalized.** Miners pay ETH for gas, Vess holders pay nothing to transfer. The token itself is feeless.
+- **No bootstrapping a validator set.** Arbitrum already has security, finality, and a live network of RPC providers and indexers.
+- **Stylus runs Rust natively.** The Cuckatoo verifier compiles to WASM and executes at near-native speed. A 42-cycle proof verifies in microseconds on-chain.
+- **ERC-20 compatibility.** Vess works with every Arbitrum wallet, DEX, and bridge out of the box.
 
-**Claim-latency rule: never deliver before inclusion.** A `VessPayment` blob is a signed promise which has no guaranteed value until the receiver submits it to the network *and* a miner includes it in a block with confirmation. Treat it like receiving a signed cheque.
-
-The format is just bytes. Any app can generate an invoice, any wallet can sign a payment, any node can accept the submission. No API key, no registration, no handshake.
+The contract is minimal: `init()`, `mint()`, plus standard ERC-20 `transfer`/`approve`/`transferFrom`/`balanceOf`. No governance token, no DAO, no upgrade proxy.
 
 ---
 
-## How it works
+## How minting works
 
-Mining is Cuckatoo27: find a 42-cycle in a graph with 2^27 edges, which takes about 1.3 GB of RAM and runs single-threaded. The 42 sorted nonces are embedded in the block header, and a block's difficulty is the number of leading zero bits on the Blake3 hash of that proof — bound to the header by the cycle itself. Sorting is consensus-enforced, so one cycle yields exactly one valid proof and the difficulty target can't be ground by permutation. Nodes verify the proof in microseconds. Difficulty adjusts every 40 blocks via a rolling average of recent block intervals toward a 1-second target.
+1. Miner builds a preimage: `blake3("vess-id-v1" || chain_hash || diff_bits || address || timestamp || nonce)`
+2. Finds a 42-cycle Cuckatoo27 proof matching that preimage (1.3 GB RAM, single-threaded)
+3. Submits `mint(chain_hash, diff_bits, address, timestamp, nonce, proof)` to the contract
+4. Contract verifies the Cuckatoo proof, checks difficulty, checks nullifier, credits the reward address
 
-The base difficulty pays 1 Vess per block. For every bit beyond, the reward doubles, resulting in a linear emissions scale.
+**Nullifiers prevent double-submission.** Each mint inserts a nullifier keyed by `blake3(preimage)` with expiry = `timestamp`. The nullifier blocks resubmission until the timestamp passes. After expiry, the timestamp itself is stale (must be in the future), so the mint is permanently dead.
 
-1% of each block reward (minimum 1 Vess) goes to a hardcoded dev key. No premine, no ICO.
+**Chain binding.** The preimage commits to `blake3(chain_name)`, set at contract init. A proof solved for "arbitrum" won't verify on a contract deployed for "ethereum" or any other chain.
 
-**The core security is DAGARC — a directed acyclic graph armored by retributive consensus.** Blocks merge; they don't orphan. Each block references every live tip it knows (up to 8). When two miners race, the next block references both branches: both coinbases pay out, no work is wasted, and the tips collapse back to one. A block's work accumulates over its full ancestry. The merge also closes the last double-spend hole: conflicting spends placed on different branches vaporize all the same when the branches unite. There is no branch on which a conflict survives.
+**No sender check.** Anyone can submit a valid proof to credit any address — the proof is bound to the reward address in the preimage, so paying gas to give someone else free tokens is the only possible "attack."
 
-Every node maintains a UTXO set in LMDB. Entries are opaque hashes with no amounts or owner data. When a payment arrives, nodes verify the ML-DSA-65 signatures, check that inputs are unspent, and apply the state change. If two payments spend the same coin, Vess doesn't reorder them: it vaporizes all inputs from both. The attacker loses everything; honest users lose nothing.
+---
 
-Both payments and wallet consolidations have a nearly identical fingerprint, making linkability extremely difficult.
-
-Spending always starts with a `vess://` invoice. The payer's wallet builds a signed `VessPayment` blob and hands it back to the receiver out-of-band. The receiver submits it to any node. Each output uses a fresh one-time ML-DSA-65 keypair — nothing to reuse, link, or track.
-
-### No seed phrases
-
-Vess has no BIP39, no HD derivation, no master seed. Each UTXO contains its own independent ML-DSA-65 keypair, stored directly in your encrypted `wallet.vess` file. Your wallet file is your money.
-
-No phrase to leak. No derivation paths, no gap limits, no chain scanning. Cold storage is copying `wallet.vess` to a USB drive or cloud storage. Backup is copy. Lose all copies and those coins are gone.
-
-### Spend conditions: hashlock and expiry
-
-Every Vess output can carry an optional `SpendCondition` with two independent constraints:
-
-**Hashlock.** The output can only be spent by revealing a preimage whose Blake3 hash matches the lock. This enables atomic swaps: Alice funds an output locked to `blake3(secret)`, Bob does the same on his chain, and when either claims using the preimage, the other learns it. A `[0u8; 32]` hash means no hashlock.
-
-**Expiry.** The output can only be spent before a given UNIX timestamp. After that time, the output is permanently dead — even with the correct preimage. Useful for payment channels with deadlines, offer windows, or time-bounded escrow. A value of `0` means no expiry.
-
-Both constraints can be combined on a single output. The payer sets the condition when building the payment; the receiver must satisfy it (provide the preimage, submit before the deadline) when submitting. A payment that fails its conditions is rejected by all nodes.
-
-### Running a node
+## Miner (ultra-light)
 
 ```
-vess-node                           # default: 0.0.0.0:9876
-vess-node --listen 0.0.0.0:9877     # custom port
-vess-node --bootstrap peer:9876     # join existing network
-vess-node --bootstrap peers.txt     # file with one peer per line
-vess-node --bootstrap https://example.com/peers.txt  # fetch from URL
+vess-miner                           # reads miner.toml, starts mining
+vess-miner --generate-config         # write default miner.toml and exit
+vess-miner --config /path/config.toml
 ```
 
-```
-mine         # start mining (1 core)
-mine 4       # start mining with 4 cores
-mine stop    # stop mining
-peer 1.2.3.4:9876  # connect to a peer
-status       # show peers, UTXOs, difficulty, mining state
-```
+The miner is a multi-threaded Cuckatoo27 solver that submits proofs directly to Arbitrum RPC.
 
-### NAT and hole-punching
+**Security model:** The miner uses a separate gas-payer key (auto-generated, stored in `miner.key`). Your reward address — set in `miner.toml` — is a public wallet that never touches the miner machine. Fund the gas address with a small amount of ETH; if the machine is compromised, the attacker gets an empty gas key and no access to your Vess.
 
-Vess nodes communicate over UDP. You don't need port forwarding, NAT traversal automatically happens using public introducer peers.
+On first run the miner generates `miner.key` and `miner.address`. Fund the address in `miner.address` with ETH, set your `reward_address` in `miner.toml`, and start mining.
 
-Every node detects whether it's behind NAT by comparing its self-reported address to the address peers see in `PeerAnnounce` messages. The only requirement is that at least one public introducer node exists in the mesh, and any node with an open port on a public IP can serve this role. Bootstrapping to a public seed node is all you need.
+The miner saves progress to `miner.json` every 30 seconds. On restart it resumes from where it left off. Ctrl+C triggers a clean save-and-exit.
 
-### Running the wallet
+---
 
-```
-vess-wallet --connect 127.0.0.1:9876 # connect to a node (required before sync, send, etc.)
-vess-wallet --import vess-db         # import coinbase UTXOs
-vess-wallet --import-key pub sec     # import a raw keypair
-vess-wallet --balance                # check balance
-vess-wallet --sync                   # confirm unclaimed UTXOs against node
-vess-wallet --invoice 100            # generate vess:// invoice
-vess-wallet --pay "vess://..." --out payment.vess
-vess-wallet --receive payment.vess   # claim received blob
-vess-wallet --consolidate            # merge small UTXOs
-```
+## Workspace
 
-Hashlock and expiry on invoices:
-```
-vess-wallet --invoice 100 --hashlock <preimage>
-vess-wallet --invoice 100 --expires 1720000000
-```
+| Crate | Purpose |
+|-------|---------|
+| `vess-crypto` | Blake3, Cuckatoo27 solver/verifier, difficulty, shared types (no_std compatible) |
+| `vess-contract` | Arbitrum Stylus ERC-20 token with Cuckatoo minting |
+| `vess-miner` | Multi-threaded miner with alloy RPC, state persistence, auto key generation |
+
+---
 
 ## License
 

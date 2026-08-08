@@ -3,11 +3,16 @@ name = "vess-crypto"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = ["full"]
+full = ["rand", "ml-dsa", "ml-kem"]
+verify = []
+
 [dependencies]
 blake3 = "1"
 argon2 = "0.5"
 chacha20poly1305 = "0.10"
-rand = "0.8"
-ml-dsa = { version = "0.1.1", features = ["zeroize"] }
-ml-kem = { version = "0.3", features = ["getrandom", "zeroize"] }
+rand = { version = "0.8", optional = true }
+ml-dsa = { version = "0.1.1", features = ["zeroize"], optional = true }
+ml-kem = { version = "0.3", features = ["getrandom", "zeroize"], optional = true }
 zeroize = { version = "1", features = ["derive"] }

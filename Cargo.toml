@@ -1,9 +1,8 @@
 [workspace]
 members = [
     "vess-crypto",
-    "vess-network",
-    "vess-wallet",
-    "vess-node",
+    "vess-contract",
+    "vess-miner",
 ]
 resolver = "2"
 

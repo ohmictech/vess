@@ -73,26 +73,58 @@ fn max_edges_for(edge_bits: u32) -> u64 {
 }
 
 pub fn verify(header_hash: &[u8; 32], proof: &[u32], cycle_len: usize, edge_bits: u32) -> bool {
-    if proof.len() != cycle_len { return false; }
+    if proof.len() != cycle_len || cycle_len > CYCLE_LENGTH { return false; }
     // Canonical form: strictly ascending nonces. Rejects permutation grinding
     // (same cycle, different order → different difficulty hash) and duplicates.
     if proof.windows(2).any(|w| w[0] >= w[1]) { return false; }
     // Every nonce must index an edge the solver could actually have used.
     let max_edges = max_edges_for(edge_bits);
     if proof.iter().any(|&n| n as u64 >= max_edges) { return false; }
+
     let key = siphash_key(header_hash);
-    let edges: Vec<(u64, u64)> = proof.iter()
-        .map(|&n| edge_pair(&key, n as u64, edge_bits))
-        .collect();
 
-    let mut node_count: HashMap<u64, u32> = HashMap::new();
-    for &(u, v) in &edges {
-        *node_count.entry(u).or_insert(0) += 1;
-        *node_count.entry(v).or_insert(0) += 1;
+    // ── zero-alloc: stack arrays instead of Vec + HashMap ─────────────
+
+    // Edges: (u, v) for each nonce.
+    let mut edges: [(u64, u64); CYCLE_LENGTH] = [(0, 0); CYCLE_LENGTH];
+    // Node counter: (node_id, count). At most 2*cycle_len unique nodes.
+    let mut nodes: [(u64, u32); CYCLE_LENGTH * 2] = [(0, 0); CYCLE_LENGTH * 2];
+    let mut node_count: usize = 0;
+
+    for i in 0..cycle_len {
+        let (u, v) = edge_pair(&key, proof[i] as u64, edge_bits);
+        edges[i] = (u, v);
+
+        // insert-or-increment u
+        let mut found = false;
+        for j in 0..node_count {
+            if nodes[j].0 == u { nodes[j].1 += 1; found = true; break; }
+        }
+        if !found {
+            if node_count >= CYCLE_LENGTH * 2 { return false; }
+            nodes[node_count] = (u, 1);
+            node_count += 1;
+        }
+        // insert-or-increment v
+        found = false;
+        for j in 0..node_count {
+            if nodes[j].0 == v { nodes[j].1 += 1; found = true; break; }
+        }
+        if !found {
+            if node_count >= CYCLE_LENGTH * 2 { return false; }
+            nodes[node_count] = (v, 1);
+            node_count += 1;
+        }
     }
-    if node_count.values().any(|&c| c != 2) { return false; }
 
-    let mut visited = vec![false; cycle_len];
+    // Every node must have degree exactly 2.
+    for j in 0..node_count {
+        if nodes[j].1 != 2 { return false; }
+    }
+
+    // ── cycle traversal ──────────────────────────────────────────────
+
+    let mut visited = [false; CYCLE_LENGTH];
     let mut cur = edges[0].0;
     for _ in 0..cycle_len {
         let mut found = false;
@@ -211,19 +243,29 @@ pub fn solve(header_hash: &[u8; 32], cycle_len: usize, edge_bits: u32) -> Option
 
 /// Hash a proof into a VessId.
 pub fn proof_to_id(proof: &[u32]) -> [u8; 32] {
-    let mut data = Vec::with_capacity(proof.len() * 4);
-    for n in proof { data.extend_from_slice(&n.to_le_bytes()); }
+    let mut data = [0u8; CYCLE_LENGTH * 4];
+    for (i, n) in proof.iter().enumerate() {
+        data[i * 4..(i + 1) * 4].copy_from_slice(&n.to_le_bytes());
+    }
     crate::blake3_hash(&data)
 }
 
 /// Build the header hash that seeds siphash for a given mint.
-pub fn mint_header(amount: u64, owner_hash: &[u8; 32], timestamp: u64, nonce: u64) -> [u8; 32] {
-    let mut pre = Vec::new();
-    pre.extend_from_slice(crate::VESS_ID_V1);
-    pre.extend_from_slice(&amount.to_le_bytes());
-    pre.extend_from_slice(owner_hash);
-    pre.extend_from_slice(&timestamp.to_le_bytes());
-    pre.extend_from_slice(&nonce.to_le_bytes());
+/// Commits to: VESS_ID_V1 || chain_hash || diff_bits || address || timestamp || nonce.
+pub fn mint_header(
+    chain_hash: &[u8; 32],
+    diff_bits: u32,
+    address: &[u8; 32],
+    timestamp: u64,
+    nonce: u64,
+) -> [u8; 32] {
+    let mut pre = [0u8; 94]; // 10 + 32 + 4 + 32 + 8 + 8
+    pre[0..10].copy_from_slice(crate::VESS_ID_V1);
+    pre[10..42].copy_from_slice(chain_hash);
+    pre[42..46].copy_from_slice(&diff_bits.to_le_bytes());
+    pre[46..78].copy_from_slice(address);
+    pre[78..86].copy_from_slice(&timestamp.to_le_bytes());
+    pre[86..94].copy_from_slice(&nonce.to_le_bytes());
     crate::blake3_hash(&pre)
 }
 
