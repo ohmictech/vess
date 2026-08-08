@@ -94,7 +94,7 @@ jobs:
         run: |
           cargo stylus check \
             --wasm-file target/wasm32-unknown-unknown/release/vess_contract.wasm \
-            --rpc-url "$RPC_URL"
+            --endpoint "$RPC_URL"
 
       - name: Deploy contract
         env:
@@ -105,5 +105,5 @@ jobs:
           cargo stylus deploy \
             --wasm-file target/wasm32-unknown-unknown/release/vess_contract.wasm \
             --private-key "$PRIVATE_KEY" \
-            --rpc-url "$RPC_URL" \
+            --endpoint "$RPC_URL" \
             --no-verify
