@@ -18,6 +18,7 @@ permissions:
 
 jobs:
   build:
+    if: github.event_name == 'push'
     strategy:
       matrix:
         include:
@@ -63,6 +64,7 @@ jobs:
           Compress-Archive -Path target/${{ matrix.target }}/release/vess-miner.exe -DestinationPath $dst
 
       - name: Upload to release
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: vess-${{ github.ref_name }}-${{ matrix.target }}.*
