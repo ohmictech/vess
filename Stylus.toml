@@ -1,4 +1,10 @@
 # Stylus contract configuration (used by cargo-stylus check/deploy)
+[workspace.networks.sepolia]
+endpoint = "https://sepolia-rollup.arbitrum.io/rpc"
+
+[workspace.networks.mainnet]
+endpoint = "https://arb1.arbitrum.io/rpc"
+
 [contract]
 crate-type = "cdylib"
 
