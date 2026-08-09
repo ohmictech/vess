@@ -1,7 +1,8 @@
-//! Call the contract's bisection probes and show which ones trap.
+//! Call the contract's bisection probes and show their results.
 //!
-//! Each probe is called via eth_call. A readable result means that layer of
-//! the mint path works; "empty revert" means that layer traps in WASM.
+//! Each probe is called via eth_call. A readable result — or a readable revert
+//! reason — means that layer of the mint path works. Stylus surfaces
+//! `Err(Vec<u8>)` as raw revert bytes (not ABI-wrapped `Error(string)`).
 
 use alloy::{
     primitives::{Address, Bytes, FixedBytes},
@@ -31,6 +32,25 @@ struct Args {
     rpc: String,
 }
 
+/// Decode `Error(string)` or raw revert bytes into a readable string.
+fn decode_revert(data: &[u8]) -> String {
+    if data.len() >= 4 && data[..4] == [0x08, 0xc3, 0x79, 0xa0] {
+        if data.len() >= 68 {
+            let len = u32::from_be_bytes(data[36..40].try_into().unwrap()) as usize;
+            let start = 68;
+            if start + len <= data.len() {
+                return String::from_utf8_lossy(&data[start..start + len]).to_string();
+            }
+        }
+        format!("Error(string) with {} bytes", data.len())
+    } else if data.is_empty() {
+        "empty revert data".into()
+    } else {
+        // Stylus `Result<T, Vec<u8>>` errors are raw bytes.
+        String::from_utf8_lossy(data).into_owned()
+    }
+}
+
 fn show(label: &str, result: Result<Bytes, alloy::transports::TransportError>) {
     match result {
         Ok(data) => println!(
@@ -39,16 +59,12 @@ fn show(label: &str, result: Result<Bytes, alloy::transports::TransportError>) {
             hex::encode(&data)
         ),
         Err(RpcError::ErrorResp(payload)) => {
-            let data = payload
-                .data
-                .as_ref()
-                .map(|raw| hex::decode(raw.get().trim_start_matches("0x")).unwrap_or_default())
-                .unwrap_or_default();
+            // RawValue::get() keeps the JSON quotes — use as_revert_data().
+            let data = payload.as_revert_data().unwrap_or_default();
             if data.is_empty() {
-                println!("{label}: TRAP (empty revert)");
+                println!("{label}: REVERT (no data): {}", payload.message);
             } else {
-                let text = String::from_utf8_lossy(&data);
-                println!("{label}: REVERT readable -> {text}");
+                println!("{label}: REVERT readable -> {}", decode_revert(&data));
             }
         }
         Err(e) => println!("{label}: CALL ERROR {e:?}"),
@@ -73,6 +89,12 @@ async fn main() -> Result<()> {
     let ts = 1786403491u64;
     let nonce = 41u64;
     let proof = [0u32; vess_crypto::cuckoo::CYCLE_LENGTH];
+    // Ascending proof exercises verify's HEAVY path (siphash, edge gen,
+    // heap alloc, degree check) instead of short-circuiting on 0>=0.
+    let mut asc = [0u32; vess_crypto::cuckoo::CYCLE_LENGTH];
+    for (i, a) in asc.iter_mut().enumerate() {
+        *a = i as u32;
+    }
 
     let call_tx = |calldata: Vec<u8>| {
         alloy::rpc::types::TransactionRequest::default()
@@ -104,7 +126,7 @@ async fn main() -> Result<()> {
             .await,
     );
     show(
-        "probeVerify(...)",
+        "probeVerify(...zeroed proof, short-circuit)...",
         provider
             .call(call_tx(
                 probeVerifyCall {
@@ -114,6 +136,22 @@ async fn main() -> Result<()> {
                     timestamp: ts,
                     nonce,
                     proof,
+                }
+                .abi_encode(),
+            ))
+            .await,
+    );
+    show(
+        "probeVerify(...ascending proof, heavy path)...",
+        provider
+            .call(call_tx(
+                probeVerifyCall {
+                    chain_hash: FixedBytes(chain_h),
+                    diff_bits: 0,
+                    address: FixedBytes(addr_32),
+                    timestamp: ts,
+                    nonce,
+                    proof: asc,
                 }
                 .abi_encode(),
             ))

@@ -142,13 +142,8 @@ async fn main() -> Result<()> {
         ),
         Err(RpcError::ErrorResp(payload)) => {
             println!("RAW ERROR payload: {payload:#?}");
-            match payload.data.as_ref() {
-                Some(raw) => {
-                    let hex_str = raw.get();
-                    let bytes = hex::decode(hex_str.trim_start_matches("0x"))
-                        .unwrap_or_default();
-                    println!("REVERT: {}", decode_revert(&bytes));
-                }
+            match payload.as_revert_data() {
+                Some(bytes) => println!("REVERT: {}", decode_revert(&bytes)),
                 None => println!("REVERT (no data): {}", payload.message),
             }
         }
@@ -177,13 +172,8 @@ async fn main() -> Result<()> {
             data.len(),
             hex::encode(&data)
         ),
-        Err(RpcError::ErrorResp(payload)) => match payload.data.as_ref() {
-            Some(raw) => {
-                let hex_str = raw.get();
-                let bytes = hex::decode(hex_str.trim_start_matches("0x"))
-                    .unwrap_or_default();
-                println!("BOGUS REVERT: {}", decode_revert(&bytes));
-            }
+        Err(RpcError::ErrorResp(payload)) => match payload.as_revert_data() {
+            Some(bytes) => println!("BOGUS REVERT: {}", decode_revert(&bytes)),
             None => println!("BOGUS REVERT (no data): {}", payload.message),
         },
         Err(e) => println!("BOGUS CALL ERROR: {e:?}"),
@@ -209,13 +199,8 @@ async fn main() -> Result<()> {
             data.len(),
             hex::encode(&data)
         ),
-        Err(RpcError::ErrorResp(payload)) => match payload.data.as_ref() {
-            Some(raw) => {
-                let hex_str = raw.get();
-                let bytes = hex::decode(hex_str.trim_start_matches("0x"))
-                    .unwrap_or_default();
-                println!("SHORT REVERT: {}", decode_revert(&bytes));
-            }
+        Err(RpcError::ErrorResp(payload)) => match payload.as_revert_data() {
+            Some(bytes) => println!("SHORT REVERT: {}", decode_revert(&bytes)),
             None => println!("SHORT REVERT (no data): {}", payload.message),
         },
         Err(e) => println!("SHORT CALL ERROR: {e:?}"),
@@ -235,10 +220,7 @@ async fn main() -> Result<()> {
     match provider.call(approve_tx).await {
         Ok(data) => println!("APPROVE OK: 0x{}", hex::encode(&data)),
         Err(RpcError::ErrorResp(payload)) => {
-            let msg = payload.data.as_ref().map(|r| {
-                let b = hex::decode(r.get().trim_start_matches("0x")).unwrap_or_default();
-                decode_revert(&b)
-            });
+            let msg = payload.as_revert_data().map(|b| decode_revert(&b));
             println!("APPROVE REVERT: {}", msg.unwrap_or_else(|| payload.message.to_string()));
         }
         Err(e) => println!("APPROVE CALL ERROR: {e:?}"),
@@ -254,10 +236,7 @@ async fn main() -> Result<()> {
     match provider.call(transfer_tx).await {
         Ok(data) => println!("TRANSFER OK (unexpected): 0x{}", hex::encode(&data)),
         Err(RpcError::ErrorResp(payload)) => {
-            let msg = payload.data.as_ref().map(|r| {
-                let b = hex::decode(r.get().trim_start_matches("0x")).unwrap_or_default();
-                decode_revert(&b)
-            });
+            let msg = payload.as_revert_data().map(|b| decode_revert(&b));
             println!(
                 "TRANSFER REVERT: {}",
                 msg.unwrap_or_else(|| payload.message.to_string())

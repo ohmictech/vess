@@ -23,6 +23,23 @@ sol! {
 
 const MAX_FUTURE_SECS: u64 = 48 * 3600;
 
+/// ABI-encode a revert reason as standard Solidity `Error(string)` (selector
+/// 0x08c379a0) so explorers, wallets, and tooling decode it natively.
+fn abi_err(msg: &str) -> Vec<u8> {
+    let msg = msg.as_bytes();
+    let padded = (msg.len() + 31) / 32 * 32;
+    let mut out = Vec::with_capacity(4 + 32 + 32 + padded);
+    out.extend_from_slice(&[0x08, 0xc3, 0x79, 0xa0]);
+    let mut word = [0u8; 32];
+    word[24..].copy_from_slice(&32u64.to_be_bytes()); // head: offset to string data
+    out.extend_from_slice(&word);
+    word[24..].copy_from_slice(&(msg.len() as u64).to_be_bytes()); // string length
+    out.extend_from_slice(&word);
+    out.extend_from_slice(msg);
+    out.resize(4 + 32 + 32 + padded, 0); // zero-pad to a 32-byte multiple
+    out
+}
+
 #[storage]
 #[entrypoint]
 pub struct Vess {
@@ -103,7 +120,7 @@ impl Vess {
         let spender = self.vm().msg_sender();
         let allowed = self.allowances.getter(from).getter(spender).get();
         if allowed < value {
-            return Err("insufficient allowance".into());
+            return Err(abi_err("insufficient allowance"));
         }
         // Unchecked sub is safe due to check above
         self.allowances
@@ -120,9 +137,10 @@ impl Vess {
     /// All fields must match the preimage the miner solved against:
     /// `mint_header(chain_hash, diff_bits, address, timestamp, nonce)`.
     ///
-    /// `proof` is a fixed `uint32[42]` (the 42 nonces). NOTE: it is a fixed
-    /// array on purpose — the Stylus 0.10 WASM router fails to decode dynamic
-    /// `bytes` args, which previously made every mint revert with empty data.
+    /// `proof` is a fixed `uint32[42]` (the 42 nonces). NOTE: fixed array on
+    /// purpose — a `Vec<u8>` param maps to Solidity `uint8[]`, not `bytes`,
+    /// which previously caused a selector mismatch with the miner's
+    /// `bytes`-encoded calls (every mint reverted at dispatch).
     pub fn mint(
         &mut self,
         chain_hash: FixedBytes<32>,
@@ -135,7 +153,7 @@ impl Vess {
         // ── chain binding ────────────────────────────────────────────────
         let expected = self.chain_hash.get();
         if chain_hash.0 != expected.0 {
-            return Err("wrong chain".into());
+            return Err(abi_err("wrong chain"));
         }
 
         // ── decode reward address ────────────────────────────────────────
@@ -146,7 +164,7 @@ impl Vess {
         reward.copy_from_slice(&address.0[..20]);
         let recipient = Address::from(reward);
         if recipient == Address::ZERO {
-            return Err("zero address".into());
+            return Err(abi_err("zero address"));
         }
 
         // ── preimage + nullifier key ────────────────────────────────────
@@ -157,7 +175,7 @@ impl Vess {
         let now = self.vm().block_timestamp();
         let existing = self.nullifiers.getter(nullifier_key).get();
         if !existing.is_zero() && U256::from(now) < existing {
-            return Err("already minted".into());
+            return Err(abi_err("already minted"));
         }
         // An expired nullifier (now >= existing) can never mint again anyway:
         // the preimage timestamp is the stored expiry, so the staleness check
@@ -165,16 +183,16 @@ impl Vess {
 
         // ── timestamp validity ───────────────────────────────────────────
         if timestamp <= now || timestamp > now + MAX_FUTURE_SECS {
-            return Err("timestamp out of range".into());
+            return Err(abi_err("timestamp out of range"));
         }
 
         // ── PoW verification ─────────────────────────────────────────────
         if !cuckoo::verify(&header, &proof, cuckoo::CYCLE_LENGTH, cuckoo::EDGE_BITS) {
-            return Err("invalid cuckatoo proof".into());
+            return Err(abi_err("invalid cuckatoo proof"));
         }
         let pow_hash = cuckoo::proof_to_id(&proof);
         if !check_difficulty(&pow_hash, diff_bits) {
-            return Err("difficulty not met".into());
+            return Err(abi_err("difficulty not met"));
         }
 
         // ── nullifier insert ─────────────────────────────────────────────
@@ -194,7 +212,7 @@ impl Vess {
     pub fn transfer_ownership(&mut self, new_owner: Address) -> Result<bool, Vec<u8>> {
         self._ensure_owner()?;
         if new_owner == Address::ZERO {
-            return Err("zero address".into());
+            return Err(abi_err("zero address"));
         }
         self.owner.set(FixedBytes::from(new_owner.into_array()));
         Ok(true)
@@ -207,7 +225,7 @@ impl Vess {
     pub fn init(&mut self, initial_owner: Address, chain_name: String) -> Result<(), Vec<u8>> {
         let current: FixedBytes<20> = self.owner.get();
         if current != FixedBytes::<20>::ZERO {
-            return Err("already initialized".into());
+            return Err(abi_err("already initialized"));
         }
         self.owner.set(FixedBytes::from(initial_owner.into_array()));
         let ch = blake3_hash(chain_name.as_bytes());
@@ -217,8 +235,8 @@ impl Vess {
     }
 
     // ── Diagnostics (bisection probes) ─────────────────────────────────
-    // These are TEMPORARY helpers to isolate why `mint` traps on-chain.
-    // Call each via eth_call; whichever reverts empty pinpoints the fault.
+    // TEMPORARY helpers from the mint-revert investigation (root cause: stale
+    // bytecode + a client-side tooling bug — no WASM traps). Call via eth_call.
 
     /// Does basic dispatch work for a no-arg function?
     pub fn probe(&self) -> Result<bool, Vec<u8>> {
@@ -289,7 +307,8 @@ impl Vess {
     }
 
     /// Mutating probe mirroring mint's pre-verify body (chain, address,
-    /// header/nullifier, timestamp). Traps if any of those steps does.
+    /// header/nullifier, timestamp). Reverts with a readable reason if any
+    /// of those steps fails.
     pub fn probe_mut_checks(
         &mut self,
         chain_hash: FixedBytes<32>,
@@ -300,13 +319,13 @@ impl Vess {
     ) -> Result<bool, Vec<u8>> {
         let expected = self.chain_hash.get();
         if chain_hash.0 != expected.0 {
-            return Err("wrong chain".into());
+            return Err(abi_err("wrong chain"));
         }
         let mut reward = [0u8; 20];
         reward.copy_from_slice(&address.0[..20]);
         let recipient = Address::from(reward);
         if recipient == Address::ZERO {
-            return Err("zero address".into());
+            return Err(abi_err("zero address"));
         }
         let header =
             cuckoo::mint_header(&chain_hash.0, diff_bits, &address.0, timestamp, nonce);
@@ -314,10 +333,10 @@ impl Vess {
         let now = self.vm().block_timestamp();
         let existing = self.nullifiers.getter(nullifier_key).get();
         if !existing.is_zero() && U256::from(now) < existing {
-            return Err("already minted".into());
+            return Err(abi_err("already minted"));
         }
         if timestamp <= now || timestamp > now + MAX_FUTURE_SECS {
-            return Err("timestamp out of range".into());
+            return Err(abi_err("timestamp out of range"));
         }
         Ok(true)
     }
@@ -340,11 +359,11 @@ impl Vess {
 
     fn _transfer(&mut self, from: Address, to: Address, value: U256) -> Result<bool, Vec<u8>> {
         if to == Address::ZERO {
-            return Err("transfer to zero address".into());
+            return Err(abi_err("transfer to zero address"));
         }
         let from_bal = self.balances.getter(from).get();
         if from_bal < value {
-            return Err("insufficient balance".into());
+            return Err(abi_err("insufficient balance"));
         }
         self.balances.setter(from).set(from_bal - value);
         let to_bal = self.balances.getter(to).get();
@@ -357,7 +376,7 @@ impl Vess {
         let sender = self.vm().msg_sender();
         let owner: FixedBytes<20> = self.owner.get();
         if sender.into_array() != owner.0 {
-            return Err("only owner".into());
+            return Err(abi_err("only owner"));
         }
         Ok(())
     }
@@ -373,9 +392,8 @@ mod tests {
         testing::TestVM,
     };
 
-    /// Proves the current source's error path returns READABLE revert data
-    /// ("insufficient balance") — unlike the stale on-chain build that
-    /// reverted empty. A fresh deploy from this source must carry error data.
+    /// Revert reasons are ABI-wrapped as standard `Error(string)` so
+    /// explorers/wallets decode them natively.
     #[test]
     fn test_transfer_revert_is_readable() {
         let vm = TestVM::default();
@@ -383,7 +401,7 @@ mod tests {
         let err = contract
             .transfer(Address::from([0x22u8; 20]), U256::from(1))
             .unwrap_err();
-        assert_eq!(err, b"insufficient balance".to_vec());
+        assert_eq!(err, abi_err("insufficient balance"));
     }
 
     #[test]
@@ -394,6 +412,19 @@ mod tests {
         contract.init(owner, "arbitrum".into()).unwrap();
         // Second init must fail with a readable "already initialized".
         let err = contract.init(owner, "arbitrum".into()).unwrap_err();
-        assert_eq!(err, b"already initialized".to_vec());
+        assert_eq!(err, abi_err("already initialized"));
+    }
+
+    /// The `Error(string)` wrapper must match the Solidity ABI layout:
+    /// selector 0x08c379a0, offset word = 32, length word, zero-padded data.
+    #[test]
+    fn test_abi_err_layout() {
+        let enc = abi_err("wrong chain"); // 11 bytes -> one padded word
+        assert_eq!(&enc[..4], [0x08, 0xc3, 0x79, 0xa0]);
+        assert_eq!(u64::from_be_bytes(enc[28..36].try_into().unwrap()), 32); // offset
+        assert_eq!(u64::from_be_bytes(enc[60..68].try_into().unwrap()), 11); // length
+        assert_eq!(&enc[68..79], b"wrong chain");
+        assert_eq!(enc.len(), 4 + 32 + 32 + 32);
+        assert!(enc[79..].iter().all(|&b| b == 0)); // padding
     }
 }
