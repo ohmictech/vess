@@ -780,6 +780,25 @@ fn mine_core(ctx: CoreCtx) {
 
 // ---- RPC submit
 
+/// Decode `Error(string)` or raw revert bytes into a readable string.
+fn decode_revert(data: &[u8]) -> String {
+    if data.len() >= 4 && data[..4] == [0x08, 0xc3, 0x79, 0xa0] {
+        if data.len() >= 68 {
+            let len = u32::from_be_bytes(data[36..40].try_into().unwrap()) as usize;
+            let start = 68;
+            if start + len <= data.len() {
+                return String::from_utf8_lossy(&data[start..start + len]).to_string();
+            }
+        }
+        format!("Error(string) with {} bytes", data.len())
+    } else if data.is_empty() {
+        "empty revert data".into()
+    } else {
+        // Stylus `Result<T, Vec<u8>>` errors are raw bytes.
+        String::from_utf8_lossy(data).into_owned()
+    }
+}
+
 async fn submit_mint(
     provider: &impl Provider,
     contract: Address,
@@ -800,6 +819,7 @@ async fn submit_mint(
         .nonce(nonce)
         .gas_limit(gas_limit)
         .input(calldata.into());
+    let tx_clone = tx.clone();
 
     let pending = provider
         .send_transaction(tx)
@@ -819,6 +839,23 @@ async fn submit_mint(
         );
         Ok(tx_hash)
     } else {
+        // Replay via eth_call to surface the real revert reason.
+        match provider.call(tx_clone).await {
+            Ok(_) => eprintln!("  (replay call unexpectedly succeeded)"),
+            Err(alloy::transports::RpcError::ErrorResp(payload)) => {
+                let reason = payload.data.as_ref().map(|raw| {
+                    let hex_str = raw.get();
+                    let bytes =
+                        hex::decode(hex_str.trim_start_matches("0x")).unwrap_or_default();
+                    decode_revert(&bytes)
+                });
+                eprintln!(
+                    "  on-chain revert: {}",
+                    reason.unwrap_or_else(|| payload.message.to_string())
+                );
+            }
+            Err(e) => eprintln!("  revert reason unavailable: {e:?}"),
+        }
         Err(SubmitError::Reverted)
     }
 }

@@ -218,6 +218,62 @@ impl Vess {
         self.total_supply.set(U256::ZERO);
         Ok(())
     }
+
+    // ── Diagnostics (bisection probes) ─────────────────────────────────
+    // These are TEMPORARY helpers to isolate why `mint` traps on-chain.
+    // Call each via eth_call; whichever reverts empty pinpoints the fault.
+
+    /// Does basic dispatch work for a no-arg function?
+    pub fn probe(&self) -> Result<bool, Vec<u8>> {
+        Ok(true)
+    }
+
+    /// Does reading the `chain_hash` storage field work?
+    pub fn probe_chain(&self) -> Result<FixedBytes<32>, Vec<u8>> {
+        Ok(self.chain_hash.get())
+    }
+
+    /// Do mint's static arg types decode and does blake3 (mint_header) work?
+    pub fn probe_header(
+        &self,
+        chain_hash: FixedBytes<32>,
+        diff_bits: u32,
+        address: FixedBytes<32>,
+        timestamp: u64,
+        nonce: u64,
+    ) -> Result<FixedBytes<32>, Vec<u8>> {
+        Ok(FixedBytes::from(cuckoo::mint_header(
+            &chain_hash.0,
+            diff_bits,
+            &address.0,
+            timestamp,
+            nonce,
+        )))
+    }
+
+    /// Do mint's full args (incl. dynamic bytes) decode, and does verify run?
+    pub fn probe_verify(
+        &self,
+        chain_hash: FixedBytes<32>,
+        diff_bits: u32,
+        address: FixedBytes<32>,
+        timestamp: u64,
+        nonce: u64,
+        proof: Vec<u8>,
+    ) -> Result<bool, Vec<u8>> {
+        let nonces: Vec<u32> = proof
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        let header =
+            cuckoo::mint_header(&chain_hash.0, diff_bits, &address.0, timestamp, nonce);
+        Ok(cuckoo::verify(
+            &header,
+            &nonces,
+            cuckoo::CYCLE_LENGTH,
+            cuckoo::EDGE_BITS,
+        ))
+    }
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────
