@@ -16,6 +16,9 @@ alloy_sol_types::sol! {
     function probeChain() external view returns (bytes32);
     function probeHeader(bytes32 chain_hash, uint32 diff_bits, bytes32 address, uint64 timestamp, uint64 nonce) external view returns (bytes32);
     function probeVerify(bytes32 chain_hash, uint32 diff_bits, bytes32 address, uint64 timestamp, uint64 nonce, uint32[42] proof) external view returns (bool);
+    function probeTs() external view returns (uint64);
+    function probeNull(bytes32 chain_hash, uint32 diff_bits, bytes32 address, uint64 timestamp, uint64 nonce) external view returns (bool);
+    function probeMutChecks(bytes32 chain_hash, uint32 diff_bits, bytes32 address, uint64 timestamp, uint64 nonce) external returns (bool);
     function mint(bytes32 chain_hash, uint32 diff_bits, bytes32 address, uint64 timestamp, uint64 nonce, uint32[42] proof) external returns (bool);
 }
 
@@ -110,7 +113,41 @@ async fn main() -> Result<()> {
                     address: FixedBytes(addr_32),
                     timestamp: ts,
                     nonce,
-                    proof: proof.clone().into(),
+                    proof,
+                }
+                .abi_encode(),
+            ))
+            .await,
+    );
+    show(
+        "probeTs()",
+        provider.call(call_tx(probeTsCall {}.abi_encode())).await,
+    );
+    show(
+        "probeNull(...)",
+        provider
+            .call(call_tx(
+                probeNullCall {
+                    chain_hash: FixedBytes(chain_h),
+                    diff_bits: 0,
+                    address: FixedBytes(addr_32),
+                    timestamp: ts,
+                    nonce,
+                }
+                .abi_encode(),
+            ))
+            .await,
+    );
+    show(
+        "probeMutChecks(...)",
+        provider
+            .call(call_tx(
+                probeMutChecksCall {
+                    chain_hash: FixedBytes(chain_h),
+                    diff_bits: 0,
+                    address: FixedBytes(addr_32),
+                    timestamp: ts,
+                    nonce,
                 }
                 .abi_encode(),
             ))
@@ -126,7 +163,7 @@ async fn main() -> Result<()> {
                     address: FixedBytes(addr_32),
                     timestamp: ts,
                     nonce,
-                    proof: proof.into(),
+                    proof,
                 }
                 .abi_encode(),
             ))

@@ -267,6 +267,60 @@ impl Vess {
             cuckoo::EDGE_BITS,
         ))
     }
+
+    /// Does the `block_timestamp` hostio work?
+    pub fn probe_ts(&self) -> Result<u64, Vec<u8>> {
+        Ok(self.vm().block_timestamp())
+    }
+
+    /// Does computing the nullifier key + reading the nullifiers storage map work?
+    pub fn probe_null(
+        &self,
+        chain_hash: FixedBytes<32>,
+        diff_bits: u32,
+        address: FixedBytes<32>,
+        timestamp: u64,
+        nonce: u64,
+    ) -> Result<bool, Vec<u8>> {
+        let header =
+            cuckoo::mint_header(&chain_hash.0, diff_bits, &address.0, timestamp, nonce);
+        let nullifier_key = U256::from_be_bytes(blake3_hash(&header));
+        Ok(self.nullifiers.getter(nullifier_key).get().is_zero())
+    }
+
+    /// Mutating probe mirroring mint's pre-verify body (chain, address,
+    /// header/nullifier, timestamp). Traps if any of those steps does.
+    pub fn probe_mut_checks(
+        &mut self,
+        chain_hash: FixedBytes<32>,
+        diff_bits: u32,
+        address: FixedBytes<32>,
+        timestamp: u64,
+        nonce: u64,
+    ) -> Result<bool, Vec<u8>> {
+        let expected = self.chain_hash.get();
+        if chain_hash.0 != expected.0 {
+            return Err("wrong chain".into());
+        }
+        let mut reward = [0u8; 20];
+        reward.copy_from_slice(&address.0[..20]);
+        let recipient = Address::from(reward);
+        if recipient == Address::ZERO {
+            return Err("zero address".into());
+        }
+        let header =
+            cuckoo::mint_header(&chain_hash.0, diff_bits, &address.0, timestamp, nonce);
+        let nullifier_key = U256::from_be_bytes(blake3_hash(&header));
+        let now = self.vm().block_timestamp();
+        let existing = self.nullifiers.getter(nullifier_key).get();
+        if !existing.is_zero() && U256::from(now) < existing {
+            return Err("already minted".into());
+        }
+        if timestamp <= now || timestamp > now + MAX_FUTURE_SECS {
+            return Err("timestamp out of range".into());
+        }
+        Ok(true)
+    }
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────
