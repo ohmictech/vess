@@ -68,7 +68,9 @@ async fn main() -> Result<()> {
     fn decode_revert(data: &[u8]) -> String {
         if data.len() >= 4 && data[..4] == [0x08, 0xc3, 0x79, 0xa0] {
             if data.len() >= 68 {
-                let len = u32::from_be_bytes(data[36..40].try_into().unwrap()) as usize;
+                // ABI: selector | offset(32B) | len(32B) | string (32B-aligned).
+                // The value sits in the LAST 4 bytes of each 32-byte word.
+                let len = u32::from_be_bytes(data[64..68].try_into().unwrap()) as usize;
                 let start = 68;
                 if start + len <= data.len() {
                     return String::from_utf8_lossy(&data[start..start + len]).to_string();
@@ -92,7 +94,11 @@ async fn main() -> Result<()> {
                 if data.is_empty() {
                     println!("{label}: REVERT (no data): {}", payload.message);
                 } else {
-                    println!("{label}: REVERT readable -> {}", decode_revert(&data));
+                    println!(
+                        "{label}: REVERT hex=0x{} decoded=[{}]",
+                        hex::encode(&data),
+                        decode_revert(&data)
+                    );
                 }
             }
             Err(e) => println!("{label}: CALL ERROR {e:?}"),

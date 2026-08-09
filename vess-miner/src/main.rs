@@ -78,7 +78,10 @@ fn default_state_file() -> String {
 }
 
 fn default_diff_bits() -> u32 {
-    1
+    // Default 4: each accepted proof mints 2^4 = 16 VESS, diluting per-VESS
+    // gas ~16x vs diff=0 (gas becomes negligible vs the electricity floor) at
+    // an average ~5h cadence per find on one core.
+    4
 }
 fn default_cores() -> usize {
     1

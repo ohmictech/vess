@@ -23,6 +23,10 @@ sol! {
 
 const MAX_FUTURE_SECS: u64 = 48 * 3600;
 
+/// Max expired nullifiers reaped per mint, so drain gas stays flat even after
+/// a long downtime (leftovers are cleaned on subsequent mints).
+const MAX_PRUNE_PER_MINT: u32 = 64;
+
 /// ABI-encode a revert reason as standard Solidity `Error(string)` (selector
 /// 0x08c379a0) so explorers, wallets, and tooling decode it natively.
 fn abi_err(msg: &str) -> Vec<u8> {
@@ -55,6 +59,14 @@ pub struct Vess {
     pub owner: StorageFixedBytes<20>,
     /// Mint nullifier: preimage_hash → expiry timestamp.
     pub nullifiers: StorageMap<U256, StorageU256>,
+    /// Expiry FIFO for nullifier pruning: seq → nullifier key (oldest first).
+    /// Lets mint reap nullifiers once their header timestamp passes, capping
+    /// the map at ~the 48h live window instead of growing forever.
+    pub null_order: StorageMap<U256, StorageU256>,
+    /// Front of the expiry FIFO.
+    pub null_head: StorageU256,
+    /// Back of the expiry FIFO (next free seq).
+    pub null_tail: StorageU256,
 }
 
 #[public]
@@ -195,10 +207,17 @@ impl Vess {
             return Err(abi_err("difficulty not met"));
         }
 
-        // ── nullifier insert ─────────────────────────────────────────────
+        // ── nullifier insert + expiry FIFO ──────────────────────────────
+        // Enqueue the key so it can be pruned once its header timestamp
+        // passes. An expired nullifier is provably inert (the header's own
+        // timestamp check rejects reuse), so deleting it bounds the map.
         self.nullifiers
             .setter(nullifier_key)
             .set(U256::from(timestamp));
+        let tail = self.null_tail.get();
+        self.null_order.setter(tail).set(nullifier_key);
+        self.null_tail.set(tail + U256::from(1));
+        self._prune_nullifiers(now);
 
         // ── reward ──────────────────────────────────────────────────────
         let reward = block_reward(diff_bits);
@@ -234,112 +253,6 @@ impl Vess {
         Ok(())
     }
 
-    // ── Diagnostics (bisection probes) ─────────────────────────────────
-    // TEMPORARY helpers from the mint-revert investigation (root cause: stale
-    // bytecode + a client-side tooling bug — no WASM traps). Call via eth_call.
-
-    /// Does basic dispatch work for a no-arg function?
-    pub fn probe(&self) -> Result<bool, Vec<u8>> {
-        Ok(true)
-    }
-
-    /// Does reading the `chain_hash` storage field work?
-    pub fn probe_chain(&self) -> Result<FixedBytes<32>, Vec<u8>> {
-        Ok(self.chain_hash.get())
-    }
-
-    /// Do mint's static arg types decode and does blake3 (mint_header) work?
-    pub fn probe_header(
-        &self,
-        chain_hash: FixedBytes<32>,
-        diff_bits: u32,
-        address: FixedBytes<32>,
-        timestamp: u64,
-        nonce: u64,
-    ) -> Result<FixedBytes<32>, Vec<u8>> {
-        Ok(FixedBytes::from(cuckoo::mint_header(
-            &chain_hash.0,
-            diff_bits,
-            &address.0,
-            timestamp,
-            nonce,
-        )))
-    }
-
-    /// Do mint's full args (incl. fixed-array proof) decode, and does verify run?
-    pub fn probe_verify(
-        &self,
-        chain_hash: FixedBytes<32>,
-        diff_bits: u32,
-        address: FixedBytes<32>,
-        timestamp: u64,
-        nonce: u64,
-        proof: [u32; cuckoo::CYCLE_LENGTH],
-    ) -> Result<bool, Vec<u8>> {
-        let header =
-            cuckoo::mint_header(&chain_hash.0, diff_bits, &address.0, timestamp, nonce);
-        Ok(cuckoo::verify(
-            &header,
-            &proof,
-            cuckoo::CYCLE_LENGTH,
-            cuckoo::EDGE_BITS,
-        ))
-    }
-
-    /// Does the `block_timestamp` hostio work?
-    pub fn probe_ts(&self) -> Result<u64, Vec<u8>> {
-        Ok(self.vm().block_timestamp())
-    }
-
-    /// Does computing the nullifier key + reading the nullifiers storage map work?
-    pub fn probe_null(
-        &self,
-        chain_hash: FixedBytes<32>,
-        diff_bits: u32,
-        address: FixedBytes<32>,
-        timestamp: u64,
-        nonce: u64,
-    ) -> Result<bool, Vec<u8>> {
-        let header =
-            cuckoo::mint_header(&chain_hash.0, diff_bits, &address.0, timestamp, nonce);
-        let nullifier_key = U256::from_be_bytes(blake3_hash(&header));
-        Ok(self.nullifiers.getter(nullifier_key).get().is_zero())
-    }
-
-    /// Mutating probe mirroring mint's pre-verify body (chain, address,
-    /// header/nullifier, timestamp). Reverts with a readable reason if any
-    /// of those steps fails.
-    pub fn probe_mut_checks(
-        &mut self,
-        chain_hash: FixedBytes<32>,
-        diff_bits: u32,
-        address: FixedBytes<32>,
-        timestamp: u64,
-        nonce: u64,
-    ) -> Result<bool, Vec<u8>> {
-        let expected = self.chain_hash.get();
-        if chain_hash.0 != expected.0 {
-            return Err(abi_err("wrong chain"));
-        }
-        let mut reward = [0u8; 20];
-        reward.copy_from_slice(&address.0[..20]);
-        let recipient = Address::from(reward);
-        if recipient == Address::ZERO {
-            return Err(abi_err("zero address"));
-        }
-        let header =
-            cuckoo::mint_header(&chain_hash.0, diff_bits, &address.0, timestamp, nonce);
-        let nullifier_key = U256::from_be_bytes(blake3_hash(&header));
-        let now = self.vm().block_timestamp();
-        let existing = self.nullifiers.getter(nullifier_key).get();
-        if !existing.is_zero() && U256::from(now) < existing {
-            return Err(abi_err("already minted"));
-        }
-        if timestamp <= now || timestamp > now + MAX_FUTURE_SECS {
-            return Err(abi_err("timestamp out of range"));
-        }
-        Ok(true)
-    }
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────
@@ -355,6 +268,32 @@ impl Vess {
             to,
             value,
         });
+    }
+
+    /// Reap nullifiers whose header timestamp has passed, oldest-first.
+    ///
+    /// The FIFO front is the oldest insertion. If the front is still live we
+    /// stop: any expired entries behind it (a later mint may have picked a
+    /// smaller future timestamp) are reaped once the front expires — worst case
+    /// they linger ~one extra 48h window, still a hard bound. Work is capped
+    /// per call so mint gas stays flat after long gaps.
+    fn _prune_nullifiers(&mut self, now: u64) {
+        let mut drained = 0u32;
+        loop {
+            let head = self.null_head.get();
+            if drained >= MAX_PRUNE_PER_MINT || head >= self.null_tail.get() {
+                break;
+            }
+            let key = self.null_order.getter(head).get();
+            let expiry = self.nullifiers.getter(key).get();
+            if U256::from(now) < expiry {
+                break; // front still live → stop
+            }
+            self.nullifiers.delete(key);
+            self.null_order.delete(head);
+            self.null_head.set(head + U256::from(1));
+            drained += 1;
+        }
     }
 
     fn _transfer(&mut self, from: Address, to: Address, value: U256) -> Result<bool, Vec<u8>> {
@@ -426,5 +365,33 @@ mod tests {
         assert_eq!(&enc[68..79], b"wrong chain");
         assert_eq!(enc.len(), 4 + 32 + 32 + 32);
         assert!(enc[79..].iter().all(|&b| b == 0)); // padding
+    }
+
+    /// The expiry FIFO must reap expired nullifiers (and free the queue slots)
+    /// while leaving still-live entries untouched, and advance head past the
+    /// reaped entries.
+    #[test]
+    fn test_nullifier_pruning() {
+        let vm = TestVM::default();
+        let mut contract = Vess::from(&vm);
+        let now: u64 = 2_000_000_000;
+
+        let k_old = U256::from(111u64);
+        let k_live = U256::from(222u64);
+        contract.null_head.set(U256::ZERO);
+        contract.null_tail.set(U256::from(2u8));
+        contract.nullifiers.setter(k_old).set(U256::from(now - 100));
+        contract.nullifiers.setter(k_live).set(U256::from(now + 1000));
+        contract.null_order.setter(U256::ZERO).set(k_old);
+        contract.null_order.setter(U256::from(1u8)).set(k_live);
+
+        contract._prune_nullifiers(now);
+
+        // Expired key removed, head advanced past it, queue slot freed.
+        assert!(contract.nullifiers.getter(k_old).get().is_zero());
+        assert_eq!(contract.null_head.get(), U256::from(1u8));
+        assert!(contract.null_order.getter(U256::ZERO).get().is_zero());
+        // Live key untouched.
+        assert!(!contract.nullifiers.getter(k_live).get().is_zero());
     }
 }
