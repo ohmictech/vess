@@ -259,3 +259,38 @@ impl Vess {
         Ok(())
     }
 }
+
+// ── Native tests (stylus-test TestVM) ─────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stylus_sdk::{
+        alloy_primitives::{Address, U256},
+        testing::TestVM,
+    };
+
+    /// Proves the current source's error path returns READABLE revert data
+    /// ("insufficient balance") — unlike the stale on-chain build that
+    /// reverted empty. A fresh deploy from this source must carry error data.
+    #[test]
+    fn test_transfer_revert_is_readable() {
+        let vm = TestVM::default();
+        let mut contract = Vess::from(&vm);
+        let err = contract
+            .transfer(Address::from([0x22u8; 20]), U256::from(1))
+            .unwrap_err();
+        assert_eq!(err, b"insufficient balance".to_vec());
+    }
+
+    #[test]
+    fn test_init_guard() {
+        let vm = TestVM::default();
+        let mut contract = Vess::from(&vm);
+        let owner = Address::from([0x11u8; 20]);
+        contract.init(owner, "arbitrum".into()).unwrap();
+        // Second init must fail with a readable "already initialized".
+        let err = contract.init(owner, "arbitrum".into()).unwrap_err();
+        assert_eq!(err, b"already initialized".to_vec());
+    }
+}
