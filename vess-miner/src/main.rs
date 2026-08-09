@@ -214,7 +214,7 @@ alloy_sol_types::sol! {
         bytes32 address,
         uint64 timestamp,
         uint64 nonce,
-        bytes calldata proof
+        uint32[42] proof
     ) external returns (bool);
 }
 
@@ -429,6 +429,10 @@ fn pool_submit_loop(rx: mpsc::Receiver<Submission>, pool_rpc: String, payout: [u
 
     while let Ok(sub) = rx.recv() {
         let cid = sub.core_id;
+        let mut proof_bytes = Vec::with_capacity(cuckoo::CYCLE_LENGTH * 4);
+        for n in &sub.call.proof {
+            proof_bytes.extend_from_slice(&n.to_le_bytes());
+        }
         let params = serde_json::json!({
             "payout_address": payout_hex,
             "chain_hash": format!("0x{}", hex::encode(sub.call.chain_hash.0)),
@@ -436,7 +440,7 @@ fn pool_submit_loop(rx: mpsc::Receiver<Submission>, pool_rpc: String, payout: [u
             "address": format!("0x{}", hex::encode(sub.call.address.0)),
             "timestamp": sub.call.timestamp,
             "nonce": sub.call.nonce,
-            "proof": format!("0x{}", hex::encode(&sub.call.proof[..])),
+            "proof": format!("0x{}", hex::encode(&proof_bytes)),
         });
         for attempt in 1..=MAX_SUBMIT_ATTEMPTS {
             match rt.block_on(pool_rpc_call(&pool_rpc, "submitMint", params.clone())) {
@@ -749,11 +753,12 @@ fn mine_core(ctx: CoreCtx) {
             eprintln!("[core {}] share nonce={current} ts={ts}", ctx.core_id);
         }
 
-        // encode proof
-        let mut proof_bytes = Vec::with_capacity(cuckoo::CYCLE_LENGTH * 4);
-        for n in &proof {
-            proof_bytes.extend_from_slice(&n.to_le_bytes());
-        }
+        // encode proof as a fixed uint32[42] array (LE bytes are NOT used —
+        // the contract now takes the nonces directly, not packed bytes)
+        let proof_arr: [u32; cuckoo::CYCLE_LENGTH] = proof
+            .as_slice()
+            .try_into()
+            .expect("solver must return exactly CYCLE_LENGTH nonces");
 
         let call = mintCall {
             chain_hash: FixedBytes(ctx.chain_h),
@@ -761,7 +766,7 @@ fn mine_core(ctx: CoreCtx) {
             address: FixedBytes(ctx.addr),
             timestamp: ts,
             nonce: current,
-            proof: proof_bytes.into(),
+            proof: proof_arr,
         };
 
         // hand off to the single submitter thread, keep mining immediately

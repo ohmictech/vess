@@ -28,7 +28,7 @@ alloy_sol_types::sol! {
         bytes32 address,
         uint64 timestamp,
         uint64 nonce,
-        bytes calldata proof
+        uint32[42] proof
     ) external returns (bool);
 
     function approve(address spender, uint256 value) external returns (bool);
@@ -94,11 +94,11 @@ async fn main() -> Result<()> {
     );
     println!("local verify OK");
 
-    // Encode the proof as LE u32 bytes, exactly like the miner submits.
-    let mut proof_bytes = Vec::with_capacity(cuckoo::CYCLE_LENGTH * 4);
-    for n in &proof {
-        proof_bytes.extend_from_slice(&n.to_le_bytes());
-    }
+    // Convert the solved proof (Vec<u32>, length 42) to the fixed array.
+    let proof_arr: [u32; cuckoo::CYCLE_LENGTH] = proof
+        .as_slice()
+        .try_into()
+        .expect("solver returned wrong length");
 
     let contract: Address = args.contract.parse().context("invalid --contract")?;
     let provider = ProviderBuilder::new()
@@ -112,13 +112,14 @@ async fn main() -> Result<()> {
         address: FixedBytes(addr_32),
         timestamp: args.ts,
         nonce: args.nonce,
-        proof: proof_bytes.into(),
+        proof: proof_arr,
     };
     let calldata = call.abi_encode();
+    println!("mint calldata: 0x{}", hex::encode(&calldata));
 
     // Compare the miner's selector against the canonical mint selector.
     let canon = alloy::primitives::keccak256(
-        b"mint(bytes32,uint32,bytes32,uint64,uint64,bytes)",
+        b"mint(bytes32,uint32,bytes32,uint64,uint64,uint32[42])",
     );
     println!(
         "miner mintCall selector : 0x{}",
@@ -165,7 +166,7 @@ async fn main() -> Result<()> {
         address: FixedBytes(addr_32),
         timestamp: args.ts,
         nonce: args.nonce,
-        proof: vec![0u8; cuckoo::CYCLE_LENGTH * 4].into(),
+        proof: [0u32; cuckoo::CYCLE_LENGTH],
     };
     let bogus_tx = alloy::rpc::types::TransactionRequest::default()
         .to(contract)
@@ -188,17 +189,16 @@ async fn main() -> Result<()> {
         Err(e) => println!("BOGUS CALL ERROR: {e:?}"),
     }
 
-    // Third probe: wrong-length proof (1 byte). This hits the `bad proof
-    // length` check BEFORE verify. Readable error => dispatch works and the
-    // panic is inside verify. Empty revert => dispatch/panic earlier.
-    println!("simulating mint with 1-byte proof ...");
+    // Third probe: a malformed fixed proof (all identical nonces) — verify
+    // rejects it with a readable "invalid cuckatoo proof" if dispatch works.
+    println!("simulating mint with malformed proof ...");
     let short = mintCall {
         chain_hash: FixedBytes(chain_h),
         diff_bits: args.diff,
         address: FixedBytes(addr_32),
         timestamp: args.ts,
         nonce: args.nonce,
-        proof: vec![0u8; 1].into(),
+        proof: [7u32; cuckoo::CYCLE_LENGTH],
     };
     let short_tx = alloy::rpc::types::TransactionRequest::default()
         .to(contract)

@@ -119,6 +119,10 @@ impl Vess {
     ///
     /// All fields must match the preimage the miner solved against:
     /// `mint_header(chain_hash, diff_bits, address, timestamp, nonce)`.
+    ///
+    /// `proof` is a fixed `uint32[42]` (the 42 nonces). NOTE: it is a fixed
+    /// array on purpose — the Stylus 0.10 WASM router fails to decode dynamic
+    /// `bytes` args, which previously made every mint revert with empty data.
     pub fn mint(
         &mut self,
         chain_hash: FixedBytes<32>,
@@ -126,7 +130,7 @@ impl Vess {
         address: FixedBytes<32>,
         timestamp: u64,
         nonce: u64,
-        proof: Vec<u8>,
+        proof: [u32; cuckoo::CYCLE_LENGTH],
     ) -> Result<bool, Vec<u8>> {
         // ── chain binding ────────────────────────────────────────────────
         let expected = self.chain_hash.get();
@@ -165,17 +169,10 @@ impl Vess {
         }
 
         // ── PoW verification ─────────────────────────────────────────────
-        if proof.len() != cuckoo::CYCLE_LENGTH * 4 {
-            return Err("bad proof length".into());
-        }
-        let nonces: Vec<u32> = proof
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
-            .collect();
-        if !cuckoo::verify(&header, &nonces, cuckoo::CYCLE_LENGTH, cuckoo::EDGE_BITS) {
+        if !cuckoo::verify(&header, &proof, cuckoo::CYCLE_LENGTH, cuckoo::EDGE_BITS) {
             return Err("invalid cuckatoo proof".into());
         }
-        let pow_hash = cuckoo::proof_to_id(&nonces);
+        let pow_hash = cuckoo::proof_to_id(&proof);
         if !check_difficulty(&pow_hash, diff_bits) {
             return Err("difficulty not met".into());
         }
@@ -251,7 +248,7 @@ impl Vess {
         )))
     }
 
-    /// Do mint's full args (incl. dynamic bytes) decode, and does verify run?
+    /// Do mint's full args (incl. fixed-array proof) decode, and does verify run?
     pub fn probe_verify(
         &self,
         chain_hash: FixedBytes<32>,
@@ -259,17 +256,13 @@ impl Vess {
         address: FixedBytes<32>,
         timestamp: u64,
         nonce: u64,
-        proof: Vec<u8>,
+        proof: [u32; cuckoo::CYCLE_LENGTH],
     ) -> Result<bool, Vec<u8>> {
-        let nonces: Vec<u32> = proof
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
-            .collect();
         let header =
             cuckoo::mint_header(&chain_hash.0, diff_bits, &address.0, timestamp, nonce);
         Ok(cuckoo::verify(
             &header,
-            &nonces,
+            &proof,
             cuckoo::CYCLE_LENGTH,
             cuckoo::EDGE_BITS,
         ))
