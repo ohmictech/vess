@@ -113,12 +113,16 @@ pub fn verify(header_hash: &[u8; 32], proof: &[u32], cycle_len: usize, edge_bits
 
     let key = siphash_key(header_hash);
 
-    // ── zero-alloc: stack arrays instead of Vec + HashMap ─────────────
+    // Heap-allocated buffers. NOTE: fixed-size stack arrays of this size
+    // caused a WASM stack overflow when `verify` was called from a mutating
+    // (`&mut self`) public function — the deeper mutating dispatch path plus a
+    // ~1.8KB stack frame exceeds the Stylus WASM stack limit. Vec keeps the
+    // frame tiny at the cost of a small allocation.
 
     // Edges: (u, v) for each nonce.
-    let mut edges: [(u64, u64); CYCLE_LENGTH] = [(0, 0); CYCLE_LENGTH];
+    let mut edges = vec![(0u64, 0u64); CYCLE_LENGTH];
     // Node counter: (node_id, count). At most 2*cycle_len unique nodes.
-    let mut nodes: [(u64, u32); CYCLE_LENGTH * 2] = [(0, 0); CYCLE_LENGTH * 2];
+    let mut nodes = vec![(0u64, 0u32); CYCLE_LENGTH * 2];
     let mut node_count: usize = 0;
 
     for i in 0..cycle_len {
@@ -146,7 +150,7 @@ pub fn verify(header_hash: &[u8; 32], proof: &[u32], cycle_len: usize, edge_bits
 
     // ── cycle traversal ──────────────────────────────────────────────
 
-    let mut visited = [false; CYCLE_LENGTH];
+    let mut visited = vec![false; CYCLE_LENGTH];
     let mut cur = edges[0].0;
     for _ in 0..cycle_len {
         let mut found = false;
