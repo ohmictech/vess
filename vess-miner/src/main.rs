@@ -68,6 +68,16 @@ struct Config {
     /// Path to state file (default: miner.json next to config).
     #[serde(default = "default_state_file")]
     state_file: String,
+    /// Optional monitoring webhook URL (ntfy/Discord/Slack/etc). Posts JSON
+    /// events on mint success, low balance, and optional heartbeat. Empty = off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    webhook_url: Option<String>,
+    /// Alert when the gas key ETH balance drops below this (default 0.0002).
+    #[serde(default = "default_min_balance_eth")]
+    min_balance_eth: f64,
+    /// Periodic webhook heartbeat every N seconds (0 = off).
+    #[serde(default)]
+    heartbeat_secs: u64,
 }
 
 fn default_key_file() -> String {
@@ -99,6 +109,9 @@ fn default_stats_interval() -> u64 {
 fn default_gas_limit() -> u64 {
     300_000
 }
+fn default_min_balance_eth() -> f64 {
+    0.0002
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -114,6 +127,9 @@ impl Default for Config {
             stats_interval_secs: default_stats_interval(),
             gas_limit: default_gas_limit(),
             state_file: default_state_file(),
+            webhook_url: None,
+            min_balance_eth: default_min_balance_eth(),
+            heartbeat_secs: 0,
         }
     }
 }
@@ -253,6 +269,30 @@ enum SubmitError {
     Failed(anyhow::Error),
 }
 
+/// Fire-and-forget JSON POST to the monitoring webhook. Never blocks the
+/// solver or submitter on network trouble (5s timeout, errors logged only).
+fn notify(
+    webhook: &Option<String>,
+    event: &str,
+    mut fields: serde_json::Map<String, serde_json::Value>,
+) {
+    let Some(url) = webhook else { return };
+    let now = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    fields.insert("event".into(), serde_json::Value::String(event.into()));
+    fields.insert("ts".into(), serde_json::Value::Number(now.into()));
+    let body = serde_json::Value::Object(fields);
+    match ureq::post(url)
+        .timeout(std::time::Duration::from_secs(5))
+        .send_json(body)
+    {
+        Ok(_) => {}
+        Err(e) => eprintln!("[monitor] webhook {event} failed: {e}"),
+    }
+}
+
 const MAX_SUBMIT_ATTEMPTS: u32 = 3;
 
 /// Single submitter loop. Serializes transactions so nonces never race, and
@@ -264,6 +304,7 @@ fn submit_loop(
     contract_addr: Address,
     signer_addr: Address,
     gas_limit: u64,
+    webhook: Option<String>,
 ) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -283,6 +324,10 @@ fn submit_loop(
             match result {
                 Ok(tx_hash) => {
                     eprintln!("[core {cid}] SUBMITTED! tx=0x{}", hex::encode(tx_hash.0));
+                    let mut f = serde_json::Map::new();
+                    f.insert("core".into(), serde_json::json!(cid));
+                    f.insert("tx".into(), serde_json::json!(hex::encode(tx_hash.0)));
+                    notify(&webhook, "mint", f);
                     break;
                 }
                 Err(SubmitError::Reverted) => {
@@ -384,11 +429,13 @@ async fn main() -> Result<()> {
 
     let (tx, rx) = mpsc::channel::<Submission>();
     let provider = Arc::new(provider);
+    let webhook = cfg.webhook_url.clone();
     let submitter = {
         let pr = provider.clone();
         let ca = contract_addr;
         let gl = cfg.gas_limit;
-        std::thread::spawn(move || submit_loop(rx, pr, ca, miner_addr, gl))
+        let wh = webhook.clone();
+        std::thread::spawn(move || submit_loop(rx, pr, ca, miner_addr, gl, wh))
     };
     let mine_addr = reward_32;
     let mine_diff = cfg.diff_bits;
@@ -441,7 +488,7 @@ async fn main() -> Result<()> {
         }
     });
 
-    // stats reporter (doesn't stop on solutions — runs until shutdown)
+    // stats reporter + monitor (balance alerts, optional heartbeat)
     let stats_shutdown = shutdown.clone();
     let stats_att = attempts.clone();
     let stats_sol = solutions.clone();
@@ -449,7 +496,15 @@ async fn main() -> Result<()> {
     let stats_interval = cfg.stats_interval_secs;
     let stats_cores = num_cores;
     let stats_diff = cfg.diff_bits;
+    let stats_provider = provider.clone();
+    let stats_gas = miner_addr;
+    let stats_webhook = webhook.clone();
+    let stats_min_bal = U256::from((cfg.min_balance_eth * 1e18) as u128);
+    let stats_min_bal_eth = cfg.min_balance_eth;
+    let stats_heartbeat = cfg.heartbeat_secs;
     let stats_handle = tokio::spawn(async move {
+        let mut low_alerted = false;
+        let mut last_heartbeat = Instant::now();
         loop {
             sleep(Duration::from_secs(stats_interval)).await;
             if stats_shutdown.load(Ordering::Relaxed) {
@@ -463,6 +518,31 @@ async fn main() -> Result<()> {
                 "[stats] {} attempts | {:.0} h/s | {} sols | {} cores | diff={}",
                 att, rate, sol, stats_cores, stats_diff
             );
+            // Balance monitor: alert once when gas runs low, re-arm on refill.
+            let bal = stats_provider
+                .get_balance(stats_gas)
+                .await
+                .unwrap_or_default();
+            if bal < stats_min_bal {
+                if !low_alerted {
+                    let mut f = serde_json::Map::new();
+                    f.insert("balance_wei".into(), serde_json::json!(bal.to_string()));
+                    f.insert("min_balance_eth".into(), serde_json::json!(stats_min_bal_eth));
+                    notify(&stats_webhook, "low_balance", f);
+                    low_alerted = true;
+                }
+            } else {
+                low_alerted = false;
+            }
+            // Optional periodic heartbeat.
+            if stats_heartbeat > 0 && last_heartbeat.elapsed().as_secs() >= stats_heartbeat {
+                let mut f = serde_json::Map::new();
+                f.insert("attempts".into(), serde_json::json!(att));
+                f.insert("solutions".into(), serde_json::json!(sol));
+                f.insert("balance_wei".into(), serde_json::json!(bal.to_string()));
+                notify(&stats_webhook, "heartbeat", f);
+                last_heartbeat = Instant::now();
+            }
         }
     });
 
