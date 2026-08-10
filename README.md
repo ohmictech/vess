@@ -36,6 +36,8 @@ The contract is minimal: `init()`, `mint()`, plus standard ERC-20 `transfer`/`ap
 
 **Nullifiers prevent double-submission.** Each mint inserts a nullifier keyed by `blake3(preimage)` with expiry = `timestamp`. The nullifier blocks resubmission until the timestamp passes. After expiry, the timestamp itself is stale (must be in the future), so the mint is permanently dead.
 
+**Storage stays bounded.** Each mint also enqueues its nullifier in an expiry FIFO and reaps expired entries from the front (capped at 64 per mint, so gas stays flat even after long downtime). Expired nullifiers are provably inert — the timestamp check rejects reuse — so deleting them is always safe, and the map hovers around the 48h live window instead of growing forever.
+
 **Chain binding.** The preimage commits to `blake3(chain_name)`, set at contract init. A proof solved for "arbitrum" won't verify on a contract deployed for "ethereum" or any other chain.
 
 **No sender check.** Anyone can submit a valid proof to credit any address — the proof is bound to the reward address in the preimage, so paying gas to give someone else free tokens is the only possible "attack."

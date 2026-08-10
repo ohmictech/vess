@@ -207,7 +207,7 @@ async fn main() -> Result<()> {
                             .await;
                         show("allowance(signer, spender) [after real approve]", after);
                     }
-                    Ok(rc) => {
+                    Ok(_) => {
                         println!("approve tx REVERTED (status=false)");
                         // replay for reason
                         let r = provider

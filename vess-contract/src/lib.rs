@@ -31,7 +31,7 @@ const MAX_PRUNE_PER_MINT: u32 = 64;
 /// 0x08c379a0) so explorers, wallets, and tooling decode it natively.
 fn abi_err(msg: &str) -> Vec<u8> {
     let msg = msg.as_bytes();
-    let padded = (msg.len() + 31) / 32 * 32;
+    let padded = msg.len().div_ceil(32) * 32;
     let mut out = Vec::with_capacity(4 + 32 + 32 + padded);
     out.extend_from_slice(&[0x08, 0xc3, 0x79, 0xa0]);
     let mut word = [0u8; 32];
@@ -278,12 +278,12 @@ impl Vess {
     /// they linger ~one extra 48h window, still a hard bound. Work is capped
     /// per call so mint gas stays flat after long gaps.
     fn _prune_nullifiers(&mut self, now: u64) {
+        // head/tail are read once; this loop is the only writer, so head is
+        // written back once at the end instead of every round.
+        let tail = self.null_tail.get();
+        let mut head = self.null_head.get();
         let mut drained = 0u32;
-        loop {
-            let head = self.null_head.get();
-            if drained >= MAX_PRUNE_PER_MINT || head >= self.null_tail.get() {
-                break;
-            }
+        while drained < MAX_PRUNE_PER_MINT && head < tail {
             let key = self.null_order.getter(head).get();
             let expiry = self.nullifiers.getter(key).get();
             if U256::from(now) < expiry {
@@ -291,8 +291,11 @@ impl Vess {
             }
             self.nullifiers.delete(key);
             self.null_order.delete(head);
-            self.null_head.set(head + U256::from(1));
+            head += U256::from(1);
             drained += 1;
+        }
+        if drained > 0 {
+            self.null_head.set(head);
         }
     }
 

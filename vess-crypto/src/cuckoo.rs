@@ -150,7 +150,9 @@ pub fn verify(header_hash: &[u8; 32], proof: &[u32], cycle_len: usize, edge_bits
 
     // ── cycle traversal ──────────────────────────────────────────────
 
-    let mut visited = vec![false; CYCLE_LENGTH];
+    // 42 bytes on the stack — negligible next to the buffers above (and it
+    // keeps clippy's `useless_vec` quiet; a Vec here buys nothing).
+    let mut visited = [false; CYCLE_LENGTH];
     let mut cur = edges[0].0;
     for _ in 0..cycle_len {
         let mut found = false;
