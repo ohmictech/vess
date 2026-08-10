@@ -1,17 +1,16 @@
 //! One-shot init tool for the Vess contract.
 //!
-//! Calls `init(owner, chain_name)` on a freshly deployed contract to set the
-//! owner and the chain binding (`chain_hash = blake3(chain_name)`). Without
-//! this, the stored `chain_hash` is zero and every `mint` reverts with
-//! "wrong chain".
+//! Calls `init(chain_name)` on a freshly deployed contract to set the chain
+//! binding (`chain_hash = blake3(chain_name)`). Without this, the stored
+//! `chain_hash` is zero and every `mint` reverts with "wrong chain".
+//! Ownerless: there is no owner field, only the one-time chain binding.
 //!
 //! Usage:
 //!   cargo run --example init_contract -- \
 //!     --contract 0x<DEPLOYED_ADDRESS> \
 //!     [--rpc https://sepolia-rollup.arbitrum.io/rpc] \
 //!     [--key-file sepolia.key] \
-//!     [--chain arbitrum] \
-//!     [--owner 0x...]      (defaults to the signer's own address)
+//!     [--chain arbitrum]
 
 use alloy::{
     network::EthereumWallet,
@@ -24,11 +23,11 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 alloy_sol_types::sol! {
-    /// The on-chain ABI: `init(address initial_owner, string chain_name)`.
-    function init(address initial_owner, string chain_name) external;
+    /// The on-chain ABI: `init(string chain_name)`.
+    function init(string chain_name) external;
 
     /// Read helper to confirm whether the contract is already initialized.
-    function owner() external view returns (address);
+    function initialized() external view returns (bool);
 }
 
 #[derive(Parser)]
@@ -48,12 +47,6 @@ struct Args {
     /// the chain the proofs are solved against.
     #[arg(long, default_value = "arbitrum")]
     chain: String,
-    /// Owner to set (defaults to the signer's address, i.e. the deployer).
-    #[arg(long)]
-    owner: Option<String>,
-    /// Proceed even if the contract already has an owner.
-    #[arg(long)]
-    force: bool,
 }
 
 /// Load a private key from a file, supporting both a bare hex key and the
@@ -76,10 +69,6 @@ async fn main() -> Result<()> {
     let signer_addr = signer.address();
     println!("signer: 0x{}", hex::encode(signer_addr.0));
 
-    let owner: Address = match &args.owner {
-        Some(o) => o.parse().context("invalid --owner")?,
-        None => signer_addr,
-    };
     let contract: Address = args.contract.parse().context("invalid --contract")?;
 
     let wallet = EthereumWallet::from(signer);
@@ -93,22 +82,17 @@ async fn main() -> Result<()> {
     println!("contract: 0x{}", hex::encode(contract.0));
 
     // Sanity check: is the contract already initialized?
-    let owner_call = ownerCall {}.abi_encode();
     let query = alloy::rpc::types::TransactionRequest::default()
         .to(contract)
-        .input(owner_call.into());
+        .input(initializedCall {}.abi_encode().into());
     if let Ok(data) = provider.call(query).await {
-        let current = if data.len() >= 32 {
-            Address::from_slice(&data[12..32])
-        } else {
-            Address::ZERO
-        };
-        println!("current owner: 0x{}", hex::encode(current.0));
-        if current != Address::ZERO && !args.force {
-            anyhow::bail!(
-                "contract already initialized (owner set). Use --force to re-init anyway."
-            );
+        let done = data.len() >= 32 && data[31] == 0x01; // bool true
+        println!("initialized: {done}");
+        if done {
+            anyhow::bail!("contract already initialized. Nothing to do.");
         }
+    } else {
+        println!("(could not read initialized() - will attempt init anyway)");
     }
 
     let ch = vess_crypto::chain_hash(&args.chain);
@@ -117,14 +101,12 @@ async fn main() -> Result<()> {
         args.chain,
         hex::encode(ch)
     );
-    println!("owner: 0x{}", hex::encode(owner.0));
 
     let nonce = provider
         .get_transaction_count(signer_addr)
         .await
         .context("fetching nonce")?;
     let calldata = initCall {
-        initial_owner: owner,
         chain_name: args.chain.clone(),
     }
     .abi_encode();

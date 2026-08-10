@@ -55,8 +55,6 @@ pub struct Vess {
     pub balances: StorageMap<Address, StorageU256>,
     /// ERC-20: owner → (spender → allowance).
     pub allowances: StorageMap<Address, StorageMap<Address, StorageU256>>,
-    /// Owner address (can transfer ownership).
-    pub owner: StorageFixedBytes<20>,
     /// Mint nullifier: preimage_hash → expiry timestamp.
     pub nullifiers: StorageMap<U256, StorageU256>,
     /// Expiry FIFO for nullifier pruning: seq → nullifier key (oldest first).
@@ -226,31 +224,24 @@ impl Vess {
         Ok(true)
     }
 
-    // ── Ownership ───────────────────────────────────────────────────────
-
-    pub fn transfer_ownership(&mut self, new_owner: Address) -> Result<bool, Vec<u8>> {
-        self._ensure_owner()?;
-        if new_owner == Address::ZERO {
-            return Err(abi_err("zero address"));
-        }
-        self.owner.set(FixedBytes::from(new_owner.into_array()));
-        Ok(true)
-    }
-
     // ── Init ────────────────────────────────────────────────────────────
 
-    /// One-time initialisation: set the owner and chain binding.
-    /// `chain_name` is the raw string, e.g. "arbitrum" — its blake3 is stored.
-    pub fn init(&mut self, initial_owner: Address, chain_name: String) -> Result<(), Vec<u8>> {
-        let current: FixedBytes<20> = self.owner.get();
-        if current != FixedBytes::<20>::ZERO {
+    /// One-time initialisation: bind the chain. `chain_name` is the raw
+    /// string, e.g. "arbitrum" — its blake3 is stored as the chain hash.
+    /// Ownerless by design: nothing can change the binding afterward.
+    pub fn init(&mut self, chain_name: String) -> Result<(), Vec<u8>> {
+        if self.chain_hash.get() != FixedBytes::<32>::ZERO {
             return Err(abi_err("already initialized"));
         }
-        self.owner.set(FixedBytes::from(initial_owner.into_array()));
         let ch = blake3_hash(chain_name.as_bytes());
         self.chain_hash.set(FixedBytes::from(ch));
         self.total_supply.set(U256::ZERO);
         Ok(())
+    }
+
+    /// Whether the contract has been initialized (chain binding set).
+    pub fn initialized(&self) -> Result<bool, Vec<u8>> {
+        Ok(self.chain_hash.get() != FixedBytes::<32>::ZERO)
     }
 
 }
@@ -313,15 +304,6 @@ impl Vess {
         self.vm().log(Transfer { from, to, value });
         Ok(true)
     }
-
-    fn _ensure_owner(&self) -> Result<(), Vec<u8>> {
-        let sender = self.vm().msg_sender();
-        let owner: FixedBytes<20> = self.owner.get();
-        if sender.into_array() != owner.0 {
-            return Err(abi_err("only owner"));
-        }
-        Ok(())
-    }
 }
 
 // ── Native tests (stylus-test TestVM) ─────────────────────────────────
@@ -350,10 +332,10 @@ mod tests {
     fn test_init_guard() {
         let vm = TestVM::default();
         let mut contract = Vess::from(&vm);
-        let owner = Address::from([0x11u8; 20]);
-        contract.init(owner, "arbitrum".into()).unwrap();
+        contract.init("arbitrum".into()).unwrap();
+        assert!(contract.initialized().unwrap());
         // Second init must fail with a readable "already initialized".
-        let err = contract.init(owner, "arbitrum".into()).unwrap_err();
+        let err = contract.init("arbitrum".into()).unwrap_err();
         assert_eq!(err, abi_err("already initialized"));
     }
 

@@ -1,6 +1,9 @@
 /target/
 /vess-pool/
 
+# Untracked helper scripts (local only)
+vess-miner/examples/bridge_eth.rs
+
 # Secrets — never commit
 sepolia.key
 *.key
