@@ -101,10 +101,11 @@ jobs:
           PRIVATE_KEY: ${{ secrets.DEPLOYER_PRIVATE_KEY }}
           RPC_URL: ${{ github.event.inputs.network == 'mainnet' && secrets.MAINNET_RPC_URL || secrets.SEPOLIA_RPC_URL }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ARBISCAN_API_KEY: ${{ secrets.ARBISCAN_API_KEY }}
         run: |
           cargo stylus deploy \
             --wasm-file target/wasm32-unknown-unknown/release/vess_contract.wasm \
             --private-key "$PRIVATE_KEY" \
             --endpoint "$RPC_URL" \
             --max-fee-per-gas-gwei 1 \
-            --no-verify
+            --verify ${ARBISCAN_API_KEY:+--api-key "$ARBISCAN_API_KEY"}
