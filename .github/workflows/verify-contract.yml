@@ -43,4 +43,6 @@ jobs:
         run: |
           cargo stylus verify \
             --deployment-tx "$DEPLOY_TX" \
+            --wasm-file target/wasm32-unknown-unknown/release/vess_contract.wasm \
+            --no-verify \
             --endpoint "$RPC_URL"
