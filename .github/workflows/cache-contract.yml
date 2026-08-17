@@ -1,0 +1,41 @@
+name: Cache Contract
+
+on:
+  workflow_dispatch:
+    inputs:
+      address:
+        description: "Activated contract address to cache in ArbOS"
+        type: string
+        required: true
+      network:
+        description: "Which network"
+        type: choice
+        default: "mainnet"
+        options:
+          - sepolia
+          - mainnet
+
+# Runs `cargo stylus cache bid` from the CI VM (cargo-stylus doesn't build on
+# Windows, so this is the way to cache a deployed contract for cheaper calls).
+jobs:
+  cache:
+    runs-on: ubuntu-latest
+    environment: deploy
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-stylus
+        run: cargo install cargo-stylus --locked
+
+      - name: Cache bid contract in ArbOS
+        env:
+          ADDRESS: ${{ github.event.inputs.address }}
+          PRIVATE_KEY: ${{ secrets.DEPLOYER_PRIVATE_KEY }}
+          RPC_URL: ${{ github.event.inputs.network == 'mainnet' && secrets.MAINNET_RPC_URL || secrets.SEPOLIA_RPC_URL }}
+        run: |
+          cargo stylus cache bid "$ADDRESS" 0 \
+            --private-key "$PRIVATE_KEY" \
+            --endpoint "$RPC_URL"
