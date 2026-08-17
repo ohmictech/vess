@@ -17,8 +17,20 @@ on:
           - mainnet
 
 # Runs `cargo stylus verify` from the CI VM (cargo-stylus doesn't build on
-# Windows). Submits the contract source to the explorer (Arbiscan) so the
-# deployed bytecode is shown as verified. No private key needed.
+# Windows).
+#
+# NOTE: `cargo stylus verify` is a LOCAL integrity check only - it rebuilds the
+# contract from this repo's source and compares the bytes against the
+# deployment transaction. It does NOT submit/publish anything to Arbiscan.
+#
+# To actually get the green "verified" badge + published Rust source on
+# Arbiscan, use the web form at https://arbiscan.io/verifyContract with:
+#   - Contract address: the deployed contract
+#   - Compiler type: "Stylus (Rust)"   <-- NOT the default Solidity compiler
+#   - Compiler version: the cargo-stylus version used to deploy (>= 0.5.0)
+#   - Source: manual paste / Rust file upload / "Fetch from Git" (Git fetch
+#     only works if the contract lives at the repo ROOT, not in a subdir).
+# "Fetch from Git" also requires a pinned `rust-toolchain.toml` in the repo.
 jobs:
   verify:
     runs-on: ubuntu-latest
@@ -36,13 +48,15 @@ jobs:
       - name: Build contract WASM
         run: cargo build --target wasm32-unknown-unknown -p vess-contract --release
 
-      - name: Verify contract source on explorer
+      - name: Local integrity check (cargo stylus verify)
         env:
           DEPLOY_TX: ${{ github.event.inputs.deployment_tx }}
           RPC_URL: ${{ github.event.inputs.network == 'mainnet' && secrets.MAINNET_RPC_URL || secrets.SEPOLIA_RPC_URL }}
         run: |
+          # This is a local reproducibility check only - it does NOT publish to
+          # Arbiscan. Use the Arbiscan web form for the green badge (see the
+          # comment at the top of this file).
           cargo stylus verify \
             --deployment-tx "$DEPLOY_TX" \
-            --wasm-file target/wasm32-unknown-unknown/release/vess_contract.wasm \
             --no-verify \
             --endpoint "$RPC_URL"
