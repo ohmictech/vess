@@ -1,0 +1,45 @@
+name: Verify Contract
+
+on:
+  workflow_dispatch:
+    inputs:
+      deployment_tx:
+        description: "Deployment tx hash (from cargo stylus deploy output)"
+        type: string
+        required: true
+      network:
+        description: "Which network"
+        type: choice
+        default: "mainnet"
+        options:
+          - sepolia
+          - mainnet
+
+# Runs `cargo stylus verify` from the CI VM (cargo-stylus doesn't build on
+# Windows). Submits the contract source to the explorer (Arbiscan) so the
+# deployed bytecode is shown as verified. No private key needed.
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust + wasm target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install cargo-stylus
+        run: cargo install cargo-stylus --locked
+
+      - name: Build contract WASM
+        run: cargo build --target wasm32-unknown-unknown -p vess-contract --release
+
+      - name: Verify contract source on explorer
+        env:
+          DEPLOY_TX: ${{ github.event.inputs.deployment_tx }}
+          RPC_URL: ${{ github.event.inputs.network == 'mainnet' && secrets.MAINNET_RPC_URL || secrets.SEPOLIA_RPC_URL }}
+        run: |
+          cargo stylus verify \
+            --deployment-tx "$DEPLOY_TX" \
+            --endpoint "$RPC_URL"
