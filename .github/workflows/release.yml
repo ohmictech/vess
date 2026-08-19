@@ -90,19 +90,6 @@ jobs:
       - name: Install cargo-stylus 0.10.7 (Arbiscan verifier max)
         run: cargo install cargo-stylus --version 0.10.7 --locked
 
-      - name: Check contract (reproducible, Docker)
-        env:
-          RPC_URL: ${{ github.event.inputs.network == 'mainnet' && secrets.MAINNET_RPC_URL || secrets.SEPOLIA_RPC_URL }}
-        working-directory: vess-verify
-        run: |
-          # Builds from source inside the cargo-stylus Docker container at the
-          # fixed path /source, so the WASM is byte-for-byte reproducible and
-          # verifiable on Arbiscan. The contract source is the self-contained
-          # vess-verify/ tree (crate at root, vess-crypto vendored in-repo).
-          cargo stylus check \
-            --endpoint "$RPC_URL" \
-            --cargo-stylus-version 0.10.7
-
       - name: Deploy contract (reproducible, Docker)
         env:
           PRIVATE_KEY: ${{ secrets.DEPLOYER_PRIVATE_KEY }}
@@ -110,6 +97,10 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         working-directory: vess-verify
         run: |
+          # `cargo stylus deploy` runs its own `check` internally, then builds
+          # from source inside the cargo-stylus Docker container at the fixed
+          # path /source, so the WASM is byte-for-byte reproducible and
+          # verifiable on Arbiscan. No --wasm-file, no --no-verify.
           cargo stylus deploy \
             --private-key "$PRIVATE_KEY" \
             --endpoint "$RPC_URL" \
