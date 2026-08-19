@@ -87,39 +87,43 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
 
-      - name: Install cargo-stylus
-        run: cargo install cargo-stylus --locked
+      - name: Install cargo-stylus 0.10.7 (Arbiscan verifier max)
+        run: cargo install cargo-stylus --version 0.10.7 --locked
 
-      - name: Build contract WASM
-        run: cargo build --target wasm32-unknown-unknown -p vess-contract --release
-
-      - name: Check contract
+      - name: Check contract (reproducible, Docker)
         env:
           RPC_URL: ${{ github.event.inputs.network == 'mainnet' && secrets.MAINNET_RPC_URL || secrets.SEPOLIA_RPC_URL }}
+        working-directory: vess-verify
         run: |
+          # Builds from source inside the cargo-stylus Docker container at the
+          # fixed path /source, so the WASM is byte-for-byte reproducible and
+          # verifiable on Arbiscan. The contract source is the self-contained
+          # vess-verify/ tree (crate at root, vess-crypto vendored in-repo).
           cargo stylus check \
-            --wasm-file target/wasm32-unknown-unknown/release/vess_contract.wasm \
-            --endpoint "$RPC_URL"
+            --endpoint "$RPC_URL" \
+            --cargo-stylus-version 0.10.7
 
-      - name: Deploy contract
+      - name: Deploy contract (reproducible, Docker)
         env:
           PRIVATE_KEY: ${{ secrets.DEPLOYER_PRIVATE_KEY }}
           RPC_URL: ${{ github.event.inputs.network == 'mainnet' && secrets.MAINNET_RPC_URL || secrets.SEPOLIA_RPC_URL }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        working-directory: vess-verify
         run: |
           cargo stylus deploy \
-            --wasm-file target/wasm32-unknown-unknown/release/vess_contract.wasm \
             --private-key "$PRIVATE_KEY" \
             --endpoint "$RPC_URL" \
             --max-fee-per-gas-gwei 1 \
-            --no-verify
+            --cargo-stylus-version 0.10.7
 
-      - name: Verify contract source on explorer
+      - name: Reproducibility check (cargo stylus verify)
         if: github.event.inputs.verify_tx != ''
         env:
           VERIFY_TX: ${{ github.event.inputs.verify_tx }}
           RPC_URL: ${{ github.event.inputs.network == 'mainnet' && secrets.MAINNET_RPC_URL || secrets.SEPOLIA_RPC_URL }}
+        working-directory: vess-verify
         run: |
           cargo stylus verify \
             --deployment-tx "$VERIFY_TX" \
+            --cargo-stylus-version 0.10.7 \
             --endpoint "$RPC_URL"

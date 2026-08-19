@@ -1,0 +1,7 @@
+# Pins the Rust compiler used for Stylus reproducible builds / Arbiscan
+# source verification. Must be a SPECIFIC version (not "stable"/"nightly") -
+# cargo-stylus and Arbiscan both require this to reproduce the deployed WASM.
+# 1.97.1 = the `stable` toolchain the mainnet deploy was built with (2026-08-17).
+[toolchain]
+channel = "1.97.1"
+targets = ["wasm32-unknown-unknown"]

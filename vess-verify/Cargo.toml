@@ -1,0 +1,49 @@
+# Root-level layout for Arbiscan Stylus "Fetch from Git" verification.
+# Byte-for-byte equivalent build to the main workspace's vess-contract:
+#  - identical package (vess-contract), profiles, and Cargo.lock
+#  - vess-crypto kept as a separate in-repo crate (path dep) so codegen matches
+#    the deployed build exactly
+[workspace]
+members = ["vess-crypto"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
+# Stylus contract: optimize for wasm size (same as the main workspace).
+[profile.release.package.vess-contract]
+opt-level = "z"
+
+[package]
+name = "vess-contract"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+stylus-sdk = "0.10"
+alloy-sol-types = "1"
+vess-crypto = { path = "vess-crypto", default-features = false, features = ["verify"] }
+
+# `cargo stylus export-abi` needs this.
+[features]
+export-abi = ["stylus-sdk/export-abi"]
+
+# Enables the SDK's TestVM mock so `cargo test` links and runs natively.
+[dev-dependencies]
+stylus-sdk = { version = "0.10", features = ["stylus-test"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = [
+    'cfg(feature, values("contract-client-gen", "stylus-test"))',
+] }
+
+[lib]
+crate-type = ["cdylib"]
