@@ -1,0 +1,4 @@
+# Marks this package as a Stylus contract for cargo-stylus. Required for
+# reproducible from-source deploys (cargo stylus deploy without --wasm-file).
+# See https://docs.arbitrum.io/stylus/reference/stylus-toml-reference
+[contract]
