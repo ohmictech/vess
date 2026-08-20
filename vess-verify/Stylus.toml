@@ -1,4 +1,12 @@
-# Marks this package as a Stylus contract for cargo-stylus. Required for
-# reproducible from-source deploys (cargo stylus deploy without --wasm-file).
-# See https://docs.arbitrum.io/stylus/reference/stylus-toml-reference
+# Marks this directory as a Stylus workspace + contract package for
+# cargo-stylus 0.10.7. Required for from-source reproducible deploys (no
+# --wasm-file). This file is parsed as BOTH a WorkspaceManifest
+# ([workspace].networks) and a ContractManifest ([contract].deployments), so
+# both sections must be present.
+# Schema:
+#   https://github.com/OffchainLabs/stylus-sdk-rs/blob/main/stylus-tools/src/core/manifest
+[workspace]
+networks = {}
+
 [contract]
+deployments = {}
