@@ -1,0 +1,45 @@
+name: Activate Contract
+
+on:
+  workflow_dispatch:
+    inputs:
+      address:
+        description: "Contract address to activate / upgrade (fixes ProgramNeedsUpgrade)"
+        type: string
+        required: true
+        default: "0xaff2f129d2bcba4649a54fb516be0cc78288898d"
+      network:
+        description: "Which network"
+        type: choice
+        default: "mainnet"
+        options:
+          - sepolia
+          - mainnet
+
+# Re-activates (upgrades) a deployed Stylus contract to the current on-chain
+# Stylus version via ArbWasm.activateProgram. Fixes
+# "ProgramNeedsUpgrade(2, 3)" (deployed program at v2, chain at v3). Does NOT
+# change the deployed code bytes, so bytecode verification is unaffected.
+jobs:
+  activate:
+    runs-on: ubuntu-latest
+    environment: deploy
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.97.1
+
+      - name: Install cargo-stylus 0.10.9
+        run: cargo install cargo-stylus --version 0.10.9 --locked
+
+      - name: Activate / upgrade contract
+        env:
+          ADDRESS: ${{ github.event.inputs.address }}
+          PRIVATE_KEY: ${{ secrets.DEPLOYER_PRIVATE_KEY }}
+          RPC_URL: ${{ github.event.inputs.network == 'mainnet' && secrets.MAINNET_RPC_URL || secrets.SEPOLIA_RPC_URL }}
+        run: |
+          cargo stylus activate \
+            --address "$ADDRESS" \
+            --private-key "$PRIVATE_KEY" \
+            --endpoint "$RPC_URL"
