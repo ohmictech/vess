@@ -7,7 +7,7 @@ on:
         description: "Activated contract address to cache in ArbOS"
         type: string
         required: true
-        default: "0x2e5d89a229cbd17efb0a731d26232f88c3746aa9"
+        default: "0xaff2f129d2bcba4649a54fb516be0cc78288898d"
       network:
         description: "Which network"
         type: choice
