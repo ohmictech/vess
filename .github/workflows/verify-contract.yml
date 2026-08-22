@@ -7,7 +7,7 @@ on:
         description: "Deployment tx hash (from cargo stylus deploy output)"
         type: string
         required: true
-        default: "0x6d632e7d16e2699c461c311f9ed6d3fba243597abab3f9fe12757a3b099fec50"
+        default: "0x6b956f592471b72c7060c496b868201800f5e1af833e72f1bc1598b4491b45bd"
       network:
         description: "Which network"
         type: choice
