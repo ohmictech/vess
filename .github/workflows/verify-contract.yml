@@ -16,9 +16,12 @@ on:
           - sepolia
           - mainnet
 
-# Runs `cargo stylus verify` (LOCAL integrity check only - it does NOT
-# publish to Arbiscan). Verifies the deployed wasm matches a rebuild of the
-# vess-verify/ source - the LAYOUT the contract was deployed from.
+# Runs `cargo stylus verify` in the reproducible Docker container
+# (cargo-stylus-base 0.10.7) - the same mechanism Arbiscan uses. Because the
+# project_hash section embedded in the deployed code is computed from the
+# container's canonical /source paths, the Docker verify matches the Docker
+# deploy; a non-Docker ("local") verify would NOT match (absolute paths differ).
+# It does NOT publish to Arbiscan.
 #
 # To publish the green "verified" badge + source on Arbiscan, use the web form:
 #   https://arbiscan.io/verifyContract
@@ -45,13 +48,14 @@ jobs:
         working-directory: vess-verify
         run: cargo build --lib --locked --release --target wasm32-unknown-unknown
 
-      - name: Local reproducibility check (cargo stylus verify)
+      - name: Reproducibility check (cargo stylus verify, Docker)
         env:
           DEPLOY_TX: ${{ github.event.inputs.deployment_tx }}
           RPC_URL: ${{ github.event.inputs.network == 'mainnet' && secrets.MAINNET_RPC_URL || secrets.SEPOLIA_RPC_URL }}
         working-directory: vess-verify
         run: |
+          # Verify in Docker (no --no-verify) so the source is built at the same
+          # canonical /source path the deploy used -> project_hash matches.
           cargo stylus verify \
             --deployment-tx "$DEPLOY_TX" \
-            --no-verify \
             --endpoint "$RPC_URL"

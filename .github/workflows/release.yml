@@ -90,30 +90,26 @@ jobs:
       - name: Install cargo-stylus 0.10.7 (Arbiscan verifier max)
         run: cargo install cargo-stylus --version 0.10.7 --locked
 
-      - name: Build contract WASM (vess-verify layout)
-        working-directory: vess-verify
-        run: |
-          # The WASM disambiguator is LAYOUT-based, not path-based: the same
-          # source builds byte-identically at any absolute path. So this plain
-          # cargo build matches what Arbiscan / `cargo stylus verify` rebuild
-          # from the vess-verify source, making the deploy verifiable.
-          cargo build --lib --locked --release --target wasm32-unknown-unknown
-
-      - name: Deploy contract
+      - name: Deploy contract (reproducible Docker build)
         env:
           PRIVATE_KEY: ${{ secrets.DEPLOYER_PRIVATE_KEY }}
           RPC_URL: ${{ github.event.inputs.network == 'mainnet' && secrets.MAINNET_RPC_URL || secrets.SEPOLIA_RPC_URL }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         working-directory: vess-verify
         run: |
+          # Deploy WITHOUT --no-verify so cargo-stylus uses its reproducible
+          # Docker build (cargo-stylus-base 0.10.7, source mounted at /source).
+          # The real project_hash is computed from the container's canonical
+          # /source paths, matching what Arbiscan's verifier reproduces, so the
+          # contract is source-verifiable. The package is named vess_contract
+          # (no hyphen) to avoid the cdylib-name bug (stylus-sdk-rs #439) that
+          # caused "build did not generate wasm file".
           cargo stylus deploy \
-            --wasm-file target/wasm32-unknown-unknown/release/vess_contract.wasm \
             --private-key "$PRIVATE_KEY" \
             --endpoint "$RPC_URL" \
-            --max-fee-per-gas-gwei 1 \
-            --no-verify
+            --max-fee-per-gas-gwei 1
 
-      - name: Reproducibility check (cargo stylus verify, local)
+      - name: Reproducibility check (cargo stylus verify, Docker)
         if: github.event.inputs.verify_tx != ''
         env:
           VERIFY_TX: ${{ github.event.inputs.verify_tx }}
@@ -122,5 +118,4 @@ jobs:
         run: |
           cargo stylus verify \
             --deployment-tx "$VERIFY_TX" \
-            --endpoint "$RPC_URL" \
-            --no-verify
+            --endpoint "$RPC_URL"
