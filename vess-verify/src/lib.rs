@@ -1,4 +1,8 @@
-#![no_std]
+// no_std for the on-chain WASM build (export-abi off) so the deployed bytes stay
+// minimal and unchanged; std when building with `--features export-abi`, because
+// the #[public] macro's export-abi codegen (used by the constructor check and
+// `cargo stylus export-abi`) requires std.
+#![cfg_attr(not(any(test, feature = "export-abi")), no_std)]
 
 extern crate alloc;
 
