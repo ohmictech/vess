@@ -1,6 +1,5 @@
 /target/
 /vess-pool/
-/vess-verify/target/
 
 # Untracked helper scripts (local only)
 vess-miner/examples/bridge_eth.rs

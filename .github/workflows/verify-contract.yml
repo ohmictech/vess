@@ -28,13 +28,21 @@ on:
 #     - Contract address: the deployed contract
 #     - Compiler type: "Stylus (Rust)"   <-- NOT the default Solidity compiler
 #     - Compiler version: stylus:0.10.7 (the version used to deploy)
-#     - Source: the vess-verify/ tree (contract at root; "Fetch from Git"
-#       needs a repo whose root IS the contract).
+#     - Source: the ohmictech/vess-contract repo (its root IS the contract;
+#       "Fetch from Git" needs a repo whose root IS the contract).
 jobs:
   verify:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      # Contract source lives in its own public repo (root = the contract
+      # project, the exact layout Arbiscan verified from).
+      - name: Checkout contract source
+        uses: actions/checkout@v4
+        with:
+          repository: ohmictech/vess-contract
+          path: contract
 
       - name: Install Rust 1.97.1 + wasm target
         uses: dtolnay/rust-toolchain@1.97.1
@@ -44,15 +52,11 @@ jobs:
       - name: Install cargo-stylus 0.10.7
         run: cargo install cargo-stylus --version 0.10.7 --locked
 
-      - name: Build contract WASM (vess-verify layout)
-        working-directory: vess-verify
-        run: cargo build --lib --locked --release --target wasm32-unknown-unknown
-
       - name: Reproducibility check (cargo stylus verify, Docker)
         env:
           DEPLOY_TX: ${{ github.event.inputs.deployment_tx }}
           RPC_URL: ${{ github.event.inputs.network == 'mainnet' && secrets.MAINNET_RPC_URL || secrets.SEPOLIA_RPC_URL }}
-        working-directory: vess-verify
+        working-directory: contract
         run: |
           # Verify in Docker (no --no-verify) so the source is built at the same
           # canonical /source path the deploy used -> project_hash matches.

@@ -4,10 +4,6 @@ members = [
     "vess-contract",
     "vess-miner",
 ]
-# vess-verify is a self-contained standalone workspace (own Cargo.toml with
-# [workspace]) used for reproducible Stylus deploys/verification - keep it out
-# of this workspace.
-exclude = ["vess-verify"]
 resolver = "2"
 
 [workspace.package]
