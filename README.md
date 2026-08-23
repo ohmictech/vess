@@ -14,6 +14,26 @@ Difficulty is set by the miner, not the network: 0 bits = 1 Vess, 1 bit = 2 Vess
 
 ---
 
+## Miner
+
+```
+vess-miner                           # reads miner.toml, starts mining
+vess-miner --generate-config         # write default miner.toml and exit
+vess-miner --config /path/config.toml
+```
+
+The miner is a multi-threaded Cuckatoo27 solver that submits proofs directly to an Arbitrum RPC endpoint.
+
+It mines on 1 core by default. Set `cores = N` in `miner.toml` to scale up. Each solver thread allocates about 1.5 GB RAM, so keep `N x 1.5 GB` within your free memory. Proofs that pass the difficulty check are handed to a single submitter thread, which serializes transactions (no nonce races), waits for receipts, and retries transient RPC failures.
+
+**Security model.** The miner uses a separate gas-payer key (auto-generated, stored in `miner.key`). Your reward address, set in `miner.toml`, is a public wallet that never touches the miner machine. Fund the gas address with a small amount of ETH. If the machine is compromised, the attacker gets an empty gas key and no access to your Vess.
+
+On first run the miner generates `miner.key` and `miner.address`. Fund the address in `miner.address` with ETH for fees, set your `reward_address` in `miner.toml`, and start mining. Progress is saved to `miner.json` every 30 seconds. On restart it resumes where it left off. Ctrl+C triggers a clean save-and-exit.
+
+Optional monitoring: set `webhook_url` in `miner.toml` (an ntfy, Discord, or Slack webhook) to get a JSON notification on each confirmed mint, a low-gas-balance alert, and an optional periodic heartbeat.
+
+---
+
 ## Why Arbitrum Stylus
 
 - **Gas is externalized.** Miners pay ETH for gas. Vess holders pay nothing to transfer. The token itself is feeless.
@@ -39,26 +59,6 @@ The contract is minimal: `init()`, `mint()`, plus standard ERC-20 `transfer`/`ap
 **Chain binding.** The preimage commits to `blake3(chain_name)`, set at contract init. A proof solved for "arbitrum" will not verify on a contract deployed for another chain.
 
 **No sender check.** Anyone can submit a valid proof to credit any address. The proof is bound to the reward address in the preimage, so the only possible "attack" is paying gas to give someone else free tokens.
-
----
-
-## Miner
-
-```
-vess-miner                           # reads miner.toml, starts mining
-vess-miner --generate-config         # write default miner.toml and exit
-vess-miner --config /path/config.toml
-```
-
-The miner is a multi-threaded Cuckatoo27 solver that submits proofs directly to an Arbitrum RPC endpoint.
-
-It mines on 1 core by default. Set `cores = N` in `miner.toml` to scale up. Each solver thread allocates about 1.5 GB RAM, so keep `N x 1.5 GB` within your free memory. Proofs that pass the difficulty check are handed to a single submitter thread, which serializes transactions (no nonce races), waits for receipts, and retries transient RPC failures.
-
-**Security model.** The miner uses a separate gas-payer key (auto-generated, stored in `miner.key`). Your reward address, set in `miner.toml`, is a public wallet that never touches the miner machine. Fund the gas address with a small amount of ETH. If the machine is compromised, the attacker gets an empty gas key and no access to your Vess.
-
-On first run the miner generates `miner.key` and `miner.address`. Fund the address in `miner.address` with ETH, set your `reward_address` in `miner.toml`, and start mining. Progress is saved to `miner.json` every 30 seconds. On restart it resumes where it left off. Ctrl+C triggers a clean save-and-exit.
-
-Optional monitoring: set `webhook_url` in `miner.toml` (an ntfy, Discord, or Slack webhook) to get a JSON notification on each confirmed mint, a low-gas-balance alert, and an optional periodic heartbeat.
 
 ---
 
