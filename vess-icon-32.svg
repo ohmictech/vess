@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32">
+  <g transform="translate(-60.893392,-127.0831)">
+    <g transform="matrix(0.38496813,0,0,0.38496813,36.367973,64.617605)">
+      <rect style="fill:#1a1a1a;stroke-width:10;stroke-linecap:round;paint-order:stroke fill markers" x="63.707661" y="162.26146" width="83.123764" height="83.123764" ry="41.561882"/>
+      <g transform="translate(-181.38737,60.66209)">
+        <path style="fill:#87cdde;stroke-width:5.72428;stroke-linecap:round;paint-order:stroke fill markers" d="m 168.73857,232.18896 -9.99991,17.32035 -1e-5,42.5411 10.00002,3.6e-4 z" transform="rotate(-30)"/>
+        <path style="fill:#87cdde;stroke-width:5.72428;stroke-linecap:round;paint-order:stroke fill markers" d="m 327.59127,-54.505639 -1e-5,40.36134 10.00021,5.7732686 -1.9e-4,-29.0786646 -9.8472,-17.055855 z m 4.2e-4,48.8504562 -1e-4,11.1495441 9.99958,-1.056e-4 3e-5,-5.37635856 z" transform="rotate(30)"/>
+        <path style="fill:#87cdde;stroke-width:4.90811;stroke-linecap:round;paint-order:stroke fill markers" d="m 183.35197,255.35754 -0.0752,1.2e-4 -7.27682,12.60381 4e-5,20.24573 7.35202,-4.24467 z" transform="rotate(-30)"/>
+        <path style="fill:#87cdde;stroke-width:5.72428;stroke-linecap:round;paint-order:stroke fill markers" d="m 327.65651,0.04951418 -1.4e-4,5.84125722 10.00021,5.7732696 2.1e-4,-11.6144432 z" transform="rotate(30)"/>
+      </g>
+    </g>
+  </g>
+</svg>
