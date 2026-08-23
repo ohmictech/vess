@@ -124,10 +124,7 @@ async fn main() -> Result<()> {
     let tx_hash: TxHash = *pending.tx_hash();
     println!("init tx: 0x{}", hex::encode(tx_hash.0));
 
-    let receipt = pending
-        .get_receipt()
-        .await
-        .context("waiting for receipt")?;
+    let receipt = pending.get_receipt().await.context("waiting for receipt")?;
     if receipt.status() {
         println!(
             "INIT OK in block {}",

@@ -36,7 +36,10 @@ alloy_sol_types::sol! {
 }
 
 #[derive(Parser)]
-#[command(name = "vess-debug-mint", about = "Simulate a mint and show the revert reason")]
+#[command(
+    name = "vess-debug-mint",
+    about = "Simulate a mint and show the revert reason"
+)]
 struct Args {
     #[arg(long, default_value = "0x00609432cb4ad6a72d7b07e279c27ddcb4682ba4")]
     contract: String,
@@ -118,17 +121,13 @@ async fn main() -> Result<()> {
     println!("mint calldata: 0x{}", hex::encode(&calldata));
 
     // Compare the miner's selector against the canonical mint selector.
-    let canon = alloy::primitives::keccak256(
-        b"mint(bytes32,uint32,bytes32,uint64,uint64,uint32[42])",
-    );
+    let canon =
+        alloy::primitives::keccak256(b"mint(bytes32,uint32,bytes32,uint64,uint64,uint32[42])");
     println!(
         "miner mintCall selector : 0x{}",
         hex::encode(&calldata[..4])
     );
-    println!(
-        "canonical mint selector : 0x{}",
-        hex::encode(&canon[..4])
-    );
+    println!("canonical mint selector : 0x{}", hex::encode(&canon[..4]));
     let tx = alloy::rpc::types::TransactionRequest::default()
         .to(contract)
         .input(calldata.into());
@@ -221,7 +220,10 @@ async fn main() -> Result<()> {
         Ok(data) => println!("APPROVE OK: 0x{}", hex::encode(&data)),
         Err(RpcError::ErrorResp(payload)) => {
             let msg = payload.as_revert_data().map(|b| decode_revert(&b));
-            println!("APPROVE REVERT: {}", msg.unwrap_or_else(|| payload.message.to_string()));
+            println!(
+                "APPROVE REVERT: {}",
+                msg.unwrap_or_else(|| payload.message.to_string())
+            );
         }
         Err(e) => println!("APPROVE CALL ERROR: {e:?}"),
     }

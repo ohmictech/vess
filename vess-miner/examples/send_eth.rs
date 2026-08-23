@@ -70,7 +70,10 @@ async fn main() -> Result<()> {
     let chain_id = provider.get_chain_id().await.context("fetching chain id")?;
     println!("connected: chain_id={chain_id}");
 
-    let balance = provider.get_balance(from).await.context("fetching balance")?;
+    let balance = provider
+        .get_balance(from)
+        .await
+        .context("fetching balance")?;
     println!("balance: {} wei", balance);
     if balance < value {
         anyhow::bail!("insufficient balance to send {value} wei");
@@ -87,10 +90,7 @@ async fn main() -> Result<()> {
         .value(value)
         .gas_limit(50_000);
 
-    let pending = provider
-        .send_transaction(tx)
-        .await
-        .context("sending tx")?;
+    let pending = provider.send_transaction(tx).await.context("sending tx")?;
     let tx_hash: TxHash = *pending.tx_hash();
     println!("tx: 0x{}", hex::encode(tx_hash.0));
 

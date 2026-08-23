@@ -527,7 +527,10 @@ async fn main() -> Result<()> {
                 if !low_alerted {
                     let mut f = serde_json::Map::new();
                     f.insert("balance_wei".into(), serde_json::json!(bal.to_string()));
-                    f.insert("min_balance_eth".into(), serde_json::json!(stats_min_bal_eth));
+                    f.insert(
+                        "min_balance_eth".into(),
+                        serde_json::json!(stats_min_bal_eth),
+                    );
                     notify(&stats_webhook, "low_balance", f);
                     low_alerted = true;
                 }

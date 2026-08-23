@@ -220,12 +220,7 @@ fn trim_scan(edges: &[(u32, u32)], alive: &mut [bool], udeg: &mut [u8], vdeg: &m
 /// small multiple of the edge count — vs. `trim_scan`, which rescans all edges
 /// every round. The final result is the same 2-core either way.
 #[cfg(feature = "full")]
-fn trim_live(
-    edges: &[(u32, u32)],
-    live: &mut Vec<u32>,
-    udeg: &mut [u8],
-    vdeg: &mut [u8],
-) -> bool {
+fn trim_live(edges: &[(u32, u32)], live: &mut Vec<u32>, udeg: &mut [u8], vdeg: &mut [u8]) -> bool {
     let mut any = false;
     loop {
         let mut changed = false;

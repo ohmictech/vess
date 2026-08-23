@@ -51,8 +51,6 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y liblmdb-dev
 
       - name: Build release
-        # Only the miner ships as a binary; vess-contract is a wasm cdylib
-        # and does not link natively.
         run: cargo build --release -p vess-miner --target ${{ matrix.target }}
 
       - name: Package (Unix)

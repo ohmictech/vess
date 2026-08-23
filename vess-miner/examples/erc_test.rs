@@ -142,24 +142,40 @@ async fn main() -> Result<()> {
     };
 
     // ── metadata ──────────────────────────────────────────────────────
-    show("name()", provider.call(call_tx(nameCall {}.abi_encode())).await);
-    show("symbol()", provider.call(call_tx(symbolCall {}.abi_encode())).await);
+    show(
+        "name()",
+        provider.call(call_tx(nameCall {}.abi_encode())).await,
+    );
+    show(
+        "symbol()",
+        provider.call(call_tx(symbolCall {}.abi_encode())).await,
+    );
     show(
         "decimals()",
         provider.call(call_tx(decimalsCall {}.abi_encode())).await,
     );
     show(
         "totalSupply()",
-        provider.call(call_tx(totalSupplyCall {}.abi_encode())).await,
+        provider
+            .call(call_tx(totalSupplyCall {}.abi_encode()))
+            .await,
     );
     show(
         "balanceOf(signer)",
-        provider.call(call_tx(balanceOfCall { account: from }.abi_encode())).await,
+        provider
+            .call(call_tx(balanceOfCall { account: from }.abi_encode()))
+            .await,
     );
     show(
         "allowance(signer, spender) [before]",
         provider
-            .call(call_tx(allowanceCall { owner: from, spender }.abi_encode()))
+            .call(call_tx(
+                allowanceCall {
+                    owner: from,
+                    spender,
+                }
+                .abi_encode(),
+            ))
             .await,
     );
 
@@ -186,12 +202,14 @@ async fn main() -> Result<()> {
             .to(contract)
             .from(from)
             .gas_limit(150_000u64)
-            .input(approveCall {
-                spender,
-                value: U256::from(1000),
-            }
-            .abi_encode()
-            .into());
+            .input(
+                approveCall {
+                    spender,
+                    value: U256::from(1000),
+                }
+                .abi_encode()
+                .into(),
+            );
         match provider.send_transaction(tx).await {
             Ok(pending) => {
                 let tx_hash = *pending.tx_hash();
@@ -199,10 +217,17 @@ async fn main() -> Result<()> {
                 println!("approve tx sent: 0x{}", hex::encode(tx_hash.0));
                 match pending.get_receipt().await {
                     Ok(rc) if rc.status() => {
-                        println!("approve CONFIRMED in block {}", rc.block_number.unwrap_or_default());
+                        println!(
+                            "approve CONFIRMED in block {}",
+                            rc.block_number.unwrap_or_default()
+                        );
                         let after = provider
                             .call(call_tx(
-                                allowanceCall { owner: from, spender }.abi_encode(),
+                                allowanceCall {
+                                    owner: from,
+                                    spender,
+                                }
+                                .abi_encode(),
                             ))
                             .await;
                         show("allowance(signer, spender) [after real approve]", after);
@@ -232,7 +257,13 @@ async fn main() -> Result<()> {
     show(
         "transfer(dead,1) [0 balance -> insufficient balance]",
         provider
-            .call(call_tx(transferCall { to: dead, value: U256::from(1) }.abi_encode()))
+            .call(call_tx(
+                transferCall {
+                    to: dead,
+                    value: U256::from(1),
+                }
+                .abi_encode(),
+            ))
             .await,
     );
     show(
@@ -258,15 +289,17 @@ async fn main() -> Result<()> {
     show(
         "mint(zero proof) [invalid cuckatoo proof]",
         provider
-            .call(call_tx(mintCall {
-                chain_hash: FixedBytes(chain_h),
-                diff_bits: 0,
-                address: FixedBytes(addr_32),
-                timestamp: ts,
-                nonce: 41,
-                proof,
-            }
-            .abi_encode()))
+            .call(call_tx(
+                mintCall {
+                    chain_hash: FixedBytes(chain_h),
+                    diff_bits: 0,
+                    address: FixedBytes(addr_32),
+                    timestamp: ts,
+                    nonce: 41,
+                    proof,
+                }
+                .abi_encode(),
+            ))
             .await,
     );
 
