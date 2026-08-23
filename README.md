@@ -2,6 +2,9 @@
 
 Vess is a compute-based token on Arbitrum. Emission tracks the work actually done. One Vess is created per unit of computation. No speculation, no gambling, no pre-mine.
 
+Current contract:
+0x00609432cb4ad6a72d7b07e279c27ddcb4682ba4
+
 ---
 
 ## Philosophy
