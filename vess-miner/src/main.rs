@@ -146,7 +146,12 @@ impl Config {
                 let cfg = Config::default();
                 let toml_str = toml::to_string_pretty(&cfg).unwrap();
                 std::fs::write(path, &toml_str).context("writing default config")?;
-                eprintln!("Created default config at {}. Edit it and re-run.", path);
+                // Generate the gas key on first run too, so the user gets a
+                // funding address without needing a second launch.
+                Config::load_miner_key(&cfg.key_file)?;
+                eprintln!("Created default config at {path}.");
+                eprintln!("Set your reward_address in that file, then re-run to start mining.");
+                pause_before_exit();
                 std::process::exit(0);
             }
             Err(e) => Err(e).context("reading config"),
@@ -366,8 +371,27 @@ struct CoreCtx {
 
 // ---- main
 
+/// Wait for Enter before returning to the shell, so the console window stays
+/// open when the miner is launched by double-clicking the .exe on Windows.
+fn pause_before_exit() {
+    #[cfg(windows)]
+    {
+        eprintln!("Press Enter to close...");
+        let mut line = String::new();
+        let _ = std::io::stdin().read_line(&mut line);
+    }
+}
+
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
+    if let Err(e) = run().await {
+        eprintln!("error: {e:#}");
+        pause_before_exit();
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<()> {
     let cli = Cli::parse();
 
     if cli.generate_config {
