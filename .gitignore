@@ -14,3 +14,5 @@ miner.toml
 
 # local Etherscan API key (Arbiscan verification)
 .etherscan-key
+
+.venv/

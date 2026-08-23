@@ -119,7 +119,7 @@ impl Default for Config {
             chain: "arbitrum".into(),
             reward_address: "0x0000000000000000000000000000000000000000".into(),
             rpc_url: "https://sepolia-rollup.arbitrum.io/rpc".into(),
-            contract_address: "0x0000000000000000000000000000000000000000".into(),
+            contract_address: "0x00609432cb4ad6a72d7b07e279c27ddcb4682ba4".into(),
             key_file: default_key_file(),
             diff_bits: default_diff_bits(),
             cores: default_cores(),
