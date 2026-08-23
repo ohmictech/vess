@@ -8,7 +8,7 @@
 //!   cargo run --example debug_mint -- \
 //!     [--ts 1786403491] [--nonce 41] [--diff 0] \
 //!     [--reward 0x973dff3d05e5c78e2f9baa839b6e311261733c09] \
-//!     [--contract 0xaff2f129d2bcba4649a54fb516be0cc78288898d] \
+//!     [--contract 0x00609432cb4ad6a72d7b07e279c27ddcb4682ba4] \
 //!     [--chain arbitrum]
 
 use alloy::{
@@ -38,7 +38,7 @@ alloy_sol_types::sol! {
 #[derive(Parser)]
 #[command(name = "vess-debug-mint", about = "Simulate a mint and show the revert reason")]
 struct Args {
-    #[arg(long, default_value = "0xaff2f129d2bcba4649a54fb516be0cc78288898d")]
+    #[arg(long, default_value = "0x00609432cb4ad6a72d7b07e279c27ddcb4682ba4")]
     contract: String,
     #[arg(long, default_value = "https://sepolia-rollup.arbitrum.io/rpc")]
     rpc: String,

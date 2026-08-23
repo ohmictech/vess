@@ -12,3 +12,6 @@ miner.key
 miner.json
 miner.address
 miner.toml
+
+# local Etherscan API key (Arbiscan verification)
+.etherscan-key
