@@ -311,23 +311,34 @@ fn submit_loop(
     gas_limit: u64,
     webhook: Option<String>,
 ) {
-    let rt = tokio::runtime::Builder::new_current_thread()
+    let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .expect("tokio runtime");
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("submitter: failed to build tokio runtime: {e:#}");
+            return;
+        }
+    };
 
     while let Ok(sub) = rx.recv() {
         let cid = sub.core_id;
         for attempt in 1..=MAX_SUBMIT_ATTEMPTS {
-            let result = rt.block_on(submit_mint(
-                &*provider,
-                contract_addr,
-                signer_addr,
-                &sub.call,
-                gas_limit,
-            ));
+            // A panic inside alloy/tokio must not kill the submitter thread and
+            // silently drop every future solution — catch it, log it, move on.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                rt.block_on(submit_mint(
+                    &*provider,
+                    contract_addr,
+                    signer_addr,
+                    &sub.call,
+                    gas_limit,
+                ))
+            }));
+
             match result {
-                Ok(tx_hash) => {
+                Ok(Ok(tx_hash)) => {
                     eprintln!("[core {cid}] SUBMITTED! tx=0x{}", hex::encode(tx_hash.0));
                     let mut f = serde_json::Map::new();
                     f.insert("core".into(), serde_json::json!(cid));
@@ -335,19 +346,30 @@ fn submit_loop(
                     notify(&webhook, "mint", f);
                     break;
                 }
-                Err(SubmitError::Reverted) => {
+                Ok(Err(SubmitError::Reverted)) => {
                     eprintln!(
                         "[core {cid}] mint reverted on-chain (proof already claimed or stale)"
                     );
                     break;
                 }
-                Err(SubmitError::Failed(e)) => {
+                Ok(Err(SubmitError::Failed(e))) => {
                     eprintln!(
                         "[core {cid}] submit failed (attempt {attempt}/{MAX_SUBMIT_ATTEMPTS}): {e:#}"
                     );
                     if attempt < MAX_SUBMIT_ATTEMPTS {
                         rt.block_on(sleep(Duration::from_secs(2)));
                     }
+                }
+                Err(payload) => {
+                    let msg = payload
+                        .downcast_ref::<&str>()
+                        .copied()
+                        .or_else(|| payload.downcast_ref::<String>().map(|s| s.as_str()))
+                        .unwrap_or("<non-string panic>");
+                    eprintln!(
+                        "[core {cid}] SUBMITTER PANICKED (attempt {attempt}): {msg}; skipping"
+                    );
+                    break;
                 }
             }
         }
@@ -601,9 +623,16 @@ async fn run() -> Result<()> {
     });
 
     for h in handles {
-        h.join().unwrap();
+        if let Err(e) = h.join() {
+            eprintln!("solver thread exited abnormally: {e:?}");
+        }
     }
-    submitter.join().unwrap(); // returns once the queue is drained
+    // The submitter catches its own per-submission panics; an Err here means
+    // something outside a submission panicked. Log it instead of panicking the
+    // main thread after a long, otherwise-fine mining run.
+    if let Err(e) = submitter.join() {
+        eprintln!("submitter thread exited abnormally: {e:?}");
+    }
     stats_handle.abort();
     save_handle.abort();
 
