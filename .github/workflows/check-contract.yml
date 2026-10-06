@@ -15,6 +15,11 @@ on:
         options:
           - sepolia
           - mainnet
+      cargo_stylus_version:
+        description: "cargo-stylus CLI version to install ('latest' for newest)"
+        type: string
+        required: true
+        default: "0.10.7"
 
 # Runs `cargo stylus check`, which builds the WASM and then asks the chain
 # whether it can be ACTIVATED (`ArbWasm.activateProgram` via eth_call with
@@ -45,8 +50,14 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
 
-      - name: Install cargo-stylus 0.10.7 (Arbiscan verifier max)
-        run: cargo install cargo-stylus --version 0.10.7 --locked
+      - name: Install cargo-stylus ${{ github.event.inputs.cargo_stylus_version }}
+        run: |
+          v="${{ github.event.inputs.cargo_stylus_version }}"
+          if [ "$v" = "latest" ]; then
+            cargo install cargo-stylus --locked
+          else
+            cargo install cargo-stylus --version "$v" --locked
+          fi
 
       - name: cargo stylus check
         env:
