@@ -1,0 +1,60 @@
+name: Check Contract
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "vess-contract ref to check (branch or tag, e.g. main or deployed-mainnet-v1)"
+        type: string
+        required: true
+        default: "main"
+      network:
+        description: "Which network"
+        type: choice
+        default: "mainnet"
+        options:
+          - sepolia
+          - mainnet
+
+# Runs `cargo stylus check`, which builds the WASM and then asks the chain
+# whether it can be ACTIVATED (`ArbWasm.activateProgram` via eth_call with
+# state overrides). No transaction is sent, so this is free.
+#
+# This is the same probe `cargo stylus deploy` runs before it sends anything,
+# which makes it the cheap way to debug a deploy that reverts before the tx.
+#
+# NOTE: cargo-stylus prints errors but has been observed to exit 0 anyway, so
+# a green run does NOT by itself mean the check passed. Read the log.
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Contract source lives in its own public repo (root = the contract
+      # project, the exact layout Arbiscan verified from).
+      - name: Checkout contract source
+        uses: actions/checkout@v4
+        with:
+          repository: ohmictech/vess-contract
+          ref: ${{ github.event.inputs.ref }}
+          path: contract
+
+      - name: Install Rust 1.97.1 + wasm target
+        uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install cargo-stylus 0.10.7 (Arbiscan verifier max)
+        run: cargo install cargo-stylus --version 0.10.7 --locked
+
+      - name: cargo stylus check
+        env:
+          RPC_URL: ${{ github.event.inputs.network == 'mainnet' && secrets.MAINNET_RPC_URL || secrets.SEPOLIA_RPC_URL }}
+        working-directory: contract
+        run: |
+          set +e
+          cargo stylus check --endpoint "$RPC_URL"
+          code=$?
+          echo "cargo stylus check exit code = $code"
+          exit $code
