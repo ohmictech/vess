@@ -1,6 +1,6 @@
 # Build output
 /target
-
+architecture.md
 # Secrets: the development fee key and any wallet keyfiles stay out of the repository
 /.vess-keys/
 *.key
