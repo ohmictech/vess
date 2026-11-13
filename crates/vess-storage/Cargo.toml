@@ -1,0 +1,13 @@
+[package]
+name = "vess-storage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+vess-core = { path = "../vess-core" }
+vess-consensus = { path = "../vess-consensus" }
+vess-state = { path = "../vess-state" }
+redb = "4.5"

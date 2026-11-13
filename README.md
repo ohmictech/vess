@@ -1,70 +1,118 @@
 # Vess
 
-Vess is a compute-based token on Arbitrum. Emission tracks the work actually done. One Vess is created per unit of computation. No speculation, no gambling, no pre-mine.
+An account-based proof-of-work ledger with **one asset**, where the block reward *is* the difficulty
+the block was mined at.
 
-Current contract:
-0x00609432cb4ad6a72d7b07e279c27ddcb4682ba4
-
----
-
-## Philosophy
-
-Every Vess represents the same marginal unit of computation. Not staking, not locking, not "owning to earn". Just raw CPU cycles turned into money at a fixed ratio.
-
-Vess inverts the usual token model. Most coins create artificial scarcity: fixed supply, halvings, deflation schedules designed to pump the chart. Vess is elastic. Issuance responds directly to hashrate. More miners means more Vess minted, fewer miners means less enters circulation. Like any commodity (oil, copper, electricity), the price is set by the market that uses it, not by a pre-programmed supply curve.
-
-Difficulty is set by the miner, not the network: 0 bits = 1 Vess, 1 bit = 2 Vess, 2 bits = 4 Vess. No DAA, no epoch adjustments, no governance. A miner picks a target difficulty, solves a Cuckatoo proof at that difficulty, and submits it. The contract verifies the proof and credits the reward address. Compute to emission, 1:1.
-
----
-
-## Miner
-
-```
-vess-miner                           # reads miner.toml, starts mining
-vess-miner --generate-config         # write default miner.toml and exit
-vess-miner --config /path/config.toml
+```text
+reward = 100 * genesis_target / target     # genesis difficulty pays 100; twice as hard pays 200
 ```
 
-The miner is a multi-threaded Cuckatoo27 solver that submits proofs directly to an Arbitrum RPC endpoint.
-
-It mines on 1 core by default. Set `cores = N` in `miner.toml` to scale up. Each solver thread allocates about 1.5 GB RAM, so keep `N x 1.5 GB` within your free memory. Proofs that pass the difficulty check are handed to a single submitter thread, which serializes transactions (no nonce races), waits for receipts, and retries transient RPC failures.
-
-**Security model.** The miner uses a separate gas-payer key (auto-generated, stored in `miner.key`). Your reward address, set in `miner.toml`, is a public wallet that never touches the miner machine. Fund the gas address with a small amount of ETH. If the machine is compromised, the attacker gets an empty gas key and no access to your Vess.
-
-On first run the miner generates `miner.key` and `miner.address`. Fund the address in `miner.address` with ETH for fees, set your `reward_address` in `miner.toml`, and start mining. Progress is saved to `miner.json` every 30 seconds. On restart it resumes where it left off. Ctrl+C triggers a clean save-and-exit.
-
-Optional monitoring: set `webhook_url` in `miner.toml` (an ntfy, Discord, or Slack webhook) to get a JSON notification on each confirmed mint, a low-gas-balance alert, and an optional periodic heartbeat.
+Revenue per hash is constant. Supply is the integral of work performed. No curve, no halving, no cap,
+no scarcity.
 
 ---
 
-## Why Arbitrum Stylus
+## Why it is built this way
 
-- **Gas is externalized.** Miners pay ETH for gas. Vess holders pay nothing to transfer. The token itself is feeless.
-- **No validator set to bootstrap.** Arbitrum already has security, finality, and a live network of RPC providers and indexers.
-- **Stylus runs Rust natively.** The Cuckatoo verifier compiles to WASM and runs at near-native speed. A 42-cycle proof verifies in microseconds on-chain.
-- **ERC-20 compatible.** Vess works with every Arbitrum wallet, DEX, and bridge out of the box.
+Bitcoin pays a fixed subsidy that halves on a timer, so reward per hash falls forever and mining only
+works if the price rises. Vess inverts that: **emission is the difficulty**, so one Vess is a claim on a
+fixed quantity of energy. If hashrate doubles, emissions double with it and per-hash income does not move.
 
-The contract is minimal: `init()`, `mint()`, plus standard ERC-20 `transfer`/`approve`/`transferFrom`/`balanceOf`. No governance token, no DAO, no upgrade proxy.
+That is a deliberate refusal of the store-of-value story. Vess is a commodity ledger with a predictable
+marginal cost, not a vault. Everything else follows from it:
 
----
+- **BLAKE3 over the 234-byte header.** No memory-hard puzzle; ASICs are accepted, because resisting them
+  was tried five times and lost (architecture.md §8.3). The reward rule decides who mines, not the puzzle.
+- **One second blocks**, retargeted every 64 blocks, clamped to ±4× per window.
+- **1% of every block goes to a hard-coded development account**, out of the reward — total issuance is
+  unchanged, and the split cannot be skipped.
+- **Accounts, not UTXOs.** An account id *is* the hash of an ML-DSA-65 public key (post-quantum), and
+  carries `balance`, `next_nonce`, and an opaque 32-byte `state_hash` that consensus never interprets.
+- **Nothing else.** No script, no second asset, no nullifiers, no smart contracts.
 
-## How minting works
+## Quick start
 
-1. A miner builds a preimage: `blake3("vess-id-v1" || chain_hash || diff_bits || address || timestamp || nonce)`
-2. Finds a 42-cycle Cuckatoo27 proof matching that preimage (about 1.5 GB RAM per solver thread)
-3. Submits `mint(chain_hash, diff_bits, address, timestamp, nonce, proof)` to the contract
-4. The contract verifies the Cuckatoo proof, checks difficulty and nullifier, and credits the reward address
+```sh
+cargo build --release
+BIN=./target/release/vess
 
-**Nullifiers prevent double-submission.** Each mint inserts a nullifier keyed by `blake3(preimage)` with expiry = `timestamp`. The nullifier blocks resubmission until the timestamp passes. After expiry the timestamp is stale (it must be in the future), so the mint is permanently dead.
+$BIN node init --datadir ./chain
+printf 'correct horse battery staple' > ./chain/pw
+$BIN wallet new --datadir ./chain --name alice --password-file ./chain/pw
+# hd=1  account=<hex>  index=0        (one master seed, accounts derived by index)
 
-**Storage stays bounded.** Each mint enqueues its nullifier in an expiry FIFO and reaps expired entries from the front (capped at 64 per mint, so gas stays flat even after long downtime). Expired nullifiers are provably inert (the timestamp check rejects reuse), so deleting them is always safe, and the map hovers around the 48h live window instead of growing forever.
+# two blocks at genesis difficulty, each paying 100: 99 to the miner, 1 to the dev account
+$BIN miner --datadir ./chain --payout <account> --blocks 2
+$BIN wallet balance --datadir ./chain --name alice --password-file ./chain/pw
+# balance=198  next_nonce=0
+```
 
-**Chain binding.** The preimage commits to `blake3(chain_name)`, set at contract init. A proof solved for "arbitrum" will not verify on a contract deployed for another chain.
+Send, then watch it confirm — no polling loop, no guessed interval:
 
-**No sender check.** Anyone can submit a valid proof to credit any address. The proof is bound to the reward address in the preimage, so the only possible "attack" is paying gas to give someone else free tokens.
+```sh
+$BIN wallet send  --datadir ./chain --name alice --to <account> --amount 5 --password-file ./chain/pw
+$BIN wallet watch --datadir ./chain --name alice --rpc 127.0.0.1:9733 --password-file ./chain/pw
+# start balance=198 … / balance=193 next_nonce=1 …
+```
 
----
+## Running a node
 
-## License
+```sh
+vess node run --datadir ./chain --rpc 9733 --port 9732 --peer 127.0.0.1:9800
+vess node run --datadir ./chain --port 9732 --seed 1.2.3.4:9732    # bootstrap, then discover
+```
 
-Apache 2.0
+Peers are found, not configured. A completed session records the address and the static key its
+handshake proved; `GET_ADDR`/`ADDR` carry only those verified records, and a crawler dials them. The book
+persists to `<datadir>/peers.txt`, so a node restarted with no flags still rejoins. Seed sources merge in
+order: `--peer`, `--seed`, `VESS_SEEDS`, then the per-network defaults compiled in.
+
+Sessions are `Noise_XX`-encrypted before a single frame is sent, and an address verified once is
+**key-pinned**: a later session presenting a different key is refused. Bans persist in
+`<datadir>/bans.txt`, so a restart no longer hands a flooding peer a clean slate.
+
+Ask a running node anything over loopback RPC:
+
+```sh
+vess node status   --rpc 127.0.0.1:9733      # height, supply, next reward, peers, bans
+vess node block    --rpc 127.0.0.1:9733 --height 12
+vess node tx       --rpc 127.0.0.1:9733 --id <txid>     # status + who paid whom, how much
+vess node account  --rpc 127.0.0.1:9733 --account <id>  # exists, balance, nonce, state hash
+vess node proof    --rpc 127.0.0.1:9733 --account <id>  # 256-sibling inclusion or non-inclusion
+vess node watch    --rpc 127.0.0.1:9733 --count 3       # long-poll: the next 3 tips
+```
+
+**History is prunable.** `--prune-blocks N --prune-headers N` keeps a window and deletes the rest. A peer
+that falls behind such a node can only join by state snapshot, which needs `--trust-snapshot` because the
+built-in checkpoint lists are still empty. Old transactions still report their depth from the index.
+
+## The numbers
+
+| | |
+|---|---|
+| Block time | 1 s; retarget every 64 blocks, ±4× clamp, median-time-past over 11 blocks |
+| Reward | `100 × genesis_target / target`, floor 1, 1% to the dev account |
+| Genesis target | devnet `2^240`, testnet `2^232`, mainnet `2^226` |
+| Block size | 1 MiB; a transfer is ~5.4 KB because the signature is post-quantum |
+| Accounts | ML-DSA-65; id = hash of public key; 256-level sparse Merkle state root |
+| Transport | Noise_XX + ChaCha20-Poly1305; key pinning after first contact |
+| Keyfiles | Argon2id (64 MiB, t=3) + ChaCha20-Poly1305; HD master seed, hardened derivation |
+| Tests | 186, with clippy `-D warnings` and `fmt --check` clean |
+
+The design document is [architecture.md](./architecture.md). Consensus constants are not a separate file:
+`vess node params --network mainnet` prints them from the binary, so the two cannot disagree.
+
+## What it does not do
+
+No privacy. No smart contracts. No light clients. No ASIC resistance. Nothing is final — only
+heavier-work branches win — and while checkpoints are enforced, every network ships an empty list, so a
+node syncing from scratch still trusts the first valid history it is shown. The ML-DSA implementation is
+not independently audited. architecture.md §23 has the full, unflattering list.
+
+## Build
+
+```sh
+cargo build --release
+cargo test --workspace      # 186 tests
+./target/release/vess node params --network devnet
+```

@@ -1,18 +1,6 @@
-/target/
-/vess-pool/
+# Build output
+/target
 
-# Untracked helper scripts (local only)
-vess-miner/examples/bridge_eth.rs
-
-# Secrets — never commit
-sepolia.key
+# Secrets: the development fee key and any wallet keyfiles stay out of the repository
+/.vess-keys/
 *.key
-miner.key
-miner.json
-miner.address
-miner.toml
-
-# local Etherscan API key (Arbiscan verification)
-.etherscan-key
-
-.venv/

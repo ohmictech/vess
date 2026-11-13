@@ -1,17 +1,32 @@
 [workspace]
+resolver = "3"
 members = [
-    "vess-crypto",
-    "vess-miner",
+    "crates/vess-core",
+    "crates/vess-emission",
+    "crates/vess-crypto",
+    "crates/vess-state",
+    "crates/vess-consensus",
+    "crates/vess-storage",
+    "crates/vess-mempool",
+    "crates/vess-net",
+    "crates/vess-wallet",
+    "crates/vess-node",
 ]
-resolver = "2"
 
 [workspace.package]
 version = "0.1.0"
-edition = "2021"
-license = "Apache-2.0"
+edition = "2024"
+rust-version = "1.93"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+blake3 = "1.5"
+ml-dsa = "0.1"
+getrandom = "0.3"
 
 [profile.release]
 opt-level = 3
-lto = true
-codegen-units = 1
-strip = true
+lto = "thin"
+panic = "abort"
+overflow-checks = true
