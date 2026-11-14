@@ -184,31 +184,25 @@ impl Target {
         }
     }
 
-    fn request(&mut self, request: Request) -> Result<ReplyBody, String> {
+    fn request_raw(&mut self, request: Request) -> Result<vess_net::rpc::Reply, String> {
         match self {
-            Target::Local(node) => {
-                let reply = node.handle_rpc(request);
-                if reply.is_ok() {
-                    Ok(reply.body)
-                } else {
-                    Err(format!(
-                        "node rejected the object (reason {})",
-                        reply.reason
-                    ))
-                }
-            }
+            Target::Local(node) => Ok(node.handle_rpc(request)),
             Target::Remote(addr) => {
                 let mut client = NodeClient::connect(addr).map_err(|e| e.to_string())?;
-                let reply = client.call_raw(request).map_err(|e| e.to_string())?;
-                if reply.is_ok() {
-                    Ok(reply.body)
-                } else {
-                    Err(format!(
-                        "node rejected the object (reason {})",
-                        reply.reason
-                    ))
-                }
+                client.call_raw(request).map_err(|e| e.to_string())
             }
+        }
+    }
+
+    fn request(&mut self, request: Request) -> Result<ReplyBody, String> {
+        let reply = self.request_raw(request)?;
+        if reply.is_ok() {
+            Ok(reply.body)
+        } else {
+            Err(format!(
+                "node rejected the object (reason {})",
+                reply.reason
+            ))
         }
     }
 
@@ -836,7 +830,7 @@ fn miner(args: &Args) -> Result<(), String> {
 
     for index in 0..blocks {
         let started = std::time::Instant::now();
-        let (header, transactions, height) = loop {
+        loop {
             let template_started = std::time::Instant::now();
             let (mut header, transactions, height) =
                 match target.request(Request::Template(payout))? {
@@ -845,28 +839,49 @@ fn miner(args: &Args) -> Result<(), String> {
                     }
                     _ => return Err("unexpected template reply".into()),
                 };
-            match vess_node::mine_fresh(&mut header, 200_000_000, template_started) {
-                vess_node::MiningResult::Found => break (header, transactions, height),
+            let mut last_check = None;
+            match vess_node::mine_fresh(&mut header, 200_000_000, template_started, |parent| {
+                if last_check.is_some_and(|last: std::time::Instant| {
+                    last.elapsed() < Duration::from_millis(50)
+                }) {
+                    return Ok(false);
+                }
+                let tip = target.status()?.tip;
+                last_check = Some(std::time::Instant::now());
+                Ok::<bool, String>(tip != *parent)
+            })? {
+                vess_node::MiningResult::Found => {}
                 vess_node::MiningResult::Refresh => continue,
                 vess_node::MiningResult::Exhausted => {
                     return Err("no solution after 200 million nonces".into());
                 }
             }
-        };
-        let bytes = assemble_block(&header, &transactions)?;
-        let bytes_len = bytes.len();
-        let id = match target.request(Request::SubmitBlock(bytes))? {
-            ReplyBody::Accepted(id) => id,
-            _ => return Err("unexpected reply".into()),
-        };
+            let bytes = assemble_block(&header, &transactions)?;
+            let bytes_len = bytes.len();
+            let reply = target.request_raw(Request::SubmitMinedBlock(bytes))?;
+            if reply.reason == vess_node::reason::NOT_TIP {
+                continue;
+            }
+            if !reply.is_ok() {
+                return Err(format!(
+                    "node rejected mined block (reason {})",
+                    reply.reason
+                ));
+            }
+            let id = match reply.body {
+                ReplyBody::Accepted(id) => id,
+                _ => return Err("unexpected reply".into()),
+            };
+            println!(
+                "mined={} height={} nonce_ms={} bytes={}",
+                hex(&id),
+                height,
+                started.elapsed().as_millis(),
+                bytes_len
+            );
+            break;
+        }
         let _ = index;
-        println!(
-            "mined={} height={} nonce_ms={} bytes={}",
-            hex(&id),
-            height,
-            started.elapsed().as_millis(),
-            bytes_len
-        );
     }
     Ok(())
 }

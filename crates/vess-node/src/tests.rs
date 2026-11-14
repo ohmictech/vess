@@ -139,19 +139,54 @@ fn mining_discards_stale_work_and_accepts_fresh_work() {
     let mut stale = template.header;
     let old = std::time::Instant::now() - crate::MINING_REFRESH_INTERVAL;
     assert!(matches!(
-        crate::mine_fresh(&mut stale, 20_000_000, old),
-        crate::MiningResult::Refresh
+        crate::mine_fresh(&mut stale, 20_000_000, old, |_| Ok::<_, ()>(false)),
+        Ok(crate::MiningResult::Refresh)
     ));
     let mut fresh = template.header;
     let mut result = crate::MiningResult::Refresh;
     for _ in 0..10 {
-        result = crate::mine_fresh(&mut fresh, 20_000_000, std::time::Instant::now());
+        result = crate::mine_fresh(&mut fresh, 20_000_000, std::time::Instant::now(), |_| {
+            Ok::<_, ()>(false)
+        })
+        .unwrap();
         if matches!(result, crate::MiningResult::Found) {
             break;
         }
     }
     assert!(matches!(result, crate::MiningResult::Found));
     assert!(fresh.meets_target());
+}
+
+#[test]
+fn tip_change_cancels_mining_and_rejects_stale_submissions() {
+    let (_dir, mut node) = node();
+    let payout = [0x21; 32];
+    let (mut old, _) = node.template(&payout, node.next_timestamp_ms()).unwrap();
+    assert!(old.mine(20_000_000));
+    mine_one(&mut node, &payout);
+    let tip = node.tip().id();
+    let signal = node.tip_signal();
+    assert!(matches!(
+        crate::mine_fresh(
+            &mut old.header,
+            20_000_000,
+            std::time::Instant::now(),
+            |parent| Ok::<_, ()>(signal.current() != *parent)
+        ),
+        Ok(crate::MiningResult::Refresh)
+    ));
+    let reply = node.handle_rpc(Request::SubmitMinedBlock(old.encode()));
+    assert_eq!(reply.reason, crate::reason::NOT_TIP);
+    assert_eq!(node.tip().id(), tip);
+    assert!(!node.chain().contains(&old.header.id()));
+    let (mut next, _) = node.template(&payout, node.next_timestamp_ms()).unwrap();
+    assert_eq!(next.header.previous_block_id, tip);
+    assert!(next.mine(20_000_000));
+    assert!(
+        node.handle_rpc(Request::SubmitMinedBlock(next.encode()))
+            .is_ok()
+    );
+    assert_eq!(node.height(), 2);
 }
 #[test]
 fn clock_driven_mining_changes_difficulty() {
@@ -174,6 +209,69 @@ fn clock_driven_mining_changes_difficulty() {
             .unwrap()
             .0
     );
+}
+
+#[test]
+fn tip_change_during_a_mining_batch_discards_found_work() {
+    let (_dir, node) = node();
+    let (mut template, _) = node
+        .template(&[0x21; 32], node.next_timestamp_ms())
+        .unwrap();
+    assert!(template.mine(20_000_000));
+    let mut checks = 0;
+    let result = crate::mine_fresh(
+        &mut template.header,
+        10_000,
+        std::time::Instant::now(),
+        |_| {
+            checks += 1;
+            Ok::<_, ()>(checks == 2)
+        },
+    )
+    .unwrap();
+    assert!(matches!(result, crate::MiningResult::Refresh));
+    assert_eq!(checks, 2);
+}
+
+#[test]
+fn rpc_miner_retries_after_tip_changes() {
+    let dir = TempDir::new();
+    let shared = Arc::new(Mutex::new(
+        Node::open(&dir.path, NetworkProfile::DEVNET).unwrap(),
+    ));
+    let listener = bind_rpc("127.0.0.1:0").unwrap();
+    let addr = crate::addr_of(&listener).unwrap();
+    let served = shared.clone();
+    std::thread::spawn(move || {
+        let _ = serve(served, listener);
+    });
+    let mut client = vess_wallet::NodeClient::connect(&addr).unwrap();
+    let payout = [0x21; 32];
+    let mut old = match client.call_raw(Request::Template(payout)).unwrap().body {
+        ReplyBody::Template(template) => template.header,
+        other => panic!("unexpected reply: {other:?}"),
+    };
+    assert!(vess_consensus::mine_header(&mut old, 20_000_000));
+    mine_one(&mut shared.lock().unwrap(), &payout);
+    let mut bytes = old.canonical().to_vec();
+    bytes.extend_from_slice(&vess_consensus::encode_body(&[]).unwrap());
+    let reply = client.call_raw(Request::SubmitMinedBlock(bytes)).unwrap();
+    assert_eq!(reply.reason, crate::reason::NOT_TIP);
+    let mut next = match client.call_raw(Request::Template(payout)).unwrap().body {
+        ReplyBody::Template(template) => template.header,
+        other => panic!("unexpected reply: {other:?}"),
+    };
+    assert_eq!(next.previous_block_id, shared.lock().unwrap().tip().id());
+    assert!(vess_consensus::mine_header(&mut next, 20_000_000));
+    let mut bytes = next.canonical().to_vec();
+    bytes.extend_from_slice(&vess_consensus::encode_body(&[]).unwrap());
+    assert!(
+        client
+            .call_raw(Request::SubmitMinedBlock(bytes))
+            .unwrap()
+            .is_ok()
+    );
+    assert_eq!(shared.lock().unwrap().height(), 2);
 }
 
 /// Mine a block from the node's own mempool and submit it through the RPC handler.

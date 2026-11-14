@@ -82,6 +82,8 @@ synchronized. The fixed genesis is shared by all nodes; the first mined block re
 and a stalled chain can resume at the current time. A long pause still affects the retarget window
 until that pause moves out of it. Built-in miners refresh their templates approximately every second
 while searching, rather than continuing to mine indefinitely with an old timestamp.
+Both built-in and RPC miners also abandon work on an outdated tip; RPC miners check for tip changes
+approximately every 50 ms, and a final node-side check prevents stale submissions.
 
 Send a payment and follow it:
 

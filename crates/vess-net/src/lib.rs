@@ -202,6 +202,8 @@ pub mod rpc_kind {
     pub const WAIT_FOR_TIP: u16 = 12;
     /// Long-poll: reply as soon as an account differs from the state the caller last saw.
     pub const WAIT_FOR_ACCOUNT: u16 = 13;
+    /// Submit locally mined work only if its parent is still the best tip.
+    pub const SUBMIT_MINED_BLOCK: u16 = 14;
 }
 
 /// How a caller names a block: by main-chain height or by id.
@@ -217,6 +219,7 @@ pub enum Request {
     Balance(AccountId),
     Template(AccountId),
     SubmitBlock(Vec<u8>),
+    SubmitMinedBlock(Vec<u8>),
     SubmitTransfer(Transfer),
     SubmitStateUpdate(StateUpdate),
     Proof(AccountId),
@@ -432,6 +435,10 @@ impl Encode for Request {
                 w.u8(rpc_kind::SUBMIT_BLOCK as u8);
                 let _ = w.var_bytes(bytes);
             }
+            Request::SubmitMinedBlock(bytes) => {
+                w.u8(rpc_kind::SUBMIT_MINED_BLOCK as u8);
+                let _ = w.var_bytes(bytes);
+            }
             Request::SubmitTransfer(t) => {
                 w.u8(rpc_kind::SUBMIT_TRANSFER as u8);
                 encode_transfer_fields(w, t);
@@ -493,6 +500,9 @@ impl Decode for Request {
             rpc_kind::TEMPLATE => Request::Template(r.array()?),
             rpc_kind::SUBMIT_BLOCK => {
                 Request::SubmitBlock(r.var_bytes(MAX_NETWORK_FRAME_BYTES)?.to_vec())
+            }
+            rpc_kind::SUBMIT_MINED_BLOCK => {
+                Request::SubmitMinedBlock(r.var_bytes(MAX_NETWORK_FRAME_BYTES)?.to_vec())
             }
             rpc_kind::SUBMIT_TRANSFER => Request::SubmitTransfer(Transfer::decode(r)?),
             rpc_kind::SUBMIT_STATE_UPDATE => Request::SubmitStateUpdate(StateUpdate::decode(r)?),
@@ -1226,6 +1236,7 @@ mod tests {
             Request::Status,
             Request::Balance([1u8; 32]),
             Request::SubmitBlock(vec![1, 2, 3]),
+            Request::SubmitMinedBlock(vec![4, 5, 6]),
             Request::WaitForTip {
                 after: [4u8; 32],
                 timeout_ms: 25_000,

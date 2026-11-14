@@ -1489,21 +1489,27 @@ pub fn mine(node: Arc<Mutex<Node>>, payout: AccountId, pause: Duration) {
                 continue;
             }
         };
-        match crate::mine_fresh(&mut template.header, 200_000_000, started) {
+        let signal = lock(&node).tip_signal();
+        let result = crate::mine_fresh(&mut template.header, 200_000_000, started, |parent| {
+            Ok::<_, std::convert::Infallible>(signal.current() != *parent)
+        })
+        .expect("infallible tip check");
+        match result {
             crate::MiningResult::Refresh => continue,
             crate::MiningResult::Exhausted => {
                 crate::log_warn!("miner", "no solution after 200 million nonces");
             }
             crate::MiningResult::Found => {
                 let bytes = template.encode();
-                match lock(&node).accept_block(&bytes) {
-                    Ok(id) => {
+                match lock(&node).accept_mined_block(&bytes) {
+                    Ok(Some(id)) => {
                         crate::log_debug!(
                             "miner",
                             "mined block {} at height {height}",
                             hex_short(&id)
                         )
                     }
+                    Ok(None) => continue,
                     Err(why) => crate::log_warn!("miner", "mined block was refused: {why}"),
                 }
             }

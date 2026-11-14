@@ -60,23 +60,28 @@ pub enum MiningResult {
 }
 
 /// Search in bounded batches so callers can replace stale templates.
-pub fn mine_fresh(header: &mut BlockHeader, max_attempts: u64, started: Instant) -> MiningResult {
+pub fn mine_fresh<E>(
+    header: &mut BlockHeader,
+    max_attempts: u64,
+    started: Instant,
+    mut stale: impl FnMut(&Hash) -> Result<bool, E>,
+) -> Result<MiningResult, E> {
     let mut remaining = max_attempts;
     while remaining > 0 {
-        if started.elapsed() >= MINING_REFRESH_INTERVAL {
-            return MiningResult::Refresh;
+        if started.elapsed() >= MINING_REFRESH_INTERVAL || stale(&header.previous_block_id)? {
+            return Ok(MiningResult::Refresh);
         }
         let attempts = remaining.min(MINING_BATCH_ATTEMPTS);
         let found = vess_consensus::mine_header(header, attempts);
-        if started.elapsed() >= MINING_REFRESH_INTERVAL {
-            return MiningResult::Refresh;
+        if started.elapsed() >= MINING_REFRESH_INTERVAL || stale(&header.previous_block_id)? {
+            return Ok(MiningResult::Refresh);
         }
         if found {
-            return MiningResult::Found;
+            return Ok(MiningResult::Found);
         }
         remaining -= attempts;
     }
-    MiningResult::Exhausted
+    Ok(MiningResult::Exhausted)
 }
 /// Approximate encoded size of one account record, used only for batching.
 const SNAPSHOT_RECORD_BYTES: usize = 128;
@@ -685,6 +690,14 @@ impl Node {
         self.accept_block_at(bytes, Self::clock_ms()?)
     }
 
+    pub fn accept_mined_block(&mut self, bytes: &[u8]) -> Result<Option<Hash>, NodeError> {
+        let (header, _) = split_block(bytes)?;
+        if header.previous_block_id != self.chain.best_id() {
+            return Ok(None);
+        }
+        self.accept_block(bytes).map(Some)
+    }
+
     fn accept_block_at(&mut self, bytes: &[u8], now: u128) -> Result<Hash, NodeError> {
         let (header, _) = split_block(bytes)?;
         Self::check_future_timestamp(header.timestamp_unix_ms, now)?;
@@ -1165,6 +1178,13 @@ impl Node {
             Request::SubmitBlock(bytes) => match self.accept_block(&bytes) {
                 Ok(id) => Reply::ok(ReplyBody::Accepted(id)),
                 Err(NodeError::UnknownParent) => Reply::reject(reason::NOT_TIP),
+                Err(NodeError::Consensus(_)) => Reply::reject(reason::CONSENSUS),
+                Err(NodeError::Storage(_)) => Reply::reject(reason::STORAGE),
+                Err(_) => Reply::reject(reason::MALFORMED),
+            },
+            Request::SubmitMinedBlock(bytes) => match self.accept_mined_block(&bytes) {
+                Ok(Some(id)) => Reply::ok(ReplyBody::Accepted(id)),
+                Ok(None) | Err(NodeError::UnknownParent) => Reply::reject(reason::NOT_TIP),
                 Err(NodeError::Consensus(_)) => Reply::reject(reason::CONSENSUS),
                 Err(NodeError::Storage(_)) => Reply::reject(reason::STORAGE),
                 Err(_) => Reply::reject(reason::MALFORMED),
