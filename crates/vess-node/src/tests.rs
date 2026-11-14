@@ -42,9 +42,143 @@ fn node() -> (TempDir, Node) {
     (dir, node)
 }
 
+#[test]
+fn mining_timestamp_tracks_clock_within_median_window() {
+    let median = 1_000;
+    assert_eq!(Node::timestamp_for_clock(1_005, median), 1_005);
+    assert_eq!(Node::timestamp_for_clock(1_005, median), 1_005);
+    assert_eq!(Node::timestamp_for_clock(1_000, median), 1_001);
+    assert_eq!(Node::timestamp_for_clock(900, median), 1_001);
+    assert_eq!(Node::timestamp_for_clock(121_000, median), 121_000);
+    assert_eq!(Node::timestamp_for_clock(200_000, median), 200_000);
+}
+
+#[test]
+fn future_timestamp_rejected_for_header_and_block_until_clock_catches_up() {
+    let (_dir, mut node) = node();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let timestamp = now + vess_core::constants::MAX_FUTURE_DRIFT_MS + 60_000;
+    let (mut template, _) = node.template(&[0x21; 32], timestamp).unwrap();
+    assert!(template.mine(20_000_000));
+    assert!(matches!(
+        node.insert_header_only(template.header),
+        Err(NodeError::Consensus(_))
+    ));
+    assert!(matches!(
+        node.accept_block(&template.encode()),
+        Err(NodeError::Consensus(_))
+    ));
+    assert_eq!(node.height(), 0);
+    assert!(Node::future_timestamp_allowed(
+        timestamp,
+        (timestamp - vess_core::constants::MAX_FUTURE_DRIFT_MS).into()
+    ));
+    assert!(!Node::future_timestamp_allowed(
+        timestamp,
+        (timestamp - vess_core::constants::MAX_FUTURE_DRIFT_MS - 1).into()
+    ));
+    let boundary = u128::from(timestamp - vess_core::constants::MAX_FUTURE_DRIFT_MS);
+    assert!(matches!(
+        node.insert_header_only_at(template.header, boundary - 1),
+        Err(NodeError::Consensus(_))
+    ));
+    node.insert_header_only_at(template.header, boundary)
+        .unwrap();
+    assert!(matches!(
+        node.accept_block_at(&template.encode(), boundary - 1),
+        Err(NodeError::Consensus(_))
+    ));
+    node.accept_block_at(&template.encode(), boundary).unwrap();
+    assert_eq!(node.height(), 1);
+}
+
+#[test]
+fn invalid_header_is_reported_and_not_counted() {
+    let (_dir, mut node) = node();
+    let (mut template, _) = node
+        .template(&[0x21; 32], node.next_timestamp_ms())
+        .unwrap();
+    template.header.version += 1;
+    assert!(matches!(
+        node.insert_header_only(template.header),
+        Err(NodeError::Consensus(_))
+    ));
+    assert_eq!(node.height(), 0);
+}
+
+#[test]
+fn stalled_chain_resumes_after_restart_at_current_time() {
+    let dir = TempDir::new();
+    let payout = [0x21; 32];
+    let genesis = NetworkProfile::DEVNET.genesis_timestamp_ms;
+    {
+        let mut node = Node::open(&dir.path, NetworkProfile::DEVNET).unwrap();
+        let (mut template, _) = node.template(&payout, genesis + 1_000).unwrap();
+        assert!(template.mine(20_000_000));
+        node.accept_block(&template.encode()).unwrap();
+    }
+    let mut node = Node::open(&dir.path, NetworkProfile::DEVNET).unwrap();
+    let now = node.next_timestamp_ms();
+    assert!(now > genesis + 120_000);
+    let (mut template, _) = node.template(&payout, now).unwrap();
+    assert!(template.mine(20_000_000));
+    node.accept_block(&template.encode()).unwrap();
+    assert_eq!(node.height(), 2);
+    assert_eq!(node.tip().timestamp_unix_ms, now);
+}
+
+#[test]
+fn mining_discards_stale_work_and_accepts_fresh_work() {
+    let (_dir, node) = node();
+    let (template, _) = node
+        .template(&[0x21; 32], node.next_timestamp_ms())
+        .unwrap();
+    let mut stale = template.header;
+    let old = std::time::Instant::now() - crate::MINING_REFRESH_INTERVAL;
+    assert!(matches!(
+        crate::mine_fresh(&mut stale, 20_000_000, old),
+        crate::MiningResult::Refresh
+    ));
+    let mut fresh = template.header;
+    let mut result = crate::MiningResult::Refresh;
+    for _ in 0..10 {
+        result = crate::mine_fresh(&mut fresh, 20_000_000, std::time::Instant::now());
+        if matches!(result, crate::MiningResult::Found) {
+            break;
+        }
+    }
+    assert!(matches!(result, crate::MiningResult::Found));
+    assert!(fresh.meets_target());
+}
+#[test]
+fn clock_driven_mining_changes_difficulty() {
+    let (_dir, mut node) = node();
+    let genesis = node.tip().timestamp_unix_ms;
+    for height in 1_u64..=128 {
+        let median =
+            vess_consensus::chain::median_time_past(node.chain(), &node.chain().best_id()).unwrap();
+        let timestamp = Node::timestamp_for_clock(genesis + height * 500, median);
+        let (mut template, _) = node.template(&[0x21; 32], timestamp).unwrap();
+        assert!(template.mine(20_000_000));
+        node.accept_block(&template.encode()).unwrap();
+    }
+    let target = node.tip().target;
+    assert_eq!(
+        target,
+        NetworkProfile::DEVNET
+            .genesis_target
+            .div_rem(vess_core::U256::from_u64(2))
+            .unwrap()
+            .0
+    );
+}
+
 /// Mine a block from the node's own mempool and submit it through the RPC handler.
 fn mine_one(node: &mut Node, payout: &[u8; 32]) -> vess_core::Hash {
-    let timestamp = node.next_timestamp();
+    let timestamp = node.next_timestamp_ms();
     let (mut template, _) = node.template(payout, timestamp).unwrap();
     assert!(template.mine(20_000_000));
     let bytes = template.encode();
@@ -100,7 +234,7 @@ fn a_transfer_flows_from_wallet_to_block_to_balance() {
     assert_eq!(node.mempool().transaction_count(), 1);
 
     // The template must include the pending transfer.
-    let timestamp = node.next_timestamp();
+    let timestamp = node.next_timestamp_ms();
     let (template, height) = node.template(&alice.account_id(), timestamp).unwrap();
     let txs = vess_consensus::decode_body(&template.body).unwrap();
     assert_eq!(txs.len(), 1);
@@ -207,7 +341,7 @@ fn an_unaffordable_pending_transfer_does_not_stall_mining() {
     assert_eq!(node.mempool().transaction_count(), 1);
 
     // Building a block must skip it instead of failing.
-    let timestamp = node.next_timestamp();
+    let timestamp = node.next_timestamp_ms();
     let (template, _) = node
         .template(&wallet.account_id(), timestamp)
         .expect("template should still build");
@@ -643,6 +777,29 @@ fn accepting_the_same_block_twice_changes_nothing() {
 }
 
 #[test]
+fn replaying_a_stored_best_block_resumes_reconciliation() {
+    use vess_consensus::chain::HeaderSource;
+
+    let (_source_dir, mut source) = node();
+    let (_target_dir, mut target) = node();
+    let payout = [0x64u8; 32];
+    let id = mine_one(&mut source, &payout);
+    let bytes = source.block_body(&id).unwrap();
+    let (header, _) = vess_consensus::split_block(&bytes).unwrap();
+    target.insert_header_only(header).unwrap();
+    let meta = target.chain.meta(&id).unwrap();
+    target
+        .store
+        .put_block_index(&header, meta.height, meta.chain_work, &bytes)
+        .unwrap();
+    assert_eq!(target.state_height(), 0);
+
+    assert_eq!(target.accept_block(&bytes).unwrap(), id);
+    assert_eq!(target.state_height(), 1);
+    assert_eq!(target.balance(&payout), MINED);
+}
+
+#[test]
 fn garbage_on_the_wire_leaves_the_node_healthy() {
     use std::io::Write;
 
@@ -738,7 +895,7 @@ impl Network {
 
     fn mine(&self, index: usize, payout: &[u8; 32]) -> vess_core::Hash {
         let mut guard = self.nodes[index].lock().unwrap();
-        let timestamp = guard.next_timestamp();
+        let timestamp = guard.next_timestamp_ms();
         let (mut template, _) = guard.template(payout, timestamp).unwrap();
         assert!(template.mine(20_000_000));
         let bytes = template.encode();
@@ -885,7 +1042,7 @@ fn transfers_propagate_across_the_network() {
     network.sync_all();
     {
         let mut guard = network.nodes[2].lock().unwrap();
-        let timestamp = guard.next_timestamp();
+        let timestamp = guard.next_timestamp_ms();
         let (mut template, _) = guard.template(&alice.account_id(), timestamp).unwrap();
         assert!(template.mine(20_000_000));
         let bytes = template.encode();
@@ -906,7 +1063,7 @@ fn transfers_propagate_across_the_network() {
     // Mining pays the same reward on every node that shares the same target.
     {
         let mut guard = network.nodes[1].lock().unwrap();
-        let timestamp = guard.next_timestamp();
+        let timestamp = guard.next_timestamp_ms();
         let (mut template, _) = guard.template(&alice.account_id(), timestamp).unwrap();
         assert!(template.mine(20_000_000));
         let bytes = template.encode();
@@ -980,8 +1137,56 @@ fn a_transaction_adopted_through_a_reorg_leaves_the_mempool() {
         "an adopted transaction must not stay pending"
     );
     // A stale entry would make the nonce already-used and break template building.
-    let timestamp = guard.next_timestamp();
+    let timestamp = guard.next_timestamp_ms();
     assert!(guard.template(&wallet.account_id(), timestamp).is_ok());
+}
+
+/// A block that loses fork choice is stored as a side branch, but it must not remove the
+/// transactions it contains from the mempool: they were never mined on the chain this node follows.
+#[test]
+fn a_side_branch_block_does_not_evict_its_transactions() {
+    let (_dir, mut node) = node();
+    let alice = Wallet::from_seed(0, [0x57u8; 32]);
+    let bob = [0xE1u8; 32];
+
+    // Fund Alice, then advance the main chain past the height the side branch will fork from.
+    for _ in 0..2 {
+        mine_one(&mut node, &alice.account_id());
+    }
+    let fork = node.tip().id();
+    for _ in 0..2 {
+        mine_one(&mut node, &alice.account_id());
+    }
+
+    let tx = alice.build_transfer(bob, 1, 0, 0, 0);
+    node.submit_transfer(tx.clone()).unwrap();
+    assert_eq!(node.mempool().transaction_count(), 1);
+
+    // Build a block on the fork point that includes the pending transfer, as an attacking miner can.
+    let parent_state = node.state_at(&fork).unwrap();
+    let timestamp = node.next_timestamp_ms();
+    let mut template = vess_consensus::build_template(
+        node.chain(),
+        &node.network,
+        &fork,
+        &parent_state,
+        &alice.account_id(),
+        timestamp,
+        &[Transaction::Transfer(tx)],
+    )
+    .unwrap();
+    assert!(template.mine(20_000_000));
+    let side = node.accept_block(&template.encode()).unwrap();
+
+    assert!(
+        !node.chain().is_ancestor(&side, &node.tip().id()),
+        "the block must stay a side branch"
+    );
+    assert_eq!(
+        node.mempool().transaction_count(),
+        1,
+        "a losing side branch must not evict its transactions"
+    );
 }
 
 #[test]
@@ -1054,7 +1259,7 @@ fn a_snapshot_reproduces_the_state_of_the_block_it_claims() {
     let wallet = Wallet::from_seed(0, [0x61u8; 32]);
     let payout = wallet.account_id();
     for _ in 0..3 {
-        let timestamp = a.lock().unwrap().next_timestamp();
+        let timestamp = a.lock().unwrap().next_timestamp_ms();
         let (mut template, _) = a.lock().unwrap().template(&payout, timestamp).unwrap();
         assert!(template.mine(20_000_000));
         let bytes = template.encode();
@@ -1062,7 +1267,7 @@ fn a_snapshot_reproduces_the_state_of_the_block_it_claims() {
     }
     let transfer = wallet.build_transfer([0x62u8; 32], 1, 0, 0, 0);
     a.lock().unwrap().submit_transfer(transfer).unwrap();
-    let timestamp = a.lock().unwrap().next_timestamp();
+    let timestamp = a.lock().unwrap().next_timestamp_ms();
     let (mut template, _) = a.lock().unwrap().template(&payout, timestamp).unwrap();
     assert!(template.mine(20_000_000));
     let bytes = template.encode();
@@ -1105,7 +1310,7 @@ fn an_unverifiable_snapshot_is_refused_unless_trusted() {
 
     let payout = [0x64u8; 32];
     for _ in 0..2 {
-        let timestamp = a.lock().unwrap().next_timestamp();
+        let timestamp = a.lock().unwrap().next_timestamp_ms();
         let (mut template, _) = a.lock().unwrap().template(&payout, timestamp).unwrap();
         assert!(template.mine(20_000_000));
         let bytes = template.encode();
@@ -1143,7 +1348,7 @@ fn a_snapshot_that_does_not_match_its_header_is_refused() {
 
     let payout = [0x63u8; 32];
     for _ in 0..2 {
-        let timestamp = a.lock().unwrap().next_timestamp();
+        let timestamp = a.lock().unwrap().next_timestamp_ms();
         let (mut template, _) = a.lock().unwrap().template(&payout, timestamp).unwrap();
         assert!(template.mine(20_000_000));
         let bytes = template.encode();

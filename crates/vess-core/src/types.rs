@@ -68,6 +68,7 @@ pub struct Transfer {
     pub amount: u64,
     pub fee: u64,
     pub nonce: u64,
+    /// Unix seconds; zero disables expiry.
     pub expiry_unix: u64,
     pub signature: Signature,
 }
@@ -142,6 +143,7 @@ pub struct StateUpdate {
     pub new_state_hash: Hash,
     pub fee: u64,
     pub nonce: u64,
+    /// Unix seconds; zero disables expiry.
     pub expiry_unix: u64,
     pub signature: Signature,
 }
@@ -263,7 +265,8 @@ pub struct BlockHeader {
     pub previous_block_id: Hash,
     pub transaction_root: Hash,
     pub state_root: Hash,
-    pub timestamp_unix: u64,
+    /// Unix time in milliseconds.
+    pub timestamp_unix_ms: u64,
     pub target: U256,
     pub payout_account_id: AccountId,
     pub security_nonce: [u8; 32],
@@ -277,7 +280,7 @@ impl BlockHeader {
         w.fixed(&self.previous_block_id);
         w.fixed(&self.transaction_root);
         w.fixed(&self.state_root);
-        w.u64(self.timestamp_unix);
+        w.u64(self.timestamp_unix_ms);
         w.fixed(&self.target.to_be_bytes());
         w.fixed(&self.payout_account_id);
         w.fixed(&self.security_nonce);
@@ -299,7 +302,7 @@ impl BlockHeader {
             previous_block_id: r.array()?,
             transaction_root: r.array()?,
             state_root: r.array()?,
-            timestamp_unix: r.u64()?,
+            timestamp_unix_ms: r.u64()?,
             target: U256::from_be_bytes(r.array()?),
             payout_account_id: r.array()?,
             security_nonce: r.array()?,
@@ -443,7 +446,7 @@ mod tests {
             previous_block_id: [2u8; 32],
             transaction_root: [3u8; 32],
             state_root: [4u8; 32],
-            timestamp_unix: 1_700_000_005,
+            timestamp_unix_ms: 1_700_000_005,
             target: U256::pow2(226),
             payout_account_id: [5u8; 32],
             security_nonce: [6u8; 32],
@@ -469,7 +472,7 @@ mod tests {
             previous_block_id: [2u8; 32],
             transaction_root: [3u8; 32],
             state_root: [4u8; 32],
-            timestamp_unix: 1_700_000_005,
+            timestamp_unix_ms: 1_700_000_005,
             target: U256::MAX,
             payout_account_id: [5u8; 32],
             security_nonce: [6u8; 32],
@@ -511,7 +514,7 @@ mod tests {
             previous_block_id: [2u8; 32],
             transaction_root: [3u8; 32],
             state_root: [4u8; 32],
-            timestamp_unix: 1_700_000_005,
+            timestamp_unix_ms: 1_700_000_005,
             target: U256::from_u64(1 << 40),
             payout_account_id: [5u8; 32],
             security_nonce: [6u8; 32],

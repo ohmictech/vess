@@ -47,7 +47,7 @@ impl Harness {
     }
 
     fn timestamp(&self) -> u64 {
-        self.chain.best_header().timestamp_unix + 1
+        self.chain.best_header().timestamp_unix_ms + 1
     }
 
     /// Build, mine, validate, and insert a block. Panics on any rejection.
@@ -127,8 +127,8 @@ fn genesis_matches_the_specification() {
     assert_eq!(genesis.transaction_root, hash::empty_tx_root());
     assert_eq!(genesis.state_root, crate::chain::empty_state_root());
     assert_eq!(
-        genesis.timestamp_unix,
-        NetworkProfile::DEVNET.genesis_timestamp
+        genesis.timestamp_unix_ms,
+        NetworkProfile::DEVNET.genesis_timestamp_ms
     );
     assert_eq!(genesis.target, NetworkProfile::DEVNET.genesis_target);
     assert_eq!(genesis.payout_account_id, [0u8; 32]);
@@ -246,7 +246,7 @@ fn a_harder_target_pays_proportionally() {
             &network,
             target,
             &[],
-            network.genesis_timestamp,
+            network.genesis_timestamp_ms,
             &miner,
         )
         .expect("empty body applies");
@@ -284,7 +284,7 @@ fn the_dev_fee_is_one_percent_of_the_reward() {
         &network,
         target,
         &[],
-        network.genesis_timestamp,
+        network.genesis_timestamp_ms,
         &miner,
     )
     .expect("empty body applies");
@@ -306,7 +306,7 @@ fn genesis_blocks_pay_exactly_one_unit_of_dev_fee() {
         &network,
         network.genesis_target,
         &[],
-        network.genesis_timestamp,
+        network.genesis_timestamp_ms,
         &miner,
     )
     .expect("empty body applies");
@@ -330,7 +330,7 @@ fn no_dev_fee_is_charged_below_one_hundred_units() {
         &network,
         target,
         &[],
-        network.genesis_timestamp,
+        network.genesis_timestamp_ms,
         &miner,
     )
     .expect("empty body applies");
@@ -453,7 +453,7 @@ fn header_validation_rejects_bad_fields() {
         previous_block_id: genesis.id(),
         transaction_root: hash::empty_tx_root(),
         state_root: genesis.state_root,
-        timestamp_unix: genesis.timestamp_unix + 1,
+        timestamp_unix_ms: genesis.timestamp_unix_ms + 1,
         target: genesis.target,
         payout_account_id: [1u8; 32],
         security_nonce: [0u8; 32],
@@ -461,7 +461,7 @@ fn header_validation_rejects_bad_fields() {
 
     // Wrong version.
     let mut bad = header;
-    bad.version = 2;
+    bad.version = PROTOCOL_VERSION + 1;
     assert_eq!(
         h.chain.validate_header(&bad),
         Err(ConsensusError::BadVersion)
@@ -493,15 +493,7 @@ fn header_validation_rejects_bad_fields() {
 
     // Timestamp equal to the median time past.
     let mut bad = header;
-    bad.timestamp_unix = genesis.timestamp_unix;
-    assert_eq!(
-        h.chain.validate_header(&bad),
-        Err(ConsensusError::BadTimestamp)
-    );
-
-    // Timestamp too far ahead.
-    let mut bad = header;
-    bad.timestamp_unix = genesis.timestamp_unix + MAX_FUTURE_DRIFT_SECONDS + 1;
+    bad.timestamp_unix_ms = genesis.timestamp_unix_ms;
     assert_eq!(
         h.chain.validate_header(&bad),
         Err(ConsensusError::BadTimestamp)
@@ -595,7 +587,7 @@ fn fork_choice_prefers_work_then_the_lower_id() {
     let mut h = Harness::new(devnet());
     let miner = account(&key(8));
     let genesis = h.chain.best_header();
-    let ts = genesis.timestamp_unix + 1;
+    let ts = genesis.timestamp_unix_ms + 1;
 
     // Two competing blocks at height 1, identical work.
     let mut ids = HashSet::new();
@@ -647,7 +639,7 @@ fn synthetic(network: NetworkProfile, count: u64, ts_step: impl Fn(u64) -> u64) 
             previous_block_id: parent_id,
             transaction_root: hash::empty_tx_root(),
             state_root: parent.state_root,
-            timestamp_unix: ts,
+            timestamp_unix_ms: ts,
             target,
             payout_account_id: [0u8; 32],
             security_nonce: [0u8; 32],
@@ -660,16 +652,18 @@ fn synthetic(network: NetworkProfile, count: u64, ts_step: impl Fn(u64) -> u64) 
 #[test]
 fn retarget_eases_when_blocks_arrive_slowly() {
     let network = testnet();
-    let base = network.genesis_timestamp;
+    let base = network.genesis_timestamp_ms;
     // Four seconds per block: the window clamps to 256, i.e. 4x easier.
-    let chain = synthetic(network, 128, |h| base + 4 * h);
+    let chain = synthetic(network, 128, |h| base + 4_000 * h);
     let retargeted = chain.main_header_at(128).unwrap().target;
     let expected = crate::chain::clamp_target(
         network
             .genesis_target
-            .checked_mul_u64(MAX_RETARGET_ELAPSED_SECONDS)
+            .checked_mul_u64(MAX_RETARGET_ELAPSED_MS)
             .unwrap()
-            .div_rem(vess_core::U256::from_u64(DIFFICULTY_WINDOW_BLOCKS))
+            .div_rem(vess_core::U256::from_u64(
+                DIFFICULTY_WINDOW_BLOCKS * TARGET_BLOCK_MS,
+            ))
             .unwrap()
             .0,
     );
@@ -680,8 +674,8 @@ fn retarget_eases_when_blocks_arrive_slowly() {
 #[test]
 fn retarget_is_unchanged_at_the_target_rate() {
     let network = testnet();
-    let base = network.genesis_timestamp;
-    let chain = synthetic(network, 128, |h| base + h);
+    let base = network.genesis_timestamp_ms;
+    let chain = synthetic(network, 128, |h| base + 1_000 * h);
     assert_eq!(
         chain.main_header_at(128).unwrap().target,
         network.genesis_target
@@ -689,32 +683,59 @@ fn retarget_is_unchanged_at_the_target_rate() {
 }
 
 #[test]
+fn retarget_preserves_subsecond_resolution() {
+    let network = testnet();
+    let base = network.genesis_timestamp_ms;
+    let chain = synthetic(network, 128, |h| base + 1_250 * h);
+    let expected = network
+        .genesis_target
+        .div_rem(vess_core::U256::from_u64(4))
+        .unwrap()
+        .0
+        .checked_mul_u64(5)
+        .unwrap();
+    assert_eq!(chain.main_header_at(128).unwrap().target, expected);
+
+    let fast = synthetic(network, 128, |h| base + 750 * h);
+    let expected_fast = network
+        .genesis_target
+        .div_rem(vess_core::U256::from_u64(4))
+        .unwrap()
+        .0
+        .checked_mul_u64(3)
+        .unwrap();
+    assert_eq!(fast.main_header_at(128).unwrap().target, expected_fast);
+}
+
+#[test]
 fn stalled_timestamps_make_the_chain_harder_never_cheaper() {
     let network = testnet();
-    let base = network.genesis_timestamp;
+    let base = network.genesis_timestamp_ms;
     // Timestamps advance once every two blocks, the slowest cadence the median rule allows.
     let chain = synthetic(network, 128, |h| base + h.div_ceil(2));
 
     // Recompute the window sum independently from the stored headers.
     let mut elapsed: u64 = 0;
     for i in 64..=127u64 {
-        let current = chain.main_header_at(i).unwrap().timestamp_unix;
-        let previous = chain.main_header_at(i - 1).unwrap().timestamp_unix;
-        elapsed += (current as i64 - previous as i64).clamp(0, MAX_PER_BLOCK_ELAPSED_SECONDS as i64)
-            as u64;
+        let current = chain.main_header_at(i).unwrap().timestamp_unix_ms;
+        let previous = chain.main_header_at(i - 1).unwrap().timestamp_unix_ms;
+        elapsed +=
+            (current as i64 - previous as i64).clamp(0, MAX_PER_BLOCK_ELAPSED_MS as i64) as u64;
     }
     assert!(
         elapsed < DIFFICULTY_WINDOW_BLOCKS,
         "the window should look fast"
     );
 
-    let elapsed = elapsed.clamp(MIN_RETARGET_ELAPSED_SECONDS, MAX_RETARGET_ELAPSED_SECONDS);
+    let elapsed = elapsed.clamp(MIN_RETARGET_ELAPSED_MS, MAX_RETARGET_ELAPSED_MS);
     let expected = crate::chain::clamp_target(
         network
             .genesis_target
             .checked_mul_u64(elapsed)
             .unwrap()
-            .div_rem(vess_core::U256::from_u64(DIFFICULTY_WINDOW_BLOCKS))
+            .div_rem(vess_core::U256::from_u64(
+                DIFFICULTY_WINDOW_BLOCKS * TARGET_BLOCK_MS,
+            ))
             .unwrap()
             .0,
     );
@@ -728,9 +749,9 @@ fn stalled_timestamps_make_the_chain_harder_never_cheaper() {
 #[test]
 fn target_never_leaves_the_permitted_bounds() {
     let network = testnet();
-    let base = network.genesis_timestamp;
+    let base = network.genesis_timestamp_ms;
     // Extremely slow blocks repeatedly push the target up; it must stop at MAXIMUM_TARGET.
-    let chain = synthetic(network, 512, |h| base + 4 * h);
+    let chain = synthetic(network, 512, |h| base + 4_000 * h);
     for height in 0..=512 {
         let target = chain.main_header_at(height).unwrap().target;
         assert!(target >= MINIMUM_TARGET, "height {height}");
@@ -740,7 +761,7 @@ fn target_never_leaves_the_permitted_bounds() {
 
 // ---------------------------------------------------------------- edge cases
 
-/// The timestamp window is closed on the past side and half-open on the future side.
+/// A stale chain can advance to the present while retaining the median-time lower bound.
 #[test]
 fn timestamp_bounds_are_exact() {
     let mut h = Harness::new(devnet());
@@ -756,15 +777,11 @@ fn timestamp_bounds_are_exact() {
 
     // At the median there is no progress in time: refused.
     assert!(template(mtp).is_err());
-    // One second past the median is the oldest legal block.
+    // One millisecond past the median is the oldest legal block.
     assert!(template(mtp + 1).is_ok());
-    // The whole allowed drift is usable...
-    assert!(template(mtp + MAX_FUTURE_DRIFT_SECONDS).is_ok());
-    // ...and one second more is not.
-    assert!(template(mtp + MAX_FUTURE_DRIFT_SECONDS + 1).is_err());
+    assert!(template(mtp + 14 * 24 * 60 * 60 * 1_000).is_ok());
 
-    // A block at the last legal timestamp really is accepted and becomes the tip.
-    let id = h.mine_block(&miner, mtp + MAX_FUTURE_DRIFT_SECONDS, &[]);
+    let id = h.mine_block(&miner, mtp + 14 * 24 * 60 * 60 * 1_000, &[]);
     assert_eq!(h.chain.best_id(), id);
 }
 
@@ -846,7 +863,7 @@ fn an_account_can_be_emptied_but_not_overdrawn() {
     assert!(rejected.is_err(), "an empty account cannot pay");
 }
 
-/// `expiry_unix == block.timestamp` is still valid; one second earlier is not.
+/// Expiry uses whole Unix seconds, inclusive of the entire expiration second.
 #[test]
 fn transfer_expiry_boundary_is_inclusive() {
     let mut h = Harness::new(devnet());
@@ -856,9 +873,9 @@ fn transfer_expiry_boundary_is_inclusive() {
 
     h.fund(&alice, 4);
 
-    let block_ts = h.timestamp();
+    let block_ts = (h.timestamp() / 1_000) * 1_000 + 999;
     let mut exactly = signed_transfer(&alice_key, bob, 2, 1, 0);
-    exactly.expiry_unix = block_ts;
+    exactly.expiry_unix = block_ts / 1_000;
     exactly.signature =
         vess_crypto::sign(&alice_key, DOM_TRANSFER, &exactly.unsigned_bytes()).unwrap();
     h.mine_block(&alice, block_ts, &[Transaction::Transfer(exactly.clone())]);
@@ -866,7 +883,7 @@ fn transfer_expiry_boundary_is_inclusive() {
 
     let block_ts = h.timestamp();
     let mut one_second_late = signed_transfer(&alice_key, bob, 10, 1, 1);
-    one_second_late.expiry_unix = block_ts - 1;
+    one_second_late.expiry_unix = block_ts / 1_000 - 1;
     one_second_late.signature =
         vess_crypto::sign(&alice_key, DOM_TRANSFER, &one_second_late.unsigned_bytes()).unwrap();
     let rejected = build_template(

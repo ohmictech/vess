@@ -5,8 +5,8 @@ use std::collections::HashSet;
 use vess_core::U256;
 use vess_core::codec::{Reader, Writer};
 use vess_core::constants::{
-    BLOCK_HEADER_BYTES, DEV_FEE_ACCOUNT, MAX_BLOCK_BYTES, MAX_FUTURE_DRIFT_SECONDS,
-    MAX_TRANSACTION_BYTES, NetworkProfile, PROTOCOL_VERSION,
+    BLOCK_HEADER_BYTES, DEV_FEE_ACCOUNT, MAX_BLOCK_BYTES, MAX_TRANSACTION_BYTES, NetworkProfile,
+    PROTOCOL_VERSION,
 };
 use vess_core::hash::{self, DOM_STATE_UPDATE, DOM_TRANSFER};
 use vess_core::{AccountId, BlockHeader, Hash, Transaction};
@@ -127,7 +127,7 @@ pub fn apply_body(
     network: &NetworkProfile,
     target: U256,
     transactions: &[Transaction],
-    timestamp_unix: u64,
+    timestamp_unix_ms: u64,
     payout: &AccountId,
 ) -> Result<(), ConsensusError> {
     state.begin_block();
@@ -150,7 +150,7 @@ pub fn apply_body(
                     return Err(reject(index, TxReject::BadSignature));
                 }
                 state
-                    .execute_transfer(t, &sender, timestamp_unix, payout)
+                    .execute_transfer(t, &sender, timestamp_unix_ms / 1_000, payout)
                     .map_err(|e| reject(index, TxReject::InvalidState(e)))?;
             }
             Transaction::StateUpdate(t) => {
@@ -170,7 +170,7 @@ pub fn apply_body(
                     return Err(reject(index, TxReject::BadSignature));
                 }
                 state
-                    .execute_state_update(t, &sender, timestamp_unix, payout)
+                    .execute_state_update(t, &sender, timestamp_unix_ms / 1_000, payout)
                     .map_err(|e| reject(index, TxReject::InvalidState(e)))?;
             }
         }
@@ -196,7 +196,7 @@ pub fn build_template<C: HeaderSource>(
     parent_id: &Hash,
     parent_state: &State,
     payout: &AccountId,
-    timestamp_unix: u64,
+    timestamp_unix_ms: u64,
     transactions: &[Transaction],
 ) -> Result<BlockTemplate, ConsensusError> {
     let parent_meta = chain.meta(parent_id).ok_or(ConsensusError::UnknownParent)?;
@@ -206,7 +206,7 @@ pub fn build_template<C: HeaderSource>(
         .ok_or(ConsensusError::BadHeader)?;
     let target = required_target(chain, network, parent_id, height)?;
     let mtp = median_time_past(chain, parent_id)?;
-    if timestamp_unix <= mtp || timestamp_unix > mtp.saturating_add(MAX_FUTURE_DRIFT_SECONDS) {
+    if timestamp_unix_ms <= mtp {
         return Err(ConsensusError::BadTimestamp);
     }
 
@@ -227,7 +227,7 @@ pub fn build_template<C: HeaderSource>(
         network,
         target,
         transactions,
-        timestamp_unix,
+        timestamp_unix_ms,
         payout,
     )?;
 
@@ -237,7 +237,7 @@ pub fn build_template<C: HeaderSource>(
         previous_block_id: *parent_id,
         transaction_root,
         state_root: state.root(),
-        timestamp_unix,
+        timestamp_unix_ms,
         target,
         payout_account_id: *payout,
         security_nonce: [0u8; 32],
@@ -282,7 +282,7 @@ pub fn validate_block<C: HeaderSource>(
         network,
         header.target,
         &transactions,
-        header.timestamp_unix,
+        header.timestamp_unix_ms,
         &header.payout_account_id,
     )?;
 

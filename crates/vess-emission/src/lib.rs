@@ -81,7 +81,7 @@ mod tests {
         NetworkProfile {
             network: 9,
             genesis_target: U256::pow2(target_exp),
-            genesis_timestamp: 0,
+            genesis_timestamp_ms: 0,
         }
     }
 

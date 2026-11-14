@@ -206,7 +206,7 @@ mod tests {
         );
         assert_eq!(
             U256::work_from_target(NetworkProfile::TESTNET.genesis_target),
-            16_777_215
+            2_097_151
         );
         assert_eq!(
             U256::work_from_target(NetworkProfile::MAINNET.genesis_target),

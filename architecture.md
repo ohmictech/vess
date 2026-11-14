@@ -84,9 +84,12 @@ chain_id = BLAKE3("VESS-CHAIN-ID-V1" || network: u8)
 
 | Network | `network` | Genesis target | Genesis timestamp | Purpose |
 |---|---|---|---|---|
-| DEVNET  | 0 | 2^240 | 1 700 000 000 | integration tests, trivial PoW |
-| TESTNET | 1 | 2^232 | 1 700 000 000 | long-running test chain |
-| MAINNET | 2 | 2^226 | 1 700 000 000 | production |
+| DEVNET  | 0 | 2^240 | 1 790 812 800 000 | integration tests, trivial PoW |
+| TESTNET | 1 | 2^235 | 1 793 491 200 000 | long-running test chain |
+| MAINNET | 2 | 2^226 | 1 796 083 200 000 | production |
+
+Genesis and block timestamps are Unix milliseconds. Protocol version 3 is incompatible with
+earlier chains and databases.
 
 The genesis target sets the reward scale as well as the starting difficulty, because the two are the
 same number (§13). A block at genesis difficulty pays `GENESIS_REWARD = 100` on every network,
@@ -99,7 +102,7 @@ One versioned module (`vess-core::constants`). Not user-configurable at runtime.
 copy is whatever `vess node params --network <name>` prints, generated from these constants.
 
 ```text
-PROTOCOL_VERSION                     = 1
+PROTOCOL_VERSION                     = 3
 
 # sizes
 MAX_BLOCK_BYTES                      = 1_048_576      # header + body, inclusive
@@ -115,17 +118,17 @@ ACCOUNT_HASH                         = BLAKE3-256
 SIGNATURE_SCHEME                     = ML-DSA-65
 
 # time
-TARGET_BLOCK_SECONDS                 = 1
+TARGET_BLOCK_MS                      = 1_000
 MTP_SPAN_BLOCKS                      = 11
-MAX_FUTURE_DRIFT_SECONDS             = 120
-MAX_PER_BLOCK_ELAPSED_SECONDS        = 4
+MAX_FUTURE_DRIFT_MS                  = 120_000
+MAX_PER_BLOCK_ELAPSED_MS             = 4_000
 
 # difficulty
 DIFFICULTY_WINDOW_BLOCKS             = 64
 DIFFICULTY_FIRST_RETARGET_HEIGHT     = 128
 MAX_DIFFICULTY_ADJUSTMENT            = 4
-MIN_RETARGET_ELAPSED_SECONDS         = 16            # window clamp: 64 / 4
-MAX_RETARGET_ELAPSED_SECONDS         = 256           # window clamp: 64 * 4
+MIN_RETARGET_ELAPSED_MS              = 16_000
+MAX_RETARGET_ELAPSED_MS              = 256_000
 MAXIMUM_TARGET                       = 2^240
 MINIMUM_TARGET                       = 2^216
 
@@ -244,7 +247,7 @@ Rules:
 - A signed transaction is valid only when `nonce == next_nonce`; success increments nonce by exactly
   one (checked).
 - The ML-DSA public key travels in every signed transaction and must hash to the sender account ID.
-- Keys cannot rotate in protocol version 1. Loss of the private key means loss of the account.
+- Keys cannot rotate in protocol version 3. Loss of the private key means loss of the account.
 - `state_hash` is opaque to consensus; the chain stores no associated data.
 - **Balance enters the ledger in exactly one place: `State::credit`.** Consensus calls it for the
   block reward and for transaction fees. There is no other issuance path, and no transaction type
@@ -252,7 +255,7 @@ Rules:
 
 ## 7. Transactions
 
-Protocol version 1 has exactly two objects that can appear in a block body:
+Protocol version 3 has exactly two objects that can appear in a block body:
 
 ```text
 BlockBody {
@@ -298,7 +301,8 @@ Execution is atomic and happens only after all checks pass:
 4. Sender account exists.
 5. `nonce == sender.next_nonce`.
 6. `amount > 0`.
-7. `expiry_unix == 0 || block.timestamp <= expiry_unix`.
+7. `expiry_unix == 0 || floor(block.timestamp_unix_ms / 1000) <= expiry_unix`.
+   Expiry is in Unix seconds and includes the entire expiration second.
 8. `balance >= amount + fee` (checked).
 9. Debit `amount + fee` from the sender.
 10. Credit `amount` to the recipient (creating the account if absent).
@@ -410,7 +414,7 @@ BlockHeader {
     previous_block_id: [u8; 32],
     transaction_root:  [u8; 32],
     state_root:        [u8; 32],
-    timestamp_unix:    u64,
+    timestamp_unix_ms: u64,
     target:            [u8; 32],     // u256 big-endian
     payout_account_id: [u8; 32],
     security_nonce:    [u8; 32],
@@ -477,7 +481,7 @@ chain_id          = chain_id(network)
 previous_block_id = 0x00 * 32
 transaction_root  = BLAKE3("VESS-TX-ROOT-V1" || u32 be(0) || 0x00*32)
 state_root        = state root of the empty account set
-timestamp_unix    = profile timestamp (§3)
+timestamp_unix_ms = profile timestamp (§3)
 target            = profile genesis target (§3)
 payout_account_id = 0x00 * 32
 security_nonce    = 0x00 * 32
@@ -509,9 +513,9 @@ fn required_target(height h, chain) -> Target:
     elapsed = 0
     for i in (h - 64) ..= (h - 1):
         dt = ts(i) - ts(i - 1)                        # signed i64
-        elapsed += clamp(dt, 0, MAX_PER_BLOCK_ELAPSED_SECONDS)   # u64
-    elapsed = clamp(elapsed, MIN_RETARGET_ELAPSED_SECONDS, MAX_RETARGET_ELAPSED_SECONDS)
-    t = (target(h - 1) as u256) * elapsed / 64        # u256; elapsed <= 256, target <= 2^240
+        elapsed += clamp(dt, 0, MAX_PER_BLOCK_ELAPSED_MS)
+    elapsed = clamp(elapsed, MIN_RETARGET_ELAPSED_MS, MAX_RETARGET_ELAPSED_MS)
+    t = floor(target(h - 1) * elapsed / 64_000)  # exact; divide first to avoid overflow
     return clamp(t, MINIMUM_TARGET, MAXIMUM_TARGET)
 ```
 
@@ -519,11 +523,11 @@ Properties asserted by tests:
 
 - One manipulated timestamp can move the window by at most ±4 s out of 64 s (≈6.25 %), because each
   delta is clamped.
-- A run of equal timestamps gives `elapsed = 0`, clamped to 16, so difficulty can rise at most 4×;
+- A run of equal timestamps gives `elapsed = 0`, clamped to 16,000 ms, so difficulty can rise at most 4×;
   equal timestamps can never produce cheaper work.
 - The target is clamped to `[MINIMUM_TARGET, MAXIMUM_TARGET]` at every retarget, so no target can
   drift outside the range where `work()` is well defined and `u128` cumulative work is safe.
-- No floating point; the divisor is the constant 64, never zero.
+- No floating point; the divisor is the constant 64,000 milliseconds, never zero.
 
 Adversarial cases covered: hashrate ÷100 step, hashrate ×100 step, constant timestamps throughout the
 window, timestamps pinned to the future bound, `elapsed` clamped at both ends, targets at both clamps.
@@ -563,21 +567,18 @@ median of what exists). Consensus rules for a non-genesis block at height `h` ov
 
 ```text
 ts >  mtp(p)                                    # strictly greater
-ts <= mtp(p) + MAX_FUTURE_DRIFT_SECONDS (120)
 ```
 
 `mtp` uses the lower median when the history is shorter than 11 blocks, so a two-block history
-resolves deterministically. The 11-block window is what stops the clock ratcheting: each block is
-bounded relative to the *median* of its recent past, not to its parent, so no run of blocks can walk
-the timestamp forward by 120 s each. The drift bound is deliberately loose — at a 1 s target an honest
-node must be able to represent 2 s, 10 s, or 60 s spacing when hashrate drops, and a tight bound would
-make difficulty unable to ease. Manipulation is contained by the per-delta clamp of §11 instead:
-whatever a miner claims, one block adds at most 4 s to the retarget window.
+resolves deterministically. There is no chain-relative upper bound: a stalled chain can resume at
+the current clock time. Nodes temporarily reject received headers and blocks more than 120 seconds
+ahead of their local clock; they can be retried later. This is a local admission rule, not a
+deterministic historical validity rule. Clocks must be synchronized, and a sufficiently skewed
+clock can delay synchronization or admit future-dated blocks. The per-delta clamp of §11 limits
+each block's contribution to 4 seconds.
 
 Timestamps are **not** required to be monotone across the chain; the retarget clamps handle
-regressions. A node may additionally refuse to relay a block whose timestamp exceeds its own wall
-clock by a few seconds before relaying it — that is *policy*, never a consensus failure, and the block
-must still be accepted later if it becomes valid.
+regressions. Local future-time rejection is temporary; the block can be accepted later.
 
 ## 13. Emission
 
@@ -621,7 +622,7 @@ Every shipped network pays `100` at genesis difficulty and grows from there:
 | Network | `genesis_target` | total reward at genesis | total reward at `MINIMUM_TARGET` |
 |---|---|---|---|
 | devnet | 2^240 | 100 | 1 677 721 600 |
-| testnet | 2^232 | 100 | 6 553 600 |
+| testnet | 2^235 | 100 | 52 428 800 |
 | mainnet | 2^226 | 100 | 102 400 |
 
 At genesis difficulty the split is 99 miner / 1 dev on every network.
@@ -1288,7 +1289,7 @@ solver crate, and any TLS stack.
 
 ## 24. Launch checklist
 
-1. Freeze `genesis_timestamp` and `genesis_target` per network; changing either changes the genesis
+1. Freeze `genesis_timestamp_ms` and `genesis_target` per network; changing either changes the genesis
    block id and every balance that depends on it.
 2. Check `MAX_BLOCK_REWARD` is above `GENESIS_REWARD * MAXIMUM_TARGET / MINIMUM_TARGET`, or the clamp,
    not the target, sets emission at the top end.

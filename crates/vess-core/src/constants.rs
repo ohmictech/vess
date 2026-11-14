@@ -2,7 +2,7 @@
 
 use crate::u256::U256;
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 3;
 
 // ---------------------------------------------------------------- networks
 
@@ -15,7 +15,7 @@ pub const NETWORK_MAINNET: u8 = 2;
 pub struct NetworkProfile {
     pub network: u8,
     pub genesis_target: U256,
-    pub genesis_timestamp: u64,
+    pub genesis_timestamp_ms: u64,
 }
 
 impl NetworkProfile {
@@ -23,22 +23,21 @@ impl NetworkProfile {
         network: NETWORK_DEVNET,
         genesis_target: U256::pow2(240),
         // 2026-10-01T00:00:00Z
-        genesis_timestamp: 1_790_812_800,
+        genesis_timestamp_ms: 1_790_812_800_000,
     };
 
     pub const TESTNET: NetworkProfile = NetworkProfile {
         network: NETWORK_TESTNET,
-        genesis_target: U256::pow2(232),
+        genesis_target: U256::pow2(235),
         // 2026-11-01T00:00:00Z
-        genesis_timestamp: 1_793_491_200,
+        genesis_timestamp_ms: 1_793_491_200_000,
     };
 
     pub const MAINNET: NetworkProfile = NetworkProfile {
         network: NETWORK_MAINNET,
         genesis_target: U256::pow2(226),
-        // 2026-12-01T00:00:00Z: mainnet cannot be mined before this, because the first block's
-        // timestamp must exceed the genesis one.
-        genesis_timestamp: 1_796_083_200,
+        // 2026-12-01T00:00:00Z
+        genesis_timestamp_ms: 1_796_083_200_000,
     };
 }
 
@@ -107,18 +106,20 @@ pub const BLOCK_HEADER_BYTES: usize = 234;
 
 // -------------------------------------------------------------------- time
 
-pub const TARGET_BLOCK_SECONDS: u64 = 1;
+pub const TARGET_BLOCK_MS: u64 = 1_000;
 pub const MTP_SPAN_BLOCKS: usize = 11;
-pub const MAX_FUTURE_DRIFT_SECONDS: u64 = 120;
-pub const MAX_PER_BLOCK_ELAPSED_SECONDS: u64 = 4;
+pub const MAX_FUTURE_DRIFT_MS: u64 = 120_000;
+pub const MAX_PER_BLOCK_ELAPSED_MS: u64 = 4_000;
 
 // -------------------------------------------------------------- difficulty
 
 pub const DIFFICULTY_WINDOW_BLOCKS: u64 = 64;
 pub const DIFFICULTY_FIRST_RETARGET_HEIGHT: u64 = 128;
 pub const MAX_DIFFICULTY_ADJUSTMENT: u64 = 4;
-pub const MIN_RETARGET_ELAPSED_SECONDS: u64 = DIFFICULTY_WINDOW_BLOCKS / MAX_DIFFICULTY_ADJUSTMENT;
-pub const MAX_RETARGET_ELAPSED_SECONDS: u64 = DIFFICULTY_WINDOW_BLOCKS * MAX_DIFFICULTY_ADJUSTMENT;
+pub const MIN_RETARGET_ELAPSED_MS: u64 =
+    DIFFICULTY_WINDOW_BLOCKS * TARGET_BLOCK_MS / MAX_DIFFICULTY_ADJUSTMENT;
+pub const MAX_RETARGET_ELAPSED_MS: u64 =
+    DIFFICULTY_WINDOW_BLOCKS * TARGET_BLOCK_MS * MAX_DIFFICULTY_ADJUSTMENT;
 
 pub const MAXIMUM_TARGET: U256 = U256::pow2(240);
 pub const MINIMUM_TARGET: U256 = U256::pow2(216);
@@ -211,8 +212,10 @@ pub const READ_TIMEOUT_MS: u64 = 30_000;
 pub const WRITE_TIMEOUT_MS: u64 = 30_000;
 
 // Compile-time invariants:
-const _: () =
-    assert!(MIN_RETARGET_ELAPSED_SECONDS == DIFFICULTY_WINDOW_BLOCKS / MAX_DIFFICULTY_ADJUSTMENT);
+const _: () = assert!(
+    MIN_RETARGET_ELAPSED_MS
+        == DIFFICULTY_WINDOW_BLOCKS * TARGET_BLOCK_MS / MAX_DIFFICULTY_ADJUSTMENT
+);
 const _: () = assert!(BLOCK_HEADER_BYTES == 234);
 
 #[cfg(test)]
@@ -226,14 +229,14 @@ mod tests {
 
     #[test]
     fn retarget_window_spans_four_x() {
-        // target_t = target * elapsed / 64, so elapsed in [16, 256] means /4 .. *4.
+        // Elapsed in [16_000, 256_000] ms means /4 .. *4.
         assert_eq!(
-            MIN_RETARGET_ELAPSED_SECONDS * MAX_DIFFICULTY_ADJUSTMENT,
-            DIFFICULTY_WINDOW_BLOCKS
+            MIN_RETARGET_ELAPSED_MS * MAX_DIFFICULTY_ADJUSTMENT,
+            DIFFICULTY_WINDOW_BLOCKS * TARGET_BLOCK_MS
         );
         assert_eq!(
-            DIFFICULTY_WINDOW_BLOCKS * MAX_DIFFICULTY_ADJUSTMENT,
-            MAX_RETARGET_ELAPSED_SECONDS
+            DIFFICULTY_WINDOW_BLOCKS * TARGET_BLOCK_MS * MAX_DIFFICULTY_ADJUSTMENT,
+            MAX_RETARGET_ELAPSED_MS
         );
     }
 

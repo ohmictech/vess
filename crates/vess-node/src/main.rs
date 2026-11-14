@@ -394,7 +394,7 @@ fn node_status(args: &Args) -> Result<(), String> {
     println!("total_supply={}", status.total_supply);
     println!("next_reward={}", status.next_reward);
     println!("next_dev_fee={}", status.next_dev_fee);
-    println!("next_timestamp={}", status.next_timestamp);
+    println!("next_timestamp_ms={}", status.next_timestamp_ms);
     println!("peers_inbound={}", status.peers_inbound);
     println!("peers_outbound={}", status.peers_outbound);
     println!("bans={}", status.bans);
@@ -427,7 +427,7 @@ fn node_block(args: &Args) -> Result<(), String> {
         ReplyBody::Block(block) => {
             println!("id={}", hex(&block.id));
             println!("height={}", block.height);
-            println!("timestamp={}", block.timestamp_unix);
+            println!("timestamp_unix_ms={}", block.timestamp_unix_ms);
             println!("chain_work={}", block.chain_work);
             println!("state_root={}", hex(&block.state_root));
             println!("transactions={}", block.transaction_ids.len());
@@ -835,17 +835,24 @@ fn miner(args: &Args) -> Result<(), String> {
     let mut target = Target::open(args, network)?;
 
     for index in 0..blocks {
-        let (header, transactions, height) = match target.request(Request::Template(payout))? {
-            ReplyBody::Template(template) => {
-                (template.header, template.transactions, template.height)
-            }
-            _ => return Err("unexpected template reply".into()),
-        };
-        let mut header = header;
         let started = std::time::Instant::now();
-        if !vess_consensus::mine_header(&mut header, 200_000_000) {
-            return Err("no solution after 200 million nonces".into());
-        }
+        let (header, transactions, height) = loop {
+            let template_started = std::time::Instant::now();
+            let (mut header, transactions, height) =
+                match target.request(Request::Template(payout))? {
+                    ReplyBody::Template(template) => {
+                        (template.header, template.transactions, template.height)
+                    }
+                    _ => return Err("unexpected template reply".into()),
+                };
+            match vess_node::mine_fresh(&mut header, 200_000_000, template_started) {
+                vess_node::MiningResult::Found => break (header, transactions, height),
+                vess_node::MiningResult::Refresh => continue,
+                vess_node::MiningResult::Exhausted => {
+                    return Err("no solution after 200 million nonces".into());
+                }
+            }
+        };
         let bytes = assemble_block(&header, &transactions)?;
         let bytes_len = bytes.len();
         let id = match target.request(Request::SubmitBlock(bytes))? {

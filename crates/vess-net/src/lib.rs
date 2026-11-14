@@ -249,7 +249,7 @@ pub struct StatusInfo {
     pub total_supply: u64,
     pub next_reward: u64,
     pub next_dev_fee: u64,
-    pub next_timestamp: u64,
+    pub next_timestamp_ms: u64,
     pub peers_inbound: u32,
     pub peers_outbound: u32,
     /// Addresses currently refused. Persisted, so this survives a restart.
@@ -292,7 +292,7 @@ pub struct ProofInfo {
 pub struct BlockInfo {
     pub id: Hash,
     pub height: u64,
-    pub timestamp_unix: u64,
+    pub timestamp_unix_ms: u64,
     pub state_root: Hash,
     pub chain_work: u128,
     pub transaction_ids: Vec<Hash>,
@@ -541,7 +541,7 @@ impl Encode for Reply {
                 w.u64(s.total_supply);
                 w.u64(s.next_reward);
                 w.u64(s.next_dev_fee);
-                w.u64(s.next_timestamp);
+                w.u64(s.next_timestamp_ms);
                 w.u32(s.peers_inbound);
                 w.u32(s.peers_outbound);
                 w.u32(s.bans);
@@ -587,7 +587,7 @@ impl Encode for Reply {
                 w.u8(6);
                 w.fixed(&b.id);
                 w.u64(b.height);
-                w.u64(b.timestamp_unix);
+                w.u64(b.timestamp_unix_ms);
                 w.fixed(&b.state_root);
                 w.bytes(&b.chain_work.to_be_bytes());
                 w.u32(b.transaction_ids.len() as u32);
@@ -646,7 +646,7 @@ impl Decode for Reply {
                     total_supply: r.u64()?,
                     next_reward: r.u64()?,
                     next_dev_fee: r.u64()?,
-                    next_timestamp: r.u64()?,
+                    next_timestamp_ms: r.u64()?,
                     peers_inbound: r.u32()?,
                     peers_outbound: r.u32()?,
                     bans: r.u32()?,
@@ -694,7 +694,7 @@ impl Decode for Reply {
             6 => {
                 let id = r.array()?;
                 let height = r.u64()?;
-                let timestamp_unix = r.u64()?;
+                let timestamp_unix_ms = r.u64()?;
                 let state_root = r.array()?;
                 let mut work = [0u8; 16];
                 work.copy_from_slice(r.bytes(16)?);
@@ -709,7 +709,7 @@ impl Decode for Reply {
                 ReplyBody::Block(BlockInfo {
                     id,
                     height,
-                    timestamp_unix,
+                    timestamp_unix_ms,
                     state_root,
                     chain_work: u128::from_be_bytes(work),
                     transaction_ids,

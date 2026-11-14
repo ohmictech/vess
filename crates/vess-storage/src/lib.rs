@@ -75,7 +75,7 @@ pub struct PruneReport {
     pub oldest_header_height: u64,
 }
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug)]
 pub enum StorageError {
@@ -887,7 +887,8 @@ mod tests {
         let mut state = store.load_state().unwrap();
 
         for _ in 0..count {
-            let timestamp = chain.best_header().timestamp_unix + 1;
+            let timestamp =
+                chain.best_header().timestamp_unix_ms + vess_core::constants::TARGET_BLOCK_MS;
             let mut template = build_template(
                 &chain,
                 &network(),
@@ -1100,7 +1101,7 @@ mod tests {
         let store = Store::open(&temp.path, network()).unwrap();
         let (chain, state) = mine_blocks(&store, 1);
 
-        let timestamp = chain.best_header().timestamp_unix + 1;
+        let timestamp = chain.best_header().timestamp_unix_ms + 1;
         let mut template = build_template(
             &chain,
             &network(),
@@ -1136,6 +1137,27 @@ mod tests {
             .err()
             .unwrap();
         assert!(matches!(err, StorageError::WrongNetwork { .. }));
+    }
+
+    #[test]
+    fn opening_a_pre_millisecond_database_fails_loudly() {
+        let temp = TempDb::new();
+        {
+            let store = Store::open(&temp.path, network()).unwrap();
+            let write = store.db.begin_write().unwrap();
+            {
+                let mut meta = write.open_table(META).unwrap();
+                meta.insert(META_SCHEMA, &1u32.to_be_bytes()[..]).unwrap();
+            }
+            write.commit().unwrap();
+        }
+        assert!(matches!(
+            Store::open(&temp.path, network()),
+            Err(StorageError::SchemaMismatch {
+                found: 1,
+                expected: 3
+            })
+        ));
     }
 
     #[test]

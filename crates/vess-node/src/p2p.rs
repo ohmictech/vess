@@ -459,14 +459,26 @@ fn reconstruct(
     Some(bytes)
 }
 
-/// `u32` count followed by each transaction in canonical form.
+/// Encode as many pending transactions as fit in one frame.
+///
+/// A full pool can exceed `MAX_NETWORK_FRAME_BYTES`, and `write_frame` fails rather than truncating,
+/// which would drop the session. The count prefix makes a prefix a well-formed reply.
 fn encode_pending(transactions: &[Transaction]) -> Vec<u8> {
-    let mut w = Writer::new();
-    w.u32(transactions.len() as u32);
+    let budget = MAX_NETWORK_FRAME_BYTES.saturating_sub(4);
+    let mut body: Vec<u8> = Vec::new();
+    let mut count = 0u32;
     for tx in transactions {
-        tx.encode_into(&mut w);
+        let bytes = tx.canonical();
+        if body.len() + bytes.len() > budget {
+            break;
+        }
+        body.extend_from_slice(&bytes);
+        count += 1;
     }
-    w.into_vec()
+    let mut out = Vec::with_capacity(4 + body.len());
+    out.extend_from_slice(&count.to_be_bytes());
+    out.extend_from_slice(&body);
+    out
 }
 
 fn decode_pending(payload: &[u8]) -> Vec<Transaction> {
@@ -485,10 +497,21 @@ fn decode_pending(payload: &[u8]) -> Vec<Transaction> {
 }
 
 fn submit(node: &Arc<Mutex<Node>>, tx: Transaction) -> bool {
+    // Signature verification is the expensive part of admitting a transaction (~370 us) and needs
+    // no node state. Doing it before the lock keeps one peer's traffic from serialising every other
+    // session's verification, mining, and RPC on the node mutex.
+    let network = lock(node).network_profile();
+    let checked = match &tx {
+        Transaction::Transfer(t) => Node::check_transfer(network, t),
+        Transaction::StateUpdate(t) => Node::check_state_update(network, t),
+    };
+    if checked.is_err() {
+        return false;
+    }
     let mut guard = lock(node);
     match tx {
-        Transaction::Transfer(t) => guard.submit_transfer(t).is_ok(),
-        Transaction::StateUpdate(t) => guard.submit_state_update(t).is_ok(),
+        Transaction::Transfer(t) => guard.apply_transfer(t).is_ok(),
+        Transaction::StateUpdate(t) => guard.apply_state_update(t).is_ok(),
     }
 }
 
@@ -1453,21 +1476,36 @@ pub fn sync_once(node: &Arc<Mutex<Node>>, addr: &str, listen_port: u16) -> Resul
 /// Mine on top of the shared node until the process ends.
 pub fn mine(node: Arc<Mutex<Node>>, payout: AccountId, pause: Duration) {
     loop {
+        let started = std::time::Instant::now();
         let next = {
             let guard = lock(&node);
-            guard.template(&payout, guard.next_timestamp()).ok()
+            guard.template(&payout, guard.next_timestamp_ms())
         };
-        let Some((mut template, height)) = next else {
-            std::thread::sleep(Duration::from_millis(200));
-            continue;
+        let (mut template, height) = match next {
+            Ok(value) => value,
+            Err(error) => {
+                crate::log_warn!("miner", "template creation failed: {error}");
+                std::thread::sleep(Duration::from_millis(200));
+                continue;
+            }
         };
-        if template.mine(200_000_000) {
-            let bytes = template.encode();
-            match lock(&node).accept_block(&bytes) {
-                Ok(id) => {
-                    crate::log_debug!("miner", "mined block {} at height {height}", hex_short(&id))
+        match crate::mine_fresh(&mut template.header, 200_000_000, started) {
+            crate::MiningResult::Refresh => continue,
+            crate::MiningResult::Exhausted => {
+                crate::log_warn!("miner", "no solution after 200 million nonces");
+            }
+            crate::MiningResult::Found => {
+                let bytes = template.encode();
+                match lock(&node).accept_block(&bytes) {
+                    Ok(id) => {
+                        crate::log_debug!(
+                            "miner",
+                            "mined block {} at height {height}",
+                            hex_short(&id)
+                        )
+                    }
+                    Err(why) => crate::log_warn!("miner", "mined block was refused: {why}"),
                 }
-                Err(why) => crate::log_warn!("miner", "mined block was refused: {why}"),
             }
         }
         std::thread::sleep(pause);
@@ -1515,7 +1553,7 @@ mod tests {
 
     fn mine_one(node: &Arc<Mutex<Node>>, payout: &AccountId) -> Hash {
         let mut guard = lock(node);
-        let timestamp = guard.next_timestamp();
+        let timestamp = guard.next_timestamp_ms();
         let (mut template, _) = guard.template(payout, timestamp).unwrap();
         assert!(template.mine(20_000_000));
         let bytes = template.encode();
@@ -1696,7 +1734,7 @@ mod tests {
 
     fn mine_template(node: &Arc<Mutex<Node>>, payout: &AccountId) -> (Hash, Vec<u8>) {
         let mut guard = lock(node);
-        let timestamp = guard.next_timestamp();
+        let timestamp = guard.next_timestamp_ms();
         let (mut template, _) = guard.template(payout, timestamp).unwrap();
         assert!(template.mine(20_000_000));
         let bytes = template.encode();
@@ -2065,6 +2103,36 @@ mod tests {
         }
         assert!(cut_off, "the session must end for a peer over its budget");
         assert_eq!(node.lock().unwrap().height(), 0);
+    }
+
+    /// A reply must fit one frame even when the pool is far larger, or `write_frame` fails and the
+    /// session is dropped.
+    #[test]
+    fn a_pending_reply_never_exceeds_one_frame() {
+        let tx = Transaction::Transfer(vess_core::Transfer {
+            version: 1,
+            chain_id: [0u8; 32],
+            sender_public_key: [1u8; 1952],
+            recipient_account_id: [2u8; 32],
+            amount: 1,
+            fee: 0,
+            nonce: 0,
+            expiry_unix: 0,
+            signature: [3u8; 3309],
+        });
+        let transactions: Vec<Transaction> = (0..1_000).map(|_| tx.clone()).collect();
+        let payload = encode_pending(&transactions);
+        assert!(
+            payload.len() <= MAX_NETWORK_FRAME_BYTES,
+            "{} bytes",
+            payload.len()
+        );
+        let decoded = decode_pending(&payload);
+        assert!(!decoded.is_empty());
+        assert!(
+            decoded.len() < transactions.len(),
+            "the test needs a pool that does not fit"
+        );
     }
 
     /// A peer cannot force unbounded signature verifications: past the budget its frames are dropped

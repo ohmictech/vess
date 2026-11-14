@@ -34,7 +34,7 @@ pub fn network_rows(network: NetworkProfile) -> Vec<Param> {
     let checkpoints = crate::constants::checkpoints(network.network);
     vec![
         row("network", network.network),
-        row("genesis_timestamp", network.genesis_timestamp),
+        row("genesis_timestamp_ms", network.genesis_timestamp_ms),
         row(
             "genesis_target",
             format!("2^{}", pow2_exponent(network.genesis_target)),
@@ -61,14 +61,14 @@ pub fn network_rows(network: NetworkProfile) -> Vec<Param> {
 pub fn network_agnostic_rows() -> Vec<Param> {
     vec![
         row("PROTOCOL_VERSION", PROTOCOL_VERSION),
-        row("TARGET_BLOCK_SECONDS", TARGET_BLOCK_SECONDS),
+        row("TARGET_BLOCK_MS", TARGET_BLOCK_MS),
         row("DIFFICULTY_WINDOW_BLOCKS", DIFFICULTY_WINDOW_BLOCKS),
         row("MAX_DIFFICULTY_ADJUSTMENT", MAX_DIFFICULTY_ADJUSTMENT),
         row(
             "DIFFICULTY_FIRST_RETARGET_HEIGHT",
             DIFFICULTY_FIRST_RETARGET_HEIGHT,
         ),
-        row("MAX_FUTURE_DRIFT_SECONDS", MAX_FUTURE_DRIFT_SECONDS),
+        row("MAX_FUTURE_DRIFT_MS", MAX_FUTURE_DRIFT_MS),
         row(
             "MINIMUM_TARGET",
             format!("2^{}", pow2_exponent(MINIMUM_TARGET)),

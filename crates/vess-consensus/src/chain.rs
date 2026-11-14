@@ -3,10 +3,9 @@
 use std::collections::{BTreeMap, HashMap};
 
 use vess_core::constants::{
-    DIFFICULTY_FIRST_RETARGET_HEIGHT, DIFFICULTY_WINDOW_BLOCKS, MAX_FUTURE_DRIFT_SECONDS,
-    MAX_PER_BLOCK_ELAPSED_SECONDS, MAX_RETARGET_ELAPSED_SECONDS, MAXIMUM_TARGET,
-    MIN_RETARGET_ELAPSED_SECONDS, MINIMUM_TARGET, MTP_SPAN_BLOCKS, NetworkProfile,
-    PROTOCOL_VERSION,
+    DIFFICULTY_FIRST_RETARGET_HEIGHT, DIFFICULTY_WINDOW_BLOCKS, MAX_PER_BLOCK_ELAPSED_MS,
+    MAX_RETARGET_ELAPSED_MS, MAXIMUM_TARGET, MIN_RETARGET_ELAPSED_MS, MINIMUM_TARGET,
+    MTP_SPAN_BLOCKS, NetworkProfile, PROTOCOL_VERSION, TARGET_BLOCK_MS,
 };
 use vess_core::hash;
 use vess_core::{BlockHeader, Hash, U256};
@@ -62,7 +61,7 @@ pub fn genesis_header(network: &NetworkProfile) -> BlockHeader {
         previous_block_id: [0u8; 32],
         transaction_root: hash::empty_tx_root(),
         state_root: empty_state_root(),
-        timestamp_unix: network.genesis_timestamp,
+        timestamp_unix_ms: network.genesis_timestamp_ms,
         target: network.genesis_target,
         payout_account_id: [0u8; 32],
         security_nonce: [0u8; 32],
@@ -97,7 +96,7 @@ pub fn median_time_past<C: HeaderSource + ?Sized>(
     let mut cur = *id;
     for _ in 0..MTP_SPAN_BLOCKS {
         let header = chain.header(&cur).ok_or(ConsensusError::UnknownParent)?;
-        times.push(header.timestamp_unix);
+        times.push(header.timestamp_unix_ms);
         let meta = chain.meta(&cur).ok_or(ConsensusError::UnknownParent)?;
         if meta.height == 0 {
             break;
@@ -142,20 +141,30 @@ pub fn required_target<C: HeaderSource + ?Sized>(
     for i in (height - DIFFICULTY_WINDOW_BLOCKS)..=height - 1 {
         let current = ancestor(chain, parent_id, i).ok_or(ConsensusError::UnknownParent)?;
         let previous = ancestor(chain, parent_id, i - 1).ok_or(ConsensusError::UnknownParent)?;
-        let delta = current.timestamp_unix as i128 - previous.timestamp_unix as i128;
-        elapsed =
-            elapsed.saturating_add(delta.clamp(0, MAX_PER_BLOCK_ELAPSED_SECONDS as i128) as u64);
+        let delta = current.timestamp_unix_ms as i128 - previous.timestamp_unix_ms as i128;
+        elapsed = elapsed.saturating_add(delta.clamp(0, MAX_PER_BLOCK_ELAPSED_MS as i128) as u64);
     }
-    let elapsed = elapsed.clamp(MIN_RETARGET_ELAPSED_SECONDS, MAX_RETARGET_ELAPSED_SECONDS);
+    let elapsed = elapsed.clamp(MIN_RETARGET_ELAPSED_MS, MAX_RETARGET_ELAPSED_MS);
 
-    let scaled = parent
+    // Divide first to avoid overflowing when multiplying a large target by milliseconds.
+    let divisor = U256::from_u64(DIFFICULTY_WINDOW_BLOCKS * TARGET_BLOCK_MS);
+    let (whole, remainder) = parent
         .target
+        .div_rem(divisor)
+        .ok_or(ConsensusError::BadTarget)?;
+    let whole = whole
         .checked_mul_u64(elapsed)
         .ok_or(ConsensusError::BadTarget)?;
-    let (quotient, _) = scaled
-        .div_rem(U256::from_u64(DIFFICULTY_WINDOW_BLOCKS))
-        .ok_or(ConsensusError::BadTarget)?;
-    Ok(clamp_target(quotient))
+    let fraction = remainder
+        .checked_mul_u64(elapsed)
+        .and_then(|value| value.div_rem(divisor))
+        .ok_or(ConsensusError::BadTarget)?
+        .0;
+    Ok(clamp_target(
+        whole
+            .checked_add(fraction)
+            .ok_or(ConsensusError::BadTarget)?,
+    ))
 }
 
 /// Full header validation: version, chain, parent, target, timestamps, and optionally PoW.
@@ -189,9 +198,7 @@ pub fn check_header<C: HeaderSource + ?Sized>(
     }
 
     let mtp = median_time_past(chain, &header.previous_block_id)?;
-    if header.timestamp_unix <= mtp
-        || header.timestamp_unix > mtp.saturating_add(MAX_FUTURE_DRIFT_SECONDS)
-    {
+    if header.timestamp_unix_ms <= mtp {
         return Err(ConsensusError::BadTimestamp);
     }
 

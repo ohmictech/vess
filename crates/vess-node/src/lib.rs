@@ -50,6 +50,34 @@ const PRUNE_INTERVAL_BLOCKS: u64 = 64;
 
 /// Target payload size for one snapshot frame, well under the 2 MiB frame limit.
 const SNAPSHOT_BATCH_BYTES: usize = 1_048_576;
+pub const MINING_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const MINING_BATCH_ATTEMPTS: u64 = 10_000;
+
+pub enum MiningResult {
+    Found,
+    Refresh,
+    Exhausted,
+}
+
+/// Search in bounded batches so callers can replace stale templates.
+pub fn mine_fresh(header: &mut BlockHeader, max_attempts: u64, started: Instant) -> MiningResult {
+    let mut remaining = max_attempts;
+    while remaining > 0 {
+        if started.elapsed() >= MINING_REFRESH_INTERVAL {
+            return MiningResult::Refresh;
+        }
+        let attempts = remaining.min(MINING_BATCH_ATTEMPTS);
+        let found = vess_consensus::mine_header(header, attempts);
+        if started.elapsed() >= MINING_REFRESH_INTERVAL {
+            return MiningResult::Refresh;
+        }
+        if found {
+            return MiningResult::Found;
+        }
+        remaining -= attempts;
+    }
+    MiningResult::Exhausted
+}
 /// Approximate encoded size of one account record, used only for batching.
 const SNAPSHOT_RECORD_BYTES: usize = 128;
 
@@ -447,6 +475,10 @@ impl Node {
         &self.chain
     }
 
+    pub fn network_profile(&self) -> NetworkProfile {
+        self.network
+    }
+
     pub fn state(&self) -> &State {
         &self.state
     }
@@ -562,10 +594,17 @@ impl Node {
 
     /// Store a header without its body (snapshot sync fetches headers first, bodies later).
     pub fn insert_header_only(&mut self, header: BlockHeader) -> Result<(), NodeError> {
-        if let Ok(outcome) = self.chain.insert(header)
-            && outcome != vess_consensus::InsertOutcome::Duplicate
-            && let Some(meta) = self.chain.meta(&header.id())
-        {
+        self.insert_header_only_at(header, Self::clock_ms()?)
+    }
+
+    fn insert_header_only_at(&mut self, header: BlockHeader, now: u128) -> Result<(), NodeError> {
+        Self::check_future_timestamp(header.timestamp_unix_ms, now)?;
+        let outcome = self.chain.insert(header)?;
+        if outcome != vess_consensus::InsertOutcome::Duplicate {
+            let meta = self
+                .chain
+                .meta(&header.id())
+                .ok_or(NodeError::Malformed("inserted header missing metadata"))?;
             self.store
                 .put_header(&header, meta.height, meta.chain_work)?;
         }
@@ -586,7 +625,7 @@ impl Node {
             total_supply: self.state.total_supply() as u64,
             next_reward: self.next_reward(),
             next_dev_fee: self.next_dev_fee(),
-            next_timestamp: self.next_timestamp(),
+            next_timestamp_ms: self.next_timestamp_ms(),
             peers_inbound: self.conn.counts().0 as u32,
             peers_outbound: self.conn.counts().1 as u32,
             bans: self.conn.ban_count() as u32,
@@ -643,13 +682,21 @@ impl Node {
     /// extend the tip, an ancestor of it, or a sibling branch. After indexing, `reconcile` makes
     /// the live state match the heaviest branch.
     pub fn accept_block(&mut self, bytes: &[u8]) -> Result<Hash, NodeError> {
+        self.accept_block_at(bytes, Self::clock_ms()?)
+    }
+
+    fn accept_block_at(&mut self, bytes: &[u8], now: u128) -> Result<Hash, NodeError> {
         let (header, _) = split_block(bytes)?;
+        Self::check_future_timestamp(header.timestamp_unix_ms, now)?;
         let id = header.id();
         let known = self.chain.contains(&id);
-        if known && self.store.body(&id)?.is_some() && self.chain.is_ancestor(&id, &self.state_tip)
-        {
-            // Already applied and stored. Re-validating would let a peer replay one cheap block to
-            // buy a full rewind-and-revalidate per frame, so acknowledge and stop here.
+        if known && self.store.body(&id)?.is_some() {
+            // Retry an interrupted reconciliation without revalidating irrelevant side branches.
+            if self.state_tip != self.chain.best_id()
+                && self.chain.is_ancestor(&id, &self.chain.best_id())
+            {
+                self.finish_block_acceptance()?;
+            }
             return Ok(id);
         }
         if !known && !self.chain.contains(&header.previous_block_id) {
@@ -677,17 +724,22 @@ impl Node {
             )?;
         }
 
-        let included = validated.transactions.clone();
-        self.reconcile()?;
-        self.prune_included(&included)?;
-        self.prune_stale()?;
-        self.maybe_prune()?;
-        for expired in self.mempool.expire(self.chain.best_header().timestamp_unix) {
-            self.store.remove_pending(&expired.id())?;
-        }
-
+        self.finish_block_acceptance()?;
         self.accepted_blocks += 1;
         Ok(id)
+    }
+
+    fn finish_block_acceptance(&mut self) -> Result<(), NodeError> {
+        self.reconcile()?;
+        self.prune_stale()?;
+        self.maybe_prune()?;
+        for expired in self
+            .mempool
+            .expire(self.chain.best_header().timestamp_unix_ms / 1_000)
+        {
+            self.store.remove_pending(&expired.id())?;
+        }
+        Ok(())
     }
 
     /// Bring the live state into agreement with the heaviest branch: rewind to the common
@@ -888,14 +940,14 @@ impl Node {
     pub fn template(
         &self,
         payout: &AccountId,
-        timestamp_unix: u64,
+        timestamp_unix_ms: u64,
     ) -> Result<(BlockTemplate, u64), NodeError> {
         let candidates = self
             .mempool
             .select_for_template(vess_core::constants::MAX_BLOCK_BYTES);
         let transactions: Vec<Transaction> = candidates
             .into_iter()
-            .filter(|tx| self.applies(tx, timestamp_unix))
+            .filter(|tx| self.applies(tx, timestamp_unix_ms))
             .collect();
         let template = build_template(
             &self.chain,
@@ -903,7 +955,7 @@ impl Node {
             &self.chain.best_id(),
             &self.state,
             payout,
-            timestamp_unix,
+            timestamp_unix_ms,
             &transactions,
         )?;
         let height = self.chain.best_height() + 1;
@@ -911,15 +963,15 @@ impl Node {
     }
 
     /// Whether a pending transaction still applies to the current state.
-    fn applies(&self, tx: &Transaction, timestamp_unix: u64) -> bool {
+    fn applies(&self, tx: &Transaction, timestamp_unix_ms: u64) -> bool {
         let payout = self.chain.best_header().payout_account_id;
-        applies_to(&self.state, &payout, tx, timestamp_unix)
+        applies_to(&self.state, &payout, tx, timestamp_unix_ms)
     }
 
     /// Drop pending transactions that no longer apply, e.g. after a reorganization replayed a
     /// block that spent the same account.
     pub fn prune_stale(&mut self) -> Result<usize, NodeError> {
-        let timestamp = self.chain.best_header().timestamp_unix;
+        let timestamp = self.chain.best_header().timestamp_unix_ms;
         let payout = self.chain.best_header().payout_account_id;
         let state = &self.state;
         let mut stale: Vec<Transaction> = Vec::new();
@@ -936,19 +988,52 @@ impl Node {
         Ok(stale.len())
     }
 
-    /// The timestamp a fresh template should carry: one second after the tip.
-    pub fn next_timestamp(&self) -> u64 {
-        self.chain.best_header().timestamp_unix + 1
+    fn clock_ms() -> Result<u128, NodeError> {
+        Ok(std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| NodeError::Io(format!("system clock before Unix epoch: {e}")))?
+            .as_millis())
     }
 
-    pub fn submit_transfer(&mut self, tx: Transfer) -> Result<Hash, NodeError> {
+    fn check_future_timestamp(timestamp: u64, now: u128) -> Result<(), NodeError> {
+        if !Self::future_timestamp_allowed(timestamp, now) {
+            return Err(NodeError::Consensus(ConsensusError::BadTimestamp));
+        }
+        Ok(())
+    }
+
+    fn future_timestamp_allowed(timestamp: u64, now: u128) -> bool {
+        u128::from(timestamp) <= now + u128::from(vess_core::constants::MAX_FUTURE_DRIFT_MS)
+    }
+
+    /// Select a timestamp close to the local clock and above median time.
+    pub fn next_timestamp_ms(&self) -> u64 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is before the Unix epoch")
+            .as_millis()
+            .try_into()
+            .expect("system clock exceeds u64 milliseconds");
+        let median = vess_consensus::chain::median_time_past(&self.chain, &self.chain.best_id())
+            .expect("best chain must have a complete median-time window");
+        Self::timestamp_for_clock(now, median)
+    }
+
+    fn timestamp_for_clock(now: u64, median: u64) -> u64 {
+        now.max(median.saturating_add(1))
+    }
+
+    /// The checks that need no node state: protocol version, chain, and signature.
+    ///
+    /// Separate from [`Self::apply_transfer`] so a caller can run the expensive ML-DSA verification
+    /// before taking the node lock.
+    pub fn check_transfer(network: NetworkProfile, tx: &Transfer) -> Result<(), NodeError> {
         if tx.version != vess_core::constants::PROTOCOL_VERSION {
             return Err(NodeError::Malformed("unsupported version"));
         }
-        if tx.chain_id != hash::chain_id(self.network.network) {
+        if tx.chain_id != hash::chain_id(network.network) {
             return Err(NodeError::Malformed("wrong chain"));
         }
-        let sender = tx.sender_id();
         if !vess_crypto::verify(
             &tx.sender_public_key,
             DOM_TRANSFER,
@@ -957,6 +1042,12 @@ impl Node {
         ) {
             return Err(NodeError::Malformed("bad signature"));
         }
+        Ok(())
+    }
+
+    /// Admit a transfer that has passed [`Self::check_transfer`].
+    pub(crate) fn apply_transfer(&mut self, tx: Transfer) -> Result<Hash, NodeError> {
+        let sender = tx.sender_id();
         let account = self
             .state
             .account(&sender)
@@ -974,14 +1065,19 @@ impl Node {
         Ok(id)
     }
 
-    pub fn submit_state_update(&mut self, tx: StateUpdate) -> Result<Hash, NodeError> {
+    pub fn submit_transfer(&mut self, tx: Transfer) -> Result<Hash, NodeError> {
+        Self::check_transfer(self.network, &tx)?;
+        self.apply_transfer(tx)
+    }
+
+    /// The checks that need no node state, for a state update.
+    pub fn check_state_update(network: NetworkProfile, tx: &StateUpdate) -> Result<(), NodeError> {
         if tx.version != vess_core::constants::PROTOCOL_VERSION {
             return Err(NodeError::Malformed("unsupported version"));
         }
-        if tx.chain_id != hash::chain_id(self.network.network) {
+        if tx.chain_id != hash::chain_id(network.network) {
             return Err(NodeError::Malformed("wrong chain"));
         }
-        let sender = tx.sender_id();
         if !vess_crypto::verify(
             &tx.sender_public_key,
             DOM_STATE_UPDATE,
@@ -990,6 +1086,12 @@ impl Node {
         ) {
             return Err(NodeError::Malformed("bad signature"));
         }
+        Ok(())
+    }
+
+    /// Admit a state update that has passed [`Self::check_state_update`].
+    pub(crate) fn apply_state_update(&mut self, tx: StateUpdate) -> Result<Hash, NodeError> {
+        let sender = tx.sender_id();
         let account = self
             .state
             .account(&sender)
@@ -1003,6 +1105,11 @@ impl Node {
         self.store.put_pending(&id, &canonical)?;
         self.accepted_transactions += 1;
         Ok(id)
+    }
+
+    pub fn submit_state_update(&mut self, tx: StateUpdate) -> Result<Hash, NodeError> {
+        Self::check_state_update(self.network, &tx)?;
+        self.apply_state_update(tx)
     }
 
     /// Re-admit everything that was pending before the last shutdown.
@@ -1037,7 +1144,7 @@ impl Node {
             Request::Status => Reply::ok(ReplyBody::Status(self.status())),
             Request::Balance(id) => Reply::ok(ReplyBody::Account(self.account_info(&id))),
             Request::Template(payout) => {
-                let ts = self.next_timestamp();
+                let ts = self.next_timestamp_ms();
                 match self.template(&payout, ts) {
                     Ok((template, height)) => {
                         let reward = vess_emission::split(self.network, template.header.target).0;
@@ -1107,7 +1214,7 @@ impl Node {
         Some(BlockInfo {
             id,
             height: meta.height,
-            timestamp_unix: header.timestamp_unix,
+            timestamp_unix_ms: header.timestamp_unix_ms,
             state_root: header.state_root,
             chain_work: meta.chain_work,
             transaction_ids: transactions.iter().map(|tx| tx.id()).collect(),
@@ -1283,14 +1390,14 @@ pub fn call(addr: &str, request: Request) -> Result<Reply, NodeError> {
 }
 
 /// Whether a transaction still applies to `state`, evaluated in isolation.
-fn applies_to(state: &State, payout: &AccountId, tx: &Transaction, timestamp_unix: u64) -> bool {
+fn applies_to(state: &State, payout: &AccountId, tx: &Transaction, timestamp_unix_ms: u64) -> bool {
     let mut probe = state.clone();
     match tx {
         Transaction::Transfer(t) => probe
-            .execute_transfer(t, &t.sender_id(), timestamp_unix, payout)
+            .execute_transfer(t, &t.sender_id(), timestamp_unix_ms / 1_000, payout)
             .is_ok(),
         Transaction::StateUpdate(t) => probe
-            .execute_state_update(t, &t.sender_id(), timestamp_unix, payout)
+            .execute_state_update(t, &t.sender_id(), timestamp_unix_ms / 1_000, payout)
             .is_ok(),
     }
 }
