@@ -1634,6 +1634,119 @@ mod tests {
     }
 
     #[test]
+    fn testnet_rejects_hostile_blocks_and_transactions_and_keeps_syncing() {
+        let (dir_a, dir_b) = (TempDir::new("chaos-a"), TempDir::new("chaos-b"));
+        let a = Arc::new(Mutex::new(
+            Node::open(&dir_a.0, NetworkProfile::TESTNET).unwrap(),
+        ));
+        let b = Arc::new(Mutex::new(
+            Node::open(&dir_b.0, NetworkProfile::TESTNET).unwrap(),
+        ));
+        let (listener, port) = listen();
+        let serve_a = a.clone();
+        std::thread::spawn(move || serve(serve_a, listener, port));
+        let wallet = vess_wallet::Wallet::from_seed(NetworkProfile::TESTNET.network, [0x42; 32]);
+        let recipient = [0x75; 32];
+        let other = [0x76; 32];
+        let mine = |node: &Arc<Mutex<Node>>| {
+            let mut guard = lock(node);
+            let (mut template, _) = guard
+                .template(&wallet.account_id(), guard.next_timestamp_ms())
+                .unwrap();
+            assert!(template.mine(200_000_000));
+            guard.accept_block(&template.encode()).unwrap()
+        };
+        mine(&a);
+        sync_once(&b, &format!("127.0.0.1:{port}"), 0).unwrap();
+        let before = lock(&a).tip().id();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        {
+            let mut guard = lock(&a);
+            let (mut future, _) = guard.template(&wallet.account_id(), now + 600_000).unwrap();
+            assert!(future.mine(200_000_000));
+            assert!(matches!(
+                guard.accept_block(&future.encode()),
+                Err(crate::NodeError::Consensus(
+                    vess_consensus::ConsensusError::BadTimestamp
+                ))
+            ));
+            let (mut past, _) = guard
+                .template(&wallet.account_id(), guard.next_timestamp_ms())
+                .unwrap();
+            past.header.timestamp_unix_ms = NetworkProfile::TESTNET.genesis_timestamp_ms;
+            assert!(past.mine(200_000_000));
+            assert!(matches!(
+                guard.accept_block(&past.encode()),
+                Err(crate::NodeError::Consensus(
+                    vess_consensus::ConsensusError::BadTimestamp
+                ))
+            ));
+            let mut bad = wallet.build_transfer(recipient, 10, 0, 0, 0);
+            bad.signature[0] ^= 1;
+            assert!(guard.submit_transfer(bad).is_err());
+            let wrong_network =
+                vess_wallet::Wallet::from_seed(NetworkProfile::DEVNET.network, [0x42; 32])
+                    .build_transfer(recipient, 10, 0, 0, 0);
+            assert!(guard.submit_transfer(wrong_network).is_err());
+            assert_eq!(guard.tip().id(), before);
+        }
+        let tx = wallet.build_transfer(recipient, 10, 0, 0, 0);
+        let conflict = wallet.build_transfer(other, 10, 0, 0, 0);
+        lock(&a).submit_transfer(tx.clone()).unwrap();
+        let pending_conflict = lock(&a).submit_transfer(conflict.clone());
+        assert!(pending_conflict.is_err());
+        println!("conflicting pending transfer: {pending_conflict:?}");
+        {
+            let mut guard = lock(&a);
+            let (mut forged, _) = guard
+                .template(&wallet.account_id(), guard.next_timestamp_ms())
+                .unwrap();
+            let mut bad = tx.clone();
+            bad.signature[0] ^= 1;
+            let invalid = Transaction::Transfer(bad);
+            forged.header.transaction_root = vess_core::hash::tx_root(&[invalid.id()]);
+            forged.body = vess_consensus::encode_body(&[invalid]).unwrap();
+            assert!(forged.mine(200_000_000));
+            let result = guard.accept_block(&forged.encode());
+            println!("proof-of-work-valid block with forged signature: {result:?}");
+            assert!(matches!(result, Err(crate::NodeError::Consensus(_))));
+            assert_eq!(guard.tip().id(), before);
+            let (mut doubled, _) = guard
+                .template(&wallet.account_id(), guard.next_timestamp_ms())
+                .unwrap();
+            let first = Transaction::Transfer(tx.clone());
+            let second = Transaction::Transfer(conflict.clone());
+            doubled.header.transaction_root = vess_core::hash::tx_root(&[first.id(), second.id()]);
+            doubled.body = vess_consensus::encode_body(&[first, second]).unwrap();
+            assert!(doubled.mine(200_000_000));
+            let result = guard.accept_block(&doubled.encode());
+            println!("proof-of-work-valid double spend block: {result:?}");
+            assert!(matches!(
+                result,
+                Err(crate::NodeError::Consensus(
+                    vess_consensus::ConsensusError::BadTransaction { .. }
+                ))
+            ));
+            assert_eq!(guard.tip().id(), before);
+        }
+        mine(&a);
+        assert!(lock(&a).submit_transfer(tx.clone()).is_err());
+        assert!(lock(&a).submit_transfer(conflict).is_err());
+        sync_once(&b, &format!("127.0.0.1:{port}"), 0).unwrap();
+        assert_eq!(lock(&a).balance(&recipient), 10);
+        assert_eq!(lock(&a).balance(&other), 0);
+        assert_eq!(lock(&a).root(), lock(&b).root());
+        mine(&a);
+        sync_once(&b, &format!("127.0.0.1:{port}"), 0).unwrap();
+        assert_eq!(lock(&a).tip().id(), lock(&b).tip().id());
+        assert_eq!(lock(&a).root(), lock(&b).root());
+        println!("testnet chaos completed: height 3, matching state and tip");
+    }
+
+    #[test]
     fn the_poller_carries_transactions_to_the_miner() {
         let (dir_a, dir_b) = (TempDir::new("a"), TempDir::new("b"));
         let a = shared(&dir_a.0);

@@ -86,7 +86,8 @@ while searching, rather than continuing to mine indefinitely with an old timesta
 Send a payment and follow it:
 
 ```sh
-$BIN wallet send  --datadir ./chain --name alice --to <account> --amount 5 --rpc 127.0.0.1:9733 --password-env VESS_WALLET_PASSWORD
+$BIN wallet send  --datadir ./chain --name alice --to <a
+ccount> --amount 5 --rpc 127.0.0.1:9733 --password-env VESS_WALLET_PASSWORD
 $BIN wallet watch --datadir ./chain --name alice --rpc 127.0.0.1:9733 --password-env VESS_WALLET_PASSWORD
 ```
 
