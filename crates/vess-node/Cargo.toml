@@ -12,6 +12,11 @@ path = "src/main.rs"
 
 [dependencies]
 getrandom.workspace = true
+rpassword = "7.4"
+serde = { version = "1", features = ["derive"] }
+tempfile = "3"
+toml = "0.8"
+zeroize = "1.8"
 vess-core = { path = "../vess-core" }
 vess-consensus = { path = "../vess-consensus" }
 vess-crypto = { path = "../vess-crypto" }

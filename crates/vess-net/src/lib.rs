@@ -204,6 +204,7 @@ pub mod rpc_kind {
     pub const WAIT_FOR_ACCOUNT: u16 = 13;
     /// Submit locally mined work only if its parent is still the best tip.
     pub const SUBMIT_MINED_BLOCK: u16 = 14;
+    pub const HISTORY_STATUS: u16 = 15;
 }
 
 /// How a caller names a block: by main-chain height or by id.
@@ -216,6 +217,7 @@ pub enum BlockQuery {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
     Status,
+    HistoryStatus,
     Balance(AccountId),
     Template(AccountId),
     SubmitBlock(Vec<u8>),
@@ -360,6 +362,11 @@ pub struct TransactionInfo {
 pub enum ReplyBody {
     Empty,
     Status(StatusInfo),
+    HistoryStatus {
+        status: u8,
+        height: u64,
+        target: u64,
+    },
     Account(AccountInfo),
     Template(TemplateInfo),
     Accepted(Hash),
@@ -423,6 +430,7 @@ impl Encode for Request {
     fn encode(&self, w: &mut Writer) {
         match self {
             Request::Status => w.u8(rpc_kind::STATUS as u8),
+            Request::HistoryStatus => w.u8(rpc_kind::HISTORY_STATUS as u8),
             Request::Balance(id) => {
                 w.u8(rpc_kind::BALANCE as u8);
                 w.fixed(id);
@@ -496,6 +504,7 @@ impl Decode for Request {
         let kind = r.u8()?;
         Ok(match kind as u16 {
             rpc_kind::STATUS => Request::Status,
+            rpc_kind::HISTORY_STATUS => Request::HistoryStatus,
             rpc_kind::BALANCE => Request::Balance(r.array()?),
             rpc_kind::TEMPLATE => Request::Template(r.array()?),
             rpc_kind::SUBMIT_BLOCK => {
@@ -631,6 +640,16 @@ impl Encode for Reply {
                 w.fixed(tip);
                 w.u64(*height);
             }
+            ReplyBody::HistoryStatus {
+                status,
+                height,
+                target,
+            } => {
+                w.u8(9);
+                w.u8(*status);
+                w.u64(*height);
+                w.u64(*target);
+            }
         }
     }
 }
@@ -755,6 +774,11 @@ impl Decode for Reply {
             8 => ReplyBody::Tip {
                 tip: r.array()?,
                 height: r.u64()?,
+            },
+            9 => ReplyBody::HistoryStatus {
+                status: r.u8()?,
+                height: r.u64()?,
+                target: r.u64()?,
             },
             _ => return Err(CodecError::UnknownVersion),
         };
@@ -1234,6 +1258,7 @@ mod tests {
     fn request_and_reply_round_trip() {
         let requests = vec![
             Request::Status,
+            Request::HistoryStatus,
             Request::Balance([1u8; 32]),
             Request::SubmitBlock(vec![1, 2, 3]),
             Request::SubmitMinedBlock(vec![4, 5, 6]),
@@ -1253,6 +1278,11 @@ mod tests {
 
         let replies = vec![
             Reply::reject(7),
+            Reply::ok(ReplyBody::HistoryStatus {
+                status: 1,
+                height: 7,
+                target: 42,
+            }),
             Reply::ok(ReplyBody::Account(AccountInfo {
                 exists: true,
                 balance: 5,

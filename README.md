@@ -43,34 +43,105 @@ cargo build --release
 BIN=./target/release/vess
 ```
 
-The examples use the default `devnet`. Choose a strong, unique password, store it securely, and
-provide it through an environment variable or password file. Back up the encrypted keyfile at
-`<datadir>/wallets/<name>.key` and the password separately; losing either can mean losing access to
-funds. Set `VESS_WALLET_PASSWORD` in your environment before running these commands.
+The first operational command creates `vess.toml` beside the executable with preset defaults:
+`devnet`, a `chain` folder beside the config, no mining, no configured peers, and snapshot trust
+enabled. Edit the file to change persistent settings.
+It includes an inactive placeholder for a future default seed; replace it with a real seed for the
+chosen network in the `seeds` list when one is available. Existing config files are not modified.
+Command-line options are optional and override the file for that invocation only; they are never
+saved to it. `--config FILE` selects a different config file. A relative `datadir` in the config is
+relative to that file; a relative `--config` or `--datadir` argument is relative to the working
+directory.
 
-Create a chain, make a wallet, and mine two blocks:
+Earlier builds placed the config and relative data directory in the working directory. Vess refuses
+to silently ignore such a config and warns if a working-directory data folder already exists. To
+keep using them, pass `--config` with the old config path, and if needed `--datadir` with the old
+data path, or set an absolute `datadir` in the config. You can instead move them together beside the
+executable. Back up wallets and data before moving them.
+
+Run the configured node with just:
 
 ```sh
-$BIN node init --datadir ./chain
-$BIN wallet new --datadir ./chain --name alice --password-env VESS_WALLET_PASSWORD
+$BIN
+```
+
+With a fresh data directory, it does not mine or connect to a peer by default. To configure either,
+stop the node, edit `vess.toml`, and restart it. For example:
+
+```toml
+network = "testnet"
+datadir = "./chain"
+rpc_port = 9733
+p2p_port = 9732
+peers = []
+seeds = ["127.0.0.1:9732"]
+mine = true
+payout = "YOUR_64_CHARACTER_ACCOUNT_ADDRESS"
+trust_snapshot = true
+```
+
+Replace the example seed and payout with real values, and use a data directory for the chosen
+network. Do **not** put a recovery phrase or wallet password in this file. Set `mine = false` if you
+only want to run a node. `--no-mine` and `--no-trust-snapshot` temporarily disable those config
+settings. The generated config lists optional `payout`, `prune_blocks`, and `prune_headers`
+settings as commented examples. Uncomment an example to apply it; leaving pruning unset preserves
+the database's saved policy. Mining resumes immediately after a block; the obsolete `mine_interval`
+setting is ignored with a warning.
+
+Trusted snapshots require a majority of at least three connected peer identities. These identities
+are not proof of independent ownership: an eclipse or Sybil attack can still supply a false state.
+Snapshot history is verified in the background when historical blocks are available; until then,
+the state remains trusted rather than fully verified. Without enough peers, snapshot sync waits.
+
+The examples use the default `devnet`. Choose a strong, unique password, store it securely, and
+provide it through an environment variable or password file. Set `VESS_WALLET_PASSWORD` in your
+environment before running these commands.
+
+New HD wallets display a 24-word recovery phrase **once**. Write it down privately and keep it safe:
+anyone with the phrase can access the wallet. It cannot be displayed again from the keyfile. Back up
+the encrypted keyfile at `<datadir>/wallets/<name>.key` and its password separately as well. If you
+lose the password, the phrase can restore the wallet with a new one. The keyfile password is not part
+of the recovery phrase.
+
+With the node stopped, create a chain, make a wallet, and mine two blocks:
+
+```sh
+$BIN node init
+$BIN wallet new --name alice --password-env VESS_WALLET_PASSWORD
 # hd=1  account=<hex>  index=0
 
-$BIN miner --datadir ./chain --payout <account> --blocks 2
-$BIN wallet balance --datadir ./chain --name alice --password-env VESS_WALLET_PASSWORD
+$BIN miner --payout <account> --blocks 2
+$BIN wallet balance --name alice --password-env VESS_WALLET_PASSWORD
 # balance=198  next_nonce=0
 ```
+
+To recover a new HD wallet, set a password for the new keyfile and run:
+
+```sh
+$BIN wallet restore --name alice-recovered --password-env VESS_WALLET_PASSWORD
+```
+
+Enter the 24 words when prompted; input is hidden. Use the same `--network` as the original wallet
+and the same account indices. Creation requires a terminal so the phrase is not accidentally captured
+in redirected output. Automation can explicitly opt in to `--unsafe-phrase-stdout` for creation or
+pipe a phrase to recovery with `--mnemonic-stdin`; protect those streams from logs and other readers.
+Do not put a phrase in command arguments or shell history.
+
+Older wallets and `wallet new --legacy` do not gain recovery phrases. Keep their keyfiles and any
+passwords backed up; they cannot be recovered with a newly generated phrase.
 
 Run a node, either mining or joining a network:
 
 ```sh
-$BIN node run --datadir ./chain --rpc 9733 --port 9732 --mine --payout <account>
+$BIN node run --rpc 9733 --port 9732 --mine --payout <account>
 $BIN node run --datadir ./chain2 --rpc 9743 --port 9742 --seed 127.0.0.1:9732
 ```
 
 There are no built-in bootstrap peers. Supply a known peer with `--seed`, `--peer`, or `VESS_SEEDS`
 when joining a network. Peers discovered after connecting are remembered in `<datadir>/peers.txt`.
-For testnet or mainnet, pass `--network testnet` or `--network mainnet` consistently to commands
-that open the data directory.
+Set the network in the config, or pass `--network testnet` or `--network mainnet` consistently to
+commands that open the data directory. When the node is running, use `--rpc 127.0.0.1:9733` (or
+its configured port) for commands that query it rather than opening the database directly.
 
 The current protocol uses millisecond block timestamps and a testnet genesis target of `2^235`.
 All networks are incompatible with earlier builds: use a new data directory and connect only to
@@ -97,6 +168,7 @@ Inspect a running node:
 
 ```sh
 $BIN node status  --rpc 127.0.0.1:9733                 # height, tip, supply, next reward, peers, bans
+$BIN node history --rpc 127.0.0.1:9733                 # snapshot verification progress
 $BIN node block   --rpc 127.0.0.1:9733 --height 12
 $BIN node tx      --rpc 127.0.0.1:9733 --id <txid>
 $BIN node account --rpc 127.0.0.1:9733 --account <id>  # balance, nonce, state commitment
@@ -104,6 +176,27 @@ $BIN node proof   --rpc 127.0.0.1:9733 --account <id>  # inclusion or non-inclus
 $BIN node params  --network mainnet                    # every consensus constant
 ```
 
-`node run` also accepts `--prune-blocks N` and `--prune-headers N` to keep only recent history, and
-`--trust-snapshot` to join a pruned peer by state snapshot. Trusting a snapshot across a history gap
-means trusting that peer's state. RPC is unauthenticated and listens only on loopback.
+`node run` also accepts `--prune-blocks N` and `--prune-headers N` to keep only recent history.
+Snapshot trust is enabled by default to join pruned peers; set `trust_snapshot = false` or pass
+`--no-trust-snapshot` to disable it. An existing config that explicitly sets it to `false` remains
+disabled. Before installing a newly received snapshot, the node asks its
+connected peers for their block ID at the snapshot height and requires a strict majority to agree.
+At least three peer identities are required; duplicate connections with the same peer key count once,
+and peers that cannot answer do not count as agreement. If the set of connected sessions changes
+during a vote, the node retries. Peer keys are not proof of independent ownership, so an attacker
+controlling enough connections can still mislead
+the node. A vote does not prove that the peer executed the block; this is not a trusted checkpoint
+or a signed attestation.
+
+This check applies to newly installed snapshots, not snapshots already in a database. The node
+independently replays snapshot history in the background using available connected peers, and checks
+the result against the snapshot's block. `node history` reports `pending`, `verified`, `invalid`, or
+`not_tracked` (not proof that an older database was independently verified). Replay resumes after a
+restart and remains pending if peers cannot supply the necessary history. It uses additional disk,
+bandwidth and CPU; the separate replay database retains the history it downloads, and header pruning
+is paused while replay is pending. If replay proves the snapshot history invalid, the node stops
+serving normal operations and refuses to reopen that database.
+
+An archival node can make history available to others by starting with `--prune-blocks 0` and
+`--prune-headers 0` before pruning has removed it. Changing these flags cannot restore blocks already
+deleted. RPC is unauthenticated and listens only on loopback.

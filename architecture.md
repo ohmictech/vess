@@ -789,7 +789,7 @@ Constraints:
   `PRUNE_FLOOR_BLOCKS` headers are re-validated on open.
 - **Fresh-sync consequence:** a node cannot replay history it no longer has. State is rebuilt by
   replaying bodies, so a peer whose body window starts above a new node's tip cannot catch it up with
-  blocks; that node joins by state snapshot (§16.2) only if it was started with `--trust-snapshot`.
+  blocks; that node may join by state snapshot (§16.2) while snapshot trust is enabled.
   A peer that is behind and cannot be helped logs the reason with both heights rather than stalling
   silently.
 
@@ -803,17 +803,17 @@ SnapshotFrame::Accounts([(account_id, Account)]) // batches
 SnapshotFrame::End { accounts }
 ```
 
-A snapshot is accepted only when the height is the tip of our own validated header chain, the
-snapshot is newer than our current state, and `state.root()` equals that header's `state_root` — and
-then only if we can **prove** that root. A header alone proves nothing: a peer may mine one block with
-any `state_root` it likes and send the accounts that hash to it, so an install requires the anchor's
-body, which is validated against the parent state we hold (a snapshot that agrees with that is simply
-a shortcut for replaying one block). A snapshot for a block we cannot validate is refused with
-`SnapshotUnproven` unless the node was started with `--trust-snapshot`, which turns the peer's account
-set at that height into a trust decision and is logged as a warning.
+A snapshot must be at the tip of the validated header chain, newer than the local state, and match the
+header's state root. If the anchor body is available, it is validated against the parent state. When
+the anchor cannot be validated locally, snapshot trust is enabled by default; set
+`trust_snapshot = false` or use `--no-trust-snapshot` to reject it with `SnapshotUnproven`.
 
-That is the honest state of the design: without trusted checkpoints baked into the binary, adopting a
-snapshot across a gap is trusting the peer for the whole state, so it is opt-in rather than automatic.
+The P2P path also requires a strict majority of connected peer identities to agree on the block ID,
+with a minimum of three distinct identities. An attacker controlling enough identities can still
+authorize a false state. This vote is not proof of execution or independent ownership, and the
+low-level `install_snapshot` API does not perform the vote itself. The node replays available history
+in the background and stops normal operation if it proves the committed history invalid.
+
 The receiver then drops undo records, bodies, and the transaction index (they describe history it does
 not have) and keeps headers and the height index. One consequence is deliberate and worth stating: a
 transaction mined before the snapshot is `unknown` afterwards, because the node has no record of it —
@@ -1133,9 +1133,8 @@ u8  network                u8  network                  u8  network
   weakening the file, and a file from another network is refused after decryption.
 - Wrong passphrase, truncated file, and tampered header or body are all distinct errors
   (`WrongPassphrase`, `MalformedKeyfile`), and none of them is a panic.
-- A passphrase is supplied to the CLI with `--password-file FILE` or `--password-env VAR`, never as an
-  argument, because arguments are visible in the process list and land in shell history. `wallet new`
-  without either writes the legacy format and says so on stderr.
+- A keyfile password is supplied to the CLI with `--password-file FILE` or `--password-env VAR`.
+  New HD wallets require encryption; `wallet new --legacy` can write an unencrypted single-key file.
 
 #### Hierarchical accounts
 
@@ -1157,6 +1156,28 @@ account(i)    = ML-DSA-65(child_seed(i))
   silently deriving something else. New wallets are HD; `wallet new --legacy` writes the old shape.
 - An HD keyring has **no unencrypted representation** — the plaintext format has no room for the kind
   byte — so `save` refuses rather than writing a file that would be misread as single-account.
+
+#### Recovery phrases
+
+New CLI HD wallets generate 256 bits of OS randomness and encode it as a 24-word English BIP-39
+phrase, including its checksum. Their exact derivation is:
+
+```text
+bip39_seed = BIP39_PBKDF2_HMAC_SHA512(mnemonic, passphrase = "")  # 64 bytes
+master_seed = BLAKE3("VESS-BIP39-HD-V1" || bip39_seed)            # 32 bytes
+child_seed(i) = BLAKE3("VESS-HD-V1" || master_seed || u32_be(i))
+```
+
+The BIP-39 passphrase is always empty; the keyfile encryption password is separate and can change on
+recovery. This is Vess-specific HD derivation, not BIP-32. Recovery checks the word count, English
+word list and checksum before creating an encrypted v3 keyfile, without replacing an existing file.
+The network and account index must match the original use.
+
+The keyfile stores the derived master, not the phrase. The phrase is shown once at creation and cannot
+be exported later. Existing v1/v2/v3 wallets keep their original keys and addresses; in particular,
+older randomly generated HD masters cannot be turned into recovery phrases by this derivation.
+Retain backups of their keyfiles and passwords. Creation refuses redirected output unless explicitly
+overridden; recovery defaults to hidden terminal entry, with piped input only by explicit opt-in.
 
 `vess-wallet` contains no consensus logic beyond encoding and signing:
 
@@ -1276,9 +1297,8 @@ solver crate, and any TLS stack.
 - **No RPC authentication.** Loopback only, by design. There is also no push subscription: a client
   that wants to follow an account uses `WAIT_FOR_TIP` (§19) and re-reads the account, which costs one
   round trip per block and no server-side state.
-- **State snapshots across a gap trust the peer.** A snapshot is only accepted when its anchor is a
-  block we validated ourselves; adopting one across a gap needs `--trust-snapshot`, because the
-  built-in checkpoint lists are still empty (§16.2, §11.9).
+- **State snapshots across a gap trust peers by default.** The connected-peer quorum does not prove
+  independent ownership or execution, and the built-in checkpoint lists are empty (§16.2, §11.9).
 - **First contact is still trust on first use.** Once an address has been verified its key is pinned
   (§18.5) and a different key at that address is refused, but the *first* connection to an address
   can still be machine-in-the-middled. Pinning shrinks that from a permanent window to a one-time

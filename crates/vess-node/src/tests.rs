@@ -234,6 +234,34 @@ fn tip_change_during_a_mining_batch_discards_found_work() {
 }
 
 #[test]
+fn solution_survives_template_timer_but_not_a_tip_change() {
+    let (_dir, node) = node();
+    let (mut template, _) = node
+        .template(&[0x21; 32], node.next_timestamp_ms())
+        .unwrap();
+    assert!(template.mine(20_000_000));
+    for tip_changed in [false, true] {
+        let mut header = template.header;
+        let mut checks = 0;
+        let result = crate::mine_fresh(&mut header, 1, std::time::Instant::now(), |_| {
+            checks += 1;
+            if checks == 1 {
+                std::thread::sleep(
+                    crate::MINING_REFRESH_INTERVAL + std::time::Duration::from_millis(20),
+                );
+            }
+            Ok::<_, ()>(tip_changed && checks == 2)
+        })
+        .unwrap();
+        assert_eq!(checks, 2);
+        assert!(matches!(
+            (tip_changed, result),
+            (false, crate::MiningResult::Found) | (true, crate::MiningResult::Refresh)
+        ));
+    }
+}
+
+#[test]
 fn rpc_miner_retries_after_tip_changes() {
     let dir = TempDir::new();
     let shared = Arc::new(Mutex::new(
@@ -416,6 +444,52 @@ fn a_replayed_transfer_is_refused_by_the_mempool() {
 }
 
 #[test]
+fn pending_replacement_and_conflicting_block_survive_restart_cleanly() {
+    let dir = TempDir::new();
+    let wallet = Wallet::from_seed(0, [0x62; 32]);
+    let payout = wallet.account_id();
+    let old = wallet.build_transfer([0x61; 32], 1, 0, 0, 0);
+    let replacement = wallet.build_transfer([0x61; 32], 1, 1, 0, 0);
+    let confirmed = wallet.build_transfer([0x63; 32], 1, 0, 0, 0);
+    {
+        let mut node = Node::open(&dir.path, NetworkProfile::DEVNET).unwrap();
+        mine_one(&mut node, &payout);
+        node.submit_transfer(old.clone()).unwrap();
+        node.submit_transfer(replacement.clone()).unwrap();
+        let pending = node.store.load_pending().unwrap();
+        assert_eq!(
+            pending,
+            vec![Transaction::Transfer(replacement.clone()).canonical()]
+        );
+    }
+    {
+        let mut node = Node::open(&dir.path, NetworkProfile::DEVNET).unwrap();
+        assert_eq!(node.pending_transactions()[0].id(), replacement.tx_id());
+        let mut template = vess_consensus::build_template(
+            node.chain(),
+            &node.network,
+            &node.tip().id(),
+            node.state(),
+            &payout,
+            node.next_timestamp_ms(),
+            &[Transaction::Transfer(confirmed)],
+        )
+        .unwrap();
+        assert!(template.mine(20_000_000));
+        node.accept_block(&template.encode()).unwrap();
+        assert!(node.pending_transactions().is_empty());
+        assert!(node.store.load_pending().unwrap().is_empty());
+        // Clean up stale records left by older versions on the next restart.
+        node.store
+            .put_pending(&old.tx_id(), &Transaction::Transfer(old).canonical())
+            .unwrap();
+    }
+    let node = Node::open(&dir.path, NetworkProfile::DEVNET).unwrap();
+    assert!(node.pending_transactions().is_empty());
+    assert!(node.store.load_pending().unwrap().is_empty());
+}
+
+#[test]
 fn an_unsigned_transfer_is_refused_at_admission() {
     let (_dir, mut node) = node();
     let alice = Wallet::from_seed(0, [0x33u8; 32]);
@@ -576,6 +650,18 @@ fn a_pruned_node_still_answers_questions_about_old_transactions() {
     );
     // The content is gone with the body, and saying so is better than inventing it.
     assert_eq!(pruned.kind, 0);
+
+    // Databases created before replay tracking can opt in without assuming their history was valid.
+    node.verify_existing_snapshot_history().unwrap();
+    assert_eq!(
+        node.snapshot_verification.unwrap().status,
+        vess_storage::SnapshotVerificationStatus::Pending
+    );
+    assert_eq!(
+        node.snapshot_verification.unwrap().height,
+        node.state_height()
+    );
+    assert_eq!(node.history_replayed, 0);
 }
 
 #[test]
@@ -1395,7 +1481,7 @@ fn a_snapshot_reproduces_the_state_of_the_block_it_claims() {
     );
 }
 
-/// Without `--trust-snapshot` a snapshot for a block we never validated is refused: a peer could
+/// With snapshot trust disabled a snapshot for a block we never validated is refused: a peer could
 /// otherwise mine one header with an invented `state_root` and rewrite our whole account set.
 #[test]
 fn an_unverifiable_snapshot_is_refused_unless_trusted() {
@@ -1421,18 +1507,137 @@ fn an_unverifiable_snapshot_is_refused_unless_trusted() {
     let frames = a.lock().unwrap().snapshot_frames();
     let (_, snapshot) = decode_snapshot(&frames);
 
-    assert!(!b.trust_snapshots(), "the default must be opt-out");
+    assert!(b.trust_snapshots(), "snapshot trust is enabled by default");
+    b.set_trust_snapshots(false);
     assert!(matches!(
         b.install_snapshot(height, snapshot.clone()),
         Err(NodeError::SnapshotUnproven)
     ));
     assert_eq!(b.state_height(), 0, "a refused snapshot changes nothing");
 
-    // Opting in does not skip the root check, so the snapshot is still honoured when it matches.
+    // Enabling trust does not skip the root check.
     b.set_trust_snapshots(true);
     b.install_snapshot(height, snapshot).unwrap();
     assert_eq!(b.state_height(), height);
     assert_eq!(b.root(), a.lock().unwrap().root());
+}
+
+#[test]
+fn snapshot_trust_can_be_disabled_before_open() {
+    let dir = TempDir::new();
+    let node = Node::open_with_snapshot_trust(&dir.path, NetworkProfile::DEVNET, false).unwrap();
+    assert!(!node.trust_snapshots());
+}
+
+#[test]
+fn snapshot_verification_progress_survives_restart() {
+    let source_dir = TempDir::new();
+    let target_dir = TempDir::new();
+    let mut source = Node::open(&source_dir.path, NetworkProfile::DEVNET).unwrap();
+    for _ in 0..2 {
+        let timestamp = source.next_timestamp_ms();
+        let (mut template, _) = source.template(&[0x41; 32], timestamp).unwrap();
+        assert!(template.mine(20_000_000));
+        source.accept_block(&template.encode()).unwrap();
+    }
+    let mut target = Node::open(&target_dir.path, NetworkProfile::DEVNET).unwrap();
+    for header in source.headers_from(0, 64) {
+        target.insert_header_only(header).unwrap();
+    }
+    target.set_trust_snapshots(true);
+    target
+        .install_snapshot(source.height(), source.state().clone())
+        .unwrap();
+    {
+        let verifier = target.history_verifier.as_ref().unwrap();
+        let mut verifier = verifier.lock().unwrap();
+        let header = source.chain().main_header_at(1).unwrap();
+        let body = source.block_body(&header.id()).unwrap();
+        assert!(
+            verifier
+                .replay(&header, &body, &NetworkProfile::DEVNET)
+                .is_ok()
+        );
+    }
+    drop(target);
+    let target = Node::open(&target_dir.path, NetworkProfile::DEVNET).unwrap();
+    assert_eq!(target.history_replayed, 1);
+    assert_eq!(
+        target.snapshot_verification.unwrap().status,
+        vess_storage::SnapshotVerificationStatus::Pending
+    );
+}
+
+#[test]
+fn completed_replay_is_finalized_after_restart_without_peers() {
+    let source_dir = TempDir::new();
+    let target_dir = TempDir::new();
+    let mut source = Node::open(&source_dir.path, NetworkProfile::DEVNET).unwrap();
+    mine_one(&mut source, &[0x41; 32]);
+    let mut target = Node::open(&target_dir.path, NetworkProfile::DEVNET).unwrap();
+    for header in source.headers_from(0, 64) {
+        target.insert_header_only(header).unwrap();
+    }
+    target.set_trust_snapshots(true);
+    target
+        .install_snapshot(source.height(), source.state().clone())
+        .unwrap();
+    {
+        let verifier = target.history_verifier.as_ref().unwrap();
+        let mut verifier = verifier.lock().unwrap();
+        let header = source.chain().main_header_at(1).unwrap();
+        let body = source.block_body(&header.id()).unwrap();
+        assert!(
+            verifier
+                .replay(&header, &body, &NetworkProfile::DEVNET)
+                .is_ok()
+        );
+    }
+    drop(target);
+    let target = Node::open(&target_dir.path, NetworkProfile::DEVNET).unwrap();
+    assert_eq!(
+        target.snapshot_verification.unwrap().status,
+        vess_storage::SnapshotVerificationStatus::Verified
+    );
+    assert_eq!(target.history_replayed, 1);
+}
+
+#[test]
+fn invalid_snapshot_history_disables_the_node_and_survives_restart() {
+    let source_dir = TempDir::new();
+    let target_dir = TempDir::new();
+    let mut source = Node::open(&source_dir.path, NetworkProfile::DEVNET).unwrap();
+    let timestamp = source.next_timestamp_ms();
+    let (mut template, _) = source.template(&[0x41; 32], timestamp).unwrap();
+    assert!(template.mine(20_000_000));
+    source.accept_block(&template.encode()).unwrap();
+    let mut target = Node::open(&target_dir.path, NetworkProfile::DEVNET).unwrap();
+    for header in source.headers_from(0, 64) {
+        target.insert_header_only(header).unwrap();
+    }
+    target.set_trust_snapshots(true);
+    target
+        .install_snapshot(source.height(), source.state().clone())
+        .unwrap();
+    let expected = target.snapshot_verification.unwrap();
+    assert!(
+        target
+            .finish_history_verification(
+                expected,
+                vess_storage::SnapshotVerificationStatus::Invalid
+            )
+            .unwrap()
+    );
+    assert!(matches!(
+        target.template(&[0x41; 32], timestamp),
+        Err(NodeError::InvalidSnapshotHistory)
+    ));
+    assert!(!target.handle_rpc(Request::Balance([0x41; 32])).is_ok());
+    drop(target);
+    assert!(matches!(
+        Node::open(&target_dir.path, NetworkProfile::DEVNET),
+        Err(NodeError::InvalidSnapshotHistory)
+    ));
 }
 
 #[test]
@@ -1443,6 +1648,7 @@ fn a_snapshot_that_does_not_match_its_header_is_refused() {
         Node::open(&dir_a.path, NetworkProfile::DEVNET).unwrap(),
     ));
     let mut b = Node::open(&dir_b.path, NetworkProfile::DEVNET).unwrap();
+    b.set_trust_snapshots(false);
 
     let payout = [0x63u8; 32];
     for _ in 0..2 {

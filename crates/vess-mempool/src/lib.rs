@@ -37,6 +37,12 @@ pub enum AddOutcome {
     Replaced,
 }
 
+#[derive(Debug)]
+pub enum AdmissionError<E> {
+    Policy(MempoolError),
+    Persistence(E),
+}
+
 #[derive(Debug, Clone)]
 struct Entry {
     tx: Transaction,
@@ -74,21 +80,35 @@ impl Mempool {
 
     /// Admit a transfer or state update. Cryptographic validity is the caller's job.
     pub fn add_transaction(&mut self, tx: Transaction) -> Result<AddOutcome, MempoolError> {
+        match self.add_transaction_with(tx, |_| Ok::<_, std::convert::Infallible>(())) {
+            Ok(outcome) => Ok(outcome),
+            Err(AdmissionError::Policy(error)) => Err(error),
+            Err(AdmissionError::Persistence(never)) => match never {},
+        }
+    }
+
+    /// Persist the admission and removals before changing the in-memory pool.
+    pub fn add_transaction_with<E>(
+        &mut self,
+        tx: Transaction,
+        persist: impl FnOnce(&[Hash]) -> Result<(), E>,
+    ) -> Result<AddOutcome, AdmissionError<E>> {
         let (account, nonce, fee, size) = match &tx {
             Transaction::Transfer(t) => (t.sender_id(), t.nonce, t.fee, tx.canonical().len()),
             Transaction::StateUpdate(t) => (t.sender_id(), t.nonce, t.fee, tx.canonical().len()),
         };
         if size > MAX_TRANSACTION_BYTES {
-            return Err(MempoolError::TooLarge);
+            return Err(AdmissionError::Policy(MempoolError::TooLarge));
         }
 
         if let Some(position) = self.entries.iter().position(|e| e.account == account) {
             if self.entries[position].tx.id() == tx.id() {
-                return Err(MempoolError::Duplicate);
+                return Err(AdmissionError::Policy(MempoolError::Duplicate));
             }
             if self.entries[position].nonce != nonce || fee <= self.entries[position].fee {
-                return Err(MempoolError::WouldNotReplace);
+                return Err(AdmissionError::Policy(MempoolError::WouldNotReplace));
             }
+            persist(&[self.entries[position].tx.id()]).map_err(AdmissionError::Persistence)?;
             let old_size = self.entries[position].size;
             self.pending_bytes = self.pending_bytes + size - old_size;
             let seq = self.next_seq();
@@ -102,22 +122,41 @@ impl Mempool {
 
         let per_account = self.entries.iter().filter(|e| e.account == account).count();
         if per_account >= MEMPOOL_PER_ACCOUNT_TRANSACTIONS {
-            return Err(MempoolError::AccountBusy);
+            return Err(AdmissionError::Policy(MempoolError::AccountBusy));
         }
 
-        while !self.entries.is_empty()
-            && (self.entries.len() >= MEMPOOL_MAX_TRANSACTIONS
-                || self.pending_bytes + size > MEMPOOL_MAX_TRANSACTION_BYTES)
+        let mut victims = Vec::new();
+        let mut remaining_bytes = self.pending_bytes;
+        if self.entries.len() >= MEMPOOL_MAX_TRANSACTIONS
+            || remaining_bytes + size > MEMPOOL_MAX_TRANSACTION_BYTES
         {
-            if !self.evict_one() {
-                break;
+            let mut candidates: Vec<usize> = (0..self.entries.len()).collect();
+            candidates.sort_by_key(|&index| (self.entries[index].fee, self.entries[index].seq));
+            for index in candidates {
+                if self.entries.len() - victims.len() < MEMPOOL_MAX_TRANSACTIONS
+                    && remaining_bytes + size <= MEMPOOL_MAX_TRANSACTION_BYTES
+                {
+                    break;
+                }
+                remaining_bytes -= self.entries[index].size;
+                victims.push(index);
             }
         }
-        if self.entries.len() >= MEMPOOL_MAX_TRANSACTIONS
-            || self.pending_bytes + size > MEMPOOL_MAX_TRANSACTION_BYTES
+        if self.entries.len() - victims.len() >= MEMPOOL_MAX_TRANSACTIONS
+            || remaining_bytes + size > MEMPOOL_MAX_TRANSACTION_BYTES
         {
-            return Err(MempoolError::Full);
+            return Err(AdmissionError::Policy(MempoolError::Full));
         }
+        let removed: Vec<Hash> = victims
+            .iter()
+            .map(|&index| self.entries[index].tx.id())
+            .collect();
+        persist(&removed).map_err(AdmissionError::Persistence)?;
+        victims.sort_unstable_by(|a, b| b.cmp(a));
+        for index in victims {
+            self.entries.remove(index);
+        }
+        self.pending_bytes = remaining_bytes;
 
         let seq = self.next_seq();
         self.entries.push(Entry {
@@ -130,6 +169,24 @@ impl Mempool {
         });
         self.pending_bytes += size;
         Ok(AddOutcome::Added)
+    }
+
+    pub fn transaction_id_for_account(&self, account: &AccountId) -> Option<Hash> {
+        self.entries
+            .iter()
+            .find(|entry| &entry.account == account)
+            .map(|entry| entry.tx.id())
+    }
+
+    pub fn transaction_ids_where(
+        &self,
+        mut predicate: impl FnMut(&Transaction) -> bool,
+    ) -> Vec<Hash> {
+        self.entries
+            .iter()
+            .filter(|entry| predicate(&entry.tx))
+            .map(|entry| entry.tx.id())
+            .collect()
     }
 
     /// Drop a transaction once it is included in a block (by id).
@@ -204,23 +261,6 @@ impl Mempool {
     fn next_seq(&mut self) -> u64 {
         self.seq += 1;
         self.seq
-    }
-
-    fn evict_one(&mut self) -> bool {
-        if self.entries.is_empty() {
-            return false;
-        }
-        let mut victim = 0;
-        for (index, entry) in self.entries.iter().enumerate() {
-            if entry.fee < self.entries[victim].fee
-                || (entry.fee == self.entries[victim].fee && entry.seq < self.entries[victim].seq)
-            {
-                victim = index;
-            }
-        }
-        let entry = self.entries.remove(victim);
-        self.pending_bytes -= entry.size;
-        true
     }
 }
 
@@ -298,6 +338,24 @@ mod tests {
     }
 
     #[test]
+    fn failed_persistence_does_not_change_the_pool() {
+        let mut pool = Mempool::new();
+        let original = transfer(1, 0, 5);
+        let original_id = original.id();
+        pool.add_transaction(original).unwrap();
+        let error = pool.add_transaction_with(transfer(1, 0, 9), |removed| {
+            assert_eq!(removed, &[original_id]);
+            Err("disk failure")
+        });
+        assert!(matches!(
+            error,
+            Err(AdmissionError::Persistence("disk failure"))
+        ));
+        assert_eq!(pool.pending_transactions()[0].id(), original_id);
+        assert_eq!(pool.transaction_count(), 1);
+    }
+
+    #[test]
     fn different_accounts_coexist() {
         let mut pool = Mempool::new();
         pool.add_transaction(transfer(1, 0, 5)).unwrap();
@@ -356,12 +414,43 @@ mod tests {
         for index in 1..=MEMPOOL_MAX_TRANSACTIONS {
             let _ = pool.add_transaction(indexed_transfer(index, 50));
         }
+
         assert!(pool.transaction_count() <= MEMPOOL_MAX_TRANSACTIONS);
         assert!(
             !pool.entries.iter().any(|e| e.fee == 1),
             "the cheapest entry must be evicted first"
         );
         assert!(pool.entries.iter().all(|e| e.fee == 50));
+    }
+
+    #[test]
+    fn eviction_reports_removed_ids_before_persistence() {
+        let mut pool = Mempool::new();
+        let victim = indexed_transfer(0, 1);
+        let victim_id = victim.id();
+        pool.add_transaction(victim).unwrap();
+        let mut index = 1;
+        loop {
+            let next = indexed_transfer(index, 50);
+            if pool.transaction_count() >= MEMPOOL_MAX_TRANSACTIONS
+                || pool.bytes() + next.canonical().len() > MEMPOOL_MAX_TRANSACTION_BYTES
+            {
+                pool.add_transaction_with(next, |removed| {
+                    assert_eq!(removed, &[victim_id]);
+                    Ok::<_, ()>(())
+                })
+                .unwrap();
+                break;
+            }
+            pool.add_transaction(next).unwrap();
+            index += 1;
+        }
+        assert!(
+            !pool
+                .pending_transactions()
+                .iter()
+                .any(|tx| tx.id() == victim_id)
+        );
     }
     #[test]
     fn removal_paths_are_consistent() {

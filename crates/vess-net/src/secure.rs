@@ -140,10 +140,19 @@ impl SecureStream {
 
     fn read_record(&mut self) -> std::io::Result<()> {
         let mut len_bytes = [0u8; 2];
-        self.inner.read_exact(&mut len_bytes)?;
+        self.inner.read_exact(&mut len_bytes[..1])?;
+        let truncated = |error: std::io::Error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("truncated noise record: {error}"),
+            )
+        };
+        self.inner
+            .read_exact(&mut len_bytes[1..])
+            .map_err(truncated)?;
         let len = usize::from(u16::from_be_bytes(len_bytes));
         let mut ciphertext = vec![0u8; len];
-        self.inner.read_exact(&mut ciphertext)?;
+        self.inner.read_exact(&mut ciphertext).map_err(truncated)?;
         let mut plain = vec![0u8; len];
         let n = self
             .state
@@ -312,6 +321,27 @@ mod tests {
         client.read_exact(&mut back).unwrap();
         writer.join().unwrap();
         assert_eq!(back, expected);
+    }
+
+    #[test]
+    fn incomplete_noise_records_are_not_reported_as_idle_timeouts() {
+        let (mut client, mut server) = pair();
+        server.set_read_timeout(50).unwrap();
+        let mut byte = [0u8; 1];
+        let idle = server.read(&mut byte).unwrap_err();
+        assert!(matches!(
+            idle.kind(),
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+        ));
+        client.inner.write_all(&[0]).unwrap();
+        let partial_length = server.read(&mut byte).unwrap_err();
+        assert_eq!(partial_length.kind(), std::io::ErrorKind::InvalidData);
+
+        let (mut client, mut server) = pair();
+        server.set_read_timeout(50).unwrap();
+        client.inner.write_all(&[0, 20, 1]).unwrap();
+        let partial_body = server.read(&mut byte).unwrap_err();
+        assert_eq!(partial_body.kind(), std::io::ErrorKind::InvalidData);
     }
 
     /// Pinning relies on a peer's static key being stable, not on any particular value: the same

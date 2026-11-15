@@ -54,6 +54,8 @@ const MAX_SCORE: u32 = 24;
 const MAX_INBOUND_CONNECTIONS: usize = 32;
 /// Simultaneous inbound sessions from a single address.
 const MAX_INBOUND_PER_IP: usize = 4;
+/// Distinct identities, not independent operators; this does not prevent Sybil attacks.
+const MIN_SNAPSHOT_PEERS: usize = 3;
 /// Transactions announced to one peer per wake-up.
 /// Transactions announced per session tick. With `SESSION_TICK_MS = 200` this sets both the relay
 /// throughput (~160 tx/s) and, via `MAX_VERIFICATIONS_PER_SECOND`, how much signature work one peer
@@ -185,6 +187,7 @@ pub struct Connections {
     /// Bans live here because every path that needs them (accept, session, dial) already has the
     /// node's connection state.
     bans: Bans,
+    quorum: Arc<crate::quorum::PeerSessions>,
 }
 
 impl Connections {
@@ -301,6 +304,9 @@ struct PeerState {
     peer_addr: Option<String>,
     /// Whether the peer is on loopback, which decides whether its gossip may contain local addresses.
     peer_is_local: bool,
+    next_history_attempt: Option<Instant>,
+    warned_history_headers: bool,
+    quorum_session: Option<crate::quorum::Session>,
 }
 
 impl PeerState {
@@ -696,6 +702,7 @@ fn session(
     let mut state = PeerState {
         peer_addr: peer_addr.clone(),
         peer_is_local: ours_is_local,
+        quorum_session: Some(conn.quorum.register(peer_key)),
         ..PeerState::default()
     };
     request_addresses(&node, &mut stream);
@@ -703,13 +710,22 @@ fn session(
     let their_oldest_body = theirs.oldest_body_height;
     let mut next_resync = Instant::now() + Duration::from_millis(RESYNC_INTERVAL_MS);
     loop {
+        if lock(&node).check_history_valid().is_err() {
+            return Err("snapshot history failed validation".into());
+        }
+        serve_quorum_request(&node, &mut stream, &mut state)?;
         announce(&node, &mut stream, &mut state)?;
+        verify_history_from_peer(&node, &mut stream, &mut state)?;
 
         // Announcements usually start a pull, but a missed or failed one would otherwise leave a
         // node stuck behind a peer that has stopped producing blocks. Re-check on a timer.
         if Instant::now() >= next_resync {
             next_resync = Instant::now() + Duration::from_millis(RESYNC_INTERVAL_MS);
-            if lock(&node).height() < their_height
+            let behind = {
+                let guard = lock(&node);
+                guard.height() < their_height || guard.state_height() < their_height
+            };
+            if behind
                 && pull(
                     &node,
                     &mut stream,
@@ -766,6 +782,218 @@ fn session(
             Err(_) => return Ok(()),
         }
     }
+}
+
+fn history_storage_error(error: NodeError) -> String {
+    let message = format!("history verification storage error: {error}");
+    log::record(Level::Error, "history", &message);
+    message
+}
+
+/// Fetch one historical body without holding the live node lock during I/O or replay.
+fn verify_history_from_peer(
+    node: &Arc<Mutex<Node>>,
+    stream: &mut SecureStream,
+    state: &mut PeerState,
+) -> Result<(), String> {
+    if state
+        .next_history_attempt
+        .is_some_and(|next| Instant::now() < next)
+    {
+        return Ok(());
+    }
+    let (verification, verifier, network) = {
+        let guard = lock(node);
+        let Some(verification) = guard.snapshot_verification else {
+            return Ok(());
+        };
+        if verification.status != vess_storage::SnapshotVerificationStatus::Pending {
+            return Ok(());
+        }
+        let Some(verifier) = guard.history_verifier.clone() else {
+            return Err("snapshot verifier is unavailable".into());
+        };
+        (verification, verifier, guard.network)
+    };
+    let Ok(mut verifier) = verifier.try_lock() else {
+        return Ok(());
+    };
+    let height = verifier.height();
+    let local_header = {
+        let guard = lock(node);
+        if guard.snapshot_verification != Some(verification) {
+            return Ok(());
+        }
+        if guard
+            .chain
+            .main_header_at(verification.height)
+            .map(|h| h.id())
+            != Some(verification.block_id)
+        {
+            if !state.warned_history_headers {
+                log::record(
+                    Level::Warn,
+                    "history",
+                    "snapshot anchor is not on the current retained chain; independent verification is paused",
+                );
+                state.warned_history_headers = true;
+            }
+            return Ok(());
+        }
+        guard.chain.main_header_at(height.saturating_add(1))
+    };
+    if height == verification.height {
+        let mut guard = lock(node);
+        if verifier.tip() != verification.block_id {
+            drop(guard);
+            verifier.reset(network).map_err(history_storage_error)?;
+            let mut guard = lock(node);
+            if guard.snapshot_verification == Some(verification) {
+                guard.history_replayed = 0;
+            }
+            state.next_history_attempt = Some(Instant::now() + Duration::from_secs(10));
+            log::record(
+                Level::Warn,
+                "history",
+                "replayed branch did not reach the snapshot anchor; retrying with other peers",
+            );
+            return Ok(());
+        }
+        guard
+            .finish_replayed_history(verification, height, verifier.tip(), verifier.root())
+            .map_err(history_storage_error)?;
+        return Ok(());
+    }
+    let header = if let Some(header) = local_header {
+        header
+    } else {
+        let mut request = Writer::new();
+        request.u64(height + 1);
+        request.u32(1);
+        write_frame(stream, P2P_MAGIC, p2p_kind::GET_HEADERS, request.as_slice())
+            .map_err(|error| error.to_string())?;
+        let Some(payload) = recv_until(node, stream, p2p_kind::HEADERS, state)? else {
+            state.next_history_attempt = Some(Instant::now() + Duration::from_secs(10));
+            return Ok(());
+        };
+        let headers = decode_headers(&payload).map_err(|error| error.to_string())?;
+        let Some(header) = headers.first().copied() else {
+            state.next_history_attempt = Some(Instant::now() + Duration::from_secs(10));
+            return Ok(());
+        };
+        if headers.len() != 1 {
+            return Err("peer sent too many historical headers".into());
+        }
+        header
+    };
+    if header.previous_block_id != verifier.tip() || height >= verification.height {
+        if local_header.is_some() && height < verification.height {
+            verifier.reset(network).map_err(history_storage_error)?;
+            let mut guard = lock(node);
+            if guard.snapshot_verification == Some(verification) {
+                guard.history_replayed = 0;
+            }
+            log::record(
+                Level::Warn,
+                "history",
+                "replayed branch does not match the retained headers; retrying with other peers",
+            );
+        }
+        state.next_history_attempt = Some(Instant::now() + Duration::from_secs(10));
+        return Ok(());
+    }
+    write_frame(stream, P2P_MAGIC, p2p_kind::GET_BLOCK, &header.id())
+        .map_err(|error| error.to_string())?;
+    let Some(payload) = recv_until(node, stream, p2p_kind::BLOCK, state)? else {
+        if !state.warned_history_headers {
+            log::record(
+                Level::Info,
+                "history",
+                "peer does not have the next historical block; waiting for another peer",
+            );
+            state.warned_history_headers = true;
+        }
+        state.next_history_attempt = Some(Instant::now() + Duration::from_secs(10));
+        return Ok(());
+    };
+    let mut reader = Reader::new(&payload);
+    let bytes = reader
+        .var_bytes(MAX_NETWORK_FRAME_BYTES)
+        .map_err(|error| error.to_string())?;
+    reader.finish().map_err(|error| error.to_string())?;
+    match verifier.replay(&header, bytes, &network) {
+        Ok(()) => {
+            let mut guard = lock(node);
+            if guard.snapshot_verification == Some(verification) {
+                guard.history_replayed = verifier.height();
+            }
+            guard
+                .finish_replayed_history(
+                    verification,
+                    verifier.height(),
+                    verifier.tip(),
+                    verifier.root(),
+                )
+                .map_err(history_storage_error)?;
+            drop(guard);
+            if verifier.height() % 1_000 == 0 {
+                log::record(
+                    Level::Info,
+                    "history",
+                    &format!(
+                        "independently verified {} of {} blocks",
+                        verifier.height(),
+                        verification.height
+                    ),
+                );
+            }
+        }
+        Err(crate::history::ReplayError::WrongBody) => {
+            log::record(
+                Level::Warn,
+                "history",
+                "peer supplied a historical body or signature that could not be verified",
+            );
+            return Err("peer sent a historical body that does not match its header".into());
+        }
+        Err(crate::history::ReplayError::Storage(error)) => {
+            return Err(history_storage_error(error));
+        }
+        Err(crate::history::ReplayError::Invalid(error)) => {
+            let mut guard = lock(node);
+            if guard.snapshot_verification == Some(verification)
+                && guard
+                    .chain
+                    .main_header_at(verification.height)
+                    .map(|h| h.id())
+                    == Some(verification.block_id)
+                && guard.chain.main_header_at(height + 1).map(|h| h.id()) == Some(header.id())
+                && guard
+                    .finish_history_verification(
+                        verification,
+                        vess_storage::SnapshotVerificationStatus::Invalid,
+                    )
+                    .map_err(history_storage_error)?
+            {
+                log::record(
+                    Level::Error,
+                    "history",
+                    &format!(
+                        "snapshot history failed at block {}: {error}; node disabled",
+                        height + 1
+                    ),
+                );
+            } else {
+                state.next_history_attempt = Some(Instant::now() + Duration::from_secs(10));
+                log::record(
+                    Level::Warn,
+                    "history",
+                    &format!("peer supplied an invalid unanchored historical block: {error}"),
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn handshake(
@@ -890,6 +1118,9 @@ fn dispatch(
     payload: &[u8],
     state: &mut PeerState,
 ) -> Result<Action, String> {
+    if lock(node).check_history_valid().is_err() {
+        return Err("snapshot history failed validation".into());
+    }
     let reply = |stream: &mut SecureStream, kind: u16, payload: &[u8]| {
         write_frame(stream, P2P_MAGIC, kind, payload).map_err(|e| e.to_string())
     };
@@ -1076,6 +1307,62 @@ fn recv_until(
     }
 }
 
+fn peer_header_at(
+    node: &Arc<Mutex<Node>>,
+    stream: &mut SecureStream,
+    state: &mut PeerState,
+    height: u64,
+) -> Result<Option<Hash>, String> {
+    let mut request = Writer::new();
+    request.u64(height);
+    request.u32(1);
+    write_frame(stream, P2P_MAGIC, p2p_kind::GET_HEADERS, request.as_slice())
+        .map_err(|error| error.to_string())?;
+    let Some(payload) = recv_until(node, stream, p2p_kind::HEADERS, state)? else {
+        return Ok(None);
+    };
+    let mut reader = Reader::new(&payload);
+    let count = reader.u32().map_err(|error| error.to_string())?;
+    let header = match count {
+        0 => None,
+        1 => Some(
+            vess_core::BlockHeader::decode(
+                reader
+                    .bytes(vess_core::constants::BLOCK_HEADER_BYTES)
+                    .map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?
+            .id(),
+        ),
+        _ => return Err("peer sent too many headers for a quorum query".into()),
+    };
+    reader.finish().map_err(|error| error.to_string())?;
+    Ok(header)
+}
+
+fn serve_quorum_request(
+    node: &Arc<Mutex<Node>>,
+    stream: &mut SecureStream,
+    state: &mut PeerState,
+) -> Result<(), String> {
+    let request = state
+        .quorum_session
+        .as_ref()
+        .and_then(|session| session.requests.try_recv().ok());
+    let Some(request) = request else {
+        return Ok(());
+    };
+    if Instant::now() >= request.deadline {
+        let _ = request.reply.send((request.peer, None));
+        return Ok(());
+    }
+    let result = peer_header_at(node, stream, state, request.height);
+    let answer = result.as_ref().ok().copied().flatten();
+    // The coordinator may have already finished or timed out.
+    let _ = request.reply.send((request.peer, answer));
+    result.map(|_| ())
+}
+
 /// Ask for one block in full and accept it.
 fn fetch_full(
     node: &Arc<Mutex<Node>>,
@@ -1116,9 +1403,13 @@ fn pull(
         return pull_blocks(node, stream, their_height, state);
     }
 
+    let conn = lock(node).connections();
+    let Some(_attempt) = conn.quorum.try_attempt() else {
+        return Ok(0);
+    };
     let applied = pull_headers(node, stream, their_height, state)?;
     match install_snapshot_from(node, stream, state) {
-        Ok(true) => {}
+        Ok(true) => state.warned_pruned = false,
         Ok(false) => {}
         // A snapshot that is merely ahead of our headers resolves on the next pull, so it is logged
         // rather than warned about, once per session.
@@ -1140,6 +1431,21 @@ fn pull(
             }
             return Ok(applied);
         }
+        Err(SnapshotIssue::Quorum(why)) => {
+            if !state.warned_pruned {
+                state.warned_pruned = true;
+                log::record(Level::Warn, "sync", &why);
+            }
+            return Ok(applied);
+        }
+        Err(SnapshotIssue::Connection(why)) => {
+            log::record(
+                Level::Warn,
+                "sync",
+                &format!("snapshot quorum session failed: {why}"),
+            );
+            return Err(why);
+        }
     }
     // The snapshot lands on the peer's tip, which is where headers put us; anything that arrived in
     // between is fetched as ordinary blocks.
@@ -1157,7 +1463,14 @@ fn pull_headers(
 ) -> Result<usize, String> {
     let mut added_total = 0usize;
     for _ in 0..MAX_PULL_ROUNDS {
-        let from = { lock(node).height() }.saturating_sub(SYNC_LOOKBACK);
+        serve_quorum_request(node, stream, state)?;
+        let from = {
+            let guard = lock(node);
+            guard
+                .height()
+                .saturating_sub(SYNC_LOOKBACK)
+                .max(guard.chain().oldest_main_height())
+        };
         let mut w = Writer::new();
         w.u64(from);
         w.u32(MAX_HEADERS_PER_MESSAGE as u32);
@@ -1198,7 +1511,14 @@ fn pull_blocks(
 ) -> Result<usize, String> {
     let mut applied = 0usize;
     for _ in 0..MAX_PULL_ROUNDS {
-        let from = { lock(node).height() }.saturating_sub(SYNC_LOOKBACK);
+        serve_quorum_request(node, stream, state)?;
+        let from = {
+            let guard = lock(node);
+            guard
+                .height()
+                .saturating_sub(SYNC_LOOKBACK)
+                .max(guard.chain().oldest_main_height())
+        };
         let mut w = Writer::new();
         w.u64(from);
         w.u32(MAX_HEADERS_PER_MESSAGE as u32);
@@ -1215,6 +1535,7 @@ fn pull_blocks(
 
         let mut progress = 0usize;
         for header in headers {
+            serve_quorum_request(node, stream, state)?;
             let id = header.id();
             if { lock(node).chain().contains(&id) } && !{ lock(node).needs_body(&id) } {
                 continue;
@@ -1266,8 +1587,117 @@ fn need_snapshot(node: &Arc<Mutex<Node>>, their_oldest_body: u64) -> bool {
 enum SnapshotIssue {
     /// Try again after the next header sync.
     Retry(String),
+    Quorum(String),
     /// The peer sent something that does not verify; say so.
     Reject(String),
+    Connection(String),
+}
+
+struct SnapshotQuorum {
+    generation: u64,
+    agreed: usize,
+    peers: usize,
+}
+
+fn install_voted_snapshot(
+    node: &mut Node,
+    height: u64,
+    block_id: Hash,
+    snapshot: vess_state::State,
+) -> Result<(), NodeError> {
+    if node.height() != height
+        || node
+            .chain()
+            .main_header_at(height)
+            .map(|header| header.id())
+            != Some(block_id)
+    {
+        return Err(NodeError::SnapshotNotAtTip);
+    }
+    node.install_snapshot(height, snapshot)
+}
+
+fn snapshot_quorum(
+    node: &Arc<Mutex<Node>>,
+    stream: &mut SecureStream,
+    state: &mut PeerState,
+    height: u64,
+    block_id: Hash,
+) -> Result<SnapshotQuorum, SnapshotIssue> {
+    let conn = lock(node).connections();
+    let source = state
+        .quorum_session
+        .as_ref()
+        .ok_or_else(|| SnapshotIssue::Quorum("snapshot peer is not a registered session".into()))?;
+    let source_key = source.key;
+    let voters = conn
+        .quorum
+        .voters(source)
+        .ok_or_else(|| SnapshotIssue::Quorum("snapshot peer disconnected".into()))?;
+    let total = voters.peers.len();
+    if total < MIN_SNAPSHOT_PEERS {
+        return Err(SnapshotIssue::Quorum(format!(
+            "snapshot requires at least {MIN_SNAPSHOT_PEERS} connected peer identities; found {total}"
+        )));
+    }
+
+    let deadline = Instant::now() + Duration::from_millis(REPLY_TIMEOUT_MS);
+    let (reply, replies) = std::sync::mpsc::channel();
+    let mut pending = HashSet::new();
+    for (peer, sender) in &voters.peers {
+        if *peer == source_key {
+            continue;
+        }
+        let query = crate::quorum::Query {
+            height,
+            deadline,
+            peer: *peer,
+            reply: reply.clone(),
+        };
+        if sender.try_send(query).is_ok() {
+            pending.insert(*peer);
+        }
+    }
+    let source_header =
+        peer_header_at(node, stream, state, height).map_err(SnapshotIssue::Connection)?;
+    let mut agreed = usize::from(source_header == Some(block_id));
+    while agreed <= total / 2 && agreed + pending.len() > total / 2 {
+        while let Ok((peer, answer)) = replies.try_recv() {
+            if pending.remove(&peer) && answer == Some(block_id) {
+                agreed += 1;
+            }
+        }
+        if agreed > total / 2 || pending.is_empty() || Instant::now() >= deadline {
+            break;
+        }
+        serve_quorum_request(node, stream, state).map_err(SnapshotIssue::Connection)?;
+        match read_frame(stream, P2P_MAGIC, MAX_NETWORK_FRAME_BYTES) {
+            Ok((kind, payload)) => {
+                if !state.note_frame() {
+                    return Err(SnapshotIssue::Connection(
+                        "peer exceeded the frame budget".into(),
+                    ));
+                }
+                if let Action::Fatal(why) = dispatch(node, stream, kind, &payload, state)
+                    .map_err(SnapshotIssue::Connection)?
+                {
+                    return Err(SnapshotIssue::Connection(why.into()));
+                }
+            }
+            Err(NetError::Timeout) => {}
+            Err(error) => return Err(SnapshotIssue::Connection(error.to_string())),
+        }
+    }
+    if agreed <= total / 2 {
+        return Err(SnapshotIssue::Quorum(format!(
+            "snapshot block at height {height} has {agreed} matching votes from {total} connected peer identities; a strict majority is required"
+        )));
+    }
+    Ok(SnapshotQuorum {
+        generation: voters.generation,
+        agreed,
+        peers: total,
+    })
 }
 
 /// Ask for the peer's state and install it if it verifies against our own header chain.
@@ -1339,13 +1769,40 @@ fn install_snapshot_from(
         ));
     }
 
+    let block_id = {
+        let guard = lock(node);
+        if height != guard.height() {
+            return Err(SnapshotIssue::Retry(
+                "snapshot height is not the selected header tip".into(),
+            ));
+        }
+        guard
+            .chain()
+            .main_header_at(height)
+            .ok_or_else(|| SnapshotIssue::Retry("snapshot header is unavailable".into()))?
+            .id()
+    };
+    let quorum = snapshot_quorum(node, stream, state, height, block_id)?;
     let snapshot = vess_state::State::restore(accounts);
-    match lock(node).install_snapshot(height, snapshot) {
+    let conn = lock(node).connections();
+    let result = conn
+        .quorum
+        .with_unchanged(quorum.generation, || {
+            let mut guard = lock(node);
+            install_voted_snapshot(&mut guard, height, block_id, snapshot)
+        })
+        .ok_or_else(|| {
+            SnapshotIssue::Quorum("connected peers changed during snapshot vote; retrying".into())
+        })?;
+    match result {
         Ok(()) => {
             log::record(
-                Level::Info,
+                Level::Warn,
                 "sync",
-                &format!("installed a verified state snapshot at height {height}"),
+                &format!(
+                    "installed a root-matched snapshot at height {height} with {}/{} peer votes; history is trusted pending independent replay",
+                    quorum.agreed, quorum.peers
+                ),
             );
             Ok(true)
         }
@@ -1449,7 +1906,11 @@ pub fn sync_once(node: &Arc<Mutex<Node>>, addr: &str, listen_port: u16) -> Resul
         .set_read_timeout(SESSION_TICK_MS)
         .map_err(|e| e.to_string())?;
 
-    let mut state = PeerState::default();
+    let conn = lock(node).connections();
+    let mut state = PeerState {
+        quorum_session: Some(conn.quorum.register(peer.static_key)),
+        ..PeerState::default()
+    };
     let applied = pull(
         node,
         &mut peer.stream,
@@ -1474,7 +1935,7 @@ pub fn sync_once(node: &Arc<Mutex<Node>>, addr: &str, listen_port: u16) -> Resul
 }
 
 /// Mine on top of the shared node until the process ends.
-pub fn mine(node: Arc<Mutex<Node>>, payout: AccountId, pause: Duration) {
+pub fn mine(node: Arc<Mutex<Node>>, payout: AccountId) {
     loop {
         let started = std::time::Instant::now();
         let next = {
@@ -1490,18 +1951,22 @@ pub fn mine(node: Arc<Mutex<Node>>, payout: AccountId, pause: Duration) {
             }
         };
         let signal = lock(&node).tip_signal();
-        let result = crate::mine_fresh(&mut template.header, 200_000_000, started, |parent| {
-            Ok::<_, std::convert::Infallible>(signal.current() != *parent)
-        })
-        .expect("infallible tip check");
+        let result = loop {
+            let result = crate::mine_fresh(&mut template.header, 200_000_000, started, |parent| {
+                Ok::<_, std::convert::Infallible>(signal.current() != *parent)
+            })
+            .expect("infallible tip check");
+            if !matches!(result, crate::MiningResult::Exhausted) {
+                break result;
+            }
+        };
         match result {
             crate::MiningResult::Refresh => continue,
-            crate::MiningResult::Exhausted => {
-                crate::log_warn!("miner", "no solution after 200 million nonces");
-            }
+            crate::MiningResult::Exhausted => unreachable!("exhausted searches are continued"),
             crate::MiningResult::Found => {
                 let bytes = template.encode();
-                match lock(&node).accept_mined_block(&bytes) {
+                let accepted = lock(&node).accept_mined_block(&bytes);
+                match accepted {
                     Ok(Some(id)) => {
                         crate::log_debug!(
                             "miner",
@@ -1510,17 +1975,20 @@ pub fn mine(node: Arc<Mutex<Node>>, payout: AccountId, pause: Duration) {
                         )
                     }
                     Ok(None) => continue,
-                    Err(why) => crate::log_warn!("miner", "mined block was refused: {why}"),
+                    Err(why) => {
+                        crate::log_warn!("miner", "mined block was refused: {why}");
+                        std::thread::sleep(Duration::from_millis(200));
+                    }
                 }
             }
         }
-        std::thread::sleep(pause);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vess_consensus::chain::HeaderSource;
     use vess_core::constants::NetworkProfile;
 
     struct TempDir(std::path::PathBuf);
@@ -1575,6 +2043,695 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         panic!("timed out waiting for {what}");
+    }
+
+    fn snapshot_peer(path: &std::path::Path, archive: &Arc<Mutex<Node>>) -> Arc<Mutex<Node>> {
+        let peer = shared(path);
+        {
+            let source = lock(archive);
+            let mut receiver = lock(&peer);
+            for header in source.headers_from(0, 64) {
+                receiver.insert_header_only(header).unwrap();
+            }
+            receiver.set_trust_snapshots(true);
+            receiver
+                .install_snapshot(source.height(), source.state().clone())
+                .unwrap();
+        }
+        peer
+    }
+
+    fn connect_test_peer(peer: Arc<Mutex<Node>>, target: Arc<Mutex<Node>>) {
+        let (listener, port) = listen();
+        std::thread::spawn(move || serve(peer, listener, port));
+        std::thread::spawn(move || {
+            let stream = vess_net::connect(&format!("127.0.0.1:{port}")).unwrap();
+            let _ = session(target, stream, 0, None, true, None, None);
+        });
+    }
+
+    #[test]
+    fn measure_block_propagation_and_stale_work_latency() {
+        let (source_dir, target_dir) = (
+            TempDir::new("latency-source"),
+            TempDir::new("latency-target"),
+        );
+        let source = shared(&source_dir.0);
+        let target = shared(&target_dir.0);
+        connect_test_peer(source.clone(), target.clone());
+        wait_until("latency test connection", || {
+            lock(&target).connections().quorum.peer_count() == 1
+        });
+        let mut delays = Vec::new();
+        for _ in 0..10 {
+            let id = mine_one(&source, &[0x41; 32]);
+            let started = Instant::now();
+            while lock(&target).tip().id() != id {
+                assert!(
+                    started.elapsed() < Duration::from_secs(10),
+                    "block did not propagate"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            delays.push(started.elapsed());
+        }
+        delays.sort_unstable();
+        let mut header = {
+            let guard = lock(&target);
+            guard
+                .template(&[0x41; 32], guard.next_timestamp_ms())
+                .unwrap()
+                .0
+                .header
+        };
+        header.target = vess_core::U256::ZERO;
+        let changed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let signal = changed.clone();
+        let (ready, ready_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut first = true;
+            crate::mine_fresh(&mut header, u64::MAX, Instant::now(), |_| {
+                if first {
+                    ready.send(()).unwrap();
+                    first = false;
+                }
+                Ok::<_, std::convert::Infallible>(signal.load(Ordering::Acquire))
+            })
+            .unwrap()
+        });
+        ready_rx.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        let changed_at = Instant::now();
+        changed.store(true, Ordering::Release);
+        assert!(matches!(
+            worker.join().unwrap(),
+            crate::MiningResult::Refresh
+        ));
+        println!(
+            "loopback block propagation (10 samples): median={:?}, max={:?}; stale search cancellation={:?}",
+            delays[4],
+            delays[9],
+            changed_at.elapsed()
+        );
+    }
+
+    #[test]
+    fn snapshot_quorum_rejects_one_connected_peer() {
+        let (archive_dir, peer_dir, target_dir) = (
+            TempDir::new("one-archive"),
+            TempDir::new("one-peer"),
+            TempDir::new("one-target"),
+        );
+        let archive = shared(&archive_dir.0);
+        for _ in 0..2 {
+            mine_one(&archive, &[0x41; 32]);
+        }
+        let peer = snapshot_peer(&peer_dir.0, &archive);
+        let target = shared(&target_dir.0);
+        lock(&target).set_trust_snapshots(true);
+        connect_test_peer(peer, target.clone());
+        wait_until("one-peer headers", || lock(&target).height() == 2);
+        std::thread::sleep(Duration::from_secs(3));
+        assert_eq!(lock(&target).state_height(), 0);
+        assert!(lock(&target).snapshot_verification.is_none());
+    }
+
+    #[test]
+    fn one_shot_sync_requires_and_accepts_a_snapshot_quorum() {
+        let (archive_dir, peer_dir, second_dir, third_dir, target_dir) = (
+            TempDir::new("one-shot-archive"),
+            TempDir::new("one-shot-peer"),
+            TempDir::new("one-shot-second"),
+            TempDir::new("one-shot-third"),
+            TempDir::new("one-shot-target"),
+        );
+        let archive = shared(&archive_dir.0);
+        mine_one(&archive, &[0x41; 32]);
+        let peer = snapshot_peer(&peer_dir.0, &archive);
+        let target = shared(&target_dir.0);
+        assert!(lock(&target).trust_snapshots());
+        connect_test_peer(snapshot_peer(&second_dir.0, &archive), target.clone());
+        connect_test_peer(snapshot_peer(&third_dir.0, &archive), target.clone());
+        wait_until("two peers for one-shot sync", || {
+            lock(&target).connections().quorum.peer_count() == 2
+        });
+        let (listener, port) = listen();
+        std::thread::spawn(move || serve(peer, listener, port));
+        sync_once(&target, &format!("127.0.0.1:{port}"), 0).unwrap();
+        assert_eq!(lock(&target).state_height(), 1);
+        assert_eq!(lock(&target).root(), lock(&archive).root());
+    }
+
+    #[test]
+    fn snapshot_quorum_joins_a_chain_mining_at_one_block_per_second() {
+        let (archive_dir, peer_dir, second_dir, third_dir, target_dir) = (
+            TempDir::new("live-archive"),
+            TempDir::new("live-peer"),
+            TempDir::new("live-second"),
+            TempDir::new("live-third"),
+            TempDir::new("live-target"),
+        );
+        let archive = shared(&archive_dir.0);
+        mine_one(&archive, &[0x41; 32]);
+        let peer = snapshot_peer(&peer_dir.0, &archive);
+        let target = shared(&target_dir.0);
+        lock(&target).set_trust_snapshots(true);
+        connect_test_peer(snapshot_peer(&second_dir.0, &archive), target.clone());
+        connect_test_peer(snapshot_peer(&third_dir.0, &archive), target.clone());
+        wait_until("two peers for live snapshot", || {
+            lock(&target).connections().quorum.peer_count() == 2
+        });
+        let miner = peer.clone();
+        let mining = std::thread::spawn(move || {
+            for _ in 0..4 {
+                std::thread::sleep(Duration::from_secs(1));
+                mine_one(&miner, &[0x41; 32]);
+            }
+        });
+        connect_test_peer(peer.clone(), target.clone());
+        wait_until("live snapshot", || lock(&target).state_height() >= 1);
+        mining.join().unwrap();
+        wait_until("live tip", || {
+            let source = lock(&peer);
+            let receiver = lock(&target);
+            receiver.state_height() == source.state_height()
+                && receiver.tip().id() == source.tip().id()
+        });
+    }
+
+    #[test]
+    fn snapshot_quorum_counts_duplicate_connections_only_once() {
+        let (archive_dir, peer_dir, target_dir) = (
+            TempDir::new("duplicate-archive"),
+            TempDir::new("duplicate-peer"),
+            TempDir::new("duplicate-target"),
+        );
+        let archive = shared(&archive_dir.0);
+        mine_one(&archive, &[0x41; 32]);
+        let peer = snapshot_peer(&peer_dir.0, &archive);
+        let target = shared(&target_dir.0);
+        connect_test_peer(peer.clone(), target.clone());
+        connect_test_peer(peer, target.clone());
+        wait_until("duplicate sessions", || {
+            lock(&target).connections().quorum.session_count() == 2
+        });
+        assert_eq!(lock(&target).connections().quorum.peer_count(), 1);
+        lock(&target).set_trust_snapshots(true);
+        wait_until("duplicate-peer headers", || lock(&target).height() == 1);
+        std::thread::sleep(Duration::from_secs(3));
+        assert_eq!(lock(&target).state_height(), 0);
+    }
+
+    #[test]
+    fn snapshot_quorum_must_still_match_the_selected_block_when_installed() {
+        let (archive_dir, target_dir) = (
+            TempDir::new("changed-anchor-source"),
+            TempDir::new("changed-anchor-target"),
+        );
+        let archive = shared(&archive_dir.0);
+        mine_one(&archive, &[0x41; 32]);
+        let target = shared(&target_dir.0);
+        let source = lock(&archive);
+        let mut receiver = lock(&target);
+        for header in source.headers_from(0, 64) {
+            receiver.insert_header_only(header).unwrap();
+        }
+        receiver.set_trust_snapshots(true);
+        assert!(matches!(
+            install_voted_snapshot(
+                &mut receiver,
+                source.height(),
+                [0xff; 32],
+                source.state().clone()
+            ),
+            Err(NodeError::SnapshotNotAtTip)
+        ));
+        assert_eq!(receiver.state_height(), 0);
+        assert!(receiver.snapshot_verification.is_none());
+    }
+
+    #[test]
+    fn snapshot_quorum_requires_a_majority_and_retries_when_peers_join() {
+        let (archive_dir, first_dir, lagging_dir, second_dir, target_dir) = (
+            TempDir::new("majority-archive"),
+            TempDir::new("majority-first"),
+            TempDir::new("majority-lagging"),
+            TempDir::new("majority-second"),
+            TempDir::new("majority-target"),
+        );
+        let archive = shared(&archive_dir.0);
+        for _ in 0..2 {
+            mine_one(&archive, &[0x41; 32]);
+        }
+        let first = snapshot_peer(&first_dir.0, &archive);
+        let second = snapshot_peer(&second_dir.0, &archive);
+        let lagging = shared(&lagging_dir.0);
+        let target = shared(&target_dir.0);
+        connect_test_peer(first.clone(), target.clone());
+        connect_test_peer(first, target.clone());
+        connect_test_peer(lagging, target.clone());
+        wait_until("two connected peer identities", || {
+            let conn = lock(&target).connections();
+            conn.quorum.peer_count() == 2 && conn.quorum.session_count() == 3
+        });
+        lock(&target).set_trust_snapshots(true);
+        wait_until("headers from snapshot peer", || lock(&target).height() == 2);
+        std::thread::sleep(Duration::from_secs(3));
+        assert_eq!(
+            lock(&target).state_height(),
+            0,
+            "one vote out of two is not a majority"
+        );
+        assert!(lock(&target).snapshot_verification.is_none());
+
+        connect_test_peer(second, target.clone());
+        wait_until("three connected peer identities", || {
+            let conn = lock(&target).connections();
+            conn.quorum.peer_count() == 3
+        });
+        wait_until("two-of-three snapshot", || {
+            lock(&target).state_height() == 2
+        });
+        assert_eq!(lock(&target).root(), lock(&archive).root());
+    }
+
+    #[test]
+    fn snapshot_quorum_rejects_disagreement_at_the_same_height() {
+        let (
+            first_dir,
+            second_dir,
+            third_dir,
+            first_peer_dir,
+            second_peer_dir,
+            third_peer_dir,
+            target_dir,
+        ) = (
+            TempDir::new("disagree-first"),
+            TempDir::new("disagree-second"),
+            TempDir::new("disagree-third"),
+            TempDir::new("disagree-peer-first"),
+            TempDir::new("disagree-peer-second"),
+            TempDir::new("disagree-peer-third"),
+            TempDir::new("disagree-target"),
+        );
+        let first = shared(&first_dir.0);
+        let second = shared(&second_dir.0);
+        let third = shared(&third_dir.0);
+        for _ in 0..2 {
+            mine_one(&first, &[0x41; 32]);
+            mine_one(&second, &[0x42; 32]);
+            mine_one(&third, &[0x43; 32]);
+        }
+        assert_ne!(lock(&first).tip().id(), lock(&second).tip().id());
+        let first_peer = snapshot_peer(&first_peer_dir.0, &first);
+        let second_peer = snapshot_peer(&second_peer_dir.0, &second);
+        let third_peer = snapshot_peer(&third_peer_dir.0, &third);
+        let target = shared(&target_dir.0);
+        connect_test_peer(first_peer, target.clone());
+        connect_test_peer(second_peer, target.clone());
+        connect_test_peer(third_peer, target.clone());
+        wait_until("three conflicting peers", || {
+            lock(&target).connections().quorum.peer_count() == 3
+        });
+        lock(&target).set_trust_snapshots(true);
+        wait_until("conflicting headers", || lock(&target).height() == 2);
+        std::thread::sleep(Duration::from_secs(3));
+        assert_eq!(lock(&target).state_height(), 0);
+        assert!(lock(&target).snapshot_verification.is_none());
+    }
+
+    #[test]
+    fn snapshot_quorum_does_not_ignore_an_unresponsive_peer() {
+        let (archive_dir, peer_dir, second_dir, third_dir, target_dir) = (
+            TempDir::new("timeout-archive"),
+            TempDir::new("timeout-peer"),
+            TempDir::new("timeout-second"),
+            TempDir::new("timeout-third"),
+            TempDir::new("timeout-target"),
+        );
+        let archive = shared(&archive_dir.0);
+        mine_one(&archive, &[0x41; 32]);
+        let peer = snapshot_peer(&peer_dir.0, &archive);
+        let target = shared(&target_dir.0);
+        let conn = lock(&target).connections();
+        let silent = conn.quorum.register([0xe1; 32]);
+        let other_silent = conn.quorum.register([0xe2; 32]);
+        lock(&target).set_trust_snapshots(true);
+        connect_test_peer(peer, target.clone());
+        wait_until("query to silent peer", || {
+            silent.requests.try_recv().is_ok()
+        });
+        std::thread::sleep(Duration::from_millis(REPLY_TIMEOUT_MS + 300));
+        assert_eq!(lock(&target).state_height(), 0);
+        assert!(lock(&target).snapshot_verification.is_none());
+        drop(silent);
+        drop(other_silent);
+        connect_test_peer(snapshot_peer(&second_dir.0, &archive), target.clone());
+        connect_test_peer(snapshot_peer(&third_dir.0, &archive), target.clone());
+        wait_until("retry after silent peer disconnects", || {
+            lock(&target).state_height() == 1
+        });
+    }
+
+    #[test]
+    fn snapshot_quorum_retries_if_membership_changes_before_installation() {
+        let (archive_dir, peer_dir, second_dir, third_dir, target_dir) = (
+            TempDir::new("membership-archive"),
+            TempDir::new("membership-peer"),
+            TempDir::new("membership-second"),
+            TempDir::new("membership-third"),
+            TempDir::new("membership-target"),
+        );
+        let archive = shared(&archive_dir.0);
+        mine_one(&archive, &[0x41; 32]);
+        let peer = snapshot_peer(&peer_dir.0, &archive);
+        let target = shared(&target_dir.0);
+        let conn = lock(&target).connections();
+        let responder = conn.quorum.register([0xe1; 32]);
+        let silent = conn.quorum.register([0xe2; 32]);
+        lock(&target).set_trust_snapshots(true);
+        connect_test_peer(peer, target.clone());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let query = loop {
+            if let Ok(query) = responder.requests.try_recv() {
+                break query;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for quorum query"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let newcomer = conn.quorum.register([0xe3; 32]);
+        query
+            .reply
+            .send((query.peer, Some(lock(&archive).tip().id())))
+            .unwrap();
+        wait_until("membership-change rejection", || {
+            conn.quorum.try_attempt().is_some()
+        });
+        assert_eq!(lock(&target).state_height(), 0);
+        assert!(lock(&target).snapshot_verification.is_none());
+        drop(newcomer);
+        drop(responder);
+        drop(silent);
+        connect_test_peer(snapshot_peer(&second_dir.0, &archive), target.clone());
+        connect_test_peer(snapshot_peer(&third_dir.0, &archive), target.clone());
+        wait_until("retry after membership stabilizes", || {
+            lock(&target).state_height() == 1
+        });
+    }
+
+    #[test]
+    fn trusted_snapshot_is_replayed_from_a_connected_archival_peer() {
+        let (dir_a, dir_b) = (TempDir::new("history-a"), TempDir::new("history-b"));
+        let a = shared(&dir_a.0);
+        let b = shared(&dir_b.0);
+        for _ in 0..3 {
+            mine_one(&a, &[0x41; 32]);
+        }
+        {
+            let source = lock(&a);
+            let mut target = lock(&b);
+            for header in source.headers_from(0, 64) {
+                target.insert_header_only(header).unwrap();
+            }
+            target.set_trust_snapshots(true);
+            target
+                .install_snapshot(source.height(), source.state().clone())
+                .unwrap();
+        }
+        assert_eq!(
+            lock(&b).snapshot_verification.unwrap().status,
+            vess_storage::SnapshotVerificationStatus::Pending
+        );
+        assert!(matches!(
+            lock(&b)
+                .handle_rpc(vess_net::rpc::Request::HistoryStatus)
+                .body,
+            vess_net::rpc::ReplyBody::HistoryStatus {
+                status: 1,
+                height: 0,
+                target: 3
+            }
+        ));
+        mine_one(&a, &[0x41; 32]);
+        let (listener, port) = listen();
+        let source = a.clone();
+        std::thread::spawn(move || serve(source, listener, port));
+        let target = b.clone();
+        std::thread::spawn(move || {
+            let stream = vess_net::connect(&format!("127.0.0.1:{port}")).unwrap();
+            let _ = session(target, stream, 0, None, true, None, None);
+        });
+        wait_until("independent history verification", || {
+            lock(&b).snapshot_verification.unwrap().status
+                == vess_storage::SnapshotVerificationStatus::Verified
+        });
+        wait_until("live sync while verifying history", || {
+            let guard = lock(&b);
+            guard.height() == 4 && guard.state_height() == 4
+        });
+        assert_eq!(lock(&b).history_replayed, 3);
+        assert_eq!(lock(&b).root(), lock(&a).root());
+        assert!(matches!(
+            lock(&b)
+                .handle_rpc(vess_net::rpc::Request::HistoryStatus)
+                .body,
+            vess_net::rpc::ReplyBody::HistoryStatus {
+                status: 2,
+                height: 3,
+                target: 3
+            }
+        ));
+    }
+
+    #[test]
+    fn replay_retries_when_a_peer_supplies_a_different_pruned_header_branch() {
+        let (main_dir, fork_dir, target_dir) = (
+            TempDir::new("branch-main"),
+            TempDir::new("branch-fork"),
+            TempDir::new("branch-target"),
+        );
+        let main = shared(&main_dir.0);
+        let fork = shared(&fork_dir.0);
+        let target = shared(&target_dir.0);
+        for _ in 0..3 {
+            mine_one(&main, &[0x41; 32]);
+        }
+        mine_one(&fork, &[0x42; 32]);
+        {
+            let source = lock(&main);
+            let mut receiver = lock(&target);
+            for header in source.headers_from(0, 64) {
+                receiver.insert_header_only(header).unwrap();
+            }
+            receiver.set_trust_snapshots(true);
+            receiver
+                .install_snapshot(source.height(), source.state().clone())
+                .unwrap();
+            receiver.chain.prune_below(2);
+        }
+        let (fork_listener, fork_port) = listen();
+        let fork_server = fork.clone();
+        std::thread::spawn(move || serve(fork_server, fork_listener, fork_port));
+        let fork_target = target.clone();
+        let fork_session = std::thread::spawn(move || {
+            let stream = vess_net::connect(&format!("127.0.0.1:{fork_port}")).unwrap();
+            let _ = session(fork_target, stream, 0, None, true, None, None);
+        });
+        wait_until("wrong branch replay", || {
+            lock(&target).history_replayed == 1
+        });
+        wait_until("wrong branch reset", || lock(&target).history_replayed == 0);
+        assert_eq!(
+            lock(&target).snapshot_verification.unwrap().status,
+            vess_storage::SnapshotVerificationStatus::Pending
+        );
+        let (main_listener, main_port) = listen();
+        let main_server = main.clone();
+        std::thread::spawn(move || serve(main_server, main_listener, main_port));
+        let main_target = target.clone();
+        std::thread::spawn(move || {
+            let stream = vess_net::connect(&format!("127.0.0.1:{main_port}")).unwrap();
+            let _ = session(main_target, stream, 0, None, true, None, None);
+        });
+        wait_until("matching branch replay", || {
+            lock(&target).snapshot_verification.unwrap().status
+                == vess_storage::SnapshotVerificationStatus::Verified
+        });
+        drop(fork_session);
+    }
+
+    #[test]
+    fn replay_waits_for_a_peer_with_the_missing_bodies() {
+        let (archive_dir, pruned_dir, target_dir) = (
+            TempDir::new("archive"),
+            TempDir::new("pruned"),
+            TempDir::new("waiting"),
+        );
+        let archive = shared(&archive_dir.0);
+        let pruned = shared(&pruned_dir.0);
+        let target = shared(&target_dir.0);
+        for _ in 0..2 {
+            mine_one(&archive, &[0x41; 32]);
+        }
+        {
+            let source = lock(&archive);
+            let mut receiver = lock(&target);
+            let mut missing = lock(&pruned);
+            for header in source.headers_from(0, 64) {
+                receiver.insert_header_only(header).unwrap();
+                missing.insert_header_only(header).unwrap();
+            }
+            receiver.set_trust_snapshots(true);
+            receiver
+                .install_snapshot(source.height(), source.state().clone())
+                .unwrap();
+        }
+        let (pruned_listener, pruned_port) = listen();
+        let pruned_server = pruned.clone();
+        std::thread::spawn(move || serve(pruned_server, pruned_listener, pruned_port));
+        let pruned_target = target.clone();
+        std::thread::spawn(move || {
+            let stream = vess_net::connect(&format!("127.0.0.1:{pruned_port}")).unwrap();
+            let _ = session(pruned_target, stream, 0, None, true, None, None);
+        });
+        std::thread::sleep(Duration::from_millis(700));
+        assert_eq!(
+            lock(&target).snapshot_verification.unwrap().status,
+            vess_storage::SnapshotVerificationStatus::Pending
+        );
+        assert_eq!(lock(&target).history_replayed, 0);
+        let (archive_listener, archive_port) = listen();
+        let archive_server = archive.clone();
+        std::thread::spawn(move || serve(archive_server, archive_listener, archive_port));
+        let archive_target = target.clone();
+        std::thread::spawn(move || {
+            let stream = vess_net::connect(&format!("127.0.0.1:{archive_port}")).unwrap();
+            let _ = session(archive_target, stream, 0, None, true, None, None);
+        });
+        wait_until("archival peer verification", || {
+            lock(&target).snapshot_verification.unwrap().status
+                == vess_storage::SnapshotVerificationStatus::Verified
+        });
+    }
+
+    #[test]
+    fn replay_rejects_tampered_signatures_without_condemning_the_chain() {
+        let (source_dir, replay_dir) = (TempDir::new("sig-source"), TempDir::new("sig-replay"));
+        let source = shared(&source_dir.0);
+        let wallet = vess_wallet::Wallet::from_seed(0, [0x61; 32]);
+        let payout = wallet.account_id();
+        let first = mine_one(&source, &payout);
+        let transfer = wallet.build_transfer([0x62; 32], 1, 0, 0, 0);
+        lock(&source).submit_transfer(transfer).unwrap();
+        let second = mine_one(&source, &payout);
+        let first_body = lock(&source).block_body(&first).unwrap();
+        let second_body = lock(&source).block_body(&second).unwrap();
+        let (header, mut transactions) = vess_consensus::split_block(&second_body).unwrap();
+        match &mut transactions[0] {
+            Transaction::Transfer(transfer) => transfer.signature[0] ^= 1,
+            _ => panic!("expected a transfer"),
+        }
+        let mut tampered = header.canonical().to_vec();
+        tampered.extend(vess_consensus::encode_body(&transactions).unwrap());
+        let mut verifier =
+            crate::history::HistoryVerifier::open(&replay_dir.0, NetworkProfile::DEVNET).unwrap();
+        let (first_header, _) = vess_consensus::split_block(&first_body).unwrap();
+        assert!(
+            verifier
+                .replay(&first_header, &first_body, &NetworkProfile::DEVNET)
+                .is_ok()
+        );
+        assert!(matches!(
+            verifier.replay(&header, &tampered, &NetworkProfile::DEVNET),
+            Err(crate::history::ReplayError::WrongBody)
+        ));
+        assert_eq!(verifier.height(), 1);
+        assert!(
+            verifier
+                .replay(&header, &second_body, &NetworkProfile::DEVNET)
+                .is_ok()
+        );
+        assert_eq!(verifier.height(), 2);
+    }
+
+    #[test]
+    fn replay_identifies_a_committed_invalid_state_root() {
+        let (source_dir, replay_dir) = (
+            TempDir::new("invalid-source"),
+            TempDir::new("invalid-replay"),
+        );
+        let source = shared(&source_dir.0);
+        let id = mine_one(&source, &[0x31; 32]);
+        let body = lock(&source).block_body(&id).unwrap();
+        let (mut header, transactions) = vess_consensus::split_block(&body).unwrap();
+        header.state_root = vess_state::State::new().root();
+        assert!(vess_consensus::mine_header(&mut header, 20_000_000));
+        let mut invalid = header.canonical().to_vec();
+        invalid.extend(vess_consensus::encode_body(&transactions).unwrap());
+        let mut verifier =
+            crate::history::HistoryVerifier::open(&replay_dir.0, NetworkProfile::DEVNET).unwrap();
+        assert!(matches!(
+            verifier.replay(&header, &invalid, &NetworkProfile::DEVNET),
+            Err(crate::history::ReplayError::Invalid(_))
+        ));
+        assert_eq!(verifier.height(), 0);
+    }
+
+    #[test]
+    fn invalid_committed_history_disables_snapshot_node_over_the_network() {
+        let (source_dir, target_dir) = (TempDir::new("bad-chain"), TempDir::new("bad-target"));
+        let source = shared(&source_dir.0);
+        let target = shared(&target_dir.0);
+        let mut template = {
+            let guard = lock(&source);
+            guard
+                .template(&[0x41; 32], guard.next_timestamp_ms())
+                .unwrap()
+                .0
+        };
+        template.header.state_root = vess_state::State::new().root();
+        assert!(template.mine(20_000_000));
+        let header = template.header;
+        {
+            let mut guard = lock(&source);
+            guard.insert_header_only(header).unwrap();
+            let meta = guard.chain.meta(&header.id()).unwrap();
+            guard
+                .store
+                .put_block_index(&header, meta.height, meta.chain_work, &template.encode())
+                .unwrap();
+        }
+        {
+            let mut guard = lock(&target);
+            guard.insert_header_only(header).unwrap();
+            guard.set_trust_snapshots(true);
+            guard.install_snapshot(1, vess_state::State::new()).unwrap();
+        }
+        let (listener, port) = listen();
+        let server = source.clone();
+        std::thread::spawn(move || serve(server, listener, port));
+        let client = target.clone();
+        std::thread::spawn(move || {
+            let stream = vess_net::connect(&format!("127.0.0.1:{port}")).unwrap();
+            let _ = session(client, stream, 0, None, true, None, None);
+        });
+        wait_until("invalid history detection", || {
+            lock(&target).snapshot_verification.unwrap().status
+                == vess_storage::SnapshotVerificationStatus::Invalid
+        });
+        let mut guard = lock(&target);
+        assert!(
+            !guard
+                .handle_rpc(vess_net::rpc::Request::Balance([0x41; 32]))
+                .is_ok()
+        );
+        assert_eq!(
+            guard.store.snapshot_verification().unwrap().unwrap().status,
+            vess_storage::SnapshotVerificationStatus::Invalid
+        );
     }
 
     #[test]

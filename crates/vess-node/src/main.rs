@@ -3,7 +3,10 @@
 //! Commands operate either on a local data directory (opening the database for the duration of the
 //! command) or against a running node over the binary RPC.
 
+mod config;
+
 use std::collections::HashMap;
+use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
@@ -16,39 +19,50 @@ use vess_core::hash::chain_id;
 use vess_core::{AccountId, BlockHeader, Hash, Transaction};
 use vess_net::rpc::{ReplyBody, Request, StatusInfo};
 use vess_node::{Node, bind_rpc, serve};
-use vess_wallet::{Keyring, NodeClient, Wallet};
+use vess_wallet::{Keyring, NodeClient, RecoveryPhrase, Wallet};
+use zeroize::Zeroizing;
 
 const USAGE: &str = "\
 vess 0.1.0 — Vess reference node
 
-  vess node init    --datadir DIR [--network devnet|testnet|mainnet]
-  vess node run     --datadir DIR [--network ...] [--rpc PORT] [--port P2P] [--peer A,B] [--mine --payout HEX]
+  vess [--config FILE]                 # run the configured node
+  vess node init    [--datadir DIR] [--network devnet|testnet|mainnet]
+  vess node run     [--datadir DIR] [--network ...] [--rpc PORT] [--port P2P] [--peer A,B] [--mine --payout HEX]
                     [--prune-blocks N] [--prune-headers N] [--trust-snapshot]   # 0 = keep everything
                     [--seed A,B]   # extra bootstrap peers; VESS_SEEDS also works
-  vess node params  --network devnet|testnet|mainnet
+                    [--no-mine] [--no-trust-snapshot]   # snapshot trust defaults on
+  vess node params  [--network devnet|testnet|mainnet]
   vess node status  --datadir DIR | --rpc HOST:PORT
+  vess node history --datadir DIR | --rpc HOST:PORT
   vess node block   --rpc HOST:PORT (--height N | --id HEX)
   vess node tx      --rpc HOST:PORT --id HEX               # position and content
   vess node watch   --rpc HOST:PORT [--count N] [--timeout MS]   # N replies, 0 = forever
   vess node account --rpc HOST:PORT --account HEX      # balance, nonce, state hash
   vess node proof   --rpc HOST:PORT --account HEX      # Merkle proof against the state root
 
-  vess wallet new         --datadir DIR --name NAME [--legacy] [--password-file FILE | --password-env VAR]
-  vess wallet addresses   --datadir DIR --name NAME [--count N] [--password-*]   # HD accounts
-  vess wallet address     --datadir DIR --name NAME [--index N] [--password-file FILE | --password-env VAR]
+  vess wallet new         [--datadir DIR] --name NAME [--legacy] [--password-file FILE | --password-env VAR]
+                          [--unsafe-phrase-stdout]
+  vess wallet restore     [--datadir DIR] --name NAME [--password-file FILE | --password-env VAR] [--mnemonic-stdin]
+  vess wallet addresses   [--datadir DIR] --name NAME [--count N] [--password-*]   # HD accounts
+  vess wallet address     [--datadir DIR] --name NAME [--index N] [--password-file FILE | --password-env VAR]
   vess wallet address     --public-key HEX            # derive an address from a public key
-  vess wallet balance     --datadir DIR --name NAME [--index N] [--rpc ADDR] [--password-*]
-  vess wallet send        --datadir DIR --name NAME --to HEX --amount N [--fee N] [--index N] [--rpc ADDR] [--password-*]
-  vess wallet set-state   --datadir DIR --name NAME --state-hash HEX [--fee N] [--rpc ADDR] [--password-*]
-  vess wallet watch       --datadir DIR --name NAME --rpc ADDR [--count N] [--timeout MS] [--password-*]
+  vess wallet balance     [--datadir DIR] --name NAME [--index N] [--rpc ADDR] [--password-*]
+  vess wallet send        [--datadir DIR] --name NAME --to HEX --amount N [--fee N] [--index N] [--rpc ADDR] [--password-*]
+  vess wallet set-state   [--datadir DIR] --name NAME --state-hash HEX [--fee N] [--rpc ADDR] [--password-*]
+  vess wallet watch       [--datadir DIR] --name NAME --rpc ADDR [--count N] [--timeout MS] [--password-*]
 
   --password-file FILE reads the first line of FILE; --password-env VAR reads an environment
-  variable. Without either, `wallet new` writes an UNENCRYPTED keyfile (legacy format) and says so,
-  and any other wallet command needs one to open an encrypted keyfile.
+  variable. HD wallet creation and recovery require a password. Only `wallet new --legacy` can
+  write an unencrypted keyfile. New HD wallets display a 24-word recovery phrase exactly once.
+  Recovery reads the phrase without terminal echo; --mnemonic-stdin accepts piped input instead.
+  --unsafe-phrase-stdout allows creation with redirected output, which may expose the phrase.
 
-  vess miner --datadir DIR --payout HEX [--blocks N] [--rpc ADDR]
+  vess miner [--datadir DIR] --payout HEX [--blocks N] [--rpc ADDR]
 
 All output is plain `key=value` text. Nothing is JSON.
+Commands load vess.toml beside the executable (or --config FILE), creating it if absent.
+Config data paths are relative to the config; --datadir paths are relative to the working directory.
+Explicit options override the file for that invocation.
 ";
 
 fn main() -> ExitCode {
@@ -89,6 +103,12 @@ impl Args {
 
     fn get(&self, key: &str) -> Option<&str> {
         self.flags.get(key).map(|s| s.as_str())
+    }
+
+    fn set_default(&mut self, key: &str, value: &str) {
+        self.flags
+            .entry(key.to_string())
+            .or_insert_with(|| value.to_string());
     }
 
     fn require(&self, key: &str) -> Result<&str, String> {
@@ -171,7 +191,8 @@ impl Target {
             Some(addr) => Ok(Target::Remote(addr.to_string())),
             None => {
                 let dir = datadir(args)?;
-                let node = Node::open(&dir, network).map_err(|e| {
+                let trust_snapshots = args.get("trust-snapshot").is_some();
+                let node = Node::open_with_snapshot_trust(&dir, network, trust_snapshots).map_err(|e| {
                     let text = e.to_string();
                     if text.contains("already open") {
                         format!("{text} — a node is running on this datadir; pass --rpc HOST:PORT instead")
@@ -223,18 +244,58 @@ impl Target {
 
 fn run(raw: &[String]) -> Result<(), String> {
     vess_node::log::init();
-    if raw.is_empty() || raw[0] == "help" || raw[0] == "--help" {
+    if raw
+        .first()
+        .is_some_and(|arg| arg == "help" || arg == "--help")
+    {
         println!("{USAGE}");
         return Ok(());
     }
-    let args = Args::parse(&raw[1..]);
-    let group = raw[0].as_str();
-    let command = raw.get(1).map(|s| s.as_str()).unwrap_or("");
+    let bare = raw.first().is_none_or(|arg| arg.starts_with("--"));
+    let (group, command, mut args) = if bare {
+        ("node", "run", Args::parse(raw))
+    } else {
+        (
+            raw[0].as_str(),
+            raw.get(1).map(|s| s.as_str()).unwrap_or(""),
+            Args::parse(&raw[1..]),
+        )
+    };
+    if !matches!(
+        (group, command),
+        (
+            "node",
+            "init"
+                | "run"
+                | "status"
+                | "history"
+                | "params"
+                | "block"
+                | "tx"
+                | "watch"
+                | "account"
+                | "proof"
+        ) | (
+            "wallet",
+            "new"
+                | "restore"
+                | "address"
+                | "addresses"
+                | "balance"
+                | "send"
+                | "set-state"
+                | "watch"
+        ) | ("miner", _)
+    ) {
+        return Err(format!("unknown command {:?}\n\n{USAGE}", (group, command)));
+    }
+    config::configure(&mut args, (group, command) == ("node", "run"))?;
 
     match (group, command) {
         ("node", "init") => node_init(&args),
         ("node", "run") => node_run(&args),
         ("node", "status") => node_status(&args),
+        ("node", "history") => node_history(&args),
         ("node", "params") => node_params(&args),
         ("node", "block") => node_block(&args),
         ("node", "tx") => node_transaction(&args),
@@ -242,6 +303,7 @@ fn run(raw: &[String]) -> Result<(), String> {
         ("node", "account") => node_account(&args),
         ("node", "proof") => node_proof(&args),
         ("wallet", "new") => wallet_new(&args),
+        ("wallet", "restore") => wallet_restore(&args),
         ("wallet", "address") => wallet_address(&args),
         ("wallet", "addresses") => wallet_addresses(&args),
         ("wallet", "balance") => wallet_balance(&args),
@@ -256,7 +318,8 @@ fn run(raw: &[String]) -> Result<(), String> {
 fn node_init(args: &Args) -> Result<(), String> {
     let network = network(args)?;
     let dir = datadir(args)?;
-    let node = Node::open(&dir, network).map_err(|e| e.to_string())?;
+    let node = Node::open_with_snapshot_trust(&dir, network, args.get("trust-snapshot").is_some())
+        .map_err(|e| e.to_string())?;
     println!("network={}", network.network);
     println!("chain_id={}", hex(&chain_id(network.network)));
     println!(
@@ -286,7 +349,9 @@ fn node_run(args: &Args) -> Result<(), String> {
         default_seeds.as_str(),
     ]);
 
-    let mut node = Node::open(&dir, network).map_err(|e| e.to_string())?;
+    let trust_snapshots = args.get("trust-snapshot").is_some();
+    let mut node = Node::open_with_snapshot_trust(&dir, network, trust_snapshots)
+        .map_err(|e| e.to_string())?;
     let known_peers = node.peer_book_size().0;
     // Pruning is destructive and stored with the data, so the flags only override when present.
     if args.get("prune-blocks").is_some() || args.get("prune-headers").is_some() {
@@ -304,13 +369,21 @@ fn node_run(args: &Args) -> Result<(), String> {
         node.set_prune_policy(policy).map_err(|e| e.to_string())?;
     }
     let policy = node.prune_policy();
-    // A snapshot this node cannot verify against a block it validated itself makes the peer's word
-    // the whole account set, so it is opt-in.
-    node.set_trust_snapshots(args.get("trust-snapshot").is_some());
     if node.trust_snapshots() {
         eprintln!(
-            "warning: --trust-snapshot is on; a peer may supply the account set at a height this \
-             node cannot validate"
+            "warning: snapshot trust is enabled; a majority of at least three connected peer identities \
+             may authorize a state this node cannot yet validate; identities can be controlled by one party"
+        );
+    }
+    if let vess_net::rpc::ReplyBody::HistoryStatus {
+        status: 1,
+        height,
+        target,
+    } = node.handle_rpc(Request::HistoryStatus).body
+    {
+        eprintln!(
+            "warning: snapshot history remains trusted while background verification is pending \
+             ({height}/{target} blocks replayed)"
         );
     }
     if !policy.is_archival() {
@@ -322,8 +395,8 @@ fn node_run(args: &Args) -> Result<(), String> {
         if policy.blocks != 0 {
             eprintln!(
                 "note: this node cannot serve blocks older than {} below its tip. A peer further \
-                 behind can only join by state snapshot (--trust-snapshot), which trusts the peer \
-                 for the state at that height because no trusted checkpoint exists yet.",
+                 behind can only join by state snapshot, which trusts a peer \
+                 majority for the state at that height because no trusted checkpoint exists yet.",
                 policy.blocks
             );
         }
@@ -367,10 +440,7 @@ fn node_run(args: &Args) -> Result<(), String> {
     if args.get("mine").is_some() {
         let payout = parse_hash(args.require("payout")?)?;
         let miner = shared.clone();
-        let interval = args.number("mine-interval", 250)?;
-        std::thread::spawn(move || {
-            vess_node::p2p::mine(miner, payout, Duration::from_millis(interval))
-        });
+        std::thread::spawn(move || vess_node::p2p::mine(miner, payout));
     }
 
     serve(shared, rpc_listener).map_err(|e| e.to_string())
@@ -396,6 +466,29 @@ fn node_status(args: &Args) -> Result<(), String> {
     println!("prune_headers={}", status.prune_headers);
     println!("oldest_body_height={}", status.oldest_body_height);
     println!("oldest_header_height={}", status.oldest_header_height);
+    Ok(())
+}
+
+fn node_history(args: &Args) -> Result<(), String> {
+    let mut target = Target::open(args, network(args)?)?;
+    let ReplyBody::HistoryStatus {
+        status,
+        height,
+        target,
+    } = target.request(Request::HistoryStatus)?
+    else {
+        return Err("unexpected history status reply".into());
+    };
+    let label = match status {
+        0 => "not_tracked",
+        1 => "pending",
+        2 => "verified",
+        3 => "invalid",
+        _ => return Err(format!("unknown history verification status {status}")),
+    };
+    println!("history_status={label}");
+    println!("history_height={height}");
+    println!("history_target={target}");
     Ok(())
 }
 
@@ -540,22 +633,41 @@ fn wallet_new(args: &Args) -> Result<(), String> {
     if path.exists() {
         return Err(format!("{} already exists", path.display()));
     }
-    // New wallets are hierarchical: one master seed, accounts by index, one backup. `--legacy` writes
-    // the older single-key shape, which still opens and still has exactly one address.
+    let pass = passphrase(args)?;
     let keyring = if args.get("legacy").is_some() {
         Keyring::Single(Box::new(Wallet::create(network.network)))
     } else {
-        Keyring::create(network.network)
+        if pass.is_none() {
+            return Err(
+                "an HD keyfile must be encrypted: supply --password-file or --password-env".into(),
+            );
+        }
+        if !std::io::stdout().is_terminal() && args.get("unsafe-phrase-stdout").is_none() {
+            return Err("refusing to print the recovery phrase to redirected stdout; use a terminal or explicitly pass --unsafe-phrase-stdout".into());
+        }
+        let phrase = RecoveryPhrase::generate().map_err(|e| e.to_string())?;
+        eprintln!(
+            "Write down the following recovery phrase privately. Anyone who knows it can spend your funds."
+        );
+        eprintln!("It is shown only once and cannot be recovered from the keyfile.");
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        write!(out, "recovery_phrase=")
+            .map_err(|e| format!("cannot display recovery phrase: {e}"))?;
+        for (index, word) in phrase.words().enumerate() {
+            if index != 0 {
+                write!(out, " ").map_err(|e| format!("cannot display recovery phrase: {e}"))?;
+            }
+            write!(out, "{word}").map_err(|e| format!("cannot display recovery phrase: {e}"))?;
+        }
+        writeln!(out)
+            .and_then(|_| out.flush())
+            .map_err(|e| format!("cannot display recovery phrase; wallet was not created: {e}"))?;
+        phrase.keyring(network.network)
     };
-    let pass = passphrase(args)?;
     keyring
-        .save(&path, pass.as_ref())
+        .save_new(&path, pass.as_ref())
         .map_err(|e| e.to_string())?;
-    if pass.is_none() && keyring.is_hd() {
-        // An HD keyring has no unencrypted representation: the plaintext format cannot say what the
-        // seed means. `save` refuses rather than downgrading, so this cannot be reached, but say why.
-        return Err("an HD keyfile must be encrypted".into());
-    }
     if pass.is_none() {
         eprintln!(
             "warning: no passphrase given, so {} is UNENCRYPTED.\n\
@@ -579,6 +691,56 @@ fn wallet_new(args: &Args) -> Result<(), String> {
             hex(&keyring.account(0).map_err(|e| e.to_string())?.account_id())
         );
     }
+    println!("keyfile={}", path.display());
+    Ok(())
+}
+
+fn wallet_restore(args: &Args) -> Result<(), String> {
+    let network = network(args)?;
+    let dir = datadir(args)?;
+    let name = args.require("name")?;
+    let path = wallet_path(&dir, name);
+    if path.exists() {
+        return Err(format!("{} already exists", path.display()));
+    }
+    let pass = passphrase(args)?
+        .ok_or("an HD keyfile must be encrypted: supply --password-file or --password-env")?;
+    let words = if args.get("mnemonic-stdin").is_some() {
+        if std::io::stdin().is_terminal() {
+            return Err(
+                "--mnemonic-stdin requires piped input; omit it for hidden terminal entry".into(),
+            );
+        }
+        let mut words = Zeroizing::new(String::new());
+        std::io::stdin()
+            .lock()
+            .take(4097)
+            .read_to_string(&mut words)
+            .map_err(|e| format!("cannot read recovery phrase: {e}"))?;
+        if words.len() > 4096 {
+            return Err("recovery phrase input is too long".into());
+        }
+        words
+    } else {
+        if !std::io::stdin().is_terminal() {
+            return Err("recovery requires a terminal for hidden input, or --mnemonic-stdin for piped input".into());
+        }
+        Zeroizing::new(
+            rpassword::prompt_password("Enter your 24-word recovery phrase (input hidden): ")
+                .map_err(|e| format!("cannot read recovery phrase: {e}"))?,
+        )
+    };
+    let phrase = RecoveryPhrase::parse(&words).map_err(|e| e.to_string())?;
+    let keyring = phrase.keyring(network.network);
+    let account = keyring.account_id(0).map_err(|e| e.to_string())?;
+    keyring
+        .save_new(&path, Some(&pass))
+        .map_err(|e| e.to_string())?;
+    println!("name={name}");
+    println!("hd=1");
+    println!("encrypted=1");
+    println!("account={}", hex(&account));
+    println!("index=0");
     println!("keyfile={}", path.display());
     Ok(())
 }

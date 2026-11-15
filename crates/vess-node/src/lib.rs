@@ -6,9 +6,11 @@
 
 use std::net::TcpListener;
 
+mod history;
 pub mod log;
 pub mod p2p;
 pub mod peers;
+mod quorum;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -18,14 +20,16 @@ use vess_consensus::{BlockTemplate, ConsensusError, build_template, split_block,
 use vess_core::constants::NetworkProfile;
 use vess_core::hash::{self, DOM_STATE_UPDATE, DOM_TRANSFER};
 use vess_core::{AccountId, BlockHeader, Hash, StateUpdate, Transaction, Transfer};
-use vess_mempool::{AddOutcome, Mempool, MempoolError};
+use vess_mempool::{AdmissionError, Mempool, MempoolError};
 use vess_net::rpc::{
     AccountInfo, BlockInfo, BlockQuery, ProofInfo, Reply, ReplyBody, Request, StatusInfo,
     TemplateInfo, TransactionInfo,
 };
 use vess_net::tx_status;
 use vess_state::State;
-use vess_storage::{PrunePolicy, PruneReport, StorageError, Store};
+use vess_storage::{
+    PrunePolicy, PruneReport, SnapshotVerification, SnapshotVerificationStatus, StorageError, Store,
+};
 
 /// Load the transport identity, creating it on first run. The key is a file rather than database
 /// state because peers may pin it and it must survive a wiped database.
@@ -73,11 +77,14 @@ pub fn mine_fresh<E>(
         }
         let attempts = remaining.min(MINING_BATCH_ATTEMPTS);
         let found = vess_consensus::mine_header(header, attempts);
-        if started.elapsed() >= MINING_REFRESH_INTERVAL || stale(&header.previous_block_id)? {
+        if stale(&header.previous_block_id)? {
             return Ok(MiningResult::Refresh);
         }
         if found {
             return Ok(MiningResult::Found);
+        }
+        if started.elapsed() >= MINING_REFRESH_INTERVAL {
+            return Ok(MiningResult::Refresh);
         }
         remaining -= attempts;
     }
@@ -105,6 +112,7 @@ pub enum NodeError {
     SnapshotUnproven,
     /// A snapshot is not newer than the state we already have.
     SnapshotNotNewer,
+    InvalidSnapshotHistory,
 }
 
 impl std::fmt::Display for NodeError {
@@ -128,6 +136,9 @@ impl std::fmt::Display for NodeError {
                 f.write_str("snapshot anchors on a block this node cannot validate")
             }
             NodeError::SnapshotNotNewer => f.write_str("snapshot is not newer than our state"),
+            NodeError::InvalidSnapshotHistory => {
+                f.write_str("trusted snapshot history failed independent validation")
+            }
         }
     }
 }
@@ -250,16 +261,61 @@ pub struct Node {
     prune: PrunePolicy,
     /// When the last pruning pass ran, so it happens on a schedule rather than per block.
     last_pruned_at_height: u64,
-    /// Whether a snapshot may be installed for a block this node cannot validate itself. Off by
-    /// default: it means trusting the peer's account set at that height.
+    /// Whether a snapshot may be installed for a block this node cannot validate itself.
     trust_snapshots: bool,
+    snapshot_verification: Option<SnapshotVerification>,
+    history_verifier: Option<Arc<Mutex<history::HistoryVerifier>>>,
+    history_replayed: u64,
 }
 
 impl Node {
+    /// Open with snapshot trust enabled and resume verification of any untracked pruned history.
     pub fn open(datadir: impl AsRef<Path>, network: NetworkProfile) -> Result<Node, NodeError> {
+        Self::open_with_snapshot_trust(datadir, network, true)
+    }
+
+    /// Open with an explicit policy for snapshots whose anchor state has not been validated locally.
+    pub fn open_with_snapshot_trust(
+        datadir: impl AsRef<Path>,
+        network: NetworkProfile,
+        trust_snapshots: bool,
+    ) -> Result<Node, NodeError> {
         let datadir = datadir.as_ref().to_path_buf();
         std::fs::create_dir_all(&datadir)?;
         let store = Store::open(&datadir.join("ledger.redb"), network)?;
+        let snapshot_verification = store.snapshot_verification()?;
+        if matches!(
+            snapshot_verification,
+            Some(SnapshotVerification {
+                status: SnapshotVerificationStatus::Invalid,
+                ..
+            })
+        ) {
+            return Err(NodeError::InvalidSnapshotHistory);
+        }
+        let verifier = if matches!(
+            snapshot_verification,
+            Some(SnapshotVerification {
+                status: SnapshotVerificationStatus::Pending,
+                ..
+            })
+        ) {
+            Some(history::HistoryVerifier::open(
+                &datadir.join("history-verification"),
+                network,
+            )?)
+        } else {
+            None
+        };
+        let history_replayed = verifier.as_ref().map_or_else(
+            || {
+                snapshot_verification
+                    .filter(|v| v.status == SnapshotVerificationStatus::Verified)
+                    .map_or(0, |v| v.height)
+            },
+            |verifier| verifier.height(),
+        );
+        let history_verifier = verifier.map(|verifier| Arc::new(Mutex::new(verifier)));
         let mut chain = store.load_chain()?;
         // The in-memory chain must not claim headers the store no longer has.
         chain.prune_below(store.oldest_header_height()?);
@@ -296,11 +352,29 @@ impl Node {
             peers_path,
             prune,
             last_pruned_at_height: 0,
-            trust_snapshots: false,
+            trust_snapshots,
+            snapshot_verification,
+            history_verifier,
+            history_replayed,
         };
         node.reconcile()?;
-        node.restore_mempool();
+        node.restore_mempool()?;
         node.verify_checkpoints()?;
+        if let (Some(verification), Some(verifier)) =
+            (node.snapshot_verification, node.history_verifier.clone())
+        {
+            let verifier = verifier.lock().unwrap_or_else(|error| error.into_inner());
+            node.finish_replayed_history(
+                verification,
+                verifier.height(),
+                verifier.tip(),
+                verifier.root(),
+            )?;
+            node.check_history_valid()?;
+        }
+        if trust_snapshots {
+            node.verify_existing_snapshot_history()?;
+        }
         Ok(node)
     }
 
@@ -343,7 +417,6 @@ impl Node {
     }
 
     /// Allow installing a snapshot this node cannot verify against a block it validated itself.
-    /// Off by default; see `install_snapshot`.
     pub fn set_trust_snapshots(&mut self, trust: bool) {
         self.trust_snapshots = trust;
     }
@@ -351,6 +424,110 @@ impl Node {
     /// Whether unverifiable snapshots may be installed.
     pub fn trust_snapshots(&self) -> bool {
         self.trust_snapshots
+    }
+
+    /// Begin replaying an existing state whose provenance predates verification tracking.
+    pub fn verify_existing_snapshot_history(&mut self) -> Result<(), NodeError> {
+        if self.snapshot_verification.is_some()
+            || self.state_height() == 0
+            || self.store.oldest_body_height()? == 0
+        {
+            return Ok(());
+        }
+        let height = self.state_height();
+        let header = self
+            .chain
+            .main_header_at(height)
+            .ok_or(NodeError::UnknownParent)?;
+        if header.id() != self.state_tip || header.state_root != self.state.root() {
+            return Err(NodeError::SnapshotMismatch);
+        }
+        let verifier = history::HistoryVerifier::open(
+            &self.datadir.join("history-verification"),
+            self.network,
+        )?;
+        self.history_replayed = verifier.height();
+        let verification = SnapshotVerification {
+            height,
+            block_id: header.id(),
+            status: SnapshotVerificationStatus::Pending,
+        };
+        self.store.begin_snapshot_verification(verification)?;
+        self.snapshot_verification = Some(verification);
+        self.history_verifier = Some(Arc::new(Mutex::new(verifier)));
+        Ok(())
+    }
+
+    fn check_history_valid(&self) -> Result<(), NodeError> {
+        if self
+            .snapshot_verification
+            .is_some_and(|verification| verification.status == SnapshotVerificationStatus::Invalid)
+        {
+            return Err(NodeError::InvalidSnapshotHistory);
+        }
+        Ok(())
+    }
+
+    fn finish_history_verification(
+        &mut self,
+        expected: SnapshotVerification,
+        status: SnapshotVerificationStatus,
+    ) -> Result<bool, NodeError> {
+        if self.snapshot_verification != Some(expected) {
+            return Ok(false);
+        }
+        if status == SnapshotVerificationStatus::Invalid {
+            // Stop serving immediately even if recording the failure itself encounters an I/O error.
+            self.snapshot_verification = Some(SnapshotVerification { status, ..expected });
+        }
+        if !self.store.finish_snapshot_verification(expected, status)? {
+            self.snapshot_verification = Some(expected);
+            return Ok(false);
+        }
+        self.snapshot_verification = Some(SnapshotVerification { status, ..expected });
+        Ok(true)
+    }
+
+    fn finish_replayed_history(
+        &mut self,
+        expected: SnapshotVerification,
+        height: u64,
+        tip: Hash,
+        root: Hash,
+    ) -> Result<bool, NodeError> {
+        if expected.status != SnapshotVerificationStatus::Pending
+            || self.snapshot_verification != Some(expected)
+            || height != expected.height
+            || tip != expected.block_id
+        {
+            return Ok(false);
+        }
+        let Some(header) = self.chain.main_header_at(height) else {
+            return Ok(false);
+        };
+        if header.id() != expected.block_id {
+            return Ok(false);
+        }
+        let status = if root == header.state_root {
+            SnapshotVerificationStatus::Verified
+        } else {
+            SnapshotVerificationStatus::Invalid
+        };
+        let updated = self.finish_history_verification(expected, status)?;
+        if updated {
+            if status == SnapshotVerificationStatus::Verified {
+                crate::log_info!(
+                    "history",
+                    "snapshot history independently verified from genesis"
+                );
+            } else {
+                crate::log_error!(
+                    "history",
+                    "snapshot history does not match the independently replayed state; node disabled"
+                );
+            }
+        }
+        Ok(updated)
     }
 
     /// Open sessions right now, reported by `STATUS`.
@@ -433,7 +610,15 @@ impl Node {
 
     /// Run one pruning pass now, and keep the in-memory chain in step with the store.
     pub fn prune_now(&mut self) -> Result<PruneReport, NodeError> {
-        let report = self.store.prune(self.chain.best_height(), self.prune)?;
+        let policy = if self
+            .snapshot_verification
+            .is_some_and(|verification| verification.status == SnapshotVerificationStatus::Pending)
+        {
+            PrunePolicy::new(self.prune.blocks, 0)
+        } else {
+            self.prune
+        };
+        let report = self.store.prune(self.chain.best_height(), policy)?;
         if report.headers_removed > 0 {
             self.chain.prune_below(report.oldest_header_height);
         }
@@ -542,13 +727,14 @@ impl Node {
         frames
     }
 
-    /// Install a snapshot that a peer sent, after proving it against a block we validated ourselves.
+    /// Install a snapshot that matches its header. The P2P caller must first establish peer quorum;
+    /// this low-level method does not perform that vote itself.
     ///
     /// `state_root` commits to the account set, so a snapshot that matches it *is* the state at that
     /// height — but only if the header is one whose root we can confirm. A header alone proves
     /// nothing: a peer may mine a single block with any `state_root` it likes and hand us the
     /// matching accounts, so the anchor's body is validated here against the parent state we hold.
-    /// Anything else is refused and the node keeps replaying blocks instead.
+    /// Otherwise snapshot trust must be enabled and its history is replayed independently.
     pub fn install_snapshot(
         &mut self,
         height: u64,
@@ -573,15 +759,28 @@ impl Node {
             }
         } else if !self.trust_snapshots {
             // Without the anchor's body a peer could mine one header with any `state_root` and hand
-            // us the accounts that hash to it, so an unproven snapshot is opt-in only.
+            // us the accounts that hash to it, so reject it when snapshot trust is disabled.
             return Err(NodeError::SnapshotUnproven);
         } else if state.root() != header.state_root {
             return Err(NodeError::SnapshotMismatch);
         }
+        if self.history_verifier.is_none() {
+            let verifier = history::HistoryVerifier::open(
+                &self.datadir.join("history-verification"),
+                self.network,
+            )?;
+            self.history_replayed = verifier.height();
+            self.history_verifier = Some(Arc::new(Mutex::new(verifier)));
+        }
         self.store.install_snapshot(&header, height, &state)?;
+        self.snapshot_verification = Some(SnapshotVerification {
+            height,
+            block_id: header.id(),
+            status: SnapshotVerificationStatus::Pending,
+        });
         self.state = state;
         self.state_tip = header.id();
-        self.restore_mempool();
+        self.restore_mempool()?;
         self.tip_signal.publish(self.chain.best_id());
         Ok(())
     }
@@ -599,6 +798,7 @@ impl Node {
 
     /// Store a header without its body (snapshot sync fetches headers first, bodies later).
     pub fn insert_header_only(&mut self, header: BlockHeader) -> Result<(), NodeError> {
+        self.check_history_valid()?;
         self.insert_header_only_at(header, Self::clock_ms()?)
     }
 
@@ -687,6 +887,7 @@ impl Node {
     /// extend the tip, an ancestor of it, or a sibling branch. After indexing, `reconcile` makes
     /// the live state match the heaviest branch.
     pub fn accept_block(&mut self, bytes: &[u8]) -> Result<Hash, NodeError> {
+        self.check_history_valid()?;
         self.accept_block_at(bytes, Self::clock_ms()?)
     }
 
@@ -746,11 +947,15 @@ impl Node {
         self.reconcile()?;
         self.prune_stale()?;
         self.maybe_prune()?;
-        for expired in self
-            .mempool
-            .expire(self.chain.best_header().timestamp_unix_ms / 1_000)
-        {
-            self.store.remove_pending(&expired.id())?;
+        let now = self.chain.best_header().timestamp_unix_ms / 1_000;
+        let is_expired = |tx: &Transaction| match tx {
+            Transaction::Transfer(t) => t.expiry_unix != 0 && t.expiry_unix < now,
+            Transaction::StateUpdate(t) => t.expiry_unix != 0 && t.expiry_unix < now,
+        };
+        let expired = self.mempool.transaction_ids_where(is_expired);
+        if !expired.is_empty() {
+            self.store.update_pending(&expired, None)?;
+            self.mempool.expire(now);
         }
         Ok(())
     }
@@ -824,13 +1029,26 @@ impl Node {
 
     /// Remove transactions that are now on the chain from the mempool and pending storage.
     fn prune_included(&mut self, included: &[Transaction]) -> Result<(), NodeError> {
+        let mut removed = Vec::new();
+        for tx in included {
+            let sender = match tx {
+                Transaction::Transfer(t) => t.sender_id(),
+                Transaction::StateUpdate(t) => t.sender_id(),
+            };
+            if let Some(id) = self.mempool.transaction_id_for_account(&sender) {
+                removed.push(id);
+            }
+            removed.push(tx.id());
+        }
+        if !removed.is_empty() {
+            self.store.update_pending(&removed, None)?;
+        }
         for tx in included {
             match tx {
                 Transaction::Transfer(t) => self.mempool.remove_account(&t.sender_id()),
                 Transaction::StateUpdate(t) => self.mempool.remove_account(&t.sender_id()),
             }
             self.mempool.remove_transaction(&tx.id());
-            self.store.remove_pending(&tx.id())?;
         }
         Ok(())
     }
@@ -955,6 +1173,7 @@ impl Node {
         payout: &AccountId,
         timestamp_unix_ms: u64,
     ) -> Result<(BlockTemplate, u64), NodeError> {
+        self.check_history_valid()?;
         let candidates = self
             .mempool
             .select_for_template(vess_core::constants::MAX_BLOCK_BYTES);
@@ -987,16 +1206,13 @@ impl Node {
         let timestamp = self.chain.best_header().timestamp_unix_ms;
         let payout = self.chain.best_header().payout_account_id;
         let state = &self.state;
-        let mut stale: Vec<Transaction> = Vec::new();
-        self.mempool.retain_valid(|tx| {
-            let ok = applies_to(state, &payout, tx, timestamp);
-            if !ok {
-                stale.push(tx.clone());
-            }
-            ok
-        });
-        for tx in &stale {
-            self.store.remove_pending(&tx.id())?;
+        let stale = self
+            .mempool
+            .transaction_ids_where(|tx| !applies_to(state, &payout, tx, timestamp));
+        if !stale.is_empty() {
+            self.store.update_pending(&stale, None)?;
+            self.mempool
+                .retain_valid(|tx| applies_to(state, &payout, tx, timestamp));
         }
         Ok(stale.len())
     }
@@ -1070,10 +1286,14 @@ impl Node {
         }
         let id = tx.tx_id();
         let canonical = Transaction::Transfer(tx.clone()).canonical();
-        match self.mempool.add_transaction(Transaction::Transfer(tx))? {
-            AddOutcome::Added | AddOutcome::Replaced => {}
-        }
-        self.store.put_pending(&id, &canonical)?;
+        self.mempool
+            .add_transaction_with(Transaction::Transfer(tx), |removed| {
+                self.store.update_pending(removed, Some((&id, &canonical)))
+            })
+            .map_err(|error| match error {
+                AdmissionError::Policy(error) => NodeError::Mempool(error),
+                AdmissionError::Persistence(error) => NodeError::Storage(error),
+            })?;
         self.accepted_transactions += 1;
         Ok(id)
     }
@@ -1114,8 +1334,14 @@ impl Node {
         }
         let id = tx.tx_id();
         let canonical = Transaction::StateUpdate(tx.clone()).canonical();
-        self.mempool.add_transaction(Transaction::StateUpdate(tx))?;
-        self.store.put_pending(&id, &canonical)?;
+        self.mempool
+            .add_transaction_with(Transaction::StateUpdate(tx), |removed| {
+                self.store.update_pending(removed, Some((&id, &canonical)))
+            })
+            .map_err(|error| match error {
+                AdmissionError::Policy(error) => NodeError::Mempool(error),
+                AdmissionError::Persistence(error) => NodeError::Storage(error),
+            })?;
         self.accepted_transactions += 1;
         Ok(id)
     }
@@ -1126,21 +1352,39 @@ impl Node {
     }
 
     /// Re-admit everything that was pending before the last shutdown.
-    fn restore_mempool(&mut self) {
-        for bytes in self.store.load_pending().unwrap_or_default() {
+    fn restore_mempool(&mut self) -> Result<(), NodeError> {
+        let pending = self.store.load_pending()?;
+        self.mempool = Mempool::new();
+        for bytes in pending {
             let mut reader = vess_core::codec::Reader::new(&bytes);
-            match Transaction::decode_from(&mut reader, vess_core::constants::MAX_TRANSACTION_BYTES)
-            {
-                Ok(Transaction::Transfer(tx)) => {
-                    let _ = self.submit_transfer(tx);
+            let result = match Transaction::decode_from(
+                &mut reader,
+                vess_core::constants::MAX_TRANSACTION_BYTES,
+            ) {
+                Ok(Transaction::Transfer(tx)) => self.submit_transfer(tx),
+                Ok(Transaction::StateUpdate(tx)) => self.submit_state_update(tx),
+                Err(error) => {
+                    crate::log_warn!("mempool", "discarding malformed saved transaction: {error}");
+                    continue;
                 }
-                Ok(Transaction::StateUpdate(tx)) => {
-                    let _ = self.submit_state_update(tx);
+            };
+            match result {
+                Ok(_) => {}
+                Err(NodeError::Storage(error)) => return Err(NodeError::Storage(error)),
+                Err(error) => {
+                    crate::log_warn!("mempool", "discarding invalid saved transaction: {error}");
                 }
-                _ => {}
             }
         }
+        let entries: Vec<_> = self
+            .mempool
+            .pending_transactions()
+            .into_iter()
+            .map(|tx| (tx.id(), tx.canonical()))
+            .collect();
+        self.store.replace_pending(&entries)?;
         self.accepted_transactions = 0;
+        Ok(())
     }
 
     pub fn balance(&self, id: &AccountId) -> u64 {
@@ -1153,8 +1397,34 @@ impl Node {
 
     /// Dispatch one RPC request. Never panics on hostile input.
     pub fn handle_rpc(&mut self, request: Request) -> Reply {
+        if self.check_history_valid().is_err()
+            && !matches!(
+                request,
+                Request::Status | Request::HistoryStatus | Request::Stop
+            )
+        {
+            return Reply::reject(reason::CONSENSUS);
+        }
         match request {
             Request::Status => Reply::ok(ReplyBody::Status(self.status())),
+            Request::HistoryStatus => {
+                let (status, target) = match self.snapshot_verification {
+                    None => (0, 0),
+                    Some(verification) => (
+                        match verification.status {
+                            SnapshotVerificationStatus::Pending => 1,
+                            SnapshotVerificationStatus::Verified => 2,
+                            SnapshotVerificationStatus::Invalid => 3,
+                        },
+                        verification.height,
+                    ),
+                };
+                Reply::ok(ReplyBody::HistoryStatus {
+                    status,
+                    height: self.history_replayed,
+                    target,
+                })
+            }
             Request::Balance(id) => Reply::ok(ReplyBody::Account(self.account_info(&id))),
             Request::Template(payout) => {
                 let ts = self.next_timestamp_ms();
@@ -1367,6 +1637,9 @@ pub fn serve(node: Arc<Mutex<Node>>, listener: TcpListener) -> std::io::Result<(
             let signal = lock_node(&node).tip_signal();
             signal.wait_for_change(after, timeout_ms.min(MAX_WAIT_MS));
             let guard = lock_node(&node);
+            if guard.check_history_valid().is_err() {
+                return Reply::reject(reason::CONSENSUS);
+            }
             return Reply::ok(ReplyBody::Tip {
                 tip: guard.chain.best_id(),
                 height: guard.chain.best_height(),
@@ -1386,6 +1659,9 @@ pub fn serve(node: Arc<Mutex<Node>>, listener: TcpListener) -> std::io::Result<(
             loop {
                 let (current, tip) = {
                     let guard = lock_node(&node);
+                    if guard.check_history_valid().is_err() {
+                        return Reply::reject(reason::CONSENSUS);
+                    }
                     (guard.account_info(account), guard.chain.best_id())
                 };
                 if current != *since || Instant::now() >= deadline {

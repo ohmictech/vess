@@ -8,8 +8,10 @@ pub mod keyfile;
 #[cfg(test)]
 mod keyfile_tests;
 
+use std::io::Write;
 use std::path::Path;
 
+use bip39::{Language, Mnemonic};
 use vess_core::codec::{Reader, Writer};
 use vess_core::constants::PROTOCOL_VERSION;
 use vess_core::hash::{self, DOM_STATE_UPDATE, DOM_TRANSFER};
@@ -19,6 +21,7 @@ use vess_net::rpc::{
     AccountInfo, BlockInfo, BlockQuery, Reply, ReplyBody, Request, RpcClient, StatusInfo,
     TransactionInfo,
 };
+use zeroize::Zeroizing;
 
 /// The legacy plaintext format. Written only when the caller asks for it.
 pub const KEYFILE_VERSION: u16 = 1;
@@ -37,6 +40,8 @@ pub enum WalletError {
     WeakPassphrase,
     /// A single-key keyfile has one account, so it has no index other than 0.
     NotHierarchical,
+    /// The recovery phrase is not a valid 24-word English BIP-39 phrase.
+    InvalidRecoveryPhrase(String),
 }
 
 impl std::fmt::Display for WalletError {
@@ -56,6 +61,9 @@ impl std::fmt::Display for WalletError {
             WalletError::NotHierarchical => f.write_str(
                 "this keyfile holds a single account; reopen it without --index (or create an HD wallet)",
             ),
+            WalletError::InvalidRecoveryPhrase(reason) => {
+                write!(f, "invalid recovery phrase: {reason}")
+            }
         }
     }
 }
@@ -71,6 +79,44 @@ impl From<std::io::Error> for WalletError {
 impl From<vess_net::NetError> for WalletError {
     fn from(e: vess_net::NetError) -> Self {
         WalletError::Rpc(e.to_string())
+    }
+}
+
+/// A 24-word English BIP-39 recovery phrase for a new Vess HD wallet.
+///
+/// The phrase is not stored in the keyfile. Anyone with it can recover the wallet.
+pub struct RecoveryPhrase(Mnemonic);
+
+impl RecoveryPhrase {
+    pub fn generate() -> Result<Self, WalletError> {
+        let mut entropy = Zeroizing::new([0u8; 32]);
+        getrandom::fill(entropy.as_mut())
+            .map_err(|e| WalletError::Io(format!("operating system randomness: {e}")))?;
+        let mnemonic = Mnemonic::from_entropy_in(Language::English, entropy.as_ref())
+            .map_err(|e| WalletError::InvalidRecoveryPhrase(e.to_string()))?;
+        Ok(Self(mnemonic))
+    }
+
+    pub fn parse(words: &str) -> Result<Self, WalletError> {
+        if words.split_whitespace().count() != 24 {
+            return Err(WalletError::InvalidRecoveryPhrase(
+                "expected exactly 24 words".into(),
+            ));
+        }
+        let mnemonic = Mnemonic::parse_in_normalized(Language::English, words)
+            .map_err(|e| WalletError::InvalidRecoveryPhrase(e.to_string()))?;
+        Ok(Self(mnemonic))
+    }
+
+    pub fn words(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.0.words()
+    }
+
+    /// BIP-39 with an empty passphrase, then the versioned Vess master-seed mapping.
+    pub fn keyring(&self, network: u8) -> Keyring {
+        let seed = Zeroizing::new(self.0.to_seed_normalized(""));
+        let master = hash::tagged(b"VESS-BIP39-HD-V1", &[seed.as_ref()]);
+        Keyring::from_master(network, master)
     }
 }
 
@@ -259,7 +305,7 @@ pub enum Keyring {
 }
 
 impl Keyring {
-    /// A new HD keyring: one master seed, unlimited accounts, one backup.
+    /// A new HD keyring with a random master. It has no recovery phrase; back up its keyfile.
     pub fn create(network: u8) -> Keyring {
         Keyring::Hd {
             network,
@@ -369,6 +415,24 @@ impl Keyring {
         path: &Path,
         passphrase: Option<&keyfile::Passphrase>,
     ) -> Result<(), WalletError> {
+        self.save_inner(path, passphrase, false)
+    }
+
+    /// Create a keyfile without replacing an existing file.
+    pub fn save_new(
+        &self,
+        path: &Path,
+        passphrase: Option<&keyfile::Passphrase>,
+    ) -> Result<(), WalletError> {
+        self.save_inner(path, passphrase, true)
+    }
+
+    fn save_inner(
+        &self,
+        path: &Path,
+        passphrase: Option<&keyfile::Passphrase>,
+        create_new: bool,
+    ) -> Result<(), WalletError> {
         let (network, seed, kind) = match self {
             Keyring::Single(wallet) => (
                 wallet.network(),
@@ -401,7 +465,15 @@ impl Keyring {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(path, &bytes)?;
+        if create_new {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)?;
+            file.write_all(&bytes)?;
+        } else {
+            std::fs::write(path, &bytes)?;
+        }
         Ok(())
     }
 }
@@ -569,6 +641,68 @@ mod tests {
         }
     }
 
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[test]
+    fn bip39_and_vess_derivation_vector() {
+        let words = format!("{}art", "abandon ".repeat(23));
+        let phrase = RecoveryPhrase::parse(&words).unwrap();
+        assert_eq!(
+            hex(&phrase.0.to_seed_normalized("")),
+            "408b285c123836004f4b8842c89324c1f01382450c0d439af345ba7fc49acf705489c6fc77dbd4e3dc1dd8cc6bc9f043db8ada1e243c4a0eafb290d399480840"
+        );
+        let keyring = phrase.keyring(0);
+        assert_eq!(
+            hex(&master_of(&keyring)),
+            "712cc78bbbc7d53b68a21adf9c3581605ea83feafcc9b83cef6820ff247147fb"
+        );
+        assert_eq!(
+            hex(&keyring.account_id(0).unwrap()),
+            "6a627498f64f1d678f4023ce75689c5caa55bd60756de8d643a25f3abaa49c80"
+        );
+        assert_eq!(
+            hex(&keyring.account_id(1).unwrap()),
+            "205802b235ae5c2a45f099a0f55d24887f739d91b87b226d8b03aeb778ac96c1"
+        );
+    }
+
+    #[test]
+    fn recovery_phrase_validation_and_generation() {
+        let generated = RecoveryPhrase::generate().unwrap();
+        let words = Zeroizing::new(generated.words().collect::<Vec<_>>().join(" "));
+        let recovered = RecoveryPhrase::parse(&words).unwrap();
+        assert_eq!(
+            generated.keyring(0).account_ids(3).unwrap(),
+            recovered.keyring(0).account_ids(3).unwrap()
+        );
+        for invalid in [
+            "abandon ".repeat(12),
+            "abandon ".repeat(24),
+            format!("{}notaword", "abandon ".repeat(23)),
+        ] {
+            assert!(matches!(
+                RecoveryPhrase::parse(&invalid),
+                Err(WalletError::InvalidRecoveryPhrase(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn saving_new_keyfiles_never_replaces_existing_files() {
+        let dir = std::env::temp_dir().join(format!("vess-save-new-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wallet.key");
+        std::fs::write(&path, b"existing").unwrap();
+        let ring = Keyring::from_master(0, [7; 32]);
+        let pass = keyfile::Passphrase::new(b"password".to_vec());
+        assert!(ring.save_new(&path, Some(&pass)).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"existing");
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
     #[test]
     fn hd_accounts_are_deterministic_distinct_and_recoverable() {
         let dir = std::env::temp_dir().join(format!("vess-hd-{}", std::process::id()));
@@ -614,6 +748,13 @@ mod tests {
         // A wallet written by the old API: one ML-DSA seed, one account, address unchanged.
         let wallet = Wallet::from_seed(0, [21u8; 32]);
         let expected = wallet.account_id();
+        wallet.save(&path, None).unwrap();
+        let legacy = Keyring::open(&path, 0, None).unwrap();
+        assert_eq!(legacy.account_id(0).unwrap(), expected);
+        assert!(matches!(
+            legacy.account(1),
+            Err(WalletError::NotHierarchical)
+        ));
         wallet.save(&path, Some(&pass)).unwrap();
 
         let keyring = Keyring::open(&path, 0, Some(&pass)).unwrap();

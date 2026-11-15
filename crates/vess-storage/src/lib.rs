@@ -36,6 +36,55 @@ const META_PRUNE_BLOCKS: &[u8] = b"prune_blocks";
 const META_PRUNE_HEADERS: &[u8] = b"prune_headers";
 const META_OLDEST_BODY: &[u8] = b"oldest_body_height";
 const META_OLDEST_HEADER: &[u8] = b"oldest_header_height";
+const META_SNAPSHOT_VERIFICATION: &[u8] = b"snapshot_verification";
+
+/// A snapshot whose history is being independently verified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotVerification {
+    pub height: u64,
+    pub block_id: Hash,
+    pub status: SnapshotVerificationStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotVerificationStatus {
+    Pending,
+    Verified,
+    Invalid,
+}
+
+impl SnapshotVerification {
+    fn encode(self) -> [u8; 41] {
+        let mut bytes = [0; 41];
+        bytes[..8].copy_from_slice(&self.height.to_be_bytes());
+        bytes[8..40].copy_from_slice(&self.block_id);
+        bytes[40] = match self.status {
+            SnapshotVerificationStatus::Pending => 0,
+            SnapshotVerificationStatus::Verified => 1,
+            SnapshotVerificationStatus::Invalid => 2,
+        };
+        bytes
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, StorageError> {
+        if bytes.len() != 41 {
+            return Err(StorageError::Corrupt("snapshot verification"));
+        }
+        let height = u64::from_be_bytes(bytes[..8].try_into().unwrap());
+        let block_id = bytes[8..40].try_into().unwrap();
+        let status = match bytes[40] {
+            0 => SnapshotVerificationStatus::Pending,
+            1 => SnapshotVerificationStatus::Verified,
+            2 => SnapshotVerificationStatus::Invalid,
+            _ => return Err(StorageError::Corrupt("snapshot verification status")),
+        };
+        Ok(Self {
+            height,
+            block_id,
+            status,
+        })
+    }
+}
 
 /// How much history this node keeps. Both fields are counted in blocks below the tip and `0` means
 /// "keep everything", so an archival node is simply `PrunePolicy::none()`.
@@ -188,8 +237,8 @@ fn clear_table(
     let keys: Vec<Vec<u8>> = table
         .iter()
         .map_err(db)?
-        .filter_map(|entry| entry.ok().map(|(key, _)| key.value().to_vec()))
-        .collect();
+        .map(|entry| entry.map(|(key, _)| key.value().to_vec()).map_err(db))
+        .collect::<Result<_, _>>()?;
     for key in keys {
         table.remove(&key[..]).map_err(db)?;
     }
@@ -367,6 +416,83 @@ impl Store {
             }
             None => Ok(None),
         }
+    }
+
+    /// Clear a dedicated replay database so verification can restart on another branch.
+    pub fn reset_replay(&self) -> Result<(), StorageError> {
+        let write = self.db.begin_write().map_err(db)?;
+        for table in [
+            ACCOUNTS,
+            HEADERS,
+            BODIES,
+            UNDO,
+            HEIGHT_INDEX,
+            TX_INDEX,
+            PENDING,
+        ] {
+            clear_table(&write, table)?;
+        }
+        {
+            let mut meta = write.open_table(META).map_err(db)?;
+            meta.remove(META_TIP).map_err(db)?;
+        }
+        write.commit().map_err(db)?;
+        Ok(())
+    }
+
+    pub fn snapshot_verification(&self) -> Result<Option<SnapshotVerification>, StorageError> {
+        let read = self.db.begin_read().map_err(db)?;
+        let meta = read.open_table(META).map_err(db)?;
+        meta.get(META_SNAPSHOT_VERIFICATION)
+            .map_err(db)?
+            .map(|value| SnapshotVerification::decode(value.value()))
+            .transpose()
+    }
+
+    pub fn begin_snapshot_verification(
+        &self,
+        verification: SnapshotVerification,
+    ) -> Result<(), StorageError> {
+        let write = self.db.begin_write().map_err(db)?;
+        {
+            let mut meta = write.open_table(META).map_err(db)?;
+            if meta.get(META_SNAPSHOT_VERIFICATION).map_err(db)?.is_some() {
+                return Err(StorageError::Corrupt(
+                    "snapshot verification already exists",
+                ));
+            }
+            let record = verification.encode();
+            meta.insert(META_SNAPSHOT_VERIFICATION, &record[..])
+                .map_err(db)?;
+        }
+        write.commit().map_err(db)?;
+        Ok(())
+    }
+
+    /// Update the verification outcome only if it still refers to the same snapshot.
+    pub fn finish_snapshot_verification(
+        &self,
+        expected: SnapshotVerification,
+        status: SnapshotVerificationStatus,
+    ) -> Result<bool, StorageError> {
+        let write = self.db.begin_write().map_err(db)?;
+        let updated;
+        {
+            let mut meta = write.open_table(META).map_err(db)?;
+            let current = meta
+                .get(META_SNAPSHOT_VERIFICATION)
+                .map_err(db)?
+                .map(|value| SnapshotVerification::decode(value.value()))
+                .transpose()?;
+            updated = current == Some(expected);
+            if updated {
+                let record = SnapshotVerification { status, ..expected }.encode();
+                meta.insert(META_SNAPSHOT_VERIFICATION, &record[..])
+                    .map_err(db)?;
+            }
+        }
+        write.commit().map_err(db)?;
+        Ok(updated)
     }
 
     /// The block that carried this transaction, if any block ever did.
@@ -634,6 +760,14 @@ impl Store {
 
             let mut meta = write.open_table(META).map_err(db)?;
             meta.insert(META_TIP, &id[..]).map_err(db)?;
+            let verification = SnapshotVerification {
+                height,
+                block_id: id,
+                status: SnapshotVerificationStatus::Pending,
+            }
+            .encode();
+            meta.insert(META_SNAPSHOT_VERIFICATION, &verification[..])
+                .map_err(db)?;
             // Nothing below the snapshot can ever be served, and no undo exists for it.
             let oldest = height.saturating_add(1);
             meta.insert(META_OLDEST_BODY, &oldest.to_be_bytes()[..])
@@ -807,20 +941,49 @@ impl Store {
 
     /// Remember an admitted transaction so it survives a restart.
     pub fn put_pending(&self, id: &Hash, bytes: &[u8]) -> Result<(), StorageError> {
+        self.update_pending(&[], Some((id, bytes)))
+    }
+
+    /// Atomically remove old entries and optionally add their replacement.
+    pub fn update_pending(
+        &self,
+        removed: &[Hash],
+        added: Option<(&Hash, &[u8])>,
+    ) -> Result<(), StorageError> {
         let write = self.db.begin_write().map_err(db)?;
         {
             let mut table = write.open_table(PENDING).map_err(db)?;
-            table.insert(&id[..], bytes).map_err(db)?;
+            for id in removed {
+                table.remove(&id[..]).map_err(db)?;
+            }
+            if let Some((id, bytes)) = added {
+                table.insert(&id[..], bytes).map_err(db)?;
+            }
         }
         write.commit().map_err(db)?;
         Ok(())
     }
 
     pub fn remove_pending(&self, id: &Hash) -> Result<(), StorageError> {
+        self.update_pending(&[*id], None)
+    }
+
+    /// Replace the pending table with the pool restored against the current state.
+    pub fn replace_pending(&self, entries: &[(Hash, Vec<u8>)]) -> Result<(), StorageError> {
         let write = self.db.begin_write().map_err(db)?;
         {
             let mut table = write.open_table(PENDING).map_err(db)?;
-            table.remove(&id[..]).map_err(db)?;
+            let keys: Vec<Vec<u8>> = table
+                .iter()
+                .map_err(db)?
+                .map(|entry| entry.map(|(key, _)| key.value().to_vec()).map_err(db))
+                .collect::<Result<_, _>>()?;
+            for key in keys {
+                table.remove(key.as_slice()).map_err(db)?;
+            }
+            for (id, bytes) in entries {
+                table.insert(&id[..], bytes.as_slice()).map_err(db)?;
+            }
         }
         write.commit().map_err(db)?;
         Ok(())
