@@ -118,6 +118,11 @@ impl SecureStream {
             .set_read_timeout(Some(std::time::Duration::from_millis(millis)))
     }
 
+    /// Whether a previous record already supplied unread plaintext.
+    pub fn has_buffered_plaintext(&self) -> bool {
+        !self.plain.is_empty()
+    }
+
     fn encrypt_chunk(&mut self, chunk: &[u8]) -> std::io::Result<()> {
         let mut buf = vec![0u8; MAX_CHUNK + 16];
         let len = self

@@ -5,7 +5,7 @@
 
 mod config;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -13,7 +13,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use vess_core::constants::{
-    MAX_BLOCK_BYTES, ML_DSA_PK_BYTES, NetworkProfile, P2P_DEFAULT_PORT, RPC_DEFAULT_PORT,
+    MAX_BLOCK_BYTES, ML_DSA_PK_BYTES, ML_DSA_SIG_BYTES, NetworkProfile, P2P_DEFAULT_PORT,
+    RPC_DEFAULT_PORT,
 };
 use vess_core::hash::chain_id;
 use vess_core::{AccountId, BlockHeader, Hash, Transaction};
@@ -46,6 +47,9 @@ vess 0.1.0 — Vess reference node
   vess wallet addresses   [--datadir DIR] --name NAME [--count N] [--password-*]   # HD accounts
   vess wallet address     [--datadir DIR] --name NAME [--index N] [--password-file FILE | --password-env VAR]
   vess wallet address     --public-key HEX            # derive an address from a public key
+  vess wallet sign        [--datadir DIR] --name NAME --message TEXT [--index N] [--password-*]
+  vess wallet sign verify --message TEXT (--proof FILE | --public-key HEX --signature HEX) [--account HEX]
+                          # --proof - reads wallet sign output from stdin
   vess wallet balance     [--datadir DIR] --name NAME [--index N] [--rpc ADDR] [--password-*]
   vess wallet send        [--datadir DIR] --name NAME --to HEX --amount N [--fee N] [--index N] [--rpc ADDR] [--password-*]
   vess wallet set-state   [--datadir DIR] --name NAME --state-hash HEX [--fee N] [--rpc ADDR] [--password-*]
@@ -60,7 +64,8 @@ vess 0.1.0 — Vess reference node
   vess miner [--datadir DIR] --payout HEX [--blocks N] [--rpc ADDR]
 
 All output is plain `key=value` text. Nothing is JSON.
-Commands load vess.toml beside the executable (or --config FILE), creating it if absent.
+Commands load vess.toml beside the executable (or --config FILE), creating it if absent,
+except for offline signature verification.
 Config data paths are relative to the config; --datadir paths are relative to the working directory.
 Explicit options override the file for that invocation.
 ";
@@ -78,27 +83,32 @@ fn main() -> ExitCode {
 
 struct Args {
     flags: HashMap<String, String>,
+    valueless: HashSet<String>,
 }
 
 impl Args {
     fn parse(raw: &[String]) -> Args {
         let mut flags = HashMap::new();
+        let mut valueless = HashSet::new();
         let mut index = 0;
         while index < raw.len() {
             let token = &raw[index];
             if let Some(name) = token.strip_prefix("--") {
                 if let Some((key, value)) = name.split_once('=') {
                     flags.insert(key.to_string(), value.to_string());
+                    valueless.remove(key);
                 } else if index + 1 < raw.len() && !raw[index + 1].starts_with("--") {
                     flags.insert(name.to_string(), raw[index + 1].clone());
+                    valueless.remove(name);
                     index += 1;
                 } else {
                     flags.insert(name.to_string(), String::from("true"));
+                    valueless.insert(name.to_string());
                 }
             }
             index += 1;
         }
-        Args { flags }
+        Args { flags, valueless }
     }
 
     fn get(&self, key: &str) -> Option<&str> {
@@ -113,6 +123,13 @@ impl Args {
 
     fn require(&self, key: &str) -> Result<&str, String> {
         self.get(key).ok_or_else(|| format!("missing --{key}"))
+    }
+
+    fn require_value(&self, key: &str) -> Result<&str, String> {
+        if self.valueless.contains(key) {
+            return Err(format!("--{key} requires a value"));
+        }
+        self.require(key)
     }
 
     fn number(&self, key: &str, default: u64) -> Result<u64, String> {
@@ -147,6 +164,9 @@ fn parse_hash(value: &str) -> Result<Hash, String> {
     if value.len() != 64 {
         return Err("expected 32 bytes of hex".into());
     }
+    if !value.is_ascii() {
+        return Err("invalid hex".into());
+    }
     let mut out = [0u8; 32];
     for (index, byte) in out.iter_mut().enumerate() {
         *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
@@ -168,6 +188,9 @@ fn decode_hex(value: &str) -> Result<Vec<u8>, String> {
     let value = value.strip_prefix("0x").unwrap_or(value);
     if !value.len().is_multiple_of(2) {
         return Err("hex string must have an even number of digits".into());
+    }
+    if !value.is_ascii() {
+        return Err("invalid hex".into());
     }
     let mut out = Vec::with_capacity(value.len() / 2);
     for index in 0..value.len() / 2 {
@@ -251,6 +274,9 @@ fn run(raw: &[String]) -> Result<(), String> {
         println!("{USAGE}");
         return Ok(());
     }
+    if raw.len() >= 3 && raw[0] == "wallet" && raw[1] == "sign" && raw[2] == "verify" {
+        return wallet_verify_signature(&raw[3..]);
+    }
     let bare = raw.first().is_none_or(|arg| arg.starts_with("--"));
     let (group, command, mut args) = if bare {
         ("node", "run", Args::parse(raw))
@@ -281,6 +307,7 @@ fn run(raw: &[String]) -> Result<(), String> {
                 | "restore"
                 | "address"
                 | "addresses"
+                | "sign"
                 | "balance"
                 | "send"
                 | "set-state"
@@ -306,6 +333,7 @@ fn run(raw: &[String]) -> Result<(), String> {
         ("wallet", "restore") => wallet_restore(&args),
         ("wallet", "address") => wallet_address(&args),
         ("wallet", "addresses") => wallet_addresses(&args),
+        ("wallet", "sign") => wallet_sign(&args),
         ("wallet", "balance") => wallet_balance(&args),
         ("wallet", "send") => wallet_send(&args),
         ("wallet", "set-state") => wallet_set_state(&args),
@@ -371,8 +399,9 @@ fn node_run(args: &Args) -> Result<(), String> {
     let policy = node.prune_policy();
     if node.trust_snapshots() {
         eprintln!(
-            "warning: snapshot trust is enabled; a majority of at least three connected peer identities \
-             may authorize a state this node cannot yet validate; identities can be controlled by one party"
+            "warning: snapshot trust is enabled; a majority of connected peer identities may authorize \
+             a state this node cannot yet validate (one peer is enough when connected alone); \
+             identities can be controlled by one party"
         );
     }
     if let vess_net::rpc::ReplyBody::HistoryStatus {
@@ -796,9 +825,191 @@ fn load_wallet(args: &Args, network: NetworkProfile) -> Result<Wallet, String> {
     let pass = passphrase(args)?;
     let keyring = Keyring::open(&wallet_path(&dir, name), network.network, pass.as_ref())
         .map_err(|e| e.to_string())?;
-    keyring
-        .account(args.number("index", 0)? as u32)
-        .map_err(|e| e.to_string())
+    let index = u32::try_from(args.number("index", 0)?)
+        .map_err(|_| "--index must be between 0 and 4294967295")?;
+    keyring.account(index).map_err(|e| e.to_string())
+}
+
+fn wallet_sign(args: &Args) -> Result<(), String> {
+    let message = args.require_value("message")?;
+    let network = network(args)?;
+    let wallet = load_wallet(args, network)?;
+    let signature = wallet
+        .sign_message(message.as_bytes())
+        .map_err(|error| format!("message signing failed: {error:?}"))?;
+    println!("algorithm=ML-DSA-65");
+    println!("context={}", vess_wallet::MESSAGE_SIGNING_CONTEXT);
+    println!("account={}", hex(&wallet.account_id()));
+    println!("public_key={}", hex(wallet.public_key()));
+    println!("signature={}", hex(&signature));
+    Ok(())
+}
+
+fn verify_options(raw: &[String]) -> Result<HashMap<String, String>, String> {
+    let allowed = ["message", "proof", "public-key", "signature", "account"];
+    let mut options = HashMap::new();
+    let mut index = 0;
+    while index < raw.len() {
+        let token = &raw[index];
+        let option = token
+            .strip_prefix("--")
+            .ok_or_else(|| format!("unexpected argument {token:?}"))?;
+        let (name, value) = if let Some((name, value)) = option.split_once('=') {
+            (name, value)
+        } else {
+            let value = raw
+                .get(index + 1)
+                .filter(|value| !value.starts_with("--"))
+                .ok_or_else(|| format!("--{option} requires a value"))?;
+            index += 1;
+            (option, value.as_str())
+        };
+        if !allowed.contains(&name) {
+            return Err(format!("unknown verification option --{name}"));
+        }
+        if options
+            .insert(name.to_string(), value.to_string())
+            .is_some()
+        {
+            return Err(format!("duplicate verification option --{name}"));
+        }
+        index += 1;
+    }
+    Ok(options)
+}
+
+fn fixed_hex<const N: usize>(value: &str, name: &str) -> Result<[u8; N], String> {
+    let digits = value.strip_prefix("0x").unwrap_or(value);
+    if digits.len() != N * 2 {
+        return Err(format!("{name} must be {N} bytes of hex"));
+    }
+    decode_hex(value)?
+        .try_into()
+        .map_err(|_| format!("{name} must be {N} bytes of hex"))
+}
+
+fn read_signature_proof(path: &str) -> Result<HashMap<String, String>, String> {
+    const LIMIT: u64 = 32_768;
+    let input: Box<dyn Read> = if path == "-" {
+        Box::new(std::io::stdin())
+    } else {
+        Box::new(
+            std::fs::File::open(path)
+                .map_err(|error| format!("cannot open signature proof {path}: {error}"))?,
+        )
+    };
+    let mut bytes = Vec::new();
+    input
+        .take(LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read signature proof: {error}"))?;
+    if bytes.len() as u64 > LIMIT {
+        return Err("signature proof is too long".into());
+    }
+    let text = if bytes.starts_with(&[0xff, 0xfe]) || bytes.starts_with(&[0xfe, 0xff]) {
+        let little_endian = bytes[0] == 0xff;
+        let encoded = &bytes[2..];
+        if !encoded.len().is_multiple_of(2) {
+            return Err("invalid UTF-16 signature proof".into());
+        }
+        let words: Vec<u16> = encoded
+            .chunks_exact(2)
+            .map(|pair| {
+                if little_endian {
+                    u16::from_le_bytes([pair[0], pair[1]])
+                } else {
+                    u16::from_be_bytes([pair[0], pair[1]])
+                }
+            })
+            .collect();
+        String::from_utf16(&words).map_err(|_| "invalid UTF-16 signature proof")?
+    } else {
+        String::from_utf8(bytes).map_err(|_| "signature proof must be UTF-8 or UTF-16")?
+    };
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    let mut fields = HashMap::new();
+    for line in text.lines().filter(|line| !line.is_empty()) {
+        let (name, value) = line
+            .split_once('=')
+            .ok_or("malformed signature proof line")?;
+        if !["algorithm", "context", "account", "public_key", "signature"].contains(&name) {
+            return Err(format!("unknown signature proof field {name:?}"));
+        }
+        if fields.insert(name.to_string(), value.to_string()).is_some() {
+            return Err(format!("duplicate signature proof field {name:?}"));
+        }
+    }
+    for name in ["algorithm", "context", "account", "public_key", "signature"] {
+        if !fields.contains_key(name) {
+            return Err(format!("missing signature proof field {name}"));
+        }
+    }
+    if fields["algorithm"] != "ML-DSA-65"
+        || fields["context"] != vess_wallet::MESSAGE_SIGNING_CONTEXT
+    {
+        return Err("unsupported signature proof algorithm or context".into());
+    }
+    Ok(fields)
+}
+
+fn wallet_verify_signature(raw: &[String]) -> Result<(), String> {
+    let options = verify_options(raw)?;
+    let message = options.get("message").ok_or("missing --message")?;
+    let proof = match options.get("proof") {
+        Some(path) => {
+            if options.contains_key("public-key") || options.contains_key("signature") {
+                return Err("give either --proof or --public-key and --signature".into());
+            }
+            Some(read_signature_proof(path)?)
+        }
+        None => None,
+    };
+    let (public_key, signature, claimed_account) = match &proof {
+        Some(fields) => (
+            fields["public_key"].as_str(),
+            fields["signature"].as_str(),
+            Some(fields["account"].as_str()),
+        ),
+        None => (
+            options
+                .get("public-key")
+                .ok_or("missing --public-key")?
+                .as_str(),
+            options
+                .get("signature")
+                .ok_or("missing --signature")?
+                .as_str(),
+            None,
+        ),
+    };
+    let public_key = fixed_hex::<ML_DSA_PK_BYTES>(public_key, "public key")?;
+    let signature = fixed_hex::<ML_DSA_SIG_BYTES>(signature, "signature")?;
+    let account = vess_crypto::account_id(&public_key);
+    let claimed_account = claimed_account
+        .map(|value| fixed_hex::<32>(value, "proof account"))
+        .transpose()?;
+    let expected_account = options
+        .get("account")
+        .map(|value| fixed_hex::<32>(value, "expected account"))
+        .transpose()?;
+    if claimed_account.is_some_and(|claimed| claimed != account)
+        || expected_account.is_some_and(|expected| expected != account)
+    {
+        println!("valid=0");
+        return Err("public key does not match the account".into());
+    }
+    if !vess_crypto::verify(
+        &public_key,
+        vess_wallet::MESSAGE_SIGNING_CONTEXT.as_bytes(),
+        message.as_bytes(),
+        &signature,
+    ) {
+        println!("valid=0");
+        return Err("message signature is invalid".into());
+    }
+    println!("valid=1");
+    println!("account={}", hex(&account));
+    Ok(())
 }
 
 fn wallet_address(args: &Args) -> Result<(), String> {

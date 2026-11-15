@@ -341,7 +341,7 @@ fn bare_start_creates_defaults_and_rejects_bad_options() {
     assert!(config.contains("seed.vess.invalid:9732"));
     for example in [
         "# payout = \"YOUR_64_CHARACTER_ACCOUNT_ADDRESS\"",
-        "# prune_blocks = 1024",
+        "# prune_blocks = 16384",
         "# prune_headers = 100000000",
     ] {
         assert!(config.contains(example), "missing {example}");
@@ -356,6 +356,12 @@ fn bare_start_creates_defaults_and_rejects_bad_options() {
         );
     }
     assert!(dir.path().join("chain").exists());
+    let status = command(dir.path())
+        .args(["node", "status", "--rpc", &format!("127.0.0.1:{port}")])
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    assert!(String::from_utf8_lossy(&status.stdout).contains("prune_blocks=16384"));
     drop(process);
 }
 

@@ -1179,6 +1179,20 @@ mod tests {
         assert_eq!(store.load_chain().unwrap().best_height(), tip_height + 1);
     }
     #[test]
+    fn default_retention_and_saved_policy_are_distinct() {
+        let temp = TempDb::new();
+        let store = Store::open(&temp.path, network()).unwrap();
+        assert_eq!(store.prune_policy().unwrap().blocks, 16_384);
+        store
+            .set_prune_policy(PrunePolicy::new(1_024, DEFAULT_PRUNE_HEADERS))
+            .unwrap();
+        drop(store);
+
+        let store = Store::open(&temp.path, network()).unwrap();
+        assert_eq!(store.prune_policy().unwrap().blocks, 1_024);
+    }
+
+    #[test]
     fn commit_and_reopen_preserves_the_whole_state() {
         let temp = TempDb::new();
         let store = Store::open(&temp.path, network()).unwrap();

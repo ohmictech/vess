@@ -15,7 +15,7 @@ use bip39::{Language, Mnemonic};
 use vess_core::codec::{Reader, Writer};
 use vess_core::constants::PROTOCOL_VERSION;
 use vess_core::hash::{self, DOM_STATE_UPDATE, DOM_TRANSFER};
-use vess_core::{AccountId, Hash, PublicKey, StateUpdate, Transfer};
+use vess_core::{AccountId, Hash, PublicKey, Signature, StateUpdate, Transfer};
 use vess_crypto::Key;
 use vess_net::rpc::{
     AccountInfo, BlockInfo, BlockQuery, Reply, ReplyBody, Request, RpcClient, StatusInfo,
@@ -25,6 +25,9 @@ use zeroize::Zeroizing;
 
 /// The legacy plaintext format. Written only when the caller asks for it.
 pub const KEYFILE_VERSION: u16 = 1;
+
+/// ML-DSA context for local message signatures, distinct from transaction contexts.
+pub const MESSAGE_SIGNING_CONTEXT: &str = "VESS-SIGNED-MESSAGE-V1";
 
 #[derive(Debug)]
 pub enum WalletError {
@@ -240,6 +243,11 @@ impl Wallet {
 
     pub fn chain_id(&self) -> Hash {
         hash::chain_id(self.network)
+    }
+
+    /// Sign the exact message bytes locally without constructing a transaction.
+    pub fn sign_message(&self, message: &[u8]) -> Result<Signature, vess_crypto::CryptoError> {
+        vess_crypto::sign(&self.key, MESSAGE_SIGNING_CONTEXT.as_bytes(), message)
     }
 
     pub fn build_transfer(
@@ -611,6 +619,37 @@ mod tests {
             DOM_TRANSFER,
             &tx.unsigned_bytes(),
             &tx.signature
+        ));
+    }
+
+    #[test]
+    fn message_signatures_are_bound_to_the_bytes_and_separate_from_transactions() {
+        let wallet = Wallet::from_seed(0, [7u8; 32]);
+        let message = "hello Vess \u{1f30d}".as_bytes();
+        let signature = wallet.sign_message(message).unwrap();
+        assert!(vess_crypto::verify(
+            wallet.public_key(),
+            MESSAGE_SIGNING_CONTEXT.as_bytes(),
+            message,
+            &signature,
+        ));
+        assert!(!vess_crypto::verify(
+            wallet.public_key(),
+            MESSAGE_SIGNING_CONTEXT.as_bytes(),
+            b"changed",
+            &signature,
+        ));
+        assert!(!vess_crypto::verify(
+            wallet.public_key(),
+            DOM_TRANSFER,
+            message,
+            &signature,
+        ));
+        assert!(!vess_crypto::verify(
+            wallet.public_key(),
+            DOM_STATE_UPDATE,
+            message,
+            &signature,
         ));
     }
 

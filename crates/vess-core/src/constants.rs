@@ -179,7 +179,7 @@ pub const BLOCK_BODY_RETENTION_SECONDS: u64 = 43_200;
 
 /// Default for `--prune-blocks`: bodies and undo records older than this many blocks below the tip
 /// are deleted. `0` keeps everything, which makes the node archival for bodies.
-pub const DEFAULT_PRUNE_BLOCKS: u64 = 1_024;
+pub const DEFAULT_PRUNE_BLOCKS: u64 = 16_384;
 
 /// Default for `--prune-headers`: a deliberately large number, so header pruning is off unless an
 /// operator asks for it. `0` means never.
