@@ -1013,7 +1013,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vess-consensus"
-version = "0.1.0"
+version = "0.0.1-testnet.1"
 dependencies = [
  "vess-core",
  "vess-crypto",
@@ -1023,14 +1023,14 @@ dependencies = [
 
 [[package]]
 name = "vess-core"
-version = "0.1.0"
+version = "0.0.1-testnet.1"
 dependencies = [
  "blake3",
 ]
 
 [[package]]
 name = "vess-crypto"
-version = "0.1.0"
+version = "0.0.1-testnet.1"
 dependencies = [
  "blake3",
  "getrandom 0.3.4",
@@ -1040,14 +1040,14 @@ dependencies = [
 
 [[package]]
 name = "vess-emission"
-version = "0.1.0"
+version = "0.0.1-testnet.1"
 dependencies = [
  "vess-core",
 ]
 
 [[package]]
 name = "vess-mempool"
-version = "0.1.0"
+version = "0.0.1-testnet.1"
 dependencies = [
  "vess-core",
  "vess-state",
@@ -1055,7 +1055,7 @@ dependencies = [
 
 [[package]]
 name = "vess-net"
-version = "0.1.0"
+version = "0.0.1-testnet.1"
 dependencies = [
  "blake3",
  "snow",
@@ -1065,7 +1065,7 @@ dependencies = [
 
 [[package]]
 name = "vess-node"
-version = "0.1.0"
+version = "0.0.1-testnet.1"
 dependencies = [
  "getrandom 0.3.4",
  "rpassword",
@@ -1086,14 +1086,14 @@ dependencies = [
 
 [[package]]
 name = "vess-state"
-version = "0.1.0"
+version = "0.0.1-testnet.1"
 dependencies = [
  "vess-core",
 ]
 
 [[package]]
 name = "vess-storage"
-version = "0.1.0"
+version = "0.0.1-testnet.1"
 dependencies = [
  "redb",
  "vess-consensus",
@@ -1103,7 +1103,7 @@ dependencies = [
 
 [[package]]
 name = "vess-wallet"
-version = "0.1.0"
+version = "0.0.1-testnet.1"
 dependencies = [
  "argon2",
  "bip39",

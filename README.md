@@ -18,13 +18,16 @@ It seeks to become the borderless, sovereign "stablecoin" of the digital age.
 
 ## Running a node
 
-Build with Rust:
+Download an archive for your platform from [GitHub Releases](https://github.com/ohmictech/vess/releases)
+and extract it to a writable directory. Release notes explain how to verify the download.
+Alternatively, build with Rust:
 
 ```sh
 cargo build --release
 ```
 
-Set the executable path for the examples below:
+Set the executable path for the examples below. For a downloaded archive, use the path to its
+extracted executable instead:
 
 ```sh
 # Linux or macOS
@@ -46,7 +49,7 @@ Start the node with:
 $BIN
 ```
 
-On first run, Vess creates `vess.toml` **beside the executable**: for this build, that is
+On first run, Vess creates `vess.toml` **beside the executable**: when built from source, that is
 `target/release/vess.toml`. It also creates the `chain` data directory beside the config. The
 generated settings are:
 

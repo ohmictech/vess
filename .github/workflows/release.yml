@@ -1,0 +1,130 @@
+name: Testnet release
+
+on:
+  push:
+    tags:
+      - "v*-testnet.*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and verify (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+          - platform: linux-aarch64
+            runner: ubuntu-24.04-arm
+          - platform: windows-x86_64
+            runner: windows-2022
+          - platform: macos-x86_64
+            runner: macos-15-intel
+          - platform: macos-aarch64
+            runner: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test release binary
+        run: cargo test --locked --release -p vess-node --test config
+      - name: Build release binary
+        run: cargo build --locked --release -p vess-node
+      - name: Check release version
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            binary=target/release/vess.exe
+          else
+            binary=target/release/vess
+          fi
+          "$binary" --help > help.txt
+          grep -Fq "vess $version " help.txt
+      - name: Package Unix binary
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p dist staging
+          cp target/release/vess README.md LICENSE staging/
+          tar -C staging -czf "dist/vess-${GITHUB_REF_NAME}-${{ matrix.platform }}.tar.gz" vess README.md LICENSE
+      - name: Package Windows binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist, staging | Out-Null
+          Copy-Item -Path target\release\vess.exe, README.md, LICENSE -Destination staging
+          Compress-Archive -Path staging\* -DestinationPath "dist\vess-$env:GITHUB_REF_NAME-${{ matrix.platform }}.zip"
+      - name: Attest archive provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vess-${{ matrix.platform }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish testnet prerelease
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: vess-*
+          merge-multiple: true
+      - name: Create checksums
+        shell: bash
+        run: |
+          cd dist
+          sha256sum vess-* > SHA256SUMS
+      - name: Attest checksum provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: dist/SHA256SUMS
+      - name: Publish prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          cat > notes.txt <<'EOF'
+          Experimental testnet software. Do not use valuable funds. The testnet may be reset, and
+          consensus or data formats may change between releases.
+
+          There is currently no built-in public testnet seed. Set `network = "testnet"` and a
+          reachable peer in `seeds` in `vess.toml`; a public network must be available separately.
+          Snapshot trust is enabled by default: a single connected peer can authorize a snapshot.
+          Set `trust_snapshot = false` if you do not want to trust peer-provided snapshots.
+
+          Extract the archive to a writable directory. Vess stores `vess.toml` and, by default,
+          chain data beside the executable. Preserve your config, chain data, and wallets when
+          upgrading. The archives are not OS code-signed or notarized.
+
+          Verify the archive and checksum file using GitHub's signed build attestations. Set
+          `TAG` to this release's tag and `ARCHIVE` to the downloaded archive's filename:
+
+          ```sh
+          gh attestation verify SHA256SUMS --repo ohmictech/vess --signer-workflow ohmictech/vess/.github/workflows/release.yml --source-ref "refs/tags/$TAG"
+          gh attestation verify "$ARCHIVE" --repo ohmictech/vess --signer-workflow ohmictech/vess/.github/workflows/release.yml --source-ref "refs/tags/$TAG"
+          ```
+
+          Then check the archive's SHA-256 against `SHA256SUMS`. Checksums alone do not
+          authenticate the publisher.
+          EOF
+          gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --prerelease \
+            --title "Vess $GITHUB_REF_NAME testnet" --notes-file notes.txt

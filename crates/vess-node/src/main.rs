@@ -23,8 +23,10 @@ use vess_node::{Node, bind_rpc, serve};
 use vess_wallet::{Keyring, NodeClient, RecoveryPhrase, Wallet};
 use zeroize::Zeroizing;
 
-const USAGE: &str = "\
-vess 0.1.0 — Vess reference node
+const USAGE: &str = concat!(
+    "vess ",
+    env!("CARGO_PKG_VERSION"),
+    " — Vess reference node
 
   vess [--config FILE]                 # run the configured node
   vess node init    [--datadir DIR] [--network devnet|testnet|mainnet]
@@ -69,7 +71,8 @@ Commands load vess.toml beside the executable (or --config FILE), creating it if
 except for offline signature verification.
 Config data paths are relative to the config; --datadir paths are relative to the working directory.
 Explicit options override the file for that invocation.
-";
+"
+);
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();

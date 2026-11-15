@@ -1,16 +1,79 @@
 use std::collections::HashSet;
+use std::ffi::OsStr;
+use std::io;
 use std::net::TcpListener;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-fn command(dir: &Path) -> Command {
+struct TestCommand(Command);
+
+impl TestCommand {
+    fn arg(&mut self, arg: impl AsRef<OsStr>) -> &mut Self {
+        self.0.arg(arg);
+        self
+    }
+
+    fn args<I, S>(&mut self, args: I) -> &mut Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        self.0.args(args);
+        self
+    }
+
+    fn env(&mut self, key: impl AsRef<OsStr>, value: impl AsRef<OsStr>) -> &mut Self {
+        self.0.env(key, value);
+        self
+    }
+
+    fn current_dir(&mut self, path: impl AsRef<Path>) -> &mut Self {
+        self.0.current_dir(path);
+        self
+    }
+
+    fn stdout(&mut self, output: Stdio) -> &mut Self {
+        self.0.stdout(output);
+        self
+    }
+
+    fn stderr(&mut self, output: Stdio) -> &mut Self {
+        self.0.stderr(output);
+        self
+    }
+
+    fn output(&mut self) -> io::Result<Output> {
+        retry_executable_busy(|| self.0.output())
+    }
+
+    fn spawn(&mut self) -> io::Result<Child> {
+        retry_executable_busy(|| self.0.spawn())
+    }
+}
+
+fn retry_executable_busy<T>(mut start: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    for attempt in 0..20 {
+        match start() {
+            Err(error) if error.kind() == io::ErrorKind::ExecutableFileBusy && attempt < 19 => {
+                if attempt == 0 {
+                    eprintln!("test executable is temporarily busy; retrying");
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            result => return result,
+        }
+    }
+    unreachable!()
+}
+
+fn command(dir: &Path) -> TestCommand {
     let exe = Path::new(env!("CARGO_BIN_EXE_vess"));
     let mut cmd = Command::new(dir.join(exe.file_name().unwrap()));
     cmd.current_dir(dir).env_remove("VESS_SEEDS");
-    cmd
+    TestCommand(cmd)
 }
 
 fn prepare(dir: &Path) {
@@ -43,13 +106,13 @@ impl Drop for Running {
     }
 }
 
-fn start(mut cmd: Command, port: u16) -> Running {
+fn start(mut cmd: TestCommand, port: u16) -> Running {
     start_with_log(&mut cmd, port, None)
 }
 
-fn start_with_log(cmd: &mut Command, port: u16, log: Option<&Path>) -> Running {
-    let dir = cmd.get_current_dir().unwrap().to_path_buf();
-    let executable = cmd.get_program().to_os_string();
+fn start_with_log(cmd: &mut TestCommand, port: u16, log: Option<&Path>) -> Running {
+    let dir = cmd.0.get_current_dir().unwrap().to_path_buf();
+    let executable = cmd.0.get_program().to_os_string();
     let stderr = match log {
         Some(path) => Stdio::from(std::fs::File::create(path).unwrap()),
         None => Stdio::null(),
@@ -57,13 +120,15 @@ fn start_with_log(cmd: &mut Command, port: u16, log: Option<&Path>) -> Running {
     let mut process = Running(cmd.stdout(Stdio::null()).stderr(stderr).spawn().unwrap());
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        if Command::new(&executable)
-            .current_dir(&dir)
-            .args(["node", "status", "--rpc", &format!("127.0.0.1:{port}")])
-            .output()
-            .unwrap()
-            .status
-            .success()
+        if retry_executable_busy(|| {
+            Command::new(&executable)
+                .current_dir(&dir)
+                .args(["node", "status", "--rpc", &format!("127.0.0.1:{port}")])
+                .output()
+        })
+        .unwrap()
+        .status
+        .success()
         {
             return process;
         }
@@ -74,6 +139,49 @@ fn start_with_log(cmd: &mut Command, port: u16, log: Option<&Path>) -> Running {
         assert!(Instant::now() < deadline, "node did not start");
         thread::sleep(Duration::from_millis(50));
     }
+}
+
+#[test]
+fn temporarily_busy_executable_is_retried_but_other_errors_are_not() {
+    let mut attempts = 0;
+    let result = retry_executable_busy(|| {
+        attempts += 1;
+        if attempts < 3 {
+            Err(io::Error::from(io::ErrorKind::ExecutableFileBusy))
+        } else {
+            Ok(())
+        }
+    });
+    assert!(result.is_ok());
+    assert_eq!(attempts, 3);
+
+    let mut attempts = 0;
+    let error = retry_executable_busy::<()>(|| {
+        attempts += 1;
+        Err(io::Error::from(io::ErrorKind::PermissionDenied))
+    })
+    .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    assert_eq!(attempts, 1);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn temporarily_busy_real_executable_can_be_started() {
+    let dir = tempfile::tempdir().unwrap();
+    prepare(dir.path());
+    let exe = Path::new(env!("CARGO_BIN_EXE_vess"));
+    let path = dir.path().join(exe.file_name().unwrap());
+    let writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    let error = Command::new(&path).arg("--help").output().unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::ExecutableFileBusy);
+    let release = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(150));
+        drop(writer);
+    });
+    let result = command(dir.path()).arg("--help").output();
+    release.join().unwrap();
+    assert!(result.unwrap().status.success());
 }
 
 #[test]
