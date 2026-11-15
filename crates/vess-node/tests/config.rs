@@ -162,6 +162,7 @@ fn bare_invocation_uses_config_and_first_run_flags_are_not_saved() {
     assert!(defaults.contains("rpc_port = 9733"));
     assert!(!defaults.contains("127.0.0.1:4"));
     assert!(defaults.contains("mine = false"));
+    assert!(defaults.contains("mine_threads = 1"));
     let mut settings: toml::Value = toml::from_str(&defaults).unwrap();
     settings["network"] = "testnet".into();
     settings["datadir"] = data.to_str().unwrap().into();
@@ -301,6 +302,10 @@ fn custom_config_overrides_and_invalid_files_are_explicit() {
         "network = \"testne\"\n",
         "rpc_prt = 1234\n",
         "mine = true\n",
+        "mine_threads = 0\n",
+        "mine_threads = 257\n",
+        "mine_threads = -1\n",
+        "mine_threads = \"two\"\n",
         "invalid toml\n",
     ] {
         std::fs::write(&custom, invalid).unwrap();
@@ -337,6 +342,7 @@ fn bare_start_creates_defaults_and_rejects_bad_options() {
     assert!(config.contains("datadir = \"./chain\""));
     assert!(config.contains("rpc_port = 9733"));
     assert!(config.contains("mine = false"));
+    assert!(config.contains("mine_threads = 1"));
     assert!(config.contains("trust_snapshot = true"));
     assert!(config.contains("seed.vess.invalid:9732"));
     for example in [
@@ -613,12 +619,13 @@ fn configured_peers_and_mining_work_without_arguments() {
             ports.push(port);
         }
     }
+
     let (rpc1, p2p1, rpc2, p2p2) = (ports[0], ports[1], ports[2], ports[3]);
     let payout = "55".repeat(32);
     std::fs::write(
         first.path().join("vess.toml"),
         format!(
-            "network = \"devnet\"\ndatadir = \"./chain\"\nrpc_port = {rpc1}\np2p_port = {p2p1}\nmine = true\npayout = \"{payout}\"\n"
+            "network = \"devnet\"\ndatadir = \"./chain\"\nrpc_port = {rpc1}\np2p_port = {p2p1}\nmine = true\nmine_threads = 2\npayout = \"{payout}\"\n"
         ),
     )
     .unwrap();
@@ -659,7 +666,10 @@ fn configured_peers_and_mining_work_without_arguments() {
                 .parse::<u64>()
                 .unwrap()
         };
-        if value(&status, "peers_outbound=") > 0 && value(&account, "balance=") > 0 {
+        if value(&status, "peers_outbound=") > 0
+            && value(&status, "height=") > 0
+            && value(&account, "balance=") > 0
+        {
             break;
         }
         assert!(
@@ -667,5 +677,42 @@ fn configured_peers_and_mining_work_without_arguments() {
             "configured mining or peer connection did not start"
         );
         thread::sleep(Duration::from_millis(200));
+    }
+}
+
+#[test]
+fn configured_mining_workers_both_produce_blocks() {
+    for (configured, override_cli) in [(2, false), (1, true)] {
+        let dir = tempfile::tempdir().unwrap();
+        prepare(dir.path());
+        let port = unused_port();
+        let payout = "56".repeat(32);
+        std::fs::write(
+            dir.path().join("vess.toml"),
+            format!(
+                "network = \"devnet\"\nrpc_port = {port}\np2p_port = 0\nmine = true\nmine_threads = {configured}\npayout = \"{payout}\"\n"
+            ),
+        )
+        .unwrap();
+        let log = dir.path().join("miner.log");
+        let mut node = command(dir.path());
+        node.env("VESS_LOG", "debug");
+        if override_cli {
+            node.args(["--mine-threads", "2"]);
+        }
+        let _node = start_with_log(&mut node, port, Some(&log));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let text = std::fs::read_to_string(&log).unwrap();
+            if text.contains("worker 0 mined block") && text.contains("worker 1 mined block") {
+                assert!(text.contains("started 2 mining worker(s)"));
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "both workers did not mine: {text}"
+            );
+            thread::sleep(Duration::from_millis(100));
+        }
     }
 }

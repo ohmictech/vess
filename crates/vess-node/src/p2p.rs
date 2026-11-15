@@ -2006,8 +2006,27 @@ pub fn sync_once(node: &Arc<Mutex<Node>>, addr: &str, listen_port: u16) -> Resul
     Ok(applied)
 }
 
+const MINING_ATTEMPTS_PER_SEARCH: u64 = 200_000_000;
+
+fn worker_nonce(worker: u64) -> [u8; 32] {
+    // Reserve the high eight bytes for the worker and the low eight for its search counter.
+    let mut nonce = [0; 32];
+    nonce[..8].copy_from_slice(&worker.to_be_bytes());
+    nonce
+}
+
+fn next_worker_nonce(nonce: &mut [u8; 32], attempts: u64) -> bool {
+    let counter = u64::from_be_bytes(nonce[24..].try_into().expect("eight nonce bytes"));
+    let Some(next) = counter.checked_add(attempts) else {
+        return false;
+    };
+    nonce[24..].copy_from_slice(&next.to_be_bytes());
+    true
+}
+
 /// Mine on top of the shared node until the process ends.
-pub fn mine(node: Arc<Mutex<Node>>, payout: AccountId) {
+pub fn mine(node: Arc<Mutex<Node>>, payout: AccountId, worker: u64) {
+    let mut nonce = worker_nonce(worker);
     loop {
         let started = std::time::Instant::now();
         let next = {
@@ -2023,14 +2042,29 @@ pub fn mine(node: Arc<Mutex<Node>>, payout: AccountId) {
             }
         };
         let signal = lock(&node).tip_signal();
+        template.header.security_nonce = nonce;
         let result = loop {
-            let result = crate::mine_fresh(&mut template.header, 200_000_000, started, |parent| {
-                Ok::<_, std::convert::Infallible>(signal.current() != *parent)
-            })
+            let mut limit = template.header.security_nonce;
+            if !next_worker_nonce(&mut limit, MINING_ATTEMPTS_PER_SEARCH + 1) {
+                crate::log_error!("miner", "worker {worker} exhausted its nonce space");
+                return;
+            }
+            let result = crate::mine_fresh(
+                &mut template.header,
+                MINING_ATTEMPTS_PER_SEARCH,
+                started,
+                |parent| Ok::<_, std::convert::Infallible>(signal.current() != *parent),
+            )
             .expect("infallible tip check");
+            nonce = template.header.security_nonce;
+            if !next_worker_nonce(&mut nonce, 1) {
+                crate::log_error!("miner", "worker {worker} exhausted its nonce space");
+                return;
+            }
             if !matches!(result, crate::MiningResult::Exhausted) {
                 break result;
             }
+            template.header.security_nonce = nonce;
         };
         match result {
             crate::MiningResult::Refresh => continue,
@@ -2042,7 +2076,7 @@ pub fn mine(node: Arc<Mutex<Node>>, payout: AccountId) {
                     Ok(Some(id)) => {
                         crate::log_debug!(
                             "miner",
-                            "mined block {} at height {height}",
+                            "worker {worker} mined block {} at height {height}",
                             hex_short(&id)
                         )
                     }
@@ -2104,6 +2138,59 @@ mod tests {
         assert!(template.mine(20_000_000));
         let bytes = template.encode();
         guard.accept_block(&bytes).unwrap()
+    }
+
+    #[test]
+    fn mining_workers_have_disjoint_nonce_ranges_and_do_not_wrap() {
+        let mut first = worker_nonce(0);
+        let mut second = worker_nonce(1);
+        assert_ne!(first, second);
+        assert!(next_worker_nonce(&mut first, MINING_ATTEMPTS_PER_SEARCH));
+        assert!(next_worker_nonce(&mut second, 1));
+        assert_ne!(&first[..8], &second[..8]);
+        assert_eq!(&first[8..24], &[0; 16]);
+        first[24..].copy_from_slice(&u64::MAX.to_be_bytes());
+        let exhausted = first;
+        assert!(!next_worker_nonce(&mut first, 1));
+        assert_eq!(first, exhausted);
+    }
+
+    #[test]
+    fn concurrent_mining_submissions_accept_only_one_winner() {
+        let dir = TempDir::new("mining-winners");
+        let node = shared(&dir.0);
+        let (template, _) = {
+            let guard = lock(&node);
+            guard
+                .template(&[0x41; 32], guard.next_timestamp_ms())
+                .unwrap()
+        };
+        let mut blocks = Vec::new();
+        for worker in 0..2 {
+            let mut candidate = template.clone();
+            candidate.header.security_nonce = worker_nonce(worker);
+            assert!(candidate.mine(20_000_000));
+            blocks.push(candidate.encode());
+        }
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let threads: Vec<_> = blocks
+            .into_iter()
+            .map(|block| {
+                let node = node.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    lock(&node).accept_mined_block(&block).unwrap()
+                })
+            })
+            .collect();
+        let accepted = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .filter(Option::is_some)
+            .count();
+        assert_eq!(accepted, 1);
+        assert_eq!(lock(&node).height(), 1);
     }
 
     fn wait_until(what: &str, mut done: impl FnMut() -> bool) {

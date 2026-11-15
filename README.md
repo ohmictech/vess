@@ -58,6 +58,7 @@ p2p_port = 9732
 peers = []
 seeds = []
 mine = false
+mine_threads = 1
 trust_snapshot = true
 
 # Optional settings
@@ -79,28 +80,23 @@ To generate the config **before** starting a node or creating a chain, run `$BIN
 instead. Edit the resulting file, then run `$BIN`.
 
 To mine continuously, first create a wallet as described below, then set `mine = true` and
-`payout = "YOUR_ACCOUNT_ADDRESS"` in the config. Leave `mine = false` to run without mining.
+`payout = "YOUR_ACCOUNT_ADDRESS"` in the config. Set `mine_threads` to the number of CPU workers
+to use (1–256; default 1), or override it for one run with `--mine-threads N`. This setting applies
+to the continuous node miner; the separate `vess miner` command uses one worker. Leave
+`mine = false` to run without mining.
 Never put a wallet password or recovery phrase in the config.
 
-The optional pruning settings retain the database's saved policy when commented out. A new database
-defaults to retaining 16,384 block bodies; set both `prune_blocks = 0` and `prune_headers = 0`
-before pruning to keep all history. Mining resumes immediately after a block; the obsolete
-`mine_interval` setting is ignored with a warning.
+By default, new nodes retain 16,384 block bodies. To keep all history, set `prune_blocks = 0` and
+`prune_headers = 0` before any blocks are pruned. Existing databases retain their saved pruning
+policy unless you change it; increasing retention cannot restore deleted blocks.
 
-Command-line options override config settings for that invocation only and are not saved.
-`--config FILE` selects another config; `--no-mine` and `--no-trust-snapshot` temporarily disable
-those settings. A relative `datadir` in the config is relative to the config file, while relative
-`--config` and `--datadir` paths are relative to the working directory.
+Config data paths are relative to the config file. Command-line options override config settings
+for one run; `--config FILE` selects another config. If upgrading from a build that stored data in
+the working directory, back it up and use `--config` and, if needed, `--datadir` to keep using it.
 
-Earlier builds placed the config and relative data directory in the working directory. To keep using
-them, pass `--config` with the old config path, and if needed `--datadir` with the old data path, or
-set an absolute `datadir` in the config. You can instead move them together beside the executable.
-Back up wallets and data before moving them.
-
-Trusted snapshots require a majority of connected peer identities; a single connected peer can
-authorize one. These identities are not proof of independent ownership: an eclipse or Sybil attack
-can still supply a false state. Snapshot history is verified in the background when historical blocks
-are available; until then, the state remains trusted rather than fully verified.
+Snapshot trust is enabled by default. A single connected peer can authorize a snapshot, so a
+malicious peer can supply false state. History is verified in the background when available; until
+then, the snapshot remains trusted. Set `trust_snapshot = false` to disable this behavior.
 
 ### Wallet
 
@@ -148,8 +144,7 @@ $BIN --help
 ```
 
 `node history` shows snapshot verification progress: `pending` and `not_tracked` do not mean
-verified, and invalid history stops normal node operation. Previously pruned blocks cannot be
-restored by increasing retention. RPC listens only on loopback and has no authentication; keep
-your system clock synchronized and use compatible node versions.
+verified, and invalid history stops normal node operation. RPC listens only on loopback and has no
+authentication. Keep your system clock synchronized and use compatible node versions.
 
 Vess is experimental and unaudited. Do not use it for valuable funds.

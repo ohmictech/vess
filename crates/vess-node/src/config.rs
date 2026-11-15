@@ -18,6 +18,7 @@ struct Config {
     peers: Vec<String>,
     seeds: Vec<String>,
     mine: bool,
+    mine_threads: u16,
     payout: Option<String>,
     trust_snapshot: bool,
     prune_blocks: Option<u64>,
@@ -35,6 +36,7 @@ impl Default for Config {
             peers: Vec::new(),
             seeds: Vec::new(),
             mine: false,
+            mine_threads: 1,
             payout: None,
             trust_snapshot: true,
             prune_blocks: None,
@@ -51,6 +53,9 @@ impl Config {
         }
         if self.datadir.is_empty() {
             return Err("config datadir must not be empty".into());
+        }
+        if !(1..=256).contains(&self.mine_threads) {
+            return Err("config mine_threads must be between 1 and 256".into());
         }
         if let Some(payout) = &self.payout {
             parse_hash(payout).map_err(|e| format!("invalid config payout: {e}"))?;
@@ -134,6 +139,11 @@ impl Config {
         if self.mine && args.get("no-mine").is_none() {
             args.set_default("mine", "true");
         }
+        args.set_default("mine-threads", &self.mine_threads.to_string());
+        args.require_value("mine-threads")?;
+        if !(1..=256).contains(&args.number("mine-threads", 1)?) {
+            return Err("--mine-threads must be between 1 and 256".into());
+        }
         if let Some(payout) = &self.payout {
             args.set_default("payout", payout);
         }
@@ -189,6 +199,7 @@ pub(super) fn configure(args: &mut Args, node_run: bool) -> Result<(), String> {
             "peer",
             "seed",
             "mine",
+            "mine-threads",
             "no-mine",
             "payout",
             "trust-snapshot",
@@ -319,6 +330,7 @@ mod tests {
         let config = Config {
             network: "testnet".into(),
             mine: true,
+            mine_threads: 4,
             payout: Some("12".repeat(32)),
             peers: vec!["127.0.0.1:8000".into()],
             seeds: vec!["127.0.0.1:8001".into()],
@@ -336,6 +348,8 @@ mod tests {
             "",
             "--prune-blocks",
             "0",
+            "--mine-threads",
+            "2",
         ]);
         config
             .apply(&mut args, true, &std::env::current_dir().unwrap())
@@ -346,6 +360,39 @@ mod tests {
         assert_eq!(args.get("peer"), Some(""));
         assert_eq!(args.get("seed"), Some("127.0.0.1:8001"));
         assert_eq!(args.get("prune-blocks"), Some("0"));
+        assert_eq!(args.get("mine-threads"), Some("2"));
+    }
+
+    #[test]
+    fn mining_thread_count_defaults_and_validation() {
+        let dir = std::env::current_dir().unwrap();
+        let default: Config = toml::from_str("").unwrap();
+        let mut defaults = args(&[]);
+        default.validate().unwrap();
+        default.apply(&mut defaults, true, &dir).unwrap();
+        assert_eq!(defaults.get("mine-threads"), Some("1"));
+
+        for value in [0, 257] {
+            let config = Config {
+                mine_threads: value,
+                ..Config::default()
+            };
+            assert!(config.validate().unwrap_err().contains("mine_threads"));
+        }
+        let mut invalid = args(&["--mine-threads", "0"]);
+        assert!(default.apply(&mut invalid, true, &dir).is_err());
+        let mut invalid = args(&["--mine-threads", "257"]);
+        assert!(default.apply(&mut invalid, true, &dir).is_err());
+        let mut invalid = args(&["--mine-threads"]);
+        assert!(default.apply(&mut invalid, true, &dir).is_err());
+        let mut configured = args(&[]);
+        let config = Config {
+            mine_threads: 256,
+            ..Config::default()
+        };
+        config.validate().unwrap();
+        config.apply(&mut configured, true, &dir).unwrap();
+        assert_eq!(configured.get("mine-threads"), Some("256"));
     }
 
     #[test]

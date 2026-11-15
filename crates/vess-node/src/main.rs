@@ -29,6 +29,7 @@ vess 0.1.0 — Vess reference node
   vess [--config FILE]                 # run the configured node
   vess node init    [--datadir DIR] [--network devnet|testnet|mainnet]
   vess node run     [--datadir DIR] [--network ...] [--rpc PORT] [--port P2P] [--peer A,B] [--mine --payout HEX]
+                    [--mine-threads N]   # 1-256 CPU workers
                     [--prune-blocks N] [--prune-headers N] [--trust-snapshot]   # 0 = keep everything
                     [--seed A,B]   # extra bootstrap peers; VESS_SEEDS also works
                     [--no-mine] [--no-trust-snapshot]   # snapshot trust defaults on
@@ -468,8 +469,15 @@ fn node_run(args: &Args) -> Result<(), String> {
 
     if args.get("mine").is_some() {
         let payout = parse_hash(args.require("payout")?)?;
-        let miner = shared.clone();
-        std::thread::spawn(move || vess_node::p2p::mine(miner, payout));
+        let workers = args.number("mine-threads", 1)?;
+        for worker in 0..workers {
+            let miner = shared.clone();
+            std::thread::Builder::new()
+                .name(format!("vess-miner-{worker}"))
+                .spawn(move || vess_node::p2p::mine(miner, payout, worker))
+                .map_err(|e| format!("cannot start mining worker {worker}: {e}"))?;
+        }
+        vess_node::log_info!("miner", "started {workers} mining worker(s)");
     }
 
     serve(shared, rpc_listener).map_err(|e| e.to_string())
@@ -1196,6 +1204,9 @@ fn wallet_set_state(args: &Args) -> Result<(), String> {
 }
 
 fn miner(args: &Args) -> Result<(), String> {
+    if args.get("mine-threads").is_some() {
+        return Err("--mine-threads applies to node run, not the separate miner command".into());
+    }
     let network = network(args)?;
     let payout = parse_hash(args.require("payout")?)?;
     let blocks = args.number("blocks", 1)?;
