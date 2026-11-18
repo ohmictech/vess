@@ -13,7 +13,7 @@ use std::path::Path;
 
 use bip39::{Language, Mnemonic};
 use vess_core::codec::{Reader, Writer};
-use vess_core::constants::PROTOCOL_VERSION;
+use vess_core::constants::{PROTOCOL_VERSION, TRANSACTION_VERSION, TX_PAYLOAD_BYTES};
 use vess_core::hash::{self, DOM_STATE_UPDATE, DOM_TRANSFER};
 use vess_core::{AccountId, Hash, PublicKey, Signature, StateUpdate, Transfer};
 use vess_crypto::Key;
@@ -258,8 +258,22 @@ impl Wallet {
         nonce: u64,
         expiry_unix: u64,
     ) -> Transfer {
+        self.build_transfer_with_payload(recipient, amount, fee, nonce, expiry_unix, None)
+    }
+
+    /// A transfer carrying an optional 32-byte application payload. The payload is inside the signed
+    /// body, so it cannot be altered without invalidating the signature or the transaction id.
+    pub fn build_transfer_with_payload(
+        &self,
+        recipient: AccountId,
+        amount: u64,
+        fee: u64,
+        nonce: u64,
+        expiry_unix: u64,
+        payload: Option<[u8; TX_PAYLOAD_BYTES]>,
+    ) -> Transfer {
         let mut tx = Transfer {
-            version: PROTOCOL_VERSION,
+            version: TRANSACTION_VERSION,
             chain_id: self.chain_id(),
             sender_public_key: self.public_key,
             recipient_account_id: recipient,
@@ -267,6 +281,7 @@ impl Wallet {
             fee,
             nonce,
             expiry_unix,
+            payload,
             signature: [0u8; vess_core::constants::ML_DSA_SIG_BYTES],
         };
         tx.signature = vess_crypto::sign(&self.key, DOM_TRANSFER, &tx.unsigned_bytes())

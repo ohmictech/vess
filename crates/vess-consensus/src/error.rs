@@ -10,6 +10,18 @@ pub enum TxReject {
     BadChainId,
     BadSignature,
     BadAccountBinding,
+    /// The revealed rules are not the version this protocol understands.
+    BadRules,
+    /// A claim presented a preimage that does not open the lock.
+    PreimageMismatch,
+    /// The claim window has closed; only the owner path is open.
+    ClaimWindowClosed,
+    /// The escrow spend names a destination the rules do not allow.
+    WrongDestination,
+    /// The submitter asked for more than the rules permit.
+    FeeTooHigh,
+    /// A rules account must be spent in full.
+    PartialSpend,
     InvalidState(StateError),
 }
 
@@ -43,6 +55,12 @@ impl fmt::Display for TxReject {
             TxReject::BadChainId => f.write_str("transaction belongs to another chain"),
             TxReject::BadSignature => f.write_str("invalid signature"),
             TxReject::BadAccountBinding => f.write_str("public key does not match the account"),
+            TxReject::BadRules => f.write_str("unsupported escrow rules version"),
+            TxReject::PreimageMismatch => f.write_str("preimage does not open the hash lock"),
+            TxReject::ClaimWindowClosed => f.write_str("claim window is closed"),
+            TxReject::WrongDestination => f.write_str("escrow spend names the wrong destination"),
+            TxReject::FeeTooHigh => f.write_str("fee exceeds the escrow rules"),
+            TxReject::PartialSpend => f.write_str("escrow balance must be spent in full"),
             TxReject::InvalidState(e) => write!(f, "state rejection: {e}"),
         }
     }

@@ -744,7 +744,7 @@ impl Node {
             .chain
             .main_header_at(height)
             .ok_or(NodeError::UnknownParent)?;
-        if height != self.chain.best_height() {
+        if height > self.chain.best_height() {
             return Err(NodeError::SnapshotNotAtTip);
         }
         if height <= self.state_height() {
@@ -1137,10 +1137,19 @@ impl Node {
     /// Whether this block's body is still worth fetching: it must be above the state (blocks at or
     /// below it are already applied, and genesis has no body at all) and not already stored.
     pub fn needs_body(&self, id: &Hash) -> bool {
+        self.needs_body_above(id, self.next_body_height().unwrap_or(u64::MAX))
+    }
+
+    /// `needs_body` with the replay floor supplied by the caller.
+    ///
+    /// The floor is the fork point plus one, not the state height: after a reorg the new branch is
+    /// replayed from where it split off, so its blocks below our old tip still need bodies. Callers
+    /// that check many blocks in a row compute the floor once instead of walking the chain per block.
+    pub fn needs_body_above(&self, id: &Hash, floor: u64) -> bool {
         let Some(meta) = self.chain.meta(id) else {
             return false;
         };
-        meta.height > self.state_height() && !self.has_body(id)
+        meta.height >= floor && !self.has_body(id)
     }
 
     /// What this node advertises to a peer.
@@ -1257,7 +1266,7 @@ impl Node {
     /// Separate from [`Self::apply_transfer`] so a caller can run the expensive ML-DSA verification
     /// before taking the node lock.
     pub fn check_transfer(network: NetworkProfile, tx: &Transfer) -> Result<(), NodeError> {
-        if tx.version != vess_core::constants::PROTOCOL_VERSION {
+        if !vess_core::types::transaction_version_supported(tx.version) {
             return Err(NodeError::Malformed("unsupported version"));
         }
         if tx.chain_id != hash::chain_id(network.network) {
@@ -1578,6 +1587,7 @@ impl Node {
                     info.recipient_id = t.recipient_account_id;
                     info.amount = t.amount;
                     info.fee = t.fee;
+                    info.payload = t.payload;
                 }
                 Transaction::StateUpdate(t) => {
                     info.sender_id = t.sender_id();

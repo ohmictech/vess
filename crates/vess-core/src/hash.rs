@@ -23,6 +23,7 @@ pub const DOM_STATE_NODE: &[u8] = b"VESS-STATE-NODE-V1";
 pub const DOM_NETWORK_FRAME: &[u8] = b"VESS-NETWORK-FRAME-V1";
 pub const DOM_RPC_FRAME: &[u8] = b"VESS-RPC-FRAME-V1";
 pub const DOM_DEV_FEE_ACCOUNT: &[u8] = b"VESS-DEV-FEE-ACCOUNT-V1";
+pub const DOM_RULES_ACCOUNT: &[u8] = b"VESS-RULES-ACCOUNT-V1";
 
 /// `BLAKE3(domain || part_0 || part_1 || ...)`.
 pub fn tagged(domain: &[u8], parts: &[&[u8]]) -> Hash {
@@ -50,6 +51,17 @@ pub fn dev_fee_placeholder_account() -> AccountId {
 
 pub fn account_id(public_key: &PublicKey) -> AccountId {
     tagged(DOM_ACCOUNT, &[public_key.as_slice()])
+}
+
+/// The account an escrow's rules own. No key hashes to this value, so only the rules can spend it.
+pub fn rules_account_id(canonical_rules: &[u8]) -> AccountId {
+    tagged(DOM_RULES_ACCOUNT, &[canonical_rules])
+}
+
+/// The hash a rules account locks against. Deliberately undomained so the same 32-byte secret can
+/// be committed with the same function on a chain that only knows BLAKE3.
+pub fn hash_lock(preimage: &[u8]) -> Hash {
+    *blake3::hash(preimage).as_bytes()
 }
 
 /// Transaction identity.

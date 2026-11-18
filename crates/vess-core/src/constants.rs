@@ -4,6 +4,31 @@ use crate::u256::U256;
 
 pub const PROTOCOL_VERSION: u16 = 3;
 
+/// Transaction version that carries the optional [`TX_PAYLOAD_BYTES`] payload. Transactions at
+/// [`PROTOCOL_VERSION`] (the pre-payload layout) are still accepted, so history written before the
+/// payload existed keeps verifying byte for byte.
+pub const TRANSACTION_VERSION_PAYLOAD: u16 = 4;
+
+/// Transaction version that replaces the mandatory sender key and signature with a tagged
+/// authority: either a signature, or the rules prefixed to an escrow account id.
+pub const TRANSACTION_VERSION: u16 = 5;
+
+/// The optional application payload a transfer can carry.
+pub const TX_PAYLOAD_BYTES: usize = 32;
+
+/// The revealing secret of a rules account. Same size as the hash it commits to.
+pub const PREIMAGE_BYTES: usize = 32;
+
+/// Version of the [`crate::types::Rules`] struct. A rules account commits to exactly these bytes.
+pub const RULES_VERSION: u8 = 1;
+
+/// Canonical size of a version 1 rules struct: `1 + 32 + 8 + 32 + 32 + 8`.
+pub const RULES_BYTES: usize = 113;
+
+/// Authority tags inside a version 5 transfer.
+pub const AUTHORITY_SIGNATURE: u8 = 0;
+pub const AUTHORITY_RULES: u8 = 1;
+
 // ---------------------------------------------------------------- networks
 
 pub const NETWORK_DEVNET: u8 = 0;

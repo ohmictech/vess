@@ -42,11 +42,24 @@ impl std::fmt::Display for NetError {
 
 impl std::error::Error for NetError {}
 
+/// Whether a socket error only means "nothing arrived yet".
+///
+/// Blocking sockets usually report a read timeout as `WouldBlock` or `TimedOut`, but Windows can
+/// surface `WSA_IO_PENDING` (997) from a timed `peek`/read instead. Treating that as a real error
+/// tears down a perfectly healthy peer session, so it counts as idle here.
+pub fn is_idle(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    ) || error.raw_os_error() == Some(997)
+}
+
 impl From<std::io::Error> for NetError {
     fn from(e: std::io::Error) -> Self {
-        match e.kind() {
-            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => NetError::Timeout,
-            _ => NetError::Io(e.to_string()),
+        if is_idle(&e) {
+            NetError::Timeout
+        } else {
+            NetError::Io(e.to_string())
         }
     }
 }
@@ -104,12 +117,7 @@ pub fn read_frame<R: Read>(
     match stream.read(&mut first) {
         Ok(0) => return Err(NetError::Io("peer closed the connection".into())),
         Ok(_) => {}
-        Err(e)
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-            ) =>
-        {
+        Err(e) if is_idle(&e) => {
             return Err(NetError::Timeout);
         }
         Err(e) => return Err(NetError::Io(e.to_string())),
@@ -356,6 +364,9 @@ pub struct TransactionInfo {
     pub fee: u64,
     /// The new account commitment of a state update. Zero for a transfer.
     pub new_state_hash: Hash,
+    /// The optional 32-byte application payload carried by a transfer. `None` for state updates and
+    /// for any transaction written before the payload existed.
+    pub payload: Option<Hash>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -634,6 +645,13 @@ impl Encode for Reply {
                 w.u64(t.fee);
                 w.fixed(&t.new_state_hash);
                 w.u8(t.status);
+                match &t.payload {
+                    Some(payload) => {
+                        w.u8(1);
+                        w.fixed(payload);
+                    }
+                    None => w.u8(0),
+                }
             }
             ReplyBody::Tip { tip, height } => {
                 w.u8(8);
@@ -756,19 +774,32 @@ impl Decode for Reply {
                 } else {
                     (None, None, 0)
                 };
+                let kind = r.u8()?;
+                let sender_id = r.array()?;
+                let recipient_id = r.array()?;
+                let amount = r.u64()?;
+                let fee = r.u64()?;
+                let new_state_hash = r.array()?;
+                let status = r.u8()?;
+                let payload = match r.u8()? {
+                    0 => None,
+                    1 => Some(r.array()?),
+                    _ => return Err(CodecError::InvalidValue),
+                };
                 ReplyBody::Transaction(TransactionInfo {
                     transaction_id,
                     in_mempool,
                     block_id,
                     height,
                     confirmations,
-                    kind: r.u8()?,
-                    sender_id: r.array()?,
-                    recipient_id: r.array()?,
-                    amount: r.u64()?,
-                    fee: r.u64()?,
-                    new_state_hash: r.array()?,
-                    status: r.u8()?,
+                    kind,
+                    sender_id,
+                    recipient_id,
+                    amount,
+                    fee,
+                    new_state_hash,
+                    status,
+                    payload,
                 })
             }
             8 => ReplyBody::Tip {
@@ -1309,6 +1340,7 @@ mod tests {
                 fee: 2,
                 new_state_hash: [0u8; 32],
                 status: 2,
+                payload: Some([0xAAu8; 32]),
             })),
             Reply::ok(ReplyBody::Transaction(TransactionInfo {
                 transaction_id: [5u8; 32],

@@ -373,8 +373,13 @@ impl Store {
                 continue; // genesis is seeded by `Chain::new`
             }
             let header = BlockHeader::decode(&bytes)?;
-            chain.insert(header)?;
+            // Validate against the parents already adopted above, then store without re-selecting
+            // the best tip: `insert` rebuilds the main chain on every header, which makes loading
+            // quadratic. `finish_loading` picks the tip once, after the last header.
+            let meta = chain.validate_header(&header)?;
+            chain.adopt(header, meta.height, meta.chain_work);
         }
+        chain.finish_loading();
         // Headers below the prune boundary are gone from disk, so they must be gone from memory
         // too: a chain that claims headers it cannot serve would answer peers with ghosts.
         chain.prune_below(oldest);

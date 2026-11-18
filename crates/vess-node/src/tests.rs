@@ -375,6 +375,40 @@ fn a_transfer_flows_from_wallet_to_block_to_balance() {
     assert_eq!(node.account_info(&alice.account_id()).next_nonce, 1);
 }
 
+/// A transfer's optional payload is signed, survives the block body, and is reported back by the
+/// transaction lookup a scanner uses.
+#[test]
+fn a_transfer_payload_reaches_the_block_and_the_lookup() {
+    let (_dir, mut node) = node();
+    let alice = Wallet::from_seed(0, [0x38u8; 32]);
+    let bob = [0xB9u8; 32];
+    mine_one(&mut node, &alice.account_id());
+
+    let payload = [0x5Au8; 32];
+    let tx = alice.build_transfer_with_payload(bob, 1, 0, 0, 0, Some(payload));
+    let txid = tx.tx_id();
+    let reply = node.handle_rpc(Request::SubmitTransfer(tx));
+    assert!(reply.is_ok(), "transfer rejected: reason {}", reply.reason);
+    assert_eq!(node.transaction_info(&txid).payload, Some(payload));
+
+    let (template, _) = node
+        .template(&alice.account_id(), node.next_timestamp_ms())
+        .unwrap();
+    match vess_consensus::decode_body(&template.body)
+        .unwrap()
+        .as_slice()
+    {
+        [Transaction::Transfer(t)] => assert_eq!(t.payload, Some(payload)),
+        other => panic!("expected one transfer, got {other:?}"),
+    }
+
+    mine_one(&mut node, &alice.account_id());
+    let info = node.transaction_info(&txid);
+    assert_eq!(info.status, vess_net::tx_status::MINED);
+    assert_eq!(info.payload, Some(payload));
+    assert_eq!(node.balance(&bob), 1);
+}
+
 /// A block pays its miner `reward - dev_fee`, and the fee lands on the hard-coded dev account.
 #[test]
 fn the_dev_fee_reporting_matches_consensus() {
@@ -1686,9 +1720,12 @@ fn a_snapshot_that_does_not_match_its_header_is_refused() {
     // The honest snapshot is accepted, and only at the tip of the chain we validated.
     let frames = a.lock().unwrap().snapshot_frames();
     let (_, snapshot) = decode_snapshot(&frames);
+    // A snapshot is anchored to the header at its own height, not to our tip: requiring the exact
+    // moving tip would make joining a mining peer impossible. A snapshot for another height is
+    // therefore refused for its root, not for its height.
     assert!(matches!(
         b.install_snapshot(height - 1, snapshot.clone()),
-        Err(NodeError::SnapshotNotAtTip)
+        Err(NodeError::SnapshotMismatch)
     ));
     assert!(matches!(
         b.install_snapshot(height + 5, snapshot.clone()),
@@ -1703,4 +1740,36 @@ fn a_snapshot_that_does_not_match_its_header_is_refused() {
         ),
         "installing the same snapshot twice is refused"
     );
+}
+
+/// A peer that keeps mining never advertises the tip we just synced, so a snapshot has to be
+/// installable at a height below our own tip. It is still checked against that height's header.
+#[test]
+fn a_snapshot_below_the_tip_is_accepted_when_it_matches_its_own_height() {
+    let dir_a = TempDir::new();
+    let dir_b = TempDir::new();
+    let a = Arc::new(Mutex::new(
+        Node::open(&dir_a.path, NetworkProfile::DEVNET).unwrap(),
+    ));
+    let mut b = Node::open(&dir_b.path, NetworkProfile::DEVNET).unwrap();
+    b.set_trust_snapshots(true);
+
+    let payout = [0x64u8; 32];
+    for _ in 0..2 {
+        let timestamp = a.lock().unwrap().next_timestamp_ms();
+        let (mut template, _) = a.lock().unwrap().template(&payout, timestamp).unwrap();
+        assert!(template.mine(20_000_000));
+        let bytes = template.encode();
+        a.lock().unwrap().accept_block(&bytes).unwrap();
+    }
+    for header in a.lock().unwrap().headers_from(0, 64) {
+        b.insert_header_only(header).unwrap();
+    }
+    assert_eq!(b.height(), 2);
+
+    let first = a.lock().unwrap().headers_from(1, 1)[0].id();
+    let state_at_first = a.lock().unwrap().state_at(&first).unwrap();
+    b.install_snapshot(1, state_at_first).unwrap();
+    assert_eq!(b.state_height(), 1);
+    assert_eq!(b.height(), 2, "the header tip is untouched by a snapshot");
 }

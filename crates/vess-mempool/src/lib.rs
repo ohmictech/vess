@@ -280,6 +280,7 @@ mod tests {
             fee,
             nonce,
             expiry_unix: 0,
+            payload: None,
             signature: [0u8; ML_DSA_SIG_BYTES],
         })
     }

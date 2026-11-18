@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use vess_core::constants::{
     MAX_BLOCK_BYTES, ML_DSA_PK_BYTES, ML_DSA_SIG_BYTES, NetworkProfile, P2P_DEFAULT_PORT,
-    RPC_DEFAULT_PORT,
+    RPC_DEFAULT_PORT, TX_PAYLOAD_BYTES,
 };
 use vess_core::hash::chain_id;
 use vess_core::{AccountId, BlockHeader, Hash, Transaction};
@@ -55,6 +55,7 @@ const USAGE: &str = concat!(
                           # --proof - reads wallet sign output from stdin
   vess wallet balance     [--datadir DIR] --name NAME [--index N] [--rpc ADDR] [--password-*]
   vess wallet send        [--datadir DIR] --name NAME --to HEX --amount N [--fee N] [--index N] [--rpc ADDR] [--password-*]
+                          [--payload HEX32]   # optional 32-byte payload, signed with the transfer
   vess wallet set-state   [--datadir DIR] --name NAME --state-hash HEX [--fee N] [--rpc ADDR] [--password-*]
   vess wallet watch       [--datadir DIR] --name NAME --rpc ADDR [--count N] [--timeout MS] [--password-*]
 
@@ -599,6 +600,9 @@ fn node_transaction(args: &Args) -> Result<(), String> {
                 if info.kind == 1 {
                     println!("recipient={}", hex(&info.recipient_id));
                     println!("amount={}", info.amount);
+                    if let Some(payload) = &info.payload {
+                        println!("payload={}", hex(payload));
+                    }
                 } else {
                     println!("new_state_hash={}", hex(&info.new_state_hash));
                 }
@@ -1107,9 +1111,14 @@ fn wallet_send(args: &Args) -> Result<(), String> {
         return Err("--amount must be positive".into());
     }
     let fee = args.number("fee", 0)?;
+    let payload = match args.get("payload") {
+        None => None,
+        Some(value) => Some(fixed_hex::<TX_PAYLOAD_BYTES>(value, "--payload")?),
+    };
     let mut target = Target::open(args, network)?;
     let info = target.balance(&wallet.account_id())?;
-    let tx = wallet.build_transfer(recipient, amount, fee, info.next_nonce, 0);
+    let tx =
+        wallet.build_transfer_with_payload(recipient, amount, fee, info.next_nonce, 0, payload);
     match target.request(Request::SubmitTransfer(tx))? {
         ReplyBody::Accepted(id) => {
             println!("accepted=transfer");

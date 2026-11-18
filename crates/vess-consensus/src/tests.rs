@@ -110,6 +110,7 @@ fn signed_transfer(
         fee,
         nonce,
         expiry_unix: 0,
+        payload: None,
         signature: [0u8; ML_DSA_SIG_BYTES],
     };
     tx.signature = vess_crypto::sign(key, DOM_TRANSFER, &tx.unsigned_bytes()).unwrap();
@@ -401,6 +402,83 @@ fn a_replayed_transfer_is_rejected_by_consensus() {
         }
         other => panic!("unexpected: {other}"),
     }
+}
+
+#[test]
+fn transaction_versions_gate_the_payload() {
+    let mut h = Harness::new(devnet());
+    let alice_key = key(6);
+    let alice = account(&alice_key);
+    h.fund(&alice, 2);
+
+    // Version 3 was written before the payload existed: no presence byte, no payload.
+    let legacy = signed_transfer(&alice_key, [0x21u8; 32], 1, 0, 0);
+    assert_eq!(legacy.version, PROTOCOL_VERSION);
+    assert!(legacy.payload.is_none());
+
+    let mut carrier = Transfer {
+        version: TRANSACTION_VERSION,
+        payload: Some([0x5Au8; 32]),
+        ..signed_transfer(&alice_key, [0x22u8; 32], 1, 0, 1)
+    };
+    carrier.signature = vess_crypto::sign(&alice_key, DOM_TRANSFER, &carrier.unsigned_bytes())
+        .expect("transaction context is short");
+
+    let ts = h.timestamp();
+    h.mine_block(
+        &alice,
+        ts,
+        &[
+            Transaction::Transfer(legacy),
+            Transaction::Transfer(carrier.clone()),
+        ],
+    );
+    assert_eq!(h.state.account(&[0x21u8; 32]).unwrap().balance, 1);
+    assert_eq!(h.state.account(&[0x22u8; 32]).unwrap().balance, 1);
+
+    let rejection = |h: &Harness, tx: Transfer| {
+        let built = build_template(
+            &h.chain,
+            &h.network,
+            &h.chain.best_id(),
+            &h.state,
+            &alice,
+            h.timestamp(),
+            &[Transaction::Transfer(tx)],
+        );
+        match built {
+            Ok(mut template) => {
+                assert!(template.mine(20_000_000));
+                validate_block(&h.chain, &h.network, &h.state, &template.encode()).unwrap_err()
+            }
+            Err(error) => error,
+        }
+    };
+
+    // The payload sits inside the signed body, so changing it invalidates the signature.
+    let tampered = Transfer {
+        version: TRANSACTION_VERSION,
+        payload: Some([0x5Bu8; 32]),
+        ..carrier
+    };
+    assert!(matches!(
+        rejection(&h, tampered),
+        ConsensusError::BadTransaction {
+            reason: crate::error::TxReject::BadSignature,
+            ..
+        }
+    ));
+
+    // A version the protocol does not know is refused outright.
+    let mut future = signed_transfer(&alice_key, [0x23u8; 32], 1, 0, 2);
+    future.version = TRANSACTION_VERSION + 1;
+    assert!(matches!(
+        rejection(&h, future),
+        ConsensusError::BadTransaction {
+            reason: crate::error::TxReject::BadVersion,
+            ..
+        }
+    ));
 }
 
 #[test]

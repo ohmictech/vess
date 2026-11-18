@@ -10,7 +10,9 @@ Vess ties the block reward to difficulty instead of using a halving schedule. A 
 genesis difficulty pays twice the reward. This aims to keep issuance per unit of mining work roughly
 constant. This is not the same as debasement, as every hash represents a tangible input cost.
 
-Bitcoin, and every other cryptocurrency with engineered scarcity, requires a continuous increase in asset price for security to remain stable long-term, and to stay useful. This monetary policy has a problematic consequence: it cannot be used as a reliable unit of account. So the crypto narrative has shifted, and every project has settled into either the "store of value" camp, or the "fiat facilitation" camp.
+Bitcoin, and every other PoW cryptocurrency with engineered scarcity, requires a continuous increase in asset price for security to remain stable long-term. This monetary policy has a problematic consequence: it cannot be used as a reliable unit of account. So the crypto narrative has shifted, and every project has settled into either the "store of value" camp, or the "fiat facilitation" camp.
+
+On the latter, crypto technology has become nothing more than a convenient transportation layer for national currencies and securities. The same problems with fiat live in stablecoins. Freeze functions, the cantillion effect, regulation, debasement.
 
 Vess reduces the impact of speculation on price, relying on the sunk costs of electricity and hardware to be the basis of commodity-style value, allowing Vess to be used as a truly decentralized, trustless, fair, digital unit of account where Bitcoin cannot be.
 

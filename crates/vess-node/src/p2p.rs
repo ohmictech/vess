@@ -37,6 +37,8 @@ use crate::{Node, NodeError, log};
 const SYNC_LOOKBACK: u64 = 32;
 /// How often an idle session wakes up to announce and to notice a closed socket.
 const SESSION_TICK_MS: u64 = 200;
+/// Allow time for a peer's message to cross a public network once reading begins.
+const SESSION_IO_TIMEOUT_MS: u64 = 2_000;
 /// Sustained inbound frames per second, with extra capacity for network and scheduling bursts.
 const FRAME_BUDGET_PER_SECOND: u32 = 256;
 const FRAME_BUDGET_BURST: u32 = 512;
@@ -334,6 +336,8 @@ struct PeerState {
     peer_is_local: bool,
     next_history_attempt: Option<Instant>,
     warned_history_headers: bool,
+    /// Set once this peer is known to have pruned history this node still needs.
+    history_unavailable: bool,
     quorum_session: Option<crate::quorum::Session>,
 }
 
@@ -688,10 +692,10 @@ fn session(
     }
     .map_err(|e| format!("noise handshake: {e}"))?;
     crate::log_debug!("p2p", "encrypted session with key {}", hex32(&peer_key));
-    stream
-        .set_read_timeout(SESSION_TICK_MS)
-        .map_err(|e| e.to_string())?;
     let theirs = handshake(&node, &mut stream, listen_port, outbound)?;
+    stream
+        .set_read_timeout(SESSION_IO_TIMEOUT_MS)
+        .map_err(|e| e.to_string())?;
 
     // The handshake proved this address belongs to that key, so the book may now advertise it.
     let peer_addr = match (&dialled, ip) {
@@ -735,7 +739,7 @@ fn session(
         }
         serve_quorum_request(&node, &mut stream, &mut state)?;
         announce(&node, &mut stream, &mut state)?;
-        verify_history_from_peer(&node, &mut stream, &mut state)?;
+        verify_history_from_peer(&node, &mut stream, &mut state, their_oldest_body)?;
 
         // Announcements usually start a pull, but a missed or failed one would otherwise leave a
         // node stuck behind a peer that has stopped producing blocks. Re-check on a timer.
@@ -745,17 +749,17 @@ fn session(
                 let guard = lock(&node);
                 guard.height() < their_height || guard.state_height() < their_height
             };
-            if behind
-                && pull(
+            if behind {
+                if let Err(why) = pull(
                     &node,
                     &mut stream,
                     their_height,
                     their_oldest_body,
                     &mut state,
-                )
-                .is_err()
-            {
-                return Ok(());
+                ) {
+                    crate::log_debug!("sync", "resync pull ended: {why}");
+                    return Ok(());
+                }
             }
         }
         if !wait_for_session_input(&stream, &state)? {
@@ -774,15 +778,14 @@ fn session(
                     Ok(Action::None) => {}
                     Ok(Action::Pull(height)) => {
                         their_height = their_height.max(height);
-                        if pull(
+                        if let Err(why) = pull(
                             &node,
                             &mut stream,
                             their_height,
                             their_oldest_body,
                             &mut state,
-                        )
-                        .is_err()
-                        {
+                        ) {
+                            crate::log_debug!("sync", "announced pull ended: {why}");
                             return Ok(());
                         }
                     }
@@ -810,13 +813,13 @@ fn session(
 /// Wait briefly for input when more transactions are due, without shortening the timeout used
 /// to read an actual encrypted record or frame.
 fn wait_for_session_input(stream: &SecureStream, state: &PeerState) -> Result<bool, String> {
-    let Some(next) = state.next_transaction_announcement else {
-        return Ok(true);
-    };
     if stream.has_buffered_plaintext() {
         return Ok(true);
     }
-    let wait = next.saturating_duration_since(Instant::now());
+    let wait = state
+        .next_transaction_announcement
+        .map(|next| next.saturating_duration_since(Instant::now()))
+        .unwrap_or(Duration::from_millis(SESSION_TICK_MS));
     if wait.is_zero() {
         return Ok(false);
     }
@@ -828,18 +831,11 @@ fn wait_for_session_input(stream: &SecureStream, state: &PeerState) -> Result<bo
     let mut byte = [0u8; 1];
     let result = stream.get_ref().peek(&mut byte);
     stream
-        .set_read_timeout(SESSION_TICK_MS)
+        .set_read_timeout(SESSION_IO_TIMEOUT_MS)
         .map_err(|e| e.to_string())?;
     match result {
         Ok(_) => Ok(true),
-        Err(e)
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-            ) =>
-        {
-            Ok(false)
-        }
+        Err(e) if vess_net::is_idle(&e) => Ok(false),
         Err(e) => Err(e.to_string()),
     }
 }
@@ -850,12 +846,24 @@ fn history_storage_error(error: NodeError) -> String {
     message
 }
 
+/// Whether a peer's retained body window still reaches the next block independent replay needs.
+///
+/// `0` means the peer keeps everything. A peer prunes forward, so a `false` here stays false for the
+/// life of that session: waiting on it would never make progress.
+fn peer_can_serve_history(their_oldest_body: u64, next_height: u64) -> bool {
+    their_oldest_body == 0 || next_height >= their_oldest_body
+}
+
 /// Fetch one historical body without holding the live node lock during I/O or replay.
 fn verify_history_from_peer(
     node: &Arc<Mutex<Node>>,
     stream: &mut SecureStream,
     state: &mut PeerState,
+    their_oldest_body: u64,
 ) -> Result<(), String> {
+    if state.history_unavailable {
+        return Ok(());
+    }
     if state
         .next_history_attempt
         .is_some_and(|next| Instant::now() < next)
@@ -879,6 +887,24 @@ fn verify_history_from_peer(
         return Ok(());
     };
     let height = verifier.height();
+    // A peer prunes forward, so once its oldest body is past the block we need it can never supply
+    // it. Stop asking for the rest of the session instead of retrying forever; an archival peer
+    // that joins later gets a fresh session and can still verify from genesis.
+    if !peer_can_serve_history(their_oldest_body, height.saturating_add(1)) {
+        state.history_unavailable = true;
+        state.warned_history_headers = true;
+        log::record(
+            Level::Info,
+            "history",
+            &format!(
+                "peer cannot serve historical block {} (its oldest body is {}); independent \
+                 verification waits for an archival peer",
+                height.saturating_add(1),
+                their_oldest_body
+            ),
+        );
+        return Ok(());
+    }
     let local_header = {
         let guard = lock(node);
         if guard.snapshot_verification != Some(verification) {
@@ -1474,7 +1500,12 @@ fn pull(
     // The normal path replays blocks the way they arrive, so the state never lags the chain. The
     // snapshot path is only for the case that path cannot handle: the peer no longer has our history.
     if !need_snapshot(node, their_oldest_body) {
-        return pull_blocks(node, stream, their_height, state);
+        // Adopt the peer's header branch first. `pull_headers` is what walks back to a deep fork
+        // point, and only then does `next_body_height` name the block where the state must start
+        // replaying. Fetching bodies first would ask for a branch our chain has not adopted yet.
+        let headers = pull_headers(node, stream, their_height, state)?;
+        let blocks = pull_blocks(node, stream, their_height, state)?;
+        return Ok(headers + blocks);
     }
 
     let conn = lock(node).connections();
@@ -1536,15 +1567,21 @@ fn pull_headers(
     state: &mut PeerState,
 ) -> Result<usize, String> {
     let mut added_total = 0usize;
+    // A peer serves headers from its own branch. If our chain has forked away from it, the first
+    // header it sends has a parent we never saw, and validating it fails with "unknown previous
+    // block". `SYNC_LOOKBACK` alone is only enough while the fork is shallow, so step the start
+    // height back until the returned range joins our chain, then walk forward with a cursor.
+    let (mut from, oldest) = {
+        let guard = lock(node);
+        let oldest = guard.chain().oldest_main_height();
+        (
+            guard.height().saturating_sub(SYNC_LOOKBACK).max(oldest),
+            oldest,
+        )
+    };
+    let mut step = SYNC_LOOKBACK;
     for _ in 0..MAX_PULL_ROUNDS {
         serve_quorum_request(node, stream, state)?;
-        let from = {
-            let guard = lock(node);
-            guard
-                .height()
-                .saturating_sub(SYNC_LOOKBACK)
-                .max(guard.chain().oldest_main_height())
-        };
         let mut w = Writer::new();
         w.u64(from);
         w.u32(MAX_HEADERS_PER_MESSAGE as u32);
@@ -1558,6 +1595,27 @@ fn pull_headers(
         if headers.is_empty() {
             break;
         }
+        let last = from + (headers.len() as u64 - 1);
+        // Decide whether this range can be adopted before touching any of it.
+        let connects = {
+            let guard = lock(node);
+            let chain = guard.chain();
+            match headers.iter().find(|header| !chain.contains(&header.id())) {
+                None => true,
+                Some(first) => chain.contains(&first.previous_block_id),
+            }
+        };
+        if !connects {
+            if from <= oldest {
+                return Err(format!(
+                    "peer's branch does not join our chain at or above height {from}"
+                ));
+            }
+            from = from.saturating_sub(step).max(oldest);
+            step = step.saturating_mul(4);
+            continue;
+        }
+
         let mut added = 0usize;
         for header in headers {
             let unknown = !{ lock(node).chain().contains(&header.id()) };
@@ -1569,9 +1627,10 @@ fn pull_headers(
             }
         }
         added_total += added;
-        if added == 0 || lock(node).height() >= their_height {
+        if lock(node).height() >= their_height {
             break;
         }
+        from = last + 1;
     }
     Ok(added_total)
 }
@@ -1586,12 +1645,16 @@ fn pull_blocks(
     let mut applied = 0usize;
     for _ in 0..MAX_PULL_ROUNDS {
         serve_quorum_request(node, stream, state)?;
-        let from = {
+        let (from, floor) = {
             let guard = lock(node);
-            guard
-                .height()
-                .saturating_sub(SYNC_LOOKBACK)
-                .max(guard.chain().oldest_main_height())
+            // A reorg replays the peer's branch from where it split off our state, which may be far
+            // below the tip; `next_body_height` names exactly that block.
+            let floor = guard.next_body_height().unwrap_or_else(|| guard.height() + 1);
+            let lookback = guard.height().saturating_sub(SYNC_LOOKBACK);
+            (
+                floor.min(lookback).max(guard.chain().oldest_main_height()),
+                floor,
+            )
         };
         let mut w = Writer::new();
         w.u64(from);
@@ -1611,7 +1674,9 @@ fn pull_blocks(
         for header in headers {
             serve_quorum_request(node, stream, state)?;
             let id = header.id();
-            if { lock(node).chain().contains(&id) } && !{ lock(node).needs_body(&id) } {
+            if { lock(node).chain().contains(&id) }
+                && !{ lock(node).needs_body_above(&id, floor) }
+            {
                 continue;
             }
             write_frame(stream, P2P_MAGIC, p2p_kind::GET_BLOCK, &id).map_err(|e| e.to_string())?;
@@ -1650,7 +1715,8 @@ fn need_snapshot(node: &Arc<Mutex<Node>>, their_oldest_body: u64) -> bool {
         // the node never asks for one unless it was told to.
         return false;
     }
-    match guard.next_body_height() {
+    let next = guard.next_body_height();
+    match next {
         Some(next) => next < their_oldest_body,
         None => false,
     }
@@ -1679,7 +1745,7 @@ fn install_voted_snapshot(
     block_id: Hash,
     snapshot: vess_state::State,
 ) -> Result<(), NodeError> {
-    if node.height() != height
+    if node.height() < height
         || node
             .chain()
             .main_header_at(height)
@@ -1843,9 +1909,9 @@ fn install_snapshot_from(
 
     let block_id = {
         let guard = lock(node);
-        if height != guard.height() {
+        if height > guard.height() {
             return Err(SnapshotIssue::Retry(
-                "snapshot height is not the selected header tip".into(),
+                "snapshot is ahead of our headers; syncing them first".into(),
             ));
         }
         guard
@@ -1975,7 +2041,7 @@ pub fn sync_once(node: &Arc<Mutex<Node>>, addr: &str, listen_port: u16) -> Resul
     let (mut peer, theirs) =
         Peer::connect(addr, &ours, &secret, &chain).map_err(|e| e.to_string())?;
     peer.stream
-        .set_read_timeout(SESSION_TICK_MS)
+        .set_read_timeout(SESSION_IO_TIMEOUT_MS)
         .map_err(|e| e.to_string())?;
 
     let conn = lock(node).connections();
@@ -2138,6 +2204,91 @@ mod tests {
         assert!(template.mine(20_000_000));
         let bytes = template.encode();
         guard.accept_block(&bytes).unwrap()
+    }
+
+    #[test]
+    fn a_timed_out_socket_read_is_idle_not_fatal() {
+        // Windows surfaces a timed `peek` as WSA_IO_PENDING (997); treating it as an error would
+        // drop a healthy peer session.
+        use std::io::{Error, ErrorKind};
+        assert!(vess_net::is_idle(&Error::from(ErrorKind::WouldBlock)));
+        assert!(vess_net::is_idle(&Error::from(ErrorKind::TimedOut)));
+        assert!(vess_net::is_idle(&Error::from_raw_os_error(997)));
+        assert!(!vess_net::is_idle(&Error::from_raw_os_error(10054)));
+        assert!(!vess_net::is_idle(&Error::from(ErrorKind::InvalidData)));
+    }
+
+    #[test]
+    fn historical_replay_only_waits_on_peers_that_can_still_serve_the_block() {
+        // An archival peer keeps everything, so it can always supply the next block.
+        assert!(peer_can_serve_history(0, 1));
+        // A peer whose oldest body is exactly the next block we need can still serve it.
+        assert!(peer_can_serve_history(47_104, 47_104));
+        // Its window only moves forward, so a pruned block below it is gone for good.
+        assert!(!peer_can_serve_history(47_104, 1));
+        assert!(!peer_can_serve_history(47_104, 47_103));
+    }
+
+    #[test]
+    fn peer_handshake_allows_a_slow_reply() {
+        let dir = TempDir::new("slow-handshake");
+        let node = shared(&dir.0);
+        let (listener, port) = listen();
+        let addr = format!("127.0.0.1:{port}");
+        let chain = lock(&node).chain_id();
+        let mut reply = lock(&node).handshake(0);
+        reply.connection_nonce = [0x5a; 32];
+        let server = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            let (mut stream, _) = SecureStream::accept(socket, &[9; 32], &chain).unwrap();
+            let (kind, _) = read_frame(&mut stream, P2P_MAGIC, MAX_NETWORK_FRAME_BYTES).unwrap();
+            assert_eq!(kind, p2p_kind::HELLO);
+            std::thread::sleep(Duration::from_millis(SESSION_TICK_MS * 3));
+            write_frame(&mut stream, P2P_MAGIC, p2p_kind::HELLO_ACK, &reply.encode()).unwrap();
+        });
+        let socket = vess_net::connect(&addr).unwrap();
+        let _ = session(node.clone(), socket, 0, None, true, Some(addr), None);
+        server.join().unwrap();
+        assert_eq!(lock(&node).peer_book_size().1, 1);
+    }
+
+    #[test]
+    fn idle_polling_keeps_short_ticks_but_allows_slow_frame_parts() {
+        use std::io::Write;
+
+        let (listener, port) = listen();
+        let chain = [7; 32];
+        let accept = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            SecureStream::accept(socket, &[2; 32], &chain).unwrap().0
+        });
+        let socket = vess_net::connect(&format!("127.0.0.1:{port}")).unwrap();
+        let (mut sender, _) = SecureStream::connect(socket, &[1; 32], &chain).unwrap();
+        let mut receiver = accept.join().unwrap();
+        receiver.set_read_timeout(SESSION_IO_TIMEOUT_MS).unwrap();
+        let state = PeerState::default();
+        let start = Instant::now();
+        assert!(!wait_for_session_input(&receiver, &state).unwrap());
+        assert!(
+            start.elapsed() < Duration::from_millis(SESSION_IO_TIMEOUT_MS),
+            "idle polling used the longer message timeout"
+        );
+
+        let mut frame = Vec::new();
+        write_frame(&mut frame, P2P_MAGIC, p2p_kind::PING, b"slow").unwrap();
+        let writer = std::thread::spawn(move || {
+            sender.write_all(&frame[..5]).unwrap();
+            sender.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(SESSION_TICK_MS * 3));
+            sender.write_all(&frame[5..]).unwrap();
+            sender.flush().unwrap();
+        });
+        assert!(wait_for_session_input(&receiver, &state).unwrap());
+        let (kind, payload) =
+            read_frame(&mut receiver, P2P_MAGIC, MAX_NETWORK_FRAME_BYTES).unwrap();
+        assert_eq!(kind, p2p_kind::PING);
+        assert_eq!(payload, b"slow");
+        writer.join().unwrap();
     }
 
     #[test]
@@ -2906,6 +3057,42 @@ mod tests {
         );
     }
 
+    /// A chain that forked from ours long ago cannot be adopted by asking from `height - 32`: the
+    /// peer's first header has a parent we never saw, and validation rejects it with "unknown
+    /// previous block". Header sync must walk back to the fork point instead of giving up, or a node
+    /// stays stranded on its own branch forever while the two chains keep drifting apart.
+    #[test]
+    fn a_deep_fork_is_adopted_by_walking_back_to_the_fork_point() {
+        let (dir_a, dir_b) = (TempDir::new("deep-a"), TempDir::new("deep-b"));
+        let a = shared(&dir_a.0);
+        let b = shared(&dir_b.0);
+        let (listener, port) = listen();
+        let serve_a = a.clone();
+        std::thread::spawn(move || serve(serve_a, listener, port));
+
+        let payout = [0x47u8; 32];
+        // Both chains grow from genesis without ever seeing each other, so they fork at height 0
+        // and the fork is far deeper than `SYNC_LOOKBACK`.
+        for _ in 0..40 {
+            mine_one(&b, &payout);
+        }
+        let forked = b.lock().unwrap().tip().id();
+        for _ in 0..45 {
+            mine_one(&a, &payout);
+        }
+        assert_eq!(b.lock().unwrap().height(), 40);
+        assert_eq!(a.lock().unwrap().height(), 45);
+
+        sync_once(&b, &format!("127.0.0.1:{port}"), 0).expect("deep fork sync");
+        assert_eq!(
+            b.lock().unwrap().tip().id(),
+            a.lock().unwrap().tip().id(),
+            "the lighter branch must be replaced by the heavier one"
+        );
+        assert_ne!(b.lock().unwrap().tip().id(), forked);
+        assert_eq!(b.lock().unwrap().root(), a.lock().unwrap().root());
+    }
+
     #[test]
     fn a_poller_catches_up_and_follows_new_blocks() {
         let (dir_a, dir_b) = (TempDir::new("a"), TempDir::new("b"));
@@ -3630,6 +3817,7 @@ mod tests {
                 fee: 0,
                 nonce: 0,
                 expiry_unix: 0,
+                payload: None,
                 signature: [5; 3309],
             });
             ids.push(tx.id());
@@ -3745,6 +3933,7 @@ mod tests {
             fee: 0,
             nonce: 0,
             expiry_unix: 0,
+            payload: None,
             signature: [3u8; 3309],
         });
         let transactions: Vec<Transaction> = (0..1_000).map(|_| tx.clone()).collect();

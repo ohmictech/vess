@@ -6,9 +6,10 @@ use vess_core::U256;
 use vess_core::codec::{Reader, Writer};
 use vess_core::constants::{
     BLOCK_HEADER_BYTES, DEV_FEE_ACCOUNT, MAX_BLOCK_BYTES, MAX_TRANSACTION_BYTES, NetworkProfile,
-    PROTOCOL_VERSION,
+    PREIMAGE_BYTES, PROTOCOL_VERSION, RULES_VERSION, TRANSACTION_VERSION,
 };
 use vess_core::hash::{self, DOM_STATE_UPDATE, DOM_TRANSFER};
+use vess_core::types::transaction_version_supported;
 use vess_core::{AccountId, BlockHeader, Hash, Transaction};
 use vess_state::{State, UndoLog};
 
@@ -120,13 +121,68 @@ fn reject(index: usize, reason: TxReject) -> ConsensusError {
     }
 }
 
+/// The escrow spend rule. No signature is involved: revealing the rules proves which account is
+/// being spent, and the rules name both destinations, so a submitter chooses only *when* to spend,
+/// never *where* the balance goes.
+///
+/// Below `rules.refund_height` the claim path is open and needs the preimage. At or above it the
+/// claim window is closed for good and only the owner may be paid, whether or not a preimage is
+/// offered.
+fn check_rules_spend(
+    tx: &vess_core::Transfer,
+    rules: &vess_core::types::Rules,
+    preimage: Option<&[u8; PREIMAGE_BYTES]>,
+    height: u64,
+    balance: u64,
+) -> Result<(), TxReject> {
+    if tx.version < TRANSACTION_VERSION {
+        return Err(TxReject::BadVersion);
+    }
+    if rules.version != RULES_VERSION {
+        return Err(TxReject::BadRules);
+    }
+    if tx.fee > rules.max_fee {
+        return Err(TxReject::FeeTooHigh);
+    }
+    if tx.expiry_unix != 0 {
+        return Err(TxReject::BadRules);
+    }
+    // An escrow leaves nothing behind: no change output, no dust, no partial sweep.
+    if tx.amount.checked_add(tx.fee) != Some(balance) {
+        return Err(TxReject::PartialSpend);
+    }
+    if rules.claims_open_at(height) {
+        match preimage {
+            Some(preimage) if hash::hash_lock(preimage) == rules.hash_lock => {
+                if tx.recipient_account_id != rules.recipient_account_id {
+                    return Err(TxReject::WrongDestination);
+                }
+            }
+            _ => return Err(TxReject::PreimageMismatch),
+        }
+    } else {
+        if preimage.is_some() {
+            return Err(TxReject::ClaimWindowClosed);
+        }
+        if tx.recipient_account_id != rules.owner_account_id {
+            return Err(TxReject::WrongDestination);
+        }
+    }
+    Ok(())
+}
+
 /// Execute a body against `state`, then credit the block reward derived from `target`.
+///
+/// `height` is the height of the block being applied: escrow rules gate on it, so it is part of the
+/// validation context and never inferred from the clock.
+#[allow(clippy::too_many_arguments)]
 pub fn apply_body(
     state: &mut State,
     chain_id: &Hash,
     network: &NetworkProfile,
     target: U256,
     transactions: &[Transaction],
+    height: u64,
     timestamp_unix_ms: u64,
     payout: &AccountId,
 ) -> Result<(), ConsensusError> {
@@ -134,20 +190,44 @@ pub fn apply_body(
     for (index, tx) in transactions.iter().enumerate() {
         match tx {
             Transaction::Transfer(t) => {
-                if t.version != PROTOCOL_VERSION {
+                if !transaction_version_supported(t.version) {
                     return Err(reject(index, TxReject::BadVersion));
                 }
                 if &t.chain_id != chain_id {
                     return Err(reject(index, TxReject::BadChainId));
                 }
                 let sender = t.sender_id();
-                if !vess_crypto::verify(
-                    &t.sender_public_key,
-                    DOM_TRANSFER,
-                    &t.unsigned_bytes(),
-                    &t.signature,
-                ) {
-                    return Err(reject(index, TxReject::BadSignature));
+                match &t.authority {
+                    vess_core::types::TransferAuthority::Signature {
+                        sender_public_key,
+                        signature,
+                    } => {
+                        if !vess_crypto::verify(
+                            sender_public_key,
+                            DOM_TRANSFER,
+                            &t.unsigned_bytes(),
+                            signature,
+                        ) {
+                            return Err(reject(index, TxReject::BadSignature));
+                        }
+                    }
+                    vess_core::types::TransferAuthority::Rules { rules, preimage } => {
+                        let account =
+                            state.account(&sender).ok_or_else(|| {
+                                reject(
+                                    index,
+                                    TxReject::InvalidState(vess_state::StateError::UnknownAccount),
+                                )
+                            })?;
+                        check_rules_spend(
+                            t,
+                            rules,
+                            preimage.as_ref(),
+                            height,
+                            account.balance,
+                        )
+                        .map_err(|reason| reject(index, reason))?;
+                    }
                 }
                 state
                     .execute_transfer(t, &sender, timestamp_unix_ms / 1_000, payout)
@@ -227,6 +307,7 @@ pub fn build_template<C: HeaderSource>(
         network,
         target,
         transactions,
+        height,
         timestamp_unix_ms,
         payout,
     )?;
@@ -282,6 +363,7 @@ pub fn validate_block<C: HeaderSource>(
         network,
         header.target,
         &transactions,
+        meta.height,
         header.timestamp_unix_ms,
         &header.payout_account_id,
     )?;
