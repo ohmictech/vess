@@ -1697,6 +1697,16 @@ fn pull_headers(
         if lock(node).height() >= their_height {
             break;
         }
+        log::record(
+            Level::Debug,
+            "sync",
+            &format!(
+                "headers from {from}: {} returned, {added} new, age {} of {}",
+                last - from + 1,
+                lock(node).height(),
+                their_height
+            ),
+        );
         from = last + 1;
     }
     Ok(added_total)

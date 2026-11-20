@@ -1116,6 +1116,8 @@ fn wallet_address(args: &Args) -> Result<(), String> {
     let network = network(args)?;
     let wallet = load_wallet(args, network)?;
     println!("account={}", hex(&wallet.account_id()));
+    // A public key is what a counterparty needs to contribute to a futures pot; the address alone
+    // is a hash and cannot be used to build their input.
     println!("public_key={}", hex(wallet.public_key().as_slice()));
     println!("network={}", network.network);
     Ok(())
