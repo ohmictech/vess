@@ -15,7 +15,8 @@ use vess_core::constants::{
 };
 use vess_core::hash::{self, DOM_NETWORK_FRAME, DOM_RPC_FRAME};
 use vess_core::{
-    Account, AccountId, BlockHeader, CodecError, Hash, StateUpdate, Transaction, Transfer,
+    Account, AccountId, BlockHeader, BlockWitness, CodecError, Hash, JointTransfer, StateUpdate,
+    Transaction, Transfer,
 };
 
 pub mod secure;
@@ -190,8 +191,8 @@ pub fn connect(addr: &str) -> Result<TcpStream, NetError> {
 
 pub mod rpc {
     pub use super::{
-        AccountInfo, BlockInfo, BlockQuery, ProofInfo, Reply, ReplyBody, Request, RpcClient,
-        StatusInfo, TemplateInfo, TransactionInfo, serve_rpc,
+        AccountInfo, BlockInfo, BlockQuery, EscrowInfo, ProofInfo, Reply, ReplyBody, Request,
+        RpcClient, StatusInfo, TemplateInfo, TransactionInfo, serve_rpc,
     };
 }
 
@@ -212,7 +213,11 @@ pub mod rpc_kind {
     pub const WAIT_FOR_ACCOUNT: u16 = 13;
     /// Submit locally mined work only if its parent is still the best tip.
     pub const SUBMIT_MINED_BLOCK: u16 = 14;
+    /// A block's body plus the parent-state proofs needed to validate it without state.
+    pub const WITNESS: u16 = 16;
     pub const HISTORY_STATUS: u16 = 15;
+    /// Submit a transaction that debits several accounts and credits several.
+    pub const SUBMIT_JOINT_TRANSFER: u16 = 17;
 }
 
 /// How a caller names a block: by main-chain height or by id.
@@ -231,10 +236,15 @@ pub enum Request {
     SubmitBlock(Vec<u8>),
     SubmitMinedBlock(Vec<u8>),
     SubmitTransfer(Transfer),
+    SubmitJointTransfer(JointTransfer),
     SubmitStateUpdate(StateUpdate),
     Proof(AccountId),
     Block(BlockQuery),
     Transaction(Hash),
+    /// The stateless witness for a block: its body plus the parent-state proofs needed to check it.
+    /// A verifier supplies the parent state root from its own header chain, so this reply cannot make
+    /// a block look valid on its own.
+    Witness(Hash),
     /// Block until the tip changes (or `timeout_ms` elapses), so a client can follow the chain
     /// without polling. Answered immediately when `after` is not the current tip.
     WaitForTip {
@@ -336,6 +346,14 @@ pub mod tx_status {
     }
 }
 
+/// The spend condition of an escrow account, as revealed by a spend.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EscrowInfo {
+    pub rules: vess_core::Rules,
+    /// The spend carried the preimage, so it was a claim rather than a refund.
+    pub claimed: bool,
+}
+
 /// Where a transaction is right now, how deep its block is, and what it actually does.
 ///
 /// The content matters as much as the position: a scanner watching for deposits has only a list of
@@ -367,6 +385,8 @@ pub struct TransactionInfo {
     /// The optional 32-byte application payload carried by a transfer. `None` for state updates and
     /// for any transaction written before the payload existed.
     pub payload: Option<Hash>,
+    /// The rules of an escrow spend. `None` for an ordinary key-signed transfer.
+    pub escrow: Option<EscrowInfo>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -388,6 +408,11 @@ pub enum ReplyBody {
     Tip {
         tip: Hash,
         height: u64,
+    },
+    /// A block's raw bytes plus the parent-state proofs that validate it without state.
+    Witness {
+        body: Vec<u8>,
+        witness: BlockWitness,
     },
 }
 
@@ -462,6 +487,10 @@ impl Encode for Request {
                 w.u8(rpc_kind::SUBMIT_TRANSFER as u8);
                 encode_transfer_fields(w, t);
             }
+            Request::SubmitJointTransfer(t) => {
+                w.u8(rpc_kind::SUBMIT_JOINT_TRANSFER as u8);
+                t.encode(w);
+            }
             Request::SubmitStateUpdate(t) => {
                 w.u8(rpc_kind::SUBMIT_STATE_UPDATE as u8);
                 t.encode(w);
@@ -485,6 +514,10 @@ impl Encode for Request {
             }
             Request::Transaction(id) => {
                 w.u8(rpc_kind::TRANSACTION as u8);
+                w.fixed(id);
+            }
+            Request::Witness(id) => {
+                w.u8(rpc_kind::WITNESS as u8);
                 w.fixed(id);
             }
             Request::WaitForTip { after, timeout_ms } => {
@@ -525,6 +558,9 @@ impl Decode for Request {
                 Request::SubmitMinedBlock(r.var_bytes(MAX_NETWORK_FRAME_BYTES)?.to_vec())
             }
             rpc_kind::SUBMIT_TRANSFER => Request::SubmitTransfer(Transfer::decode(r)?),
+            rpc_kind::SUBMIT_JOINT_TRANSFER => {
+                Request::SubmitJointTransfer(JointTransfer::decode(r)?)
+            }
             rpc_kind::SUBMIT_STATE_UPDATE => Request::SubmitStateUpdate(StateUpdate::decode(r)?),
             rpc_kind::PROOF => Request::Proof(r.array()?),
             rpc_kind::BLOCK => {
@@ -536,6 +572,7 @@ impl Decode for Request {
                 }
             }
             rpc_kind::TRANSACTION => Request::Transaction(r.array()?),
+            rpc_kind::WITNESS => Request::Witness(r.array()?),
             rpc_kind::WAIT_FOR_TIP => Request::WaitForTip {
                 after: r.array()?,
                 timeout_ms: r.u32()?,
@@ -652,6 +689,14 @@ impl Encode for Reply {
                     }
                     None => w.u8(0),
                 }
+                match &t.escrow {
+                    Some(escrow) => {
+                        w.u8(1);
+                        escrow.rules.encode(w);
+                        w.u8(u8::from(escrow.claimed));
+                    }
+                    None => w.u8(0),
+                }
             }
             ReplyBody::Tip { tip, height } => {
                 w.u8(8);
@@ -667,6 +712,11 @@ impl Encode for Reply {
                 w.u8(*status);
                 w.u64(*height);
                 w.u64(*target);
+            }
+            ReplyBody::Witness { body, witness } => {
+                w.u8(10);
+                let _ = w.var_bytes(body);
+                witness.encode(w);
             }
         }
     }
@@ -786,6 +836,14 @@ impl Decode for Reply {
                     1 => Some(r.array()?),
                     _ => return Err(CodecError::InvalidValue),
                 };
+                let escrow = match r.u8()? {
+                    0 => None,
+                    1 => Some(EscrowInfo {
+                        rules: vess_core::Rules::decode(r)?,
+                        claimed: r.u8()? == 1,
+                    }),
+                    _ => return Err(CodecError::InvalidValue),
+                };
                 ReplyBody::Transaction(TransactionInfo {
                     transaction_id,
                     in_mempool,
@@ -800,6 +858,7 @@ impl Decode for Reply {
                     new_state_hash,
                     status,
                     payload,
+                    escrow,
                 })
             }
             8 => ReplyBody::Tip {
@@ -811,6 +870,11 @@ impl Decode for Reply {
                 height: r.u64()?,
                 target: r.u64()?,
             },
+            10 => {
+                let body = r.var_bytes(MAX_NETWORK_FRAME_BYTES)?.to_vec();
+                let witness = BlockWitness::decode(r)?;
+                ReplyBody::Witness { body, witness }
+            }
             _ => return Err(CodecError::UnknownVersion),
         };
         Ok(Reply { reason, body })
@@ -914,6 +978,12 @@ pub mod p2p_kind {
     pub const GET_ADDR: u16 = 18;
     /// Answer to `GET_ADDR`: `u32` count, then `(var_bytes addr, [u8; 32] static key)` entries.
     pub const ADDR: u16 = 19;
+    /// Request several blocks in one round trip: `u32` count, then that many block ids. The reply is
+    /// a run of `BLOCK` frames terminated by `BLOCK_END`, so a catching-up node is not limited to one
+    /// block per network round trip.
+    pub const GET_BLOCKS: u16 = 20;
+    /// Ends a `GET_BLOCKS` reply: `u32` count of blocks sent before it.
+    pub const BLOCK_END: u16 = 21;
 }
 
 /// Most addresses one `ADDR` message may carry. A peer that sends more is rejected rather than
@@ -1341,6 +1411,17 @@ mod tests {
                 new_state_hash: [0u8; 32],
                 status: 2,
                 payload: Some([0xAAu8; 32]),
+                escrow: Some(EscrowInfo {
+                    rules: vess_core::Rules {
+                        version: 1,
+                        hash_lock: [0x61u8; 32],
+                        refund_height: 900,
+                        recipient_account_id: [0x62u8; 32],
+                        owner_account_id: [0x63u8; 32],
+                        max_fee: 4,
+                    },
+                    claimed: true,
+                }),
             })),
             Reply::ok(ReplyBody::Transaction(TransactionInfo {
                 transaction_id: [5u8; 32],

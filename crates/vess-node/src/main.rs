@@ -14,10 +14,10 @@ use std::time::Duration;
 
 use vess_core::constants::{
     MAX_BLOCK_BYTES, ML_DSA_PK_BYTES, ML_DSA_SIG_BYTES, NetworkProfile, P2P_DEFAULT_PORT,
-    RPC_DEFAULT_PORT, TX_PAYLOAD_BYTES,
+    PREIMAGE_BYTES, RPC_DEFAULT_PORT, TX_PAYLOAD_BYTES,
 };
 use vess_core::hash::chain_id;
-use vess_core::{AccountId, BlockHeader, Hash, Transaction};
+use vess_core::{AccountId, BlockHeader, Hash, JointTransfer, PublicKey, Transaction};
 use vess_net::rpc::{ReplyBody, Request, StatusInfo};
 use vess_node::{Node, bind_rpc, serve};
 use vess_wallet::{Keyring, NodeClient, RecoveryPhrase, Wallet};
@@ -32,7 +32,8 @@ const USAGE: &str = concat!(
   vess node init    [--datadir DIR] [--network devnet|testnet|mainnet]
   vess node run     [--datadir DIR] [--network ...] [--rpc PORT] [--port P2P] [--peer A,B] [--mine --payout HEX]
                     [--mine-threads N]   # 1-256 CPU workers
-                    [--prune-blocks N] [--prune-headers N] [--trust-snapshot]   # 0 = keep everything
+                    [--prune-blocks N] [--prune-headers N] [--prune-undo N] [--trust-snapshot]   # 0 = keep everything
+                    [--finality-depth N]   # blocks below the tip that no branch may replace; 0 = off
                     [--seed A,B]   # extra bootstrap peers; VESS_SEEDS also works
                     [--no-mine] [--no-trust-snapshot]   # snapshot trust defaults on
   vess node params  [--network devnet|testnet|mainnet]
@@ -43,6 +44,8 @@ const USAGE: &str = concat!(
   vess node watch   --rpc HOST:PORT [--count N] [--timeout MS]   # N replies, 0 = forever
   vess node account --rpc HOST:PORT --account HEX      # balance, nonce, state hash
   vess node proof   --rpc HOST:PORT --account HEX      # Merkle proof against the state root
+  vess node witness --rpc HOST:PORT --id HEX           # stateless witness: parent-state proofs
+  vess node verify-stateless --rpc HOST:PORT --id HEX  # validate a block with headers + witness only
 
   vess wallet new         [--datadir DIR] --name NAME [--legacy] [--password-file FILE | --password-env VAR]
                           [--unsafe-phrase-stdout]
@@ -54,10 +57,22 @@ const USAGE: &str = concat!(
   vess wallet sign verify --message TEXT (--proof FILE | --public-key HEX --signature HEX) [--account HEX]
                           # --proof - reads wallet sign output from stdin
   vess wallet balance     [--datadir DIR] --name NAME [--index N] [--rpc ADDR] [--password-*]
-  vess wallet send        [--datadir DIR] --name NAME --to HEX --amount N [--fee N] [--index N] [--rpc ADDR] [--password-*]
+  vess wallet send        [--datadir DIR] --name NAME (--to HEX | --rules FILE) --amount N [--fee N] [--index N] [--rpc ADDR] [--password-*]
                           [--payload HEX32]   # optional 32-byte payload, signed with the transfer
+  vess wallet spend       [--datadir DIR] --name NAME --rules FILE [--preimage HEX32] [--fee N] [--rpc ADDR] [--password-*]
+                          # claim an escrow with the preimage, or refund it once refund_height passes
   vess wallet set-state   [--datadir DIR] --name NAME --state-hash HEX [--fee N] [--rpc ADDR] [--password-*]
   vess wallet watch       [--datadir DIR] --name NAME --rpc ADDR [--count N] [--timeout MS] [--password-*]
+
+  vess wallet futures-fund   [--datadir DIR] --name NAME --rules FILE --amount N [--fee N] [--tx FILE]
+                             [--counterparty HEX] [--counterparty-amount N] [--rpc ADDR] [--password-*]
+                          # build the dual-signed deposit into a futures pot; --tx names the file
+  vess wallet futures-sign   [--datadir DIR] --name NAME [--tx FILE] [--password-*]
+                          # add this wallet's signature to a prebuilt funding transaction
+  vess wallet futures-submit [--datadir DIR] [--tx FILE] [--rpc ADDR] [--password-*]
+                          # submit a fully signed funding transaction
+  vess wallet futures-settle [--datadir DIR] --name NAME --rules FILE [--fee N] [--rpc ADDR] [--password-*]
+                          # split a matured pot by the measured supply delta; unsigned, so anyone may run it
 
   --password-file FILE reads the first line of FILE; --password-env VAR reads an environment
   variable. HD wallet creation and recovery require a password. Only `wallet new --legacy` can
@@ -65,7 +80,25 @@ const USAGE: &str = concat!(
   Recovery reads the phrase without terminal echo; --mnemonic-stdin accepts piped input instead.
   --unsafe-phrase-stdout allows creation with redirected output, which may expose the phrase.
 
+  --rules FILE is an escrow's spend condition, one key=value per line: hash_lock (32-byte hex of
+  BLAKE3(preimage)), refund_height, recipient, owner, max_fee. The escrow's account id is derived
+  from exactly these bytes, so funding it is `wallet send --rules FILE` and the file is required to
+  ever spend it. Before refund_height a spend needs --preimage and pays recipient; afterwards it
+  needs no preimage and pays owner. Either way the balance moves whole, and the spender is fixed.
+
+  A futures rules file is also key=value: start_supply, target_delta, earliest_settle_height,
+  recipient, owner, max_fee. The pot's account id is derived from exactly those bytes. Both parties
+  fund it in one transaction they both sign, so the pot is never half funded; from
+  earliest_settle_height anyone may settle it, and consensus splits the pot linearly in the measured
+  supply delta: recipient gets pot * min(delta, 2*target_delta) / (2*target_delta), owner the rest.
+  At exactly target_delta the split is even.
+
   vess miner [--datadir DIR] --payout HEX [--blocks N] [--rpc ADDR]
+
+  vess export --datadir DIR --out DIR [--from H] [--to H]   # bodies as verifiable chunk files
+  vess archive verify --dir DIR                             # re-hash every chunk, no node needed
+  vess archive encode --dir DIR [--data 10] [--parity 4]    # Reed-Solomon shards under DIR/shards
+  vess archive decode --dir DIR/shards --out DIR            # rebuild from any `data` of the shards
 
 All output is plain `key=value` text. Nothing is JSON.
 Commands load vess.toml beside the executable (or --config FILE), creating it if absent,
@@ -306,6 +339,8 @@ fn run(raw: &[String]) -> Result<(), String> {
                 | "watch"
                 | "account"
                 | "proof"
+                | "witness"
+                | "verify-stateless"
         ) | (
             "wallet",
             "new"
@@ -315,9 +350,16 @@ fn run(raw: &[String]) -> Result<(), String> {
                 | "sign"
                 | "balance"
                 | "send"
+                | "spend"
                 | "set-state"
                 | "watch"
+                | "futures-fund"
+                | "futures-sign"
+                | "futures-submit"
+                | "futures-settle"
         ) | ("miner", _)
+            | ("export", _)
+            | ("archive", "verify" | "encode" | "decode")
     ) {
         return Err(format!("unknown command {:?}\n\n{USAGE}", (group, command)));
     }
@@ -334,6 +376,8 @@ fn run(raw: &[String]) -> Result<(), String> {
         ("node", "watch") => node_watch(&args),
         ("node", "account") => node_account(&args),
         ("node", "proof") => node_proof(&args),
+        ("node", "witness") => node_witness(&args),
+        ("node", "verify-stateless") => node_verify_stateless(&args),
         ("wallet", "new") => wallet_new(&args),
         ("wallet", "restore") => wallet_restore(&args),
         ("wallet", "address") => wallet_address(&args),
@@ -341,9 +385,18 @@ fn run(raw: &[String]) -> Result<(), String> {
         ("wallet", "sign") => wallet_sign(&args),
         ("wallet", "balance") => wallet_balance(&args),
         ("wallet", "send") => wallet_send(&args),
+        ("wallet", "spend") => wallet_spend(&args),
+        ("wallet", "futures-fund") => wallet_futures_fund(&args),
+        ("wallet", "futures-sign") => wallet_futures_sign(&args),
+        ("wallet", "futures-submit") => wallet_futures_submit(&args),
+        ("wallet", "futures-settle") => wallet_futures_settle(&args),
         ("wallet", "set-state") => wallet_set_state(&args),
         ("wallet", "watch") => wallet_watch(&args),
         ("miner", _) => miner(&args),
+        ("export", _) => export_archive(&args),
+        ("archive", "verify") => archive_verify(&args),
+        ("archive", "encode") => archive_encode(&args),
+        ("archive", "decode") => archive_decode(&args),
         other => Err(format!("unknown command {other:?}\n\n{USAGE}")),
     }
 }
@@ -387,7 +440,10 @@ fn node_run(args: &Args) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     let known_peers = node.peer_book_size().0;
     // Pruning is destructive and stored with the data, so the flags only override when present.
-    if args.get("prune-blocks").is_some() || args.get("prune-headers").is_some() {
+    if args.get("prune-blocks").is_some()
+        || args.get("prune-headers").is_some()
+        || args.get("prune-undo").is_some()
+    {
         let current = node.prune_policy();
         let policy = vess_storage::PrunePolicy::new(
             match args.get("prune-blocks") {
@@ -398,8 +454,15 @@ fn node_run(args: &Args) -> Result<(), String> {
                 Some(_) => args.number("prune-headers", 0)?,
                 None => current.headers,
             },
-        );
+        )
+        .with_undo(match args.get("prune-undo") {
+            Some(_) => args.number("prune-undo", 0)?,
+            None => current.undo,
+        });
         node.set_prune_policy(policy).map_err(|e| e.to_string())?;
+    }
+    if args.get("finality-depth").is_some() {
+        node.set_finality_depth(args.number("finality-depth", 0)?);
     }
     let policy = node.prune_policy();
     if node.trust_snapshots() {
@@ -430,7 +493,7 @@ fn node_run(args: &Args) -> Result<(), String> {
             eprintln!(
                 "note: this node cannot serve blocks older than {} below its tip. A peer further \
                  behind can only join by state snapshot, which trusts a peer \
-                 majority for the state at that height because no trusted checkpoint exists yet.",
+                 majority for the state at that height because no finality anchor exists yet.",
                 policy.blocks
             );
         }
@@ -607,6 +670,13 @@ fn node_transaction(args: &Args) -> Result<(), String> {
                     println!("new_state_hash={}", hex(&info.new_state_hash));
                 }
                 println!("fee={}", info.fee);
+                if let Some(escrow) = &info.escrow {
+                    println!("escrow_hash_lock={}", hex(&escrow.rules.hash_lock));
+                    println!("escrow_refund_height={}", escrow.rules.refund_height);
+                    println!("escrow_owner={}", hex(&escrow.rules.owner_account_id));
+                    println!("escrow_max_fee={}", escrow.rules.max_fee);
+                    println!("escrow_claimed={}", u8::from(escrow.claimed));
+                }
             }
             Ok(())
         }
@@ -1102,10 +1172,335 @@ fn node_proof(args: &Args) -> Result<(), String> {
     }
 }
 
+/// Read a rules file: `key=value` lines naming the escrow's spend condition. The account id is
+/// derived from these bytes, so the file is the escrow's only handle.
+fn load_rules(path: &str) -> Result<vess_core::Rules, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("reading {path}: {e}"))?;
+    let mut fields: HashMap<&str, &str> = HashMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (key, value) = line
+            .split_once('=')
+            .ok_or_else(|| format!("{path}: expected key=value"))?;
+        fields.insert(key.trim(), value.trim());
+    }
+    let field = |key: &str| {
+        fields
+            .get(key)
+            .copied()
+            .ok_or_else(|| format!("{path}: missing {key}"))
+    };
+    let height = |key: &str| -> Result<u64, String> {
+        field(key)?
+            .parse()
+            .map_err(|_| format!("{path}: {key} must be a decimal height"))
+    };
+    let number = |key: &str| -> Result<u64, String> {
+        field(key)?
+            .parse()
+            .map_err(|_| format!("{path}: {key} must be a decimal integer"))
+    };
+    Ok(vess_core::Rules {
+        version: vess_core::constants::RULES_VERSION,
+        hash_lock: fixed_hex::<32>(field("hash_lock")?, "hash_lock")?,
+        refund_height: height("refund_height")?,
+        recipient_account_id: fixed_hex::<32>(field("recipient")?, "recipient")?,
+        owner_account_id: fixed_hex::<32>(field("owner")?, "owner")?,
+        max_fee: number("max_fee")?,
+    })
+}
+
+/// Verify a block from its witness alone: the parent state root comes from our own header chain, so
+/// nothing here reads an account tree.
+fn node_verify_stateless(args: &Args) -> Result<(), String> {
+    let network = network(args)?;
+    let id = parse_hash(args.require("id")?)?;
+    let mut target = Target::open(args, network)?;
+
+    let height = match target.request(Request::Block(vess_net::rpc::BlockQuery::Id(id)))? {
+        ReplyBody::Block(block) => block.height,
+        _ => return Err("unexpected block reply".into()),
+    };
+    if height == 0 {
+        return Err("genesis has no body and no witness".into());
+    }
+    // The trusted input: the parent's state root, taken from the header chain we hold ourselves.
+    let parent_root = match target.request(Request::Block(vess_net::rpc::BlockQuery::Height(
+        height - 1,
+    )))? {
+        ReplyBody::Block(block) => block.state_root,
+        _ => return Err("unexpected parent block reply".into()),
+    };
+    let (body, witness) = match target.request(Request::Witness(id))? {
+        ReplyBody::Witness { body, witness } => (body, witness),
+        _ => return Err("unexpected witness reply".into()),
+    };
+
+    let (header, transactions) = vess_consensus::split_block(&body).map_err(|e| e.to_string())?;
+    let root = vess_consensus::verify_witness(
+        &network,
+        &parent_root,
+        &header,
+        &transactions,
+        height,
+        &witness,
+    )
+    .map_err(|e| e.to_string())?;
+    if root != header.state_root {
+        return Err(format!(
+            "witness produced state root {} but the header commits to {}",
+            hex(&root),
+            hex(&header.state_root)
+        ));
+    }
+
+    println!("verified=stateless");
+    println!("block={}", hex(&id));
+    println!("height={height}");
+    println!("transactions={}", transactions.len());
+    println!("witness_accounts={}", witness.accounts.len());
+    println!("witness_bytes={}", witness_bytes(&witness));
+    println!("state_root={}", hex(&root));
+    Ok(())
+}
+
+fn witness_bytes(witness: &vess_core::BlockWitness) -> usize {
+    32 + 4
+        + witness
+            .accounts
+            .iter()
+            .map(vess_core::AccountWitness::encoded_len)
+            .sum::<usize>()
+}
+
+fn node_witness(args: &Args) -> Result<(), String> {
+    let network = network(args)?;
+    let id = parse_hash(args.require("id")?)?;
+    let mut target = Target::open(args, network)?;
+    match target.request(Request::Witness(id))? {
+        ReplyBody::Witness { witness, .. } => {
+            println!("block={}", hex(&id));
+            println!("account_root={}", hex(&witness.account_root));
+            println!("accounts={}", witness.accounts.len());
+            println!("bytes={}", witness_bytes(&witness));
+            for account in &witness.accounts {
+                let state = match account.account {
+                    Some(account) => {
+                        format!("balance={} nonce={}", account.balance, account.next_nonce)
+                    }
+                    None => "absent".to_string(),
+                };
+                println!(
+                    "account={} {state} siblings={}",
+                    hex(&account.id),
+                    account.siblings.len()
+                );
+            }
+            Ok(())
+        }
+        _ => Err("unexpected witness reply".into()),
+    }
+}
+
+/// Read a futures rules file: `key=value` lines naming a contract's terms.
+///
+/// The pot's account id is derived from exactly these bytes, so this file is the contract's only
+/// handle: funding pays the derived id, and only these bytes can ever spend it.
+fn load_futures_rules(path: &str) -> Result<vess_core::FuturesRules, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("reading {path}: {e}"))?;
+    let mut fields: HashMap<&str, &str> = HashMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (key, value) = line
+            .split_once('=')
+            .ok_or_else(|| format!("{path}: expected key=value"))?;
+        fields.insert(key.trim(), value.trim());
+    }
+    let field = |key: &str| {
+        fields
+            .get(key)
+            .copied()
+            .ok_or_else(|| format!("{path}: missing {key}"))
+    };
+    let number = |key: &str| -> Result<u64, String> {
+        field(key)?
+            .parse()
+            .map_err(|_| format!("{path}: {key} must be a decimal integer"))
+    };
+    Ok(vess_core::FuturesRules {
+        version: vess_core::constants::RULES_VERSION_FUTURES,
+        start_supply: number("start_supply")?,
+        target_delta: number("target_delta")?,
+        earliest_settle_height: number("earliest_settle_height")?,
+        recipient_account_id: fixed_hex::<32>(field("recipient")?, "recipient")?,
+        owner_account_id: fixed_hex::<32>(field("owner")?, "owner")?,
+        max_fee: number("max_fee")?,
+    })
+}
+
+/// Where a joint transaction is carried between the parties: one hex line.
+fn futures_tx_path(args: &Args) -> PathBuf {
+    PathBuf::from(args.get("tx").unwrap_or("futures.tx"))
+}
+
+fn read_joint_transfer(path: &Path) -> Result<JointTransfer, String> {
+    let text =
+        std::fs::read_to_string(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+    let bytes = decode_hex(text.trim())?;
+    vess_core::codec::from_bytes(&bytes).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+fn write_joint_transfer(path: &Path, tx: &JointTransfer) -> Result<(), String> {
+    let bytes = vess_core::codec::to_bytes(tx);
+    std::fs::write(path, format!("{}\n", hex(&bytes)))
+        .map_err(|e| format!("writing {}: {e}", path.display()))
+}
+
+/// Build the joint funding transaction both parties sign.
+///
+/// The pot is either funded exactly as declared or not at all, because the two debits live in one
+/// transaction. That is why there is no deposit-first risk and no refund path: nothing is ever half
+/// funded.
+fn wallet_futures_fund(args: &Args) -> Result<(), String> {
+    let network = network(args)?;
+    let wallet = load_wallet(args, network)?;
+    let rules = load_futures_rules(args.require("rules")?)?;
+    let pot = rules.account_id();
+    let amount = args.number("amount", 0)?;
+    if amount == 0 {
+        return Err("--amount must be positive".into());
+    }
+    let fee = args.number("fee", 0)?;
+
+    let mut target = Target::open(args, network)?;
+    let mine = target.balance(&wallet.account_id())?;
+    let mut inputs = vec![wallet.joint_input(amount, mine.next_nonce)];
+
+    if let Some(value) = args.get("counterparty") {
+        let key: PublicKey = decode_hex(value)?
+            .try_into()
+            .map_err(|_| "--counterparty must be an ML-DSA public key".to_string())?;
+        let account = vess_core::hash::account_id(&key);
+        let theirs = target.balance(&account)?;
+        let their_amount = match args.get("counterparty-amount") {
+            Some(value) => value
+                .parse()
+                .map_err(|_| "--counterparty-amount must be a decimal integer".to_string())?,
+            None => amount,
+        };
+        inputs.push(vess_core::TransferInput {
+            authority: vess_core::InputAuthority::Signature {
+                public_key: key,
+                signature: [0u8; ML_DSA_SIG_BYTES],
+            },
+            amount: their_amount,
+            nonce: theirs.next_nonce,
+        });
+    }
+
+    let mut tx = wallet
+        .build_joint_funding(inputs, pot, fee)
+        .ok_or_else(|| "--fee exceeds the contributed amount".to_string())?;
+    wallet.sign_joint_transfer(&mut tx);
+    let path = futures_tx_path(args);
+    write_joint_transfer(&path, &tx)?;
+
+    println!("pot={}", hex(&pot));
+    println!("txid={}", hex(&tx.tx_id()));
+    println!("accounts={}", tx.inputs.len());
+    println!("file={}", path.display());
+    Ok(())
+}
+
+/// Add this wallet's signature to a prebuilt funding transaction.
+fn wallet_futures_sign(args: &Args) -> Result<(), String> {
+    let network = network(args)?;
+    let wallet = load_wallet(args, network)?;
+    let path = futures_tx_path(args);
+    let mut tx = read_joint_transfer(&path)?;
+    wallet.sign_joint_transfer(&mut tx);
+    write_joint_transfer(&path, &tx)?;
+    println!("signed={}", hex(&tx.tx_id()));
+    println!("file={}", path.display());
+    Ok(())
+}
+
+/// Submit a fully signed funding transaction.
+fn wallet_futures_submit(args: &Args) -> Result<(), String> {
+    let network = network(args)?;
+    let path = futures_tx_path(args);
+    let tx = read_joint_transfer(&path)?;
+    let id = tx.tx_id();
+    let mut target = Target::open(args, network)?;
+    match target.request(Request::SubmitJointTransfer(tx))? {
+        ReplyBody::Accepted(_) => {
+            println!("accepted=funding");
+            println!("txid={}", hex(&id));
+            Ok(())
+        }
+        _ => Err("unexpected reply".into()),
+    }
+}
+
+/// Settle a matured futures pot. Nothing here is signed: the terms name both destinations and
+/// consensus derives both amounts, so any holder of the terms can submit it.
+fn wallet_futures_settle(args: &Args) -> Result<(), String> {
+    let network = network(args)?;
+    let wallet = load_wallet(args, network)?;
+    let rules = load_futures_rules(args.require("rules")?)?;
+    let pot = rules.account_id();
+    let fee = args.number("fee", 0)?;
+
+    let mut target = Target::open(args, network)?;
+    let info = target.balance(&pot)?;
+    if !info.exists {
+        return Err(format!("pot {} has no balance", hex(&pot)));
+    }
+    let supply = target.status()?.total_supply as u128;
+    let (owner, recipient) = rules
+        .split(
+            info.balance
+                .checked_sub(fee)
+                .ok_or("--fee exceeds the pot")?,
+            supply,
+        )
+        .ok_or("the futures terms are unusable")?;
+    let tx = wallet
+        .build_futures_settle(&rules, fee, info.next_nonce, info.balance, supply)
+        .ok_or_else(|| "--fee exceeds the pot".to_string())?;
+    let id = tx.tx_id();
+    let body = target.request(Request::SubmitJointTransfer(tx))?;
+    let ReplyBody::Accepted(_) = body else {
+        return Err(format!("unexpected reply {body:?}"));
+    };
+
+    println!("accepted=settlement");
+    println!("pot={}", hex(&pot));
+    println!("txid={}", hex(&id));
+    println!("supply={supply}");
+    println!("owner_amount={owner}");
+    println!("recipient_amount={recipient}");
+    println!("fee={fee}");
+    Ok(())
+}
+
 fn wallet_send(args: &Args) -> Result<(), String> {
     let network = network(args)?;
     let wallet = load_wallet(args, network)?;
-    let recipient = parse_hash(args.require("to")?)?;
+    let (recipient, escrow) = match (args.get("to"), args.get("rules")) {
+        (Some(to), None) => (parse_hash(to)?, None),
+        (None, Some(path)) => {
+            let rules = load_rules(path)?;
+            (rules.account_id(), Some(rules))
+        }
+        _ => return Err("give exactly one of --to or --rules".into()),
+    };
     let amount = args.number("amount", 0)?;
     if amount == 0 {
         return Err("--amount must be positive".into());
@@ -1124,10 +1519,120 @@ fn wallet_send(args: &Args) -> Result<(), String> {
             println!("accepted=transfer");
             println!("txid={}", hex(&id));
             println!("nonce={}", info.next_nonce);
+            if let Some(rules) = escrow {
+                println!("escrow={}", hex(&rules.account_id()));
+                println!("refund_height={}", rules.refund_height);
+            }
+            Ok(())
         }
-        _ => return Err("unexpected reply".into()),
+        _ => Err("unexpected reply".into()),
     }
+}
+
+/// Write every body this node still holds as verifiable chunk files.
+///
+/// Runs on the store directly, so it works on an offline data directory (a running node holds the
+/// database lock). The export covers whatever the prune policy kept: a pruned node exports the part
+/// of history it has, an archival node exports everything.
+fn export_archive(args: &Args) -> Result<(), String> {
+    let network = network(args)?;
+    let dir = datadir(args)?;
+    let out = PathBuf::from(args.require("out")?);
+    let store =
+        vess_storage::Store::open(&dir.join("ledger.redb"), network).map_err(|e| e.to_string())?;
+    let chain = store.load_chain().map_err(|e| e.to_string())?;
+    let oldest = store.oldest_body_height().map_err(|e| e.to_string())?;
+    let from = args.number("from", oldest.max(1))?;
+    let to = args.number("to", chain.best_height())?;
+    if from > to {
+        return Err(format!("--from {from} is above --to {to}"));
+    }
+    let summary = vess_node::archive::export(&out, network.network, from, to, |height| {
+        let header = chain
+            .main_header_at(height)
+            .ok_or_else(|| format!("no header at height {height}"))?;
+        store.body(&header.id()).map_err(|e| e.to_string())
+    })?;
+    println!("chunks={}", summary.chunks);
+    println!("blocks={}", summary.blocks);
+    println!("bytes={}", summary.bytes);
+    println!("first={}", summary.first);
+    println!("last={}", summary.last);
+    println!("dir={}", out.display());
     Ok(())
+}
+
+fn archive_verify(args: &Args) -> Result<(), String> {
+    let dir = PathBuf::from(args.require("dir")?);
+    let summary = vess_node::archive::verify(&dir)?;
+    println!("chunks={}", summary.chunks);
+    println!("blocks={}", summary.blocks);
+    println!("status=ok");
+    Ok(())
+}
+
+fn archive_encode(args: &Args) -> Result<(), String> {
+    let dir = PathBuf::from(args.require("dir")?);
+    let data = args.number("data", 10)? as usize;
+    let parity = args.number("parity", 4)? as usize;
+    let sets = vess_node::archive::encode(&dir, data, parity)?;
+    let shards: usize = sets.iter().map(|set| set.shards.len()).sum();
+    println!("files={}", sets.len());
+    println!("shards={shards}");
+    println!("data={data}");
+    println!("parity={parity}");
+    println!("dir={}", dir.join("shards").display());
+    Ok(())
+}
+
+fn archive_decode(args: &Args) -> Result<(), String> {
+    let dir = PathBuf::from(args.require("dir")?);
+    let out = PathBuf::from(args.require("out")?);
+    let written = vess_node::archive::decode(&dir, &out)?;
+    println!("files={}", written.len());
+    println!("dir={}", out.display());
+    Ok(())
+}
+
+/// Claim an escrow with its preimage, or refund it to the owner once `refund_height` has passed.
+/// Nothing here is signed: the rules name the destination, so this can be run by anyone.
+fn wallet_spend(args: &Args) -> Result<(), String> {
+    let network = network(args)?;
+    let wallet = load_wallet(args, network)?;
+    let rules = load_rules(args.require("rules")?)?;
+    let escrow = rules.account_id();
+    let preimage = match args.get("preimage") {
+        None => None,
+        Some(value) => Some(fixed_hex::<PREIMAGE_BYTES>(value, "--preimage")?),
+    };
+    let fee = args.number("fee", 0)?;
+    let mut target = Target::open(args, network)?;
+    let info = target.balance(&escrow)?;
+    if !info.exists {
+        return Err(format!("escrow {} has no balance", hex(&escrow)));
+    }
+    let tx = wallet
+        .build_rules_spend(&rules, preimage, fee, info.next_nonce, info.balance)
+        .ok_or_else(|| format!("--fee {fee} exceeds the escrow balance {}", info.balance))?;
+    match target.request(Request::SubmitTransfer(tx))? {
+        ReplyBody::Accepted(id) => {
+            println!(
+                "accepted={}",
+                if preimage.is_some() {
+                    "claim"
+                } else {
+                    "refund"
+                }
+            );
+            println!("escrow={}", hex(&escrow));
+            println!("txid={}", hex(&id));
+            println!("amount={}", info.balance - fee);
+            println!("fee={fee}");
+            println!("nonce={}", info.next_nonce);
+            Ok(())
+        }
+        _ => Err("unexpected reply".into()),
+    }
 }
 
 /// Follow one account's state with `WAIT_FOR_ACCOUNT`: no poll interval to choose, and blocks that

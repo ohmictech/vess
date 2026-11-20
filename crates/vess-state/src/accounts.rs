@@ -5,8 +5,11 @@
 
 use std::collections::BTreeMap;
 
+use vess_core::constants::{MAX_TRANSFER_INPUTS, MAX_TRANSFER_OUTPUTS};
 use vess_core::hash;
-use vess_core::types::{Account, AccountId, Hash, StateUpdate, Transfer};
+use vess_core::types::{
+    Account, AccountId, AccountWitness, Hash, JointTransfer, StateUpdate, Transfer,
+};
 
 use crate::error::StateError;
 use crate::merkle::SparseMerkle;
@@ -17,6 +20,12 @@ pub struct State {
     accounts: BTreeMap<AccountId, Account>,
     account_tree: SparseMerkle,
     log: UndoLog,
+    /// Running sum of every balance.
+    ///
+    /// Supply changes only by mint-like credits (the block reward), so maintaining it as accounts are
+    /// written keeps [`State::total_supply`] O(1) for the consensus and mempool paths that evaluate a
+    /// supply delta per candidate transaction.
+    supply: u128,
 }
 
 impl State {
@@ -32,6 +41,7 @@ impl State {
             state.accounts.insert(id, account);
             state.account_tree.insert(id, account.leaf_value().to_vec());
         }
+        state.supply = state.accounts.values().map(|a| a.balance as u128).sum();
         state
     }
 
@@ -60,7 +70,7 @@ impl State {
     /// Total balance across every account. Supply is the sum of balances, because the only way
     /// balance enters is the block reward.
     pub fn total_supply(&self) -> u128 {
-        self.accounts.values().map(|a| a.balance as u128).sum()
+        self.supply
     }
 
     pub fn account_root(&self) -> Hash {
@@ -77,6 +87,57 @@ impl State {
         self.account_tree.proof(id)
     }
 
+    /// Everything needed to prove this account's value under the current root, in about
+    /// `log2(accounts)` hashes rather than 256.
+    pub fn witness(&self, id: &AccountId) -> AccountWitness {
+        AccountWitness {
+            id: *id,
+            account: self.accounts.get(id).copied(),
+            siblings: self.account_tree.compact_proof(id),
+        }
+    }
+
+    /// Rebuild a state from witnesses alone, or `None` if they do not open `account_root`.
+    ///
+    /// Each proof is checked against `account_root` on its own, and the reconstructed partial tree
+    /// must then agree with it — a witness that is missing an account fails that second check rather
+    /// than quietly describing a different state.
+    ///
+    /// `total_supply` is the network total the witness claims, because supply is not derivable from a
+    /// subset of accounts. A wrong value cannot make an invalid block verify: the only rule that reads
+    /// it is the futures settlement, which compares the split it derives against outputs fixed by the
+    /// block, so a lie makes a valid block fail rather than an invalid one pass.
+    pub fn from_witnesses(
+        witnesses: &[AccountWitness],
+        account_root: &Hash,
+        total_supply: u128,
+    ) -> Option<State> {
+        let mut proofs = Vec::with_capacity(witnesses.len());
+        let mut accounts = BTreeMap::new();
+        for witness in witnesses {
+            let value = witness.account.map(|account| account.leaf_value().to_vec());
+            if !SparseMerkle::verify_compact_proof(
+                account_root,
+                &witness.id,
+                value.as_deref(),
+                &witness.siblings,
+            ) {
+                return None;
+            }
+            if let Some(account) = witness.account {
+                accounts.insert(witness.id, account);
+            }
+            proofs.push((witness.id, value, witness.siblings.clone()));
+        }
+        let state = State {
+            accounts,
+            account_tree: SparseMerkle::from_proofs(&proofs),
+            log: UndoLog::new(),
+            supply: total_supply,
+        };
+        (state.account_root() == *account_root).then_some(state)
+    }
+
     pub fn root(&self) -> Hash {
         hash::state_root(&self.account_root())
     }
@@ -87,8 +148,16 @@ impl State {
     fn put_account(&mut self, id: AccountId, account: Account) {
         let previous = self.accounts.get(&id).copied();
         self.log.record_account(id, previous);
+        self.adjust_supply(previous, Some(account));
         self.accounts.insert(id, account);
         self.account_tree.insert(id, account.leaf_value().to_vec());
+    }
+
+    /// Keep [`Self::supply`] exact across an account write, removal, or undo.
+    fn adjust_supply(&mut self, before: Option<Account>, after: Option<Account>) {
+        let before = before.map_or(0u128, |a| a.balance as u128);
+        let after = after.map_or(0u128, |a| a.balance as u128);
+        self.supply = self.supply - before + after;
     }
 
     /// Start recording an undo log for the block about to be applied.
@@ -107,16 +176,20 @@ impl State {
     pub fn apply_undo(&mut self, log: UndoLog) {
         for change in log.into_changes().into_iter().rev() {
             match change {
-                StateChange::Account(id, previous) => match previous {
-                    Some(account) => {
-                        self.accounts.insert(id, account);
-                        self.account_tree.insert(id, account.leaf_value().to_vec());
+                StateChange::Account(id, previous) => {
+                    let current = self.accounts.get(&id).copied();
+                    self.adjust_supply(current, previous);
+                    match previous {
+                        Some(account) => {
+                            self.accounts.insert(id, account);
+                            self.account_tree.insert(id, account.leaf_value().to_vec());
+                        }
+                        None => {
+                            self.accounts.remove(&id);
+                            self.account_tree.remove(&id);
+                        }
                     }
-                    None => {
-                        self.accounts.remove(&id);
-                        self.account_tree.remove(&id);
-                    }
-                },
+                }
             }
         }
     }
@@ -170,6 +243,89 @@ impl State {
         self.put_account(*sender, account);
 
         self.credit(tx.recipient_account_id, tx.amount)?;
+        self.credit(*payout, tx.fee)?;
+        Ok(())
+    }
+
+    /// Apply a joint transaction: several debits, several credits, all or nothing.
+    ///
+    /// Every input is validated before anything is written, so a transaction that fails halfway
+    /// leaves the state untouched. The canonical-form checks here — ascending unique accounts,
+    /// non-zero amounts, inputs equal to outputs plus fee — are the same rules every node applies, so
+    /// two parties building the body independently cannot disagree about what it means.
+    pub fn execute_joint_transfer(
+        &mut self,
+        tx: &JointTransfer,
+        block_timestamp: u64,
+        payout: &AccountId,
+    ) -> Result<(), StateError> {
+        if tx.expiry_unix != 0 && block_timestamp > tx.expiry_unix {
+            return Err(StateError::Expired);
+        }
+        if tx.inputs.is_empty() || tx.outputs.is_empty() {
+            return Err(StateError::EmptyTransaction);
+        }
+        if tx.inputs.len() > MAX_TRANSFER_INPUTS || tx.outputs.len() > MAX_TRANSFER_OUTPUTS {
+            return Err(StateError::Oversized);
+        }
+
+        let mut debits = Vec::with_capacity(tx.inputs.len());
+        let mut total_in = 0u64;
+        for input in &tx.inputs {
+            let id = input.account_id();
+            if let Some(previous) = debits.last().map(|(id, _): &(AccountId, u64)| *id)
+                && id <= previous
+            {
+                return Err(StateError::DuplicateInput);
+            }
+            if input.amount == 0 {
+                return Err(StateError::ZeroAmount);
+            }
+            let account = self.accounts.get(&id).ok_or(StateError::UnknownAccount)?;
+            if account.next_nonce != input.nonce {
+                return Err(StateError::BadNonce);
+            }
+            if account.balance < input.amount {
+                return Err(StateError::InsufficientBalance);
+            }
+            total_in = total_in
+                .checked_add(input.amount)
+                .ok_or(StateError::Overflow)?;
+            debits.push((id, input.amount));
+        }
+
+        let mut total_out = 0u64;
+        let mut previous: Option<AccountId> = None;
+        for output in &tx.outputs {
+            if let Some(previous) = previous
+                && output.account_id <= previous
+            {
+                return Err(StateError::DuplicateOutput);
+            }
+            previous = Some(output.account_id);
+            if output.amount == 0 {
+                return Err(StateError::ZeroAmount);
+            }
+            total_out = total_out
+                .checked_add(output.amount)
+                .ok_or(StateError::Overflow)?;
+        }
+        if total_in != total_out.checked_add(tx.fee).ok_or(StateError::Overflow)? {
+            return Err(StateError::Unbalanced);
+        }
+
+        for (id, amount) in debits {
+            let mut account = *self.accounts.get(&id).ok_or(StateError::UnknownAccount)?;
+            account.balance -= amount;
+            account.next_nonce = account
+                .next_nonce
+                .checked_add(1)
+                .ok_or(StateError::Overflow)?;
+            self.put_account(id, account);
+        }
+        for output in &tx.outputs {
+            self.credit(output.account_id, output.amount)?;
+        }
         self.credit(*payout, tx.fee)?;
         Ok(())
     }
@@ -249,14 +405,16 @@ mod tests {
         Transfer {
             version: PROTOCOL_VERSION,
             chain_id: chain_id(0),
-            sender_public_key: [9u8; ML_DSA_PK_BYTES],
             recipient_account_id: recipient(),
             amount,
             fee,
             nonce,
             expiry_unix: 0,
             payload: None,
-            signature: [0u8; ML_DSA_SIG_BYTES],
+            authority: vess_core::TransferAuthority::Signature {
+                sender_public_key: [9u8; ML_DSA_PK_BYTES],
+                signature: [0u8; ML_DSA_SIG_BYTES],
+            },
         }
     }
 
@@ -422,5 +580,170 @@ mod tests {
         // A transfer with the largest signature still fits a transaction.
         let bytes = vess_core::codec::to_bytes(&transfer(u64::MAX, u64::MAX, u64::MAX));
         assert!(bytes.len() < MAX_TRANSACTION_BYTES);
+    }
+
+    /// A public key whose derived account id is stable, so a test can credit exactly that account.
+    fn joint_key(id: u8) -> vess_core::PublicKey {
+        [id; ML_DSA_PK_BYTES]
+    }
+
+    fn joint_account(id: u8) -> AccountId {
+        vess_core::hash::account_id(&joint_key(id))
+    }
+
+    fn joint_input(id: u8, amount: u64, nonce: u64) -> vess_core::TransferInput {
+        vess_core::TransferInput {
+            authority: vess_core::InputAuthority::Signature {
+                public_key: joint_key(id),
+                signature: [0u8; ML_DSA_SIG_BYTES],
+            },
+            amount,
+            nonce,
+        }
+    }
+
+    /// A joint transfer over keys 1 and 4, in canonical (ascending account) order.
+    fn joint(amounts: (u64, u64), fee: u64) -> vess_core::JointTransfer {
+        let mut inputs = vec![joint_input(1, amounts.0, 0), joint_input(4, amounts.1, 0)];
+        inputs.sort_by_key(vess_core::TransferInput::account_id);
+        let credited = amounts.0 + amounts.1 - fee;
+        let mut outputs = vec![vess_core::Output {
+            account_id: recipient(),
+            amount: credited,
+        }];
+        outputs.sort_by_key(|output| output.account_id);
+        vess_core::JointTransfer {
+            version: vess_core::constants::TRANSACTION_VERSION_JOINT,
+            chain_id: vess_core::hash::chain_id(0),
+            inputs,
+            fee,
+            expiry_unix: 0,
+            outputs,
+        }
+    }
+
+    #[test]
+    fn a_joint_transfer_debits_every_input_and_credits_every_output() {
+        let mut state = State::new();
+        state.credit(joint_account(1), 100).unwrap();
+        state.credit(joint_account(4), 100).unwrap();
+        state
+            .execute_joint_transfer(&joint((40, 40), 5), 0, &payout())
+            .unwrap();
+        assert_eq!(state.balance(&joint_account(1)), 60);
+        assert_eq!(state.balance(&joint_account(4)), 60);
+        assert_eq!(state.balance(&recipient()), 75);
+        assert_eq!(state.balance(&payout()), 5);
+        assert_eq!(state.next_nonce(&joint_account(1)), Some(1));
+        assert_eq!(state.next_nonce(&joint_account(4)), Some(1));
+        // Moving balance is not issuing it.
+        assert_eq!(state.total_supply(), 200);
+    }
+
+    #[test]
+    fn a_joint_transfer_is_all_or_nothing() {
+        let mut state = State::new();
+        state.credit(joint_account(1), 100).unwrap();
+        state.credit(joint_account(4), 10).unwrap();
+        let before = state.root();
+        assert_eq!(
+            state.execute_joint_transfer(&joint((40, 40), 0), 0, &payout()),
+            Err(StateError::InsufficientBalance)
+        );
+        // The first input would have been debited had the transaction been applied piecemeal.
+        assert_eq!(state.root(), before);
+        assert_eq!(state.balance(&joint_account(1)), 100);
+        assert_eq!(state.next_nonce(&joint_account(1)), Some(0));
+    }
+
+    #[test]
+    fn a_joint_transfer_rejects_non_canonical_shapes() {
+        let mut state = State::new();
+        state.credit(joint_account(1), 1_000).unwrap();
+        state.credit(joint_account(4), 1_000).unwrap();
+
+        let duplicate = vess_core::JointTransfer {
+            inputs: vec![joint_input(1, 10, 0), joint_input(1, 10, 1)],
+            outputs: vec![vess_core::Output {
+                account_id: recipient(),
+                amount: 20,
+            }],
+            ..joint((40, 40), 0)
+        };
+        assert_eq!(
+            state.execute_joint_transfer(&duplicate, 0, &payout()),
+            Err(StateError::DuplicateInput)
+        );
+
+        let unbalanced = vess_core::JointTransfer {
+            fee: 0,
+            outputs: vec![vess_core::Output {
+                account_id: recipient(),
+                amount: 79,
+            }],
+            ..joint((40, 40), 0)
+        };
+        assert_eq!(
+            state.execute_joint_transfer(&unbalanced, 0, &payout()),
+            Err(StateError::Unbalanced)
+        );
+
+        let zero = vess_core::JointTransfer {
+            inputs: vec![joint_input(1, 0, 0)],
+            outputs: vec![vess_core::Output {
+                account_id: recipient(),
+                amount: 1,
+            }],
+            ..joint((40, 40), 0)
+        };
+        assert_eq!(
+            state.execute_joint_transfer(&zero, 0, &payout()),
+            Err(StateError::ZeroAmount)
+        );
+
+        let duplicate_outputs = vess_core::JointTransfer {
+            outputs: vec![
+                vess_core::Output {
+                    account_id: recipient(),
+                    amount: 40,
+                },
+                vess_core::Output {
+                    account_id: recipient(),
+                    amount: 40,
+                },
+            ],
+            ..joint((40, 40), 0)
+        };
+        assert_eq!(
+            state.execute_joint_transfer(&duplicate_outputs, 0, &payout()),
+            Err(StateError::DuplicateOutput)
+        );
+    }
+
+    /// Supply is a running total, so it has to survive credits, debits, and an undo exactly.
+    #[test]
+    fn supply_is_exact_across_credits_and_undo() {
+        let mut state = funded(1_000);
+        assert_eq!(state.total_supply(), 1_000);
+        state.credit(payout(), 50).unwrap();
+        assert_eq!(state.total_supply(), 1_050);
+
+        state.begin_block();
+        state
+            .execute_transfer(&transfer(100, 5, 0), &sender(), 0, &payout())
+            .unwrap();
+        assert_eq!(state.total_supply(), 1_050);
+        let log = state.take_undo();
+        state.apply_undo(log);
+        assert_eq!(state.total_supply(), 1_050);
+        assert_eq!(state.balance(&recipient()), 0);
+
+        let restored = State::restore(
+            state
+                .accounts_iter()
+                .map(|(id, account)| (*id, *account))
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(restored.total_supply(), state.total_supply());
     }
 }

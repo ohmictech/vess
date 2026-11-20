@@ -23,6 +23,8 @@ struct Config {
     trust_snapshot: bool,
     prune_blocks: Option<u64>,
     prune_headers: Option<u64>,
+    prune_undo: Option<u64>,
+    finality_depth: Option<u64>,
     mine_interval: Option<u64>,
 }
 
@@ -41,6 +43,8 @@ impl Default for Config {
             trust_snapshot: true,
             prune_blocks: None,
             prune_headers: None,
+            prune_undo: None,
+            finality_depth: None,
             mine_interval: None,
         }
     }
@@ -150,6 +154,8 @@ impl Config {
         for (flag, value) in [
             ("prune-blocks", self.prune_blocks),
             ("prune-headers", self.prune_headers),
+            ("prune-undo", self.prune_undo),
+            ("finality-depth", self.finality_depth),
         ] {
             if let Some(value) = value {
                 args.set_default(flag, &value.to_string());
@@ -206,6 +212,8 @@ pub(super) fn configure(args: &mut Args, node_run: bool) -> Result<(), String> {
             "no-trust-snapshot",
             "prune-blocks",
             "prune-headers",
+            "prune-undo",
+            "finality-depth",
             "mine-interval",
         ];
         if let Some(name) = args

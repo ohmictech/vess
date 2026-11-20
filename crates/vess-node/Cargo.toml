@@ -26,3 +26,4 @@ vess-net = { path = "../vess-net" }
 vess-state = { path = "../vess-state" }
 vess-storage = { path = "../vess-storage" }
 vess-wallet = { path = "../vess-wallet" }
+reed-solomon-erasure = "6.0.0"

@@ -13,9 +13,15 @@ use std::path::Path;
 
 use bip39::{Language, Mnemonic};
 use vess_core::codec::{Reader, Writer};
-use vess_core::constants::{PROTOCOL_VERSION, TRANSACTION_VERSION, TX_PAYLOAD_BYTES};
-use vess_core::hash::{self, DOM_STATE_UPDATE, DOM_TRANSFER};
-use vess_core::{AccountId, Hash, PublicKey, Signature, StateUpdate, Transfer};
+use vess_core::constants::{
+    ML_DSA_SIG_BYTES, PREIMAGE_BYTES, PROTOCOL_VERSION, TRANSACTION_VERSION,
+    TRANSACTION_VERSION_JOINT, TX_PAYLOAD_BYTES,
+};
+use vess_core::hash::{self, DOM_JOINT_TRANSFER, DOM_STATE_UPDATE, DOM_TRANSFER};
+use vess_core::{
+    AccountId, FuturesRules, Hash, InputAuthority, JointTransfer, Output, PublicKey, Rules,
+    Signature, StateUpdate, Transfer, TransferAuthority, TransferInput,
+};
 use vess_crypto::Key;
 use vess_net::rpc::{
     AccountInfo, BlockInfo, BlockQuery, Reply, ReplyBody, Request, RpcClient, StatusInfo,
@@ -275,18 +281,170 @@ impl Wallet {
         let mut tx = Transfer {
             version: TRANSACTION_VERSION,
             chain_id: self.chain_id(),
-            sender_public_key: self.public_key,
             recipient_account_id: recipient,
             amount,
             fee,
             nonce,
             expiry_unix,
             payload,
-            signature: [0u8; vess_core::constants::ML_DSA_SIG_BYTES],
+            authority: TransferAuthority::Signature {
+                sender_public_key: self.public_key,
+                signature: [0u8; vess_core::constants::ML_DSA_SIG_BYTES],
+            },
         };
-        tx.signature = vess_crypto::sign(&self.key, DOM_TRANSFER, &tx.unsigned_bytes())
+        let signature = vess_crypto::sign(&self.key, DOM_TRANSFER, &tx.unsigned_bytes())
             .expect("transaction context is short");
+        tx.authority = TransferAuthority::Signature {
+            sender_public_key: self.public_key,
+            signature,
+        };
         tx
+    }
+
+    /// Fund a rules account. The recipient is the rules' own account id, so the balance can only
+    /// ever be spent by revealing those rules.
+    pub fn build_deposit(&self, rules: &Rules, amount: u64, fee: u64, nonce: u64) -> Transfer {
+        self.build_transfer(rules.account_id(), amount, fee, nonce, 0)
+    }
+
+    /// Spend an escrow account in full. A `preimage` selects the claim path and pays
+    /// `rules.recipient_account_id`; without one the only possible spend is a refund to
+    /// `rules.owner_account_id`, which consensus accepts at or after `rules.refund_height`.
+    ///
+    /// Returns `None` when the fee exceeds the balance, since the whole balance must be spent.
+    pub fn build_rules_spend(
+        &self,
+        rules: &Rules,
+        preimage: Option<[u8; PREIMAGE_BYTES]>,
+        fee: u64,
+        nonce: u64,
+        balance: u64,
+    ) -> Option<Transfer> {
+        let amount = balance.checked_sub(fee)?;
+        let recipient_account_id = if preimage.is_some() {
+            rules.recipient_account_id
+        } else {
+            rules.owner_account_id
+        };
+        Some(Transfer {
+            version: TRANSACTION_VERSION,
+            chain_id: self.chain_id(),
+            recipient_account_id,
+            amount,
+            fee,
+            nonce,
+            expiry_unix: 0,
+            payload: None,
+            authority: TransferAuthority::Rules {
+                rules: rules.clone(),
+                preimage,
+            },
+        })
+    }
+
+    /// An unsigned input contributing `amount` from this wallet to a joint transaction.
+    ///
+    /// The signature stays zero until [`Self::sign_joint_transfer`] fills it in, so a counterparty's
+    /// input can be carried through unchanged.
+    pub fn joint_input(&self, amount: u64, nonce: u64) -> TransferInput {
+        TransferInput {
+            authority: InputAuthority::Signature {
+                public_key: self.public_key,
+                signature: [0u8; ML_DSA_SIG_BYTES],
+            },
+            amount,
+            nonce,
+        }
+    }
+
+    /// Sign every input this wallet owns, leaving the rest untouched.
+    ///
+    /// Every signature covers the same body, so it commits to all inputs and all outputs: whichever
+    /// party is handed the transaction afterwards cannot change the counterparty, the pot, or the
+    /// fee without invalidating the signature already on it.
+    pub fn sign_joint_transfer(&self, tx: &mut JointTransfer) {
+        let body = tx.unsigned_bytes();
+        for input in tx.inputs.iter_mut() {
+            if let InputAuthority::Signature {
+                public_key,
+                signature,
+            } = &mut input.authority
+                && *public_key == self.public_key
+            {
+                *signature = vess_crypto::sign(&self.key, DOM_JOINT_TRANSFER, &body)
+                    .expect("transaction context is short");
+            }
+        }
+    }
+
+    /// A joint funding transaction that credits `pot` with every input minus the fee.
+    ///
+    /// Inputs and outputs are sorted into canonical order, so two parties building the same
+    /// transaction independently sign identical bytes.
+    pub fn build_joint_funding(
+        &self,
+        inputs: Vec<TransferInput>,
+        pot: AccountId,
+        fee: u64,
+    ) -> Option<JointTransfer> {
+        let total = inputs
+            .iter()
+            .try_fold(0u64, |sum, input| sum.checked_add(input.amount))?;
+        let amount = total.checked_sub(fee)?;
+        let mut inputs = inputs;
+        inputs.sort_by_key(TransferInput::account_id);
+        Some(JointTransfer {
+            version: TRANSACTION_VERSION_JOINT,
+            chain_id: self.chain_id(),
+            inputs,
+            fee,
+            expiry_unix: 0,
+            outputs: vec![Output {
+                account_id: pot,
+                amount,
+            }],
+        })
+    }
+
+    /// The settlement for a matured futures contract.
+    ///
+    /// Nothing here is signed: the terms name both destinations and consensus derives both amounts,
+    /// so any holder of the terms can submit it. Returns `None` when the fee exceeds the pot or the
+    /// terms are unusable.
+    pub fn build_futures_settle(
+        &self,
+        rules: &FuturesRules,
+        fee: u64,
+        nonce: u64,
+        balance: u64,
+        supply: u128,
+    ) -> Option<JointTransfer> {
+        let pot = balance.checked_sub(fee)?;
+        let (owner, recipient) = rules.split(pot, supply)?;
+        let mut outputs = vec![
+            Output {
+                account_id: rules.owner_account_id,
+                amount: owner,
+            },
+            Output {
+                account_id: rules.recipient_account_id,
+                amount: recipient,
+            },
+        ];
+        outputs.retain(|output| output.amount > 0);
+        outputs.sort_unstable_by(|a, b| a.account_id.cmp(&b.account_id));
+        Some(JointTransfer {
+            version: TRANSACTION_VERSION_JOINT,
+            chain_id: self.chain_id(),
+            inputs: vec![TransferInput {
+                authority: InputAuthority::Futures { rules: *rules },
+                amount: balance,
+                nonce,
+            }],
+            fee,
+            expiry_unix: 0,
+            outputs,
+        })
     }
 
     pub fn build_state_update(
@@ -629,11 +787,18 @@ mod tests {
         let wallet = Wallet::from_seed(0, [7u8; 32]);
         let tx = wallet.build_transfer([9u8; 32], 10, 1, 0, 0);
         assert_eq!(tx.sender_id(), wallet.account_id());
+        let (key, signature) = match &tx.authority {
+            TransferAuthority::Signature {
+                sender_public_key,
+                signature,
+            } => (sender_public_key, signature),
+            TransferAuthority::Rules { .. } => panic!("a wallet transfer is signed"),
+        };
         assert!(vess_crypto::verify(
-            &tx.sender_public_key,
+            key,
             DOM_TRANSFER,
             &tx.unsigned_bytes(),
-            &tx.signature
+            signature
         ));
     }
 

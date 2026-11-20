@@ -5,6 +5,43 @@ use std::sync::{Arc, Mutex};
 use vess_core::Transaction;
 use vess_core::constants::{GENESIS_REWARD, NetworkProfile};
 
+/// Only a window of headers stays in memory, but the node must still serve older ones, answer
+/// questions about them, and keep extending the tip.
+#[test]
+fn headers_outside_the_memory_window_are_served_from_disk() {
+    let dir = TempDir::new();
+    let mut node = Node::open(&dir.path, NetworkProfile::DEVNET).unwrap();
+    let payout = [0x51u8; 32];
+    for _ in 0..70 {
+        mine_one(&mut node, &payout);
+    }
+    assert_eq!(node.height(), 70);
+    let first = node.headers_from(1, 1);
+    assert_eq!(first.len(), 1);
+
+    node.trim_header_memory_to(64);
+    assert!(
+        node.chain().main_header_at(1).is_none(),
+        "old headers must leave memory"
+    );
+
+    // Serving a peer still works: the header comes back from the store.
+    let served = node.headers_from(1, 3);
+    assert_eq!(served.len(), 3, "old headers must still be served");
+    assert_eq!(served[0].id(), first[0].id());
+
+    // So does an RPC-style lookup by height.
+    let info = node
+        .block_info(crate::BlockQuery::Height(1))
+        .expect("block 1 from disk");
+    assert_eq!(info.height, 1);
+    assert_eq!(info.id, first[0].id());
+
+    // And the chain still extends after the trim.
+    mine_one(&mut node, &payout);
+    assert_eq!(node.height(), 71);
+}
+
 /// What a block at genesis difficulty pays its miner: the reward minus the 1% dev fee.
 const MINED: u64 = GENESIS_REWARD - GENESIS_REWARD / 100;
 use vess_net::rpc::{ReplyBody, Request};
@@ -530,7 +567,9 @@ fn an_unsigned_transfer_is_refused_at_admission() {
     mine_one(&mut node, &alice.account_id());
 
     let mut tx = alice.build_transfer([0xB6u8; 32], 1, 1, 0, 0);
-    tx.signature[10] ^= 0xFF;
+    if let vess_core::TransferAuthority::Signature { signature, .. } = &mut tx.authority {
+        signature[10] ^= 0xFF;
+    }
     let reply = node.handle_rpc(Request::SubmitTransfer(tx));
     assert!(!reply.is_ok());
 }
@@ -696,6 +735,191 @@ fn a_pruned_node_still_answers_questions_about_old_transactions() {
         node.state_height()
     );
     assert_eq!(node.history_replayed, 0);
+}
+
+/// An escrow is funded by an ordinary transfer and spent with nothing but its rules, so the whole
+/// flow needs no new account type and no signature from the escrow.
+#[test]
+fn an_escrow_is_funded_claimed_and_reported() {
+    let (_dir, mut node) = node();
+    let alice = Wallet::from_seed(0, [0x51u8; 32]);
+    let bob = [0xBAu8; 32];
+    mine_one(&mut node, &alice.account_id());
+
+    let secret = [0x9Eu8; 32];
+    let rules = vess_core::Rules {
+        version: vess_core::constants::RULES_VERSION,
+        hash_lock: vess_core::hash::hash_lock(&secret),
+        refund_height: node.height() + 100,
+        recipient_account_id: bob,
+        owner_account_id: alice.account_id(),
+        max_fee: 2,
+    };
+    let escrow = rules.account_id();
+
+    let deposit = alice.build_deposit(&rules, 10, 0, 0);
+    node.submit_transfer(deposit).unwrap();
+    mine_one(&mut node, &alice.account_id());
+    assert_eq!(node.balance(&escrow), 10);
+
+    let claim = alice
+        .build_rules_spend(&rules, Some(secret), 1, 0, 10)
+        .unwrap();
+    let claim_id = node.submit_transfer(claim).unwrap();
+    mine_one(&mut node, &alice.account_id());
+
+    assert_eq!(node.balance(&bob), 9);
+    assert_eq!(node.balance(&escrow), 0);
+    let info = node.transaction_info(&claim_id);
+    assert_eq!(info.sender_id, escrow, "the escrow is the sender");
+    assert_eq!(info.recipient_id, bob);
+    let reported = info.escrow.expect("an escrow spend reports its rules");
+    assert!(reported.claimed);
+    assert_eq!(reported.rules.refund_height, rules.refund_height);
+    assert_eq!(reported.rules.hash_lock, rules.hash_lock);
+}
+
+#[test]
+fn a_premature_refund_cannot_stall_the_miner() {
+    let (_dir, mut node) = node();
+    let alice = Wallet::from_seed(0, [0x52u8; 32]);
+    let bob = [0xBBu8; 32];
+    mine_one(&mut node, &alice.account_id());
+
+    let secret = [0x9Fu8; 32];
+    let rules = vess_core::Rules {
+        version: vess_core::constants::RULES_VERSION,
+        hash_lock: vess_core::hash::hash_lock(&secret),
+        refund_height: node.height() + 50,
+        recipient_account_id: bob,
+        owner_account_id: alice.account_id(),
+        max_fee: 2,
+    };
+    node.submit_transfer(alice.build_deposit(&rules, 10, 0, 0))
+        .unwrap();
+    mine_one(&mut node, &alice.account_id());
+
+    // Refused outright: a refund that no height could mine must never occupy the escrow's single
+    // per-account mempool slot, and must never reach a block template.
+    let early = alice.build_rules_spend(&rules, None, 0, 0, 10).unwrap();
+    assert!(node.submit_transfer(early).is_err());
+    assert_eq!(node.mempool().transaction_count(), 0);
+
+    // Mining is unaffected, and the claim still lands.
+    mine_one(&mut node, &alice.account_id());
+    let claim = alice
+        .build_rules_spend(&rules, Some(secret), 0, 0, 10)
+        .unwrap();
+    node.submit_transfer(claim).unwrap();
+    mine_one(&mut node, &alice.account_id());
+    assert_eq!(node.balance(&bob), 10);
+}
+
+/// The finality window is what stops a long-range rewrite: a branch that replaces our own chain
+/// below it is refused even when its blocks are otherwise valid.
+#[test]
+fn a_branch_below_the_finality_window_is_refused() {
+    let (_dir, mut node) = node();
+    let alice = Wallet::from_seed(0, [0x71u8; 32]);
+    let payout = alice.account_id();
+    for _ in 0..6 {
+        mine_one(&mut node, &payout);
+    }
+    node.set_finality_depth(2);
+    let (finalized_height, finalized_id) = node.finalized().expect("a finalized anchor");
+    assert_eq!(finalized_height, node.height() - 2);
+
+    // A competing block on the parent of the settled block: the classic rewrite attempt.
+    let fork_height = finalized_height - 1;
+    let fork_parent = node.chain().main_header_at(fork_height).unwrap();
+    let parent_state = node.state_at(&fork_parent.id()).unwrap();
+    let mut template = vess_consensus::build_template(
+        node.chain(),
+        &NetworkProfile::DEVNET,
+        &fork_parent.id(),
+        &parent_state,
+        &payout,
+        fork_parent.timestamp_unix_ms + 1,
+        &[],
+    )
+    .unwrap();
+    assert!(template.mine(20_000_000));
+    let forged = template.encode();
+
+    assert!(matches!(
+        node.accept_block(&forged),
+        Err(NodeError::Finalized)
+    ));
+    assert_eq!(
+        node.chain().main_header_at(finalized_height).unwrap().id(),
+        finalized_id
+    );
+
+    // With finality off the same block is a harmless side branch, which shows the refusal above
+    // came from the window and not from the block being invalid.
+    node.set_finality_depth(0);
+    assert!(node.finalized().is_none());
+    assert!(node.accept_block(&forged).is_ok());
+}
+
+/// A fork above the window is an ordinary reorg and must keep working.
+#[test]
+fn a_fork_above_the_finality_window_is_still_accepted() {
+    let (_dir, mut node) = node();
+    let alice = Wallet::from_seed(0, [0x72u8; 32]);
+    let payout = alice.account_id();
+    for _ in 0..6 {
+        mine_one(&mut node, &payout);
+    }
+    node.set_finality_depth(2);
+    let (finalized_height, _) = node.finalized().unwrap();
+
+    let fork_parent = node.chain().main_header_at(finalized_height).unwrap();
+    let parent_state = node.state_at(&fork_parent.id()).unwrap();
+    let mut template = vess_consensus::build_template(
+        node.chain(),
+        &NetworkProfile::DEVNET,
+        &fork_parent.id(),
+        &parent_state,
+        &payout,
+        fork_parent.timestamp_unix_ms + 1,
+        &[],
+    )
+    .unwrap();
+    assert!(template.mine(20_000_000));
+    assert!(node.accept_block(&template.encode()).is_ok());
+}
+
+/// A block can be checked against its witness with no account state at all: build the witness from a
+/// serving node, then validate using only the header chain.
+#[test]
+fn a_block_validates_from_its_witness_alone() {
+    let (_dir, mut node) = node();
+    let alice = Wallet::from_seed(0, [0x77u8; 32]);
+    let bob = [0xBDu8; 32];
+    mine_one(&mut node, &alice.account_id());
+
+    let tx = alice.build_transfer(bob, 3, 1, 0, 0);
+    node.submit_transfer(tx).unwrap();
+    let id = mine_one(&mut node, &alice.account_id());
+
+    let witness = node.block_witness(&id).unwrap();
+    // Two accounts here (the transfer's sender and recipient) plus the payout and dev accounts.
+    assert!(witness.accounts.len() >= 2);
+    assert!(!witness.accounts[0].siblings.is_empty());
+
+    let root = node.verify_block_stateless(&id, &witness).unwrap();
+    assert_eq!(root, node.root(), "matches the state a full node holds");
+
+    // A witness that claims a richer sender cannot open the parent root.
+    let mut forged = witness.clone();
+    let entry = forged
+        .accounts
+        .iter_mut()
+        .find(|account| account.account.is_some())
+        .unwrap();
+    entry.account.as_mut().unwrap().balance += 1;
+    assert!(node.verify_block_stateless(&id, &forged).is_err());
 }
 
 #[test]
@@ -1047,10 +1271,12 @@ fn garbage_on_the_wire_leaves_the_node_healthy() {
         }
     }
 
-    // The node still serves a normal peer and its chain is intact.
+    // The node still serves a normal peer and its chain is intact. `applied` counts headers plus
+    // bodies, and B had neither, so two of each must arrive.
     let applied = p2p::sync_once(&b, &addr, 0).unwrap();
-    assert_eq!(applied, 2);
+    assert_eq!(applied, 4, "two headers and two bodies");
     assert_eq!(b.lock().unwrap().height(), 2);
+    assert_eq!(b.lock().unwrap().state_height(), 2);
     assert_eq!(
         b.lock().unwrap().tip().id(),
         shared.lock().unwrap().tip().id()
@@ -1772,4 +1998,75 @@ fn a_snapshot_below_the_tip_is_accepted_when_it_matches_its_own_height() {
     b.install_snapshot(1, state_at_first).unwrap();
     assert_eq!(b.state_height(), 1);
     assert_eq!(b.height(), 2, "the header tip is untouched by a snapshot");
+}
+
+/// A futures pot is funded by one transaction both parties sign, and settled by revealing its terms.
+/// Neither step needs a key to own the pot, so the node's admission and template policy must accept
+/// an unsigned settlement whose payouts it computes itself.
+#[test]
+fn a_futures_pot_is_funded_atomically_and_then_settled() {
+    let (_dir, mut node) = node();
+    let alice = Wallet::from_seed(0, [0x61u8; 32]);
+    let bob = Wallet::from_seed(0, [0x62u8; 32]);
+    mine_one(&mut node, &alice.account_id());
+    mine_one(&mut node, &bob.account_id());
+
+    let start_supply = node.state().total_supply() as u64;
+    let rules = vess_core::FuturesRules {
+        version: vess_core::constants::RULES_VERSION_FUTURES,
+        start_supply,
+        // Wide enough that the split lands inside the pot rather than at a clamp.
+        target_delta: 500,
+        earliest_settle_height: node.height() + 3,
+        recipient_account_id: bob.account_id(),
+        owner_account_id: alice.account_id(),
+        max_fee: 2,
+    };
+    let pot = rules.account_id();
+    assert_ne!(pot, alice.account_id());
+    assert_ne!(pot, bob.account_id());
+
+    let alice_nonce = node.state().next_nonce(&alice.account_id()).unwrap();
+    let bob_nonce = node.state().next_nonce(&bob.account_id()).unwrap();
+    let mut inputs = vec![
+        alice.joint_input(10, alice_nonce),
+        bob.joint_input(10, bob_nonce),
+    ];
+    inputs.sort_by_key(vess_core::TransferInput::account_id);
+    let mut funding = alice.build_joint_funding(inputs, pot, 0).unwrap();
+    alice.sign_joint_transfer(&mut funding);
+    bob.sign_joint_transfer(&mut funding);
+    let funding_id = node.submit_joint_transfer(funding).unwrap();
+    mine_one(&mut node, &alice.account_id());
+
+    assert_eq!(
+        node.balance(&pot),
+        20,
+        "both deposits landed or neither did"
+    );
+    let info = node.transaction_info(&funding_id);
+    assert_eq!(info.kind, vess_core::types::TRANSACTION_KIND_JOINT_TRANSFER);
+
+    while node.height() + 1 < rules.earliest_settle_height {
+        mine_one(&mut node, &alice.account_id());
+    }
+
+    let bob_before = node.balance(&bob.account_id());
+    let supply = node.state().total_supply();
+    let (owner, recipient) = rules.split(20, supply).unwrap();
+    assert!(owner > 0 && recipient > 0, "the split should be interior");
+    let settle = alice
+        .build_futures_settle(
+            &rules,
+            0,
+            node.state().next_nonce(&pot).unwrap(),
+            node.state().balance(&pot),
+            supply,
+        )
+        .unwrap();
+    node.submit_joint_transfer(settle).unwrap();
+    mine_one(&mut node, &alice.account_id());
+
+    assert_eq!(node.balance(&pot), 0, "the pot is spent whole");
+    assert_eq!(node.balance(&bob.account_id()), bob_before + recipient);
 }

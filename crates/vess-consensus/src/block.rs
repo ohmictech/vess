@@ -6,11 +6,15 @@ use vess_core::U256;
 use vess_core::codec::{Reader, Writer};
 use vess_core::constants::{
     BLOCK_HEADER_BYTES, DEV_FEE_ACCOUNT, MAX_BLOCK_BYTES, MAX_TRANSACTION_BYTES, NetworkProfile,
-    PREIMAGE_BYTES, PROTOCOL_VERSION, RULES_VERSION, TRANSACTION_VERSION,
+    PREIMAGE_BYTES, PROTOCOL_VERSION, RULES_VERSION, RULES_VERSION_FUTURES, TRANSACTION_VERSION,
+    TRANSACTION_VERSION_JOINT,
 };
-use vess_core::hash::{self, DOM_STATE_UPDATE, DOM_TRANSFER};
+use vess_core::hash::{self, DOM_JOINT_TRANSFER, DOM_STATE_UPDATE, DOM_TRANSFER};
 use vess_core::types::transaction_version_supported;
-use vess_core::{AccountId, BlockHeader, Hash, Transaction};
+use vess_core::{
+    AccountId, BlockHeader, BlockWitness, FuturesRules, Hash, InputAuthority, JointTransfer,
+    Output, Transaction,
+};
 use vess_state::{State, UndoLog};
 
 use crate::chain::{HeaderSource, check_header, median_time_past, required_target};
@@ -48,28 +52,11 @@ impl BlockTemplate {
     }
 }
 
-fn increment_nonce(nonce: &mut [u8; 32]) {
-    for byte in nonce.iter_mut().rev() {
-        let (v, overflow) = byte.overflowing_add(1);
-        *byte = v;
-        if !overflow {
-            return;
-        }
-    }
-}
-
 /// Increment `security_nonce` until the PoW hash meets the target.
 pub fn mine_header(header: &mut BlockHeader, max_attempts: u64) -> bool {
-    if header.meets_target() {
-        return true;
-    }
-    for _ in 0..max_attempts {
-        increment_nonce(&mut header.security_nonce);
-        if header.meets_target() {
-            return true;
-        }
-    }
-    false
+    // The search itself lives on the header so it can hash the fixed prefix once and vary only the
+    // trailing nonce; this stays the stable entry point for callers.
+    header.mine_nonce(max_attempts)
 }
 
 /// Canonical block body: `u32` count followed by every transaction.
@@ -128,7 +115,10 @@ fn reject(index: usize, reason: TxReject) -> ConsensusError {
 /// Below `rules.refund_height` the claim path is open and needs the preimage. At or above it the
 /// claim window is closed for good and only the owner may be paid, whether or not a preimage is
 /// offered.
-fn check_rules_spend(
+///
+/// Public because a node decides mempool membership and block templates with the same predicate that
+/// consensus applies; two implementations would eventually disagree.
+pub fn check_rules_spend(
     tx: &vess_core::Transfer,
     rules: &vess_core::types::Rules,
     preimage: Option<&[u8; PREIMAGE_BYTES]>,
@@ -171,8 +161,172 @@ fn check_rules_spend(
     Ok(())
 }
 
-/// Execute a body against `state`, then credit the block reward derived from `target`.
+/// The futures settlement rule.
 ///
+/// The submitter chooses nothing. Consensus derives both destinations and both amounts from the
+/// revealed terms and the measured supply delta, then requires the transaction to declare exactly
+/// that split — a mismatch is a rejection, never a rewrite, so a transaction id always describes the
+/// effect it actually has.
+///
+/// ```text
+/// delta     = supply - rules.start_supply        (saturating at zero)
+/// recipient = (pot - fee) * min(delta, 2 * target_delta) / (2 * target_delta)
+/// owner     = (pot - fee) - recipient
+/// ```
+///
+/// The split is linear in the delta and clamped to the pot, so the contract is fully collateralized
+/// by construction: neither side can be asked for more than what was posted. At
+/// `delta == target_delta` the two sides receive exactly half, which is the fair strike for equal
+/// collateral.
+///
+/// `supply` is the state entering the settling block. Because transfers conserve supply and the block
+/// reward is credited after the body, that value is the same wherever the settlement sits in the
+/// block: nobody can move it by stuffing the block.
+pub fn check_futures_settle(
+    tx: &JointTransfer,
+    rules: &FuturesRules,
+    height: u64,
+    balance: u64,
+    supply: u128,
+) -> Result<(), TxReject> {
+    if rules.version != RULES_VERSION_FUTURES {
+        return Err(TxReject::BadRules);
+    }
+    if rules.owner_account_id == rules.recipient_account_id {
+        return Err(TxReject::BadFuturesRules);
+    }
+    if tx.version < TRANSACTION_VERSION_JOINT {
+        return Err(TxReject::BadVersion);
+    }
+    if !rules.settle_open_at(height) {
+        return Err(TxReject::SettleTooEarly);
+    }
+    if tx.fee > rules.max_fee {
+        return Err(TxReject::FeeTooHigh);
+    }
+    if tx.expiry_unix != 0 {
+        return Err(TxReject::BadFuturesRules);
+    }
+    // The pot is spent whole, and only the pot: no second input, no change output, no dust.
+    if tx.inputs.len() != 1 || tx.inputs[0].amount != balance {
+        return Err(TxReject::PartialSpend);
+    }
+    let pot = balance.checked_sub(tx.fee).ok_or(TxReject::FeeTooHigh)?;
+    if pot == 0 {
+        return Err(TxReject::FeeTooHigh);
+    }
+
+    let (owner, recipient) = rules.split(pot, supply).ok_or(TxReject::BadFuturesRules)?;
+    let mut expected: Vec<Output> = [
+        (rules.owner_account_id, owner),
+        (rules.recipient_account_id, recipient),
+    ]
+    .into_iter()
+    .filter(|(_, amount)| *amount > 0)
+    .map(|(account_id, amount)| Output { account_id, amount })
+    .collect();
+    expected.sort_unstable_by(|a, b| a.account_id.cmp(&b.account_id));
+    if tx.outputs.len() != expected.len() || tx.outputs.iter().zip(&expected).any(|(a, b)| a != b) {
+        return Err(TxReject::BadSettlement);
+    }
+    Ok(())
+}
+
+/// Every account a block reads or writes: each transaction's sender and recipient, plus the two
+/// accounts the reward is credited to.
+///
+/// This is derived from the block alone, so a witness can be checked for completeness: it must name
+/// exactly these accounts, no more and no fewer.
+pub fn touched_accounts(transactions: &[Transaction], payout: &AccountId) -> Vec<AccountId> {
+    let mut set = std::collections::BTreeSet::new();
+    for tx in transactions {
+        match tx {
+            Transaction::Transfer(t) => {
+                set.insert(t.sender_id());
+                set.insert(t.recipient_account_id);
+            }
+            Transaction::StateUpdate(t) => {
+                set.insert(t.sender_id());
+            }
+            Transaction::JointTransfer(t) => {
+                for input in &t.inputs {
+                    set.insert(input.account_id());
+                }
+                for output in &t.outputs {
+                    set.insert(output.account_id);
+                }
+            }
+        }
+    }
+    set.insert(*payout);
+    set.insert(DEV_FEE_ACCOUNT);
+    set.into_iter().collect()
+}
+
+/// Validate a block from its header and a witness, without holding the parent state.
+///
+/// The witness is the parent state's proof for [`touched_accounts`]. Every proof is opened against
+/// `parent_state_root`, the block is executed against the partial state it reconstructs, and the
+/// resulting root must equal `header.state_root`. Nothing here reads the database or a full tree, so
+/// a verifier needs only headers (for `parent_state_root`) and the block with its witness.
+///
+/// The result is the post-block state root, which the caller compares with `header.state_root`; it is
+/// returned so a caller can chain blocks without re-reading it from the header.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_witness(
+    network: &NetworkProfile,
+    parent_state_root: &Hash,
+    header: &BlockHeader,
+    transactions: &[Transaction],
+    height: u64,
+    witness: &BlockWitness,
+) -> Result<Hash, ConsensusError> {
+    if header.version != PROTOCOL_VERSION {
+        return Err(ConsensusError::BadVersion);
+    }
+    if header.chain_id != hash::chain_id(network.network) {
+        return Err(ConsensusError::BadChainId);
+    }
+    let ids: Vec<Hash> = transactions.iter().map(|tx| tx.id()).collect();
+    if hash::tx_root(&ids) != header.transaction_root {
+        return Err(ConsensusError::BadTxRoot);
+    }
+
+    // The witness names the account root it opens; it is only useful if that root is the one the
+    // trusted header commits to.
+    if hash::state_root(&witness.account_root) != *parent_state_root {
+        return Err(ConsensusError::BadWitness);
+    }
+
+    // A witness that names the wrong accounts could otherwise omit one and still fold to a root,
+    // because the missing account would simply be absent from the partial tree.
+    let expected = touched_accounts(transactions, &header.payout_account_id);
+    if witness.accounts.len() != expected.len()
+        || witness.accounts.iter().map(|w| w.id).ne(expected)
+    {
+        return Err(ConsensusError::BadWitness);
+    }
+
+    let mut state = State::from_witnesses(
+        &witness.accounts,
+        &witness.account_root,
+        witness.total_supply,
+    )
+    .ok_or(ConsensusError::BadWitness)?;
+    apply_body(
+        &mut state,
+        &header.chain_id,
+        network,
+        header.target,
+        transactions,
+        height,
+        header.timestamp_unix_ms,
+        &header.payout_account_id,
+    )?;
+    Ok(state.root())
+}
+
+/// Execute a body against `state`, then credit the block reward derived from `target`.
 /// `height` is the height of the block being applied: escrow rules gate on it, so it is part of the
 /// validation context and never inferred from the clock.
 #[allow(clippy::too_many_arguments)]
@@ -212,21 +366,14 @@ pub fn apply_body(
                         }
                     }
                     vess_core::types::TransferAuthority::Rules { rules, preimage } => {
-                        let account =
-                            state.account(&sender).ok_or_else(|| {
-                                reject(
-                                    index,
-                                    TxReject::InvalidState(vess_state::StateError::UnknownAccount),
-                                )
-                            })?;
-                        check_rules_spend(
-                            t,
-                            rules,
-                            preimage.as_ref(),
-                            height,
-                            account.balance,
-                        )
-                        .map_err(|reason| reject(index, reason))?;
+                        let account = state.account(&sender).ok_or_else(|| {
+                            reject(
+                                index,
+                                TxReject::InvalidState(vess_state::StateError::UnknownAccount),
+                            )
+                        })?;
+                        check_rules_spend(t, rules, preimage.as_ref(), height, account.balance)
+                            .map_err(|reason| reject(index, reason))?;
                     }
                 }
                 state
@@ -251,6 +398,44 @@ pub fn apply_body(
                 }
                 state
                     .execute_state_update(t, &sender, timestamp_unix_ms / 1_000, payout)
+                    .map_err(|e| reject(index, TxReject::InvalidState(e)))?;
+            }
+            Transaction::JointTransfer(t) => {
+                if !transaction_version_supported(t.version) {
+                    return Err(reject(index, TxReject::BadVersion));
+                }
+                if &t.chain_id != chain_id {
+                    return Err(reject(index, TxReject::BadChainId));
+                }
+                // A settlement is authorised by the terms it reveals, so it is checked against the
+                // measured supply before anything moves. The supply read here is the state entering
+                // the block whenever the settlement sits inside it, because transfers conserve
+                // supply and the reward is credited afterwards.
+                if let Some(rules) = t.futures_rules() {
+                    let account = state.account(&rules.account_id()).ok_or_else(|| {
+                        reject(
+                            index,
+                            TxReject::InvalidState(vess_state::StateError::UnknownAccount),
+                        )
+                    })?;
+                    check_futures_settle(t, rules, height, account.balance, state.total_supply())
+                        .map_err(|reason| reject(index, reason))?;
+                }
+                // Every signature covers the same body, so each signer agreed to every input and
+                // every output, not just its own.
+                let body = t.unsigned_bytes();
+                for input in &t.inputs {
+                    if let InputAuthority::Signature {
+                        public_key,
+                        signature,
+                    } = &input.authority
+                        && !vess_crypto::verify(public_key, DOM_JOINT_TRANSFER, &body, signature)
+                    {
+                        return Err(reject(index, TxReject::BadSignature));
+                    }
+                }
+                state
+                    .execute_joint_transfer(t, timestamp_unix_ms / 1_000, payout)
                     .map_err(|e| reject(index, TxReject::InvalidState(e)))?;
             }
         }

@@ -10,8 +10,8 @@ use vess_consensus::chain::Chain;
 use vess_consensus::{ConsensusError, ValidatedBlock, check_header};
 use vess_core::codec::{Decode, Encode, Reader, Writer};
 use vess_core::constants::{
-    BLOCK_HEADER_BYTES, DEFAULT_PRUNE_BLOCKS, DEFAULT_PRUNE_HEADERS, DIFFICULTY_WINDOW_BLOCKS,
-    NetworkProfile, PRUNE_FLOOR_BLOCKS,
+    BLOCK_HEADER_BYTES, DEFAULT_PRUNE_BLOCKS, DEFAULT_PRUNE_HEADERS, DEFAULT_PRUNE_UNDO,
+    DIFFICULTY_WINDOW_BLOCKS, NetworkProfile, PRUNE_FLOOR_BLOCKS,
 };
 use vess_core::{Account, AccountId, BlockHeader, CodecError, Hash};
 use vess_state::{State, StateChange, UndoLog};
@@ -19,6 +19,40 @@ use vess_state::{State, StateChange, UndoLog};
 const ACCOUNTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("accounts");
 const HEADERS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("headers");
 const BODIES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("bodies");
+/// First byte of a `BODIES` value that stores the block *without* its header. The header is already
+/// in `HEADERS`, and a canonical header begins with its version (`0x00`), so this marker is
+/// unambiguous against records written before bodies were trimmed.
+const BODY_WITHOUT_HEADER: u8 = 0x01;
+
+/// Decode a `HEADERS` record: canonical header, height, chain work.
+fn decode_header_record(record: &[u8]) -> Result<(BlockHeader, u64, u128), StorageError> {
+    if record.len() < BLOCK_HEADER_BYTES + 24 {
+        return Err(StorageError::Corrupt("header record"));
+    }
+    let header = BlockHeader::decode(&record[..BLOCK_HEADER_BYTES])?;
+    let mut height = [0u8; 8];
+    height.copy_from_slice(&record[BLOCK_HEADER_BYTES..BLOCK_HEADER_BYTES + 8]);
+    let mut work = [0u8; 16];
+    work.copy_from_slice(&record[BLOCK_HEADER_BYTES + 8..BLOCK_HEADER_BYTES + 24]);
+    Ok((
+        header,
+        u64::from_be_bytes(height),
+        u128::from_be_bytes(work),
+    ))
+}
+
+/// Encode a block body the way `BODIES` stores it: the header is dropped because `HEADERS` holds it.
+fn encode_body_record(block: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(block.len().saturating_sub(BLOCK_HEADER_BYTES) + 1);
+    if block.len() >= BLOCK_HEADER_BYTES {
+        out.push(BODY_WITHOUT_HEADER);
+        out.extend_from_slice(&block[BLOCK_HEADER_BYTES..]);
+    } else {
+        // Not a whole block; store it verbatim so nothing is silently lost.
+        out.extend_from_slice(block);
+    }
+    out
+}
 const UNDO: TableDefinition<&[u8], &[u8]> = TableDefinition::new("undo");
 const PENDING: TableDefinition<&[u8], &[u8]> = TableDefinition::new("pending");
 const META: TableDefinition<&[u8], &[u8]> = TableDefinition::new("meta");
@@ -34,8 +68,10 @@ const META_NETWORK: &[u8] = b"network";
 const META_TIP: &[u8] = b"tip";
 const META_PRUNE_BLOCKS: &[u8] = b"prune_blocks";
 const META_PRUNE_HEADERS: &[u8] = b"prune_headers";
+const META_PRUNE_UNDO: &[u8] = b"prune_undo";
 const META_OLDEST_BODY: &[u8] = b"oldest_body_height";
 const META_OLDEST_HEADER: &[u8] = b"oldest_header_height";
+const META_OLDEST_UNDO: &[u8] = b"oldest_undo_height";
 const META_SNAPSHOT_VERIFICATION: &[u8] = b"snapshot_verification";
 
 /// A snapshot whose history is being independently verified.
@@ -86,14 +122,17 @@ impl SnapshotVerification {
     }
 }
 
-/// How much history this node keeps. Both fields are counted in blocks below the tip and `0` means
+/// How much history this node keeps. Every field is counted in blocks below the tip and `0` means
 /// "keep everything", so an archival node is simply `PrunePolicy::none()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PrunePolicy {
-    /// Blocks whose bodies (and undo records) are deleted.
+    /// Blocks whose bodies are deleted.
     pub blocks: u64,
     /// Blocks whose headers are deleted. Headers are 234 bytes, so this is normally left high.
     pub headers: u64,
+    /// Blocks whose undo records are deleted. Only reorgs can read an undo record, so this can be
+    /// far shorter than `blocks`: an archival node keeps every body and still drops the reorg log.
+    pub undo: u64,
 }
 
 impl PrunePolicy {
@@ -102,13 +141,25 @@ impl PrunePolicy {
         PrunePolicy {
             blocks: 0,
             headers: 0,
+            undo: 0,
         }
     }
 
     pub const fn new(blocks: u64, headers: u64) -> PrunePolicy {
-        PrunePolicy { blocks, headers }
+        PrunePolicy {
+            blocks,
+            headers,
+            undo: DEFAULT_PRUNE_UNDO,
+        }
     }
 
+    /// Keep undo records for `undo` blocks instead of the default.
+    pub const fn with_undo(mut self, undo: u64) -> PrunePolicy {
+        self.undo = undo;
+        self
+    }
+
+    /// Bodies and headers are what make a node archival; a short undo window does not.
     pub fn is_archival(&self) -> bool {
         self.blocks == 0 && self.headers == 0
     }
@@ -119,9 +170,11 @@ impl PrunePolicy {
 pub struct PruneReport {
     pub bodies_removed: u64,
     pub headers_removed: u64,
+    pub undo_removed: u64,
     /// Bodies below this height no longer exist. `0` means nothing has been pruned.
     pub oldest_body_height: u64,
     pub oldest_header_height: u64,
+    pub oldest_undo_height: u64,
 }
 
 pub const SCHEMA_VERSION: u32 = 3;
@@ -529,9 +582,66 @@ impl Store {
         let read = self.db.begin_read().map_err(db)?;
         let table = read.open_table(BODIES).map_err(db)?;
         match table.get(&id[..]).map_err(db)? {
-            Some(v) => Ok(Some(v.value().to_vec())),
             None => Ok(None),
+            Some(value) => {
+                let value = value.value();
+                // Newer records omit the header because `HEADERS` already holds it; older ones kept
+                // the whole block. A canonical header starts with its version (`0x00 0x..`), so the
+                // marker byte cannot be confused with a legacy record.
+                if value.first() != Some(&BODY_WITHOUT_HEADER) {
+                    return Ok(Some(value.to_vec()));
+                }
+                let headers = read.open_table(HEADERS).map_err(db)?;
+                let Some(record) = headers.get(&id[..]).map_err(db)? else {
+                    return Err(StorageError::Corrupt("body without its header"));
+                };
+                let record = record.value();
+                if record.len() < BLOCK_HEADER_BYTES {
+                    return Err(StorageError::Corrupt("header record"));
+                }
+                let mut block = Vec::with_capacity(BLOCK_HEADER_BYTES + value.len() - 1);
+                block.extend_from_slice(&record[..BLOCK_HEADER_BYTES]);
+                block.extend_from_slice(&value[1..]);
+                Ok(Some(block))
+            }
         }
+    }
+
+    /// A stored header with its position, so a node that keeps only a window of headers in memory can
+    /// still serve and validate the rest from disk.
+    pub fn header_record(
+        &self,
+        id: &Hash,
+    ) -> Result<Option<(BlockHeader, u64, u128)>, StorageError> {
+        let read = self.db.begin_read().map_err(db)?;
+        let headers = read.open_table(HEADERS).map_err(db)?;
+        let Some(record) = headers.get(&id[..]).map_err(db)? else {
+            return Ok(None);
+        };
+        Ok(Some(decode_header_record(record.value())?))
+    }
+
+    /// The same record, addressed by main-chain height.
+    pub fn header_at_height(
+        &self,
+        height: u64,
+    ) -> Result<Option<(BlockHeader, u64, u128)>, StorageError> {
+        let read = self.db.begin_read().map_err(db)?;
+        let heights = read.open_table(HEIGHT_INDEX).map_err(db)?;
+        let start = height_key(height, &[0u8; 32]);
+        let end = height_key(height.saturating_add(1), &[0u8; 32]);
+        let Some(entry) = heights.range(&start[..]..&end[..]).map_err(db)?.next() else {
+            return Ok(None);
+        };
+        let key = entry.map_err(db)?.0.value().to_vec();
+        if key.len() != 40 {
+            return Err(StorageError::Corrupt("height index key"));
+        }
+        let mut id = [0u8; 32];
+        id.copy_from_slice(&key[8..]);
+        drop(heights);
+        drop(read);
+        self.header_record(&id)
     }
 
     pub fn undo(&self, id: &Hash) -> Result<Option<UndoLog>, StorageError> {
@@ -583,7 +693,7 @@ impl Store {
             write
                 .open_table(BODIES)
                 .map_err(db)?
-                .insert(&id[..], body)
+                .insert(&id[..], encode_body_record(body).as_slice())
                 .map_err(db)?;
 
             write
@@ -683,7 +793,7 @@ impl Store {
             write
                 .open_table(BODIES)
                 .map_err(db)?
-                .insert(&id[..], body)
+                .insert(&id[..], encode_body_record(body).as_slice())
                 .map_err(db)?;
             write
                 .open_table(HEIGHT_INDEX)
@@ -802,6 +912,7 @@ impl Store {
         Ok(PrunePolicy {
             blocks: get(META_PRUNE_BLOCKS)?.unwrap_or(DEFAULT_PRUNE_BLOCKS),
             headers: get(META_PRUNE_HEADERS)?.unwrap_or(DEFAULT_PRUNE_HEADERS),
+            undo: get(META_PRUNE_UNDO)?.unwrap_or(DEFAULT_PRUNE_UNDO),
         })
     }
 
@@ -815,6 +926,8 @@ impl Store {
             meta.insert(META_PRUNE_BLOCKS, &policy.blocks.to_be_bytes()[..])
                 .map_err(db)?;
             meta.insert(META_PRUNE_HEADERS, &policy.headers.to_be_bytes()[..])
+                .map_err(db)?;
+            meta.insert(META_PRUNE_UNDO, &policy.undo.to_be_bytes()[..])
                 .map_err(db)?;
         }
         write.commit().map_err(db)?;
@@ -830,6 +943,12 @@ impl Store {
     /// The lowest height whose header still exists (1 once header pruning has run; genesis stays).
     pub fn oldest_header_height(&self) -> Result<u64, StorageError> {
         self.meta_u64(META_OLDEST_HEADER)
+            .map(|value| value.unwrap_or(0))
+    }
+
+    /// The lowest height whose undo record still exists (0 when nothing has been pruned).
+    pub fn oldest_undo_height(&self) -> Result<u64, StorageError> {
+        self.meta_u64(META_OLDEST_UNDO)
             .map(|value| value.unwrap_or(0))
     }
 
@@ -875,19 +994,27 @@ impl Store {
             PRUNE_FLOOR_BLOCKS,
             self.oldest_header_height()?,
         );
+        let undo_cutoff = prune_cutoff(
+            tip_height,
+            policy.undo,
+            PRUNE_FLOOR_BLOCKS,
+            self.oldest_undo_height()?,
+        );
 
         let mut report = PruneReport {
             oldest_body_height: self.oldest_body_height()?,
             oldest_header_height: self.oldest_header_height()?,
+            oldest_undo_height: self.oldest_undo_height()?,
             ..PruneReport::default()
         };
         let bodies_done = body_cutoff == 0 || body_cutoff <= report.oldest_body_height;
         let headers_done = header_cutoff == 0 || header_cutoff <= report.oldest_header_height;
-        if bodies_done && headers_done {
+        let undo_done = undo_cutoff == 0 || undo_cutoff <= report.oldest_undo_height;
+        if bodies_done && headers_done && undo_done {
             return Ok(report);
         }
 
-        let upper = body_cutoff.max(header_cutoff);
+        let upper = body_cutoff.max(header_cutoff).max(undo_cutoff);
         let write = self.db.begin_write().map_err(db)?;
         {
             let rows: Vec<(u64, Hash)> = {
@@ -918,8 +1045,11 @@ impl Store {
             for (height, id) in rows {
                 if body_cutoff > 0 && height < body_cutoff {
                     bodies.remove(&id[..]).map_err(db)?;
-                    undo.remove(&id[..]).map_err(db)?;
                     report.bodies_removed += 1;
+                }
+                if undo_cutoff > 0 && height < undo_cutoff {
+                    undo.remove(&id[..]).map_err(db)?;
+                    report.undo_removed += 1;
                 }
                 if header_cutoff > 0 && height < header_cutoff {
                     headers.remove(&id[..]).map_err(db)?;
@@ -936,6 +1066,10 @@ impl Store {
             if header_cutoff > 0 {
                 report.oldest_header_height = report.oldest_header_height.max(header_cutoff);
                 self.set_meta_u64(&mut meta, META_OLDEST_HEADER, report.oldest_header_height)?;
+            }
+            if undo_cutoff > 0 {
+                report.oldest_undo_height = report.oldest_undo_height.max(undo_cutoff);
+                self.set_meta_u64(&mut meta, META_OLDEST_UNDO, report.oldest_undo_height)?;
             }
         }
         write.commit().map_err(db)?;
@@ -1183,6 +1317,42 @@ mod tests {
         mine_blocks(&store, 1);
         assert_eq!(store.load_chain().unwrap().best_height(), tip_height + 1);
     }
+
+    /// Undo records are the only thing a reorg reads, so they carry their own retention window: an
+    /// archival node keeps every body and still drops the reorg log it can never reach.
+    #[test]
+    fn undo_retention_is_independent_of_bodies() {
+        let temp = TempDb::new();
+        let store = Store::open(&temp.path, network()).unwrap();
+        let (chain, _) = mine_blocks(&store, 290);
+        let tip_height = chain.best_height();
+        let floor = tip_height - PRUNE_FLOOR_BLOCKS;
+        let id_at = |height: u64| chain.main_header_at(height).unwrap().id();
+
+        // Keep every body, keep undo only inside the reorg window.
+        let policy = PrunePolicy::new(0, 0).with_undo(PRUNE_FLOOR_BLOCKS);
+        let report = store.prune(tip_height, policy).unwrap();
+        assert_eq!(report.bodies_removed, 0, "archival bodies survive");
+        assert_eq!(report.undo_removed, floor - 1);
+        assert_eq!(store.oldest_body_height().unwrap(), 0);
+        assert_eq!(store.oldest_undo_height().unwrap(), floor);
+        // Genesis carries neither a body nor an undo record, so the removable range starts at 1.
+        assert!(store.body(&id_at(1)).unwrap().is_some());
+        assert!(store.undo(&id_at(1)).unwrap().is_none());
+        assert!(store.undo(&id_at(floor)).unwrap().is_some());
+
+        // A later pass with the same policy does nothing, and bodies are still untouched.
+        let report = store.prune(tip_height, policy).unwrap();
+        assert_eq!(report.undo_removed, 0);
+        assert_eq!(report.bodies_removed, 0);
+
+        // The window is stored with the data.
+        store.set_prune_policy(policy).unwrap();
+        drop(store);
+        let store = Store::open(&temp.path, network()).unwrap();
+        assert_eq!(store.prune_policy().unwrap(), policy);
+        assert_eq!(store.prune_policy().unwrap().undo, PRUNE_FLOOR_BLOCKS);
+    }
     #[test]
     fn default_retention_and_saved_policy_are_distinct() {
         let temp = TempDb::new();
@@ -1223,6 +1393,53 @@ mod tests {
         assert_eq!(state.balance(&MINER), balance);
         assert!(store.body(&tip).unwrap().is_some());
         assert!(store.undo(&tip).unwrap().is_some());
+    }
+
+    /// The header already lives in `HEADERS`, so `BODIES` stores only what follows it. Reads must
+    /// still hand back a whole block, and a legacy record must keep working.
+    #[test]
+    fn bodies_do_not_store_a_second_copy_of_the_header() {
+        let temp = TempDb::new();
+        let store = Store::open(&temp.path, network()).unwrap();
+        let (chain, _) = mine_blocks(&store, 2);
+        let tip = chain.best_id();
+        let block = store.body(&tip).unwrap().expect("stored body");
+        let header = chain.main_header_at(2).unwrap().canonical();
+        assert_eq!(&block[..BLOCK_HEADER_BYTES], &header[..]);
+
+        let record = {
+            let read = store.db.begin_read().unwrap();
+            let table = read.open_table(BODIES).unwrap();
+            table.get(&tip[..]).unwrap().unwrap().value().to_vec()
+        };
+        assert_eq!(
+            record.len(),
+            block.len() - BLOCK_HEADER_BYTES + 1,
+            "only the body and one marker byte are stored"
+        );
+        assert_eq!(record[0], BODY_WITHOUT_HEADER);
+        assert_eq!(&record[1..], &block[BLOCK_HEADER_BYTES..]);
+    }
+
+    /// A record written before bodies were trimmed holds the whole block and must still be readable.
+    #[test]
+    fn a_legacy_whole_block_body_is_still_returned() {
+        let temp = TempDb::new();
+        let store = Store::open(&temp.path, network()).unwrap();
+        let (chain, _) = mine_blocks(&store, 1);
+        let tip = chain.best_id();
+        let block = store.body(&tip).unwrap().expect("stored body");
+
+        {
+            let write = store.db.begin_write().unwrap();
+            write
+                .open_table(BODIES)
+                .unwrap()
+                .insert(&tip[..], block.as_slice())
+                .unwrap();
+            write.commit().unwrap();
+        }
+        assert_eq!(store.body(&tip).unwrap().unwrap(), block);
     }
 
     /// A process that dies mid-life must still find its last committed block.

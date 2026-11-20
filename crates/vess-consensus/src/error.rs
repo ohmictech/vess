@@ -22,6 +22,12 @@ pub enum TxReject {
     FeeTooHigh,
     /// A rules account must be spent in full.
     PartialSpend,
+    /// The revealed futures terms are malformed or unusable.
+    BadFuturesRules,
+    /// A settlement arrived before the terms allow one.
+    SettleTooEarly,
+    /// The settlement does not declare the split consensus derives from the measured supply.
+    BadSettlement,
     InvalidState(StateError),
 }
 
@@ -39,9 +45,9 @@ pub enum ConsensusError {
     DuplicateInBlock,
     BadTxRoot,
     BadStateRoot,
+    /// A stateless witness did not open the parent state root, or named the wrong accounts.
+    BadWitness,
     UnknownTip,
-    /// A checkpointed height held a different block id, so this is not our chain.
-    CheckpointMismatch,
     BadTransaction {
         index: u32,
         reason: TxReject,
@@ -61,6 +67,11 @@ impl fmt::Display for TxReject {
             TxReject::WrongDestination => f.write_str("escrow spend names the wrong destination"),
             TxReject::FeeTooHigh => f.write_str("fee exceeds the escrow rules"),
             TxReject::PartialSpend => f.write_str("escrow balance must be spent in full"),
+            TxReject::BadFuturesRules => f.write_str("malformed or unusable futures terms"),
+            TxReject::SettleTooEarly => f.write_str("settlement is not open yet"),
+            TxReject::BadSettlement => {
+                f.write_str("settlement does not match the measured supply delta")
+            }
             TxReject::InvalidState(e) => write!(f, "state rejection: {e}"),
         }
     }
@@ -81,10 +92,10 @@ impl fmt::Display for ConsensusError {
             ConsensusError::DuplicateInBlock => f.write_str("duplicate transaction or mint id"),
             ConsensusError::BadTxRoot => f.write_str("transaction root mismatch"),
             ConsensusError::BadStateRoot => f.write_str("state root mismatch"),
-            ConsensusError::UnknownTip => f.write_str("no current tip"),
-            ConsensusError::CheckpointMismatch => {
-                f.write_str("block conflicts with a trusted checkpoint")
+            ConsensusError::BadWitness => {
+                f.write_str("witness does not open the parent state root")
             }
+            ConsensusError::UnknownTip => f.write_str("no current tip"),
             ConsensusError::BadTransaction { index, reason } => {
                 write!(f, "transaction {index}: {reason}")
             }

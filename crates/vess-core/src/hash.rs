@@ -10,6 +10,7 @@ use crate::types::{AccountId, Hash, PublicKey};
 pub const DOM_CHAIN_ID: &[u8] = b"VESS-CHAIN-ID-V1";
 pub const DOM_ACCOUNT: &[u8] = b"VESS-ACCOUNT-V1";
 pub const DOM_TRANSFER: &[u8] = b"VESS-TRANSFER-V1";
+pub const DOM_JOINT_TRANSFER: &[u8] = b"VESS-JOINT-TRANSFER-V1";
 pub const DOM_STATE_UPDATE: &[u8] = b"VESS-STATE-UPDATE-V1";
 pub const DOM_TRANSACTION_ID: &[u8] = b"VESS-TRANSACTION-ID-V1";
 pub const DOM_BLOCK_POW: &[u8] = b"VESS-BLOCK-HEADER-POW-V1";
@@ -24,6 +25,7 @@ pub const DOM_NETWORK_FRAME: &[u8] = b"VESS-NETWORK-FRAME-V1";
 pub const DOM_RPC_FRAME: &[u8] = b"VESS-RPC-FRAME-V1";
 pub const DOM_DEV_FEE_ACCOUNT: &[u8] = b"VESS-DEV-FEE-ACCOUNT-V1";
 pub const DOM_RULES_ACCOUNT: &[u8] = b"VESS-RULES-ACCOUNT-V1";
+pub const DOM_FUTURES_ACCOUNT: &[u8] = b"VESS-FUTURES-ACCOUNT-V1";
 
 /// `BLAKE3(domain || part_0 || part_1 || ...)`.
 pub fn tagged(domain: &[u8], parts: &[&[u8]]) -> Hash {
@@ -58,6 +60,12 @@ pub fn rules_account_id(canonical_rules: &[u8]) -> AccountId {
     tagged(DOM_RULES_ACCOUNT, &[canonical_rules])
 }
 
+/// The account a futures contract's terms own. Distinct domain from [`rules_account_id`] so an
+/// escrow and a futures contract can never be confused for one another, whatever their bytes.
+pub fn futures_account_id(canonical_rules: &[u8]) -> AccountId {
+    tagged(DOM_FUTURES_ACCOUNT, &[canonical_rules])
+}
+
 /// The hash a rules account locks against. Deliberately undomained so the same 32-byte secret can
 /// be committed with the same function on a chain that only knows BLAKE3.
 pub fn hash_lock(preimage: &[u8]) -> Hash {
@@ -75,6 +83,18 @@ pub fn block_id(header_bytes: &[u8; crate::constants::BLOCK_HEADER_BYTES]) -> Ha
 
 pub fn pow_hash(header_bytes: &[u8; crate::constants::BLOCK_HEADER_BYTES]) -> Hash {
     tagged(DOM_BLOCK_POW, &[header_bytes])
+}
+
+/// The proof-of-work hash state after `domain || prefix`, ready to absorb the mining nonce.
+///
+/// Hashing the prefix once lets a search vary only the trailing nonce, instead of re-serialising and
+/// re-hashing the whole header for every attempt. Finalising this with the nonce appended is exactly
+/// `pow_hash(&header.canonical())`, only split across two `update` calls.
+pub fn pow_state(prefix: &[u8]) -> Hasher {
+    let mut h = Hasher::new();
+    h.update(DOM_BLOCK_POW);
+    h.update(prefix);
+    h
 }
 
 fn tx_merkle(ids: &[Hash]) -> Hash {

@@ -31,28 +31,12 @@ fn pow2_exponent(target: U256) -> u32 {
 
 /// The parameters of one network, in a fixed order so output diffs are readable.
 pub fn network_rows(network: NetworkProfile) -> Vec<Param> {
-    let checkpoints = crate::constants::checkpoints(network.network);
     vec![
         row("network", network.network),
         row("genesis_timestamp_ms", network.genesis_timestamp_ms),
         row(
             "genesis_target",
             format!("2^{}", pow2_exponent(network.genesis_target)),
-        ),
-        // A checkpoint is a consensus rule, so it belongs here rather than in a config file: an
-        // operator who cannot see which heights the binary settles cannot tell what it will refuse.
-        row("checkpoints", checkpoints.len()),
-        row(
-            "checkpoint",
-            if checkpoints.is_empty() {
-                "none".to_string()
-            } else {
-                checkpoints
-                    .iter()
-                    .map(|c| format!("{}:{}", c.height, hex(&c.id)))
-                    .collect::<Vec<_>>()
-                    .join(",")
-            },
         ),
     ]
 }

@@ -13,6 +13,17 @@ pub const TRANSACTION_VERSION_PAYLOAD: u16 = 4;
 /// authority: either a signature, or the rules prefixed to an escrow account id.
 pub const TRANSACTION_VERSION: u16 = 5;
 
+/// Transaction version that carries several inputs and several outputs in one atomic spend. Every
+/// input is debited and every output credited, or the whole transaction is rejected.
+pub const TRANSACTION_VERSION_JOINT: u16 = 6;
+
+/// Most inputs a joint transaction may carry. Bounds both decode allocation and the amount of state
+/// work a single transaction can impose.
+pub const MAX_TRANSFER_INPUTS: usize = 16;
+
+/// Most outputs a joint transaction may carry.
+pub const MAX_TRANSFER_OUTPUTS: usize = 16;
+
 /// The optional application payload a transfer can carry.
 pub const TX_PAYLOAD_BYTES: usize = 32;
 
@@ -25,9 +36,28 @@ pub const RULES_VERSION: u8 = 1;
 /// Canonical size of a version 1 rules struct: `1 + 32 + 8 + 32 + 32 + 8`.
 pub const RULES_BYTES: usize = 113;
 
-/// Authority tags inside a version 5 transfer.
+/// Version of the [`crate::types::FuturesRules`] struct. A futures account commits to exactly these
+/// bytes, and the version byte keeps its id space disjoint from an escrow's.
+pub const RULES_VERSION_FUTURES: u8 = 2;
+
+/// Canonical size of a futures rules struct: `1 + 8 + 8 + 8 + 32 + 32 + 8`.
+pub const FUTURES_RULES_BYTES: usize = 97;
+
+/// Ceiling on `FuturesRules::target_delta`.
+///
+/// The settlement split multiplies the pot by `min(delta, 2 * target_delta)` in `u128`. Bounding the
+/// delta at `2^62` keeps `2 * target_delta` inside `u64` and the product inside `u128` for every
+/// reachable balance, so the arithmetic cannot overflow and no contract can be written whose payout
+/// is unrepresentable.
+pub const MAX_TARGET_DELTA: u64 = 1 << 62;
+
+/// Depth of the account tree: one path bit per level, one level per bit of the account id.
+pub const DEPTH: usize = 256;
+
+/// Authority tags inside a version 5 transfer, and input authorities inside a version 6 one.
 pub const AUTHORITY_SIGNATURE: u8 = 0;
 pub const AUTHORITY_RULES: u8 = 1;
+pub const AUTHORITY_FUTURES: u8 = 2;
 
 // ---------------------------------------------------------------- networks
 
@@ -210,6 +240,18 @@ pub const DEFAULT_PRUNE_BLOCKS: u64 = 16_384;
 /// operator asks for it. `0` means never.
 pub const DEFAULT_PRUNE_HEADERS: u64 = 100_000_000;
 
+/// Default for `--prune-undo`: undo records older than this many blocks below the tip are deleted.
+/// Deliberately separate from `--prune-blocks`, so an archival node can keep every body without
+/// carrying a reorg log that no reorg can ever reach. `0` keeps them forever.
+pub const DEFAULT_PRUNE_UNDO: u64 = 16_384;
+
+/// Blocks below the tip whose history this node treats as final: no branch that replaces our main
+/// chain at or below that height is adopted.
+///
+/// The anchor is derived from the chain the node validated itself, so it needs no published hashes,
+/// no attestations and no operator maintenance. `0` disables the rule.
+pub const DEFAULT_FINALITY_DEPTH_BLOCKS: u64 = 10_000;
+
 /// Never prune inside this window, whatever the configuration says. It covers median-time-past (11
 /// blocks), the difficulty window (64), the peer sync lookback (32) and a reorg allowance, so a
 /// pruned node can still validate new blocks and follow an ordinary fork.
@@ -229,7 +271,9 @@ pub const RPC_MAGIC: u32 = 0x5645_5352;
 pub const P2P_DEFAULT_PORT: u16 = 9_732;
 pub const RPC_DEFAULT_PORT: u16 = 9_733;
 
-pub const MAX_HEADERS_PER_MESSAGE: usize = 512;
+/// Headers one message may carry. Bounded by the frame limit rather than by round-trip comfort:
+/// 4,096 headers is ~958 KiB, and every extra kilobyte here is one less round trip during catch-up.
+pub const MAX_HEADERS_PER_MESSAGE: usize = 4_096;
 
 pub const CONNECT_TIMEOUT_MS: u64 = 5_000;
 pub const HANDSHAKE_TIMEOUT_MS: u64 = 10_000;
@@ -250,6 +294,17 @@ mod tests {
     #[test]
     fn header_size_matches_field_layout() {
         assert_eq!(BLOCK_HEADER_BYTES, 2 + 32 + 32 + 32 + 32 + 8 + 32 + 32 + 32);
+    }
+
+    /// A full header batch must fit one frame: the encoder refuses oversized payloads rather than
+    /// splitting them, so a batch that did not fit would stall catch-up instead of slowing it.
+    #[test]
+    fn a_full_header_batch_fits_in_one_frame() {
+        let batch = 4 + MAX_HEADERS_PER_MESSAGE * BLOCK_HEADER_BYTES;
+        assert!(
+            batch <= MAX_NETWORK_FRAME_BYTES,
+            "a {MAX_HEADERS_PER_MESSAGE}-header batch is {batch} bytes"
+        );
     }
 
     #[test]

@@ -46,11 +46,49 @@ pub enum AdmissionError<E> {
 #[derive(Debug, Clone)]
 struct Entry {
     tx: Transaction,
-    account: AccountId,
+    /// Every account the transaction debits. One for a transfer or a state update, one or more for a
+    /// joint transaction.
+    accounts: Vec<AccountId>,
     nonce: u64,
     fee: u64,
     size: usize,
     seq: u64,
+}
+
+/// The accounts a transaction debits, in canonical order.
+fn tx_accounts(tx: &Transaction) -> Vec<AccountId> {
+    match tx {
+        Transaction::Transfer(t) => vec![t.sender_id()],
+        Transaction::StateUpdate(t) => vec![t.sender_id()],
+        Transaction::JointTransfer(t) => t.input_accounts(),
+    }
+}
+
+/// The nonce a replacement has to beat. A joint transaction has one per input; the highest is the
+/// only one that orders it against a later attempt by any participant.
+fn tx_nonce(tx: &Transaction) -> u64 {
+    match tx {
+        Transaction::Transfer(t) => t.nonce,
+        Transaction::StateUpdate(t) => t.nonce,
+        Transaction::JointTransfer(t) => t.inputs.iter().map(|i| i.nonce).max().unwrap_or(0),
+    }
+}
+
+fn tx_fee(tx: &Transaction) -> u64 {
+    match tx {
+        Transaction::Transfer(t) => t.fee,
+        Transaction::StateUpdate(t) => t.fee,
+        Transaction::JointTransfer(t) => t.fee,
+    }
+}
+
+fn tx_expiry(tx: &Transaction) -> Option<u64> {
+    let expiry = match tx {
+        Transaction::Transfer(t) => t.expiry_unix,
+        Transaction::StateUpdate(t) => t.expiry_unix,
+        Transaction::JointTransfer(t) => t.expiry_unix,
+    };
+    (expiry != 0).then_some(expiry)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -93,19 +131,33 @@ impl Mempool {
         tx: Transaction,
         persist: impl FnOnce(&[Hash]) -> Result<(), E>,
     ) -> Result<AddOutcome, AdmissionError<E>> {
-        let (account, nonce, fee, size) = match &tx {
-            Transaction::Transfer(t) => (t.sender_id(), t.nonce, t.fee, tx.canonical().len()),
-            Transaction::StateUpdate(t) => (t.sender_id(), t.nonce, t.fee, tx.canonical().len()),
-        };
+        let (accounts, nonce, fee, size) = (
+            tx_accounts(&tx),
+            tx_nonce(&tx),
+            tx_fee(&tx),
+            tx.canonical().len(),
+        );
         if size > MAX_TRANSACTION_BYTES {
             return Err(AdmissionError::Policy(MempoolError::TooLarge));
         }
 
-        if let Some(position) = self.entries.iter().position(|e| e.account == account) {
-            if self.entries[position].tx.id() == tx.id() {
+        if let Some(position) = self
+            .entries
+            .iter()
+            .position(|e| e.accounts.iter().any(|a| accounts.contains(a)))
+        {
+            let existing = &self.entries[position];
+            if existing.tx.id() == tx.id() {
                 return Err(AdmissionError::Policy(MempoolError::Duplicate));
             }
-            if self.entries[position].nonce != nonce || fee <= self.entries[position].fee {
+            // Replacement is only well defined when both sides touch exactly one account: a joint
+            // transaction occupies several, so any overlap is treated as a plain conflict.
+            let replaceable = accounts.len() == 1
+                && existing.accounts.len() == 1
+                && existing.accounts[0] == accounts[0]
+                && existing.nonce == nonce
+                && fee > existing.fee;
+            if !replaceable {
                 return Err(AdmissionError::Policy(MempoolError::WouldNotReplace));
             }
             persist(&[self.entries[position].tx.id()]).map_err(AdmissionError::Persistence)?;
@@ -120,9 +172,15 @@ impl Mempool {
             return Ok(AddOutcome::Replaced);
         }
 
-        let per_account = self.entries.iter().filter(|e| e.account == account).count();
-        if per_account >= MEMPOOL_PER_ACCOUNT_TRANSACTIONS {
-            return Err(AdmissionError::Policy(MempoolError::AccountBusy));
+        for account in &accounts {
+            let per_account = self
+                .entries
+                .iter()
+                .filter(|e| e.accounts.contains(account))
+                .count();
+            if per_account >= MEMPOOL_PER_ACCOUNT_TRANSACTIONS {
+                return Err(AdmissionError::Policy(MempoolError::AccountBusy));
+            }
         }
 
         let mut victims = Vec::new();
@@ -161,7 +219,7 @@ impl Mempool {
         let seq = self.next_seq();
         self.entries.push(Entry {
             tx,
-            account,
+            accounts,
             nonce,
             fee,
             size,
@@ -174,7 +232,7 @@ impl Mempool {
     pub fn transaction_id_for_account(&self, account: &AccountId) -> Option<Hash> {
         self.entries
             .iter()
-            .find(|entry| &entry.account == account)
+            .find(|entry| entry.accounts.contains(account))
             .map(|entry| entry.tx.id())
     }
 
@@ -199,7 +257,11 @@ impl Mempool {
 
     /// Drop a transaction for an account whose state moved on (nonce consumed).
     pub fn remove_account(&mut self, account: &AccountId) {
-        if let Some(pos) = self.entries.iter().position(|e| &e.account == account) {
+        if let Some(pos) = self
+            .entries
+            .iter()
+            .position(|e| e.accounts.contains(account))
+        {
             let entry = self.entries.remove(pos);
             self.pending_bytes -= entry.size;
         }
@@ -210,10 +272,7 @@ impl Mempool {
         let mut dropped = Vec::new();
         let mut index = 0;
         while index < self.entries.len() {
-            let expired = match &self.entries[index].tx {
-                Transaction::Transfer(t) => t.expiry_unix != 0 && t.expiry_unix < now,
-                Transaction::StateUpdate(t) => t.expiry_unix != 0 && t.expiry_unix < now,
-            };
+            let expired = tx_expiry(&self.entries[index].tx).is_some_and(|expiry| expiry < now);
             if expired {
                 let entry = self.entries.remove(index);
                 self.pending_bytes -= entry.size;
@@ -268,20 +327,22 @@ impl Mempool {
 mod tests {
     use super::*;
     use vess_core::constants::{ML_DSA_PK_BYTES, ML_DSA_SIG_BYTES, PROTOCOL_VERSION};
-    use vess_core::{StateUpdate, Transfer};
+    use vess_core::{StateUpdate, Transfer, TransferAuthority};
 
     fn transfer(sender_byte: u8, nonce: u64, fee: u64) -> Transaction {
         Transaction::Transfer(Transfer {
             version: PROTOCOL_VERSION,
             chain_id: [1u8; 32],
-            sender_public_key: [sender_byte; ML_DSA_PK_BYTES],
             recipient_account_id: [0xEEu8; 32],
             amount: 1,
             fee,
             nonce,
             expiry_unix: 0,
             payload: None,
-            signature: [0u8; ML_DSA_SIG_BYTES],
+            authority: TransferAuthority::Signature {
+                sender_public_key: [sender_byte; ML_DSA_PK_BYTES],
+                signature: [0u8; ML_DSA_SIG_BYTES],
+            },
         })
     }
 
@@ -400,9 +461,16 @@ mod tests {
 
     fn indexed_transfer(index: usize, fee: u64) -> Transaction {
         let mut tx = transfer(0, 0, fee);
-        if let Transaction::Transfer(t) = &mut tx {
-            t.sender_public_key[0] = (index & 0xff) as u8;
-            t.sender_public_key[1] = ((index >> 8) & 0xff) as u8;
+        if let Transaction::Transfer(Transfer {
+            authority:
+                TransferAuthority::Signature {
+                    sender_public_key, ..
+                },
+            ..
+        }) = &mut tx
+        {
+            sender_public_key[0] = (index & 0xff) as u8;
+            sender_public_key[1] = ((index >> 8) & 0xff) as u8;
         }
         tx
     }
@@ -470,7 +538,7 @@ mod tests {
         pool.add_transaction(transfer(1, 0, 5)).unwrap();
         pool.add_transaction(transfer(2, 0, 5)).unwrap();
         pool.retain_valid(
-            |tx| matches!(tx, Transaction::Transfer(t) if t.sender_public_key[0] == 1),
+            |tx| matches!(tx, Transaction::Transfer(t) if t.sender_public_key().is_some_and(|k| k[0] == 1)),
         );
         assert_eq!(pool.transaction_count(), 1);
     }

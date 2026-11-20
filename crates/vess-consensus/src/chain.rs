@@ -24,30 +24,6 @@ pub trait HeaderSource {
     fn header(&self, id: &Hash) -> Option<BlockHeader>;
     fn meta(&self, id: &Hash) -> Option<BlockMeta>;
     fn network(&self) -> NetworkProfile;
-    /// Heights whose block id this node refuses to dispute. Empty for a chain that carries none,
-    /// which is what the synthetic chains in the tests use.
-    fn checkpoints(&self) -> &[Checkpoint] {
-        &[]
-    }
-}
-
-/// A block this network treats as settled: the header chain must contain exactly this id at this
-/// height, or it is not this network's chain at all.
-///
-/// Re-exported from `vess-core::constants`, where the per-network lists live: the type has to sit
-/// below the consensus crate so the constants can name it.
-pub use vess_core::constants::Checkpoint;
-
-/// Reject `id` at `height` when a checkpoint says that height belongs to another block.
-pub fn check_checkpoint(
-    checkpoints: &[Checkpoint],
-    height: u64,
-    id: &Hash,
-) -> Result<(), ConsensusError> {
-    match checkpoints.iter().find(|c| c.height == height) {
-        Some(expected) if expected.id != *id => Err(ConsensusError::CheckpointMismatch),
-        _ => Ok(()),
-    }
 }
 
 pub fn empty_state_root() -> Hash {
@@ -188,9 +164,6 @@ pub fn check_header<C: HeaderSource + ?Sized>(
         .checked_add(1)
         .ok_or(ConsensusError::BadHeader)?;
 
-    // A checkpointed height belongs to one block and no other, whatever the work behind it.
-    check_checkpoint(chain.checkpoints(), height, &header.id())?;
-
     let required = required_target(chain, network, &header.previous_block_id, height)?;
     if header.target != required || header.target < MINIMUM_TARGET || header.target > MAXIMUM_TARGET
     {
@@ -233,21 +206,11 @@ pub struct Chain {
     meta: HashMap<Hash, BlockMeta>,
     main: BTreeMap<u64, Hash>,
     best: Hash,
-    checkpoints: Vec<Checkpoint>,
 }
 
 impl Chain {
-    /// A chain containing only genesis, carrying the network's compiled-in checkpoints.
+    /// A chain containing only genesis.
     pub fn new(network: NetworkProfile) -> Chain {
-        Chain::with_checkpoints(
-            network,
-            vess_core::constants::checkpoints(network.network).to_vec(),
-        )
-    }
-
-    /// A chain with an explicit checkpoint list. Used by the node (which passes what the binary was
-    /// compiled with) and by the tests (which need a checkpoint they can predict).
-    pub fn with_checkpoints(network: NetworkProfile, checkpoints: Vec<Checkpoint>) -> Chain {
         let genesis = genesis_header(&network);
         let id = genesis.id();
         let meta = BlockMeta {
@@ -262,20 +225,7 @@ impl Chain {
             meta: HashMap::from([(id, meta)]),
             main,
             best: id,
-            checkpoints,
         }
-    }
-
-    pub fn checkpoints(&self) -> &[Checkpoint] {
-        &self.checkpoints
-    }
-
-    /// The checkpointed id at `height`, if this chain has one.
-    pub fn checkpoint_at(&self, height: u64) -> Option<Hash> {
-        self.checkpoints
-            .iter()
-            .find(|c| c.height == height)
-            .map(|c| c.id)
     }
 
     pub fn network(&self) -> NetworkProfile {
@@ -324,7 +274,6 @@ impl Chain {
             meta: HashMap::new(),
             main: BTreeMap::new(),
             best: [0u8; 32],
-            checkpoints: vess_core::constants::checkpoints(network.network).to_vec(),
         }
     }
 
@@ -502,9 +451,5 @@ impl HeaderSource for Chain {
 
     fn network(&self) -> NetworkProfile {
         self.network
-    }
-
-    fn checkpoints(&self) -> &[Checkpoint] {
-        &self.checkpoints
     }
 }

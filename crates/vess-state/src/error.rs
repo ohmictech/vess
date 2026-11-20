@@ -10,6 +10,15 @@ pub enum StateError {
     BadNonce,
     InsufficientBalance,
     Overflow,
+    /// A transaction with no inputs or no outputs.
+    EmptyTransaction,
+    /// More inputs or outputs than the protocol allows.
+    Oversized,
+    /// Two inputs debit the same account, or two outputs credit it.
+    DuplicateInput,
+    DuplicateOutput,
+    /// Inputs do not equal outputs plus fee.
+    Unbalanced,
 }
 
 impl fmt::Display for StateError {
@@ -21,6 +30,11 @@ impl fmt::Display for StateError {
             StateError::BadNonce => "nonce mismatch",
             StateError::InsufficientBalance => "insufficient balance",
             StateError::Overflow => "arithmetic overflow",
+            StateError::EmptyTransaction => "transaction has no inputs or no outputs",
+            StateError::Oversized => "too many inputs or outputs",
+            StateError::DuplicateInput => "duplicate input account",
+            StateError::DuplicateOutput => "duplicate output account",
+            StateError::Unbalanced => "inputs do not equal outputs plus fee",
         };
         f.write_str(s)
     }

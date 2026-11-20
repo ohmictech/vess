@@ -11,6 +11,8 @@ pub mod u256;
 
 pub use error::CodecError;
 pub use types::{
-    Account, AccountId, BlockHeader, Hash, PublicKey, Signature, StateUpdate, Transaction, Transfer,
+    Account, AccountId, AccountWitness, BlockHeader, BlockWitness, FuturesRules, Hash,
+    InputAuthority, JointTransfer, Output, PublicKey, Rules, Signature, StateUpdate, Transaction,
+    Transfer, TransferAuthority, TransferInput,
 };
 pub use u256::U256;

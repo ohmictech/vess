@@ -7,12 +7,14 @@ use vess_core::constants::*;
 /// What a block at genesis difficulty pays its miner: the full reward minus the 1% dev fee.
 const MINED: u64 = GENESIS_REWARD - GENESIS_REWARD / 100;
 use vess_core::hash::{self, DOM_TRANSFER};
-use vess_core::{AccountId, BlockHeader, Hash, Transaction, Transfer};
+use vess_core::{AccountId, BlockHeader, BlockWitness, Hash, Transaction, Transfer};
 use vess_state::State;
 
-use crate::block::{apply_body, build_template, validate_block};
+use crate::block::{
+    apply_body, build_template, split_block, touched_accounts, validate_block, verify_witness,
+};
 use crate::chain::{Chain, median_time_past, required_target};
-use crate::error::ConsensusError;
+use crate::error::{ConsensusError, TxReject};
 
 fn devnet() -> NetworkProfile {
     NetworkProfile::DEVNET
@@ -32,15 +34,6 @@ impl Harness {
     fn new(network: NetworkProfile) -> Self {
         Harness {
             chain: Chain::new(network),
-            state: State::new(),
-            network,
-        }
-    }
-
-    /// A harness whose chain carries an explicit checkpoint list.
-    fn with_checkpoints(network: NetworkProfile, checkpoints: Vec<crate::Checkpoint>) -> Self {
-        Harness {
-            chain: Chain::with_checkpoints(network, checkpoints),
             state: State::new(),
             network,
         }
@@ -104,17 +97,32 @@ fn signed_transfer(
     let mut tx = Transfer {
         version: PROTOCOL_VERSION,
         chain_id: hash::chain_id(NETWORK_DEVNET),
-        sender_public_key: vess_crypto::public_key_bytes(key),
         recipient_account_id: recipient,
         amount,
         fee,
         nonce,
         expiry_unix: 0,
         payload: None,
-        signature: [0u8; ML_DSA_SIG_BYTES],
+        authority: vess_core::TransferAuthority::Signature {
+            sender_public_key: vess_crypto::public_key_bytes(key),
+            signature: [0u8; ML_DSA_SIG_BYTES],
+        },
     };
-    tx.signature = vess_crypto::sign(key, DOM_TRANSFER, &tx.unsigned_bytes()).unwrap();
+    let signature = vess_crypto::sign(key, DOM_TRANSFER, &tx.unsigned_bytes()).unwrap();
+    tx.authority = vess_core::TransferAuthority::Signature {
+        sender_public_key: vess_crypto::public_key_bytes(key),
+        signature,
+    };
     tx
+}
+
+/// Re-sign a transfer after mutating its body.
+fn resign(key: &vess_crypto::Key, tx: &mut Transfer) {
+    let signature = vess_crypto::sign(key, DOM_TRANSFER, &tx.unsigned_bytes()).unwrap();
+    tx.authority = vess_core::TransferAuthority::Signature {
+        sender_public_key: vess_crypto::public_key_bytes(key),
+        signature,
+    };
 }
 
 #[test]
@@ -154,81 +162,51 @@ fn empty_block_pays_the_reward_and_advances_the_chain() {
     assert_eq!(h.state.total_supply(), GENESIS_REWARD as u128);
 }
 
+/// Fork choice is cumulative work; equal work is broken by the lower block id, deterministically, so
+/// every node lands on the same tip without needing to agree on arrival order.
 #[test]
-fn a_checkpoint_rejects_any_other_block_at_its_height() {
-    // A long-range fork is not detectable by work alone, so the checkpoint decides: whatever work a
-    // competing history has, only one id is allowed at a settled height.
+fn equal_work_is_broken_by_the_lower_block_id() {
+    let h = Harness::new(devnet());
     let miner = account(&key(1));
-    let mut honest = Harness::new(devnet());
-    let mut ids = Vec::new();
-    for _ in 0..3 {
-        let ts = honest.timestamp();
-        ids.push(honest.mine_block(&miner, ts, &[]));
+    let genesis = h.chain.best_header();
+
+    let mut headers = Vec::new();
+    for byte in 0..2u8 {
+        let mut template = build_template(
+            &h.chain,
+            &h.network,
+            &genesis.id(),
+            &h.state,
+            &miner,
+            genesis.timestamp_unix_ms + 1,
+            &[],
+        )
+        .unwrap();
+        // Same parent, target and timestamp: identical work, different id.
+        template.header.security_nonce = [byte; 32];
+        assert!(template.mine(20_000_000));
+        headers.push(template.header);
     }
+    assert_ne!(headers[0].id(), headers[1].id());
 
-    // Replaying the same history with its block 2 checkpointed changes nothing.
-    let mut settled = Harness::with_checkpoints(
-        devnet(),
-        vec![crate::Checkpoint {
-            height: 2,
-            id: ids[1],
-        }],
-    );
-    for _ in 0..3 {
-        let ts = settled.timestamp();
-        settled.mine_block(&miner, ts, &[]);
+    let mut chain = Chain::new(devnet());
+    for header in &headers {
+        chain.insert(*header).unwrap();
     }
+    let lower = headers[0].id().min(headers[1].id());
+    assert_eq!(chain.best_height(), 1, "a tie never adds height");
     assert_eq!(
-        settled.chain.best_id(),
-        ids[2],
-        "the honest history still passes"
+        chain.best_id(),
+        lower,
+        "the lower id wins, whatever order they arrived in"
     );
 
-    // A checkpoint naming another block makes exactly that history unacceptable.
-    let mut fork = Harness::with_checkpoints(
-        devnet(),
-        vec![crate::Checkpoint {
-            height: 2,
-            id: [0xABu8; 32],
-        }],
-    );
-    let ts = fork.timestamp();
-    fork.mine_block(&miner, ts, &[]);
-    let timestamp = fork.timestamp();
-    let template = build_template(
-        &fork.chain,
-        &fork.network,
-        &fork.chain.best_id(),
-        &fork.state,
-        &miner,
-        timestamp,
-        &[],
-    )
-    .unwrap();
-    let mut header = template.header;
-    assert!(crate::mine_header(&mut header, 20_000_000));
-    assert_eq!(
-        fork.chain.insert(header),
-        Err(ConsensusError::CheckpointMismatch),
-        "a checkpointed height holds one block and no other"
-    );
-    assert_eq!(fork.chain.best_height(), 1, "the fork was not adopted");
-}
-
-#[test]
-fn checkpoint_lookup_is_exact_and_ignores_other_heights() {
-    let checkpoints = [crate::Checkpoint {
-        height: 10,
-        id: [3u8; 32],
-    }];
-    assert!(crate::check_checkpoint(&checkpoints, 10, &[3u8; 32]).is_ok());
-    assert_eq!(
-        crate::check_checkpoint(&checkpoints, 10, &[4u8; 32]),
-        Err(ConsensusError::CheckpointMismatch)
-    );
-    // Heights without a checkpoint are unaffected, and an empty list settles nothing.
-    assert!(crate::check_checkpoint(&checkpoints, 11, &[4u8; 32]).is_ok());
-    assert!(crate::check_checkpoint(&[], 10, &[4u8; 32]).is_ok());
+    // Re-inserting in the opposite order reaches the same tip.
+    let mut reversed = Chain::new(devnet());
+    for header in headers.iter().rev() {
+        reversed.insert(*header).unwrap();
+    }
+    assert_eq!(reversed.best_id(), lower);
 }
 
 /// The reward is a function of the block's own target, so a block mined at twice the difficulty
@@ -247,6 +225,7 @@ fn a_harder_target_pays_proportionally() {
             &network,
             target,
             &[],
+            0,
             network.genesis_timestamp_ms,
             &miner,
         )
@@ -285,6 +264,7 @@ fn the_dev_fee_is_one_percent_of_the_reward() {
         &network,
         target,
         &[],
+        0,
         network.genesis_timestamp_ms,
         &miner,
     )
@@ -307,6 +287,7 @@ fn genesis_blocks_pay_exactly_one_unit_of_dev_fee() {
         &network,
         network.genesis_target,
         &[],
+        0,
         network.genesis_timestamp_ms,
         &miner,
     )
@@ -331,6 +312,7 @@ fn no_dev_fee_is_charged_below_one_hundred_units() {
         &network,
         target,
         &[],
+        0,
         network.genesis_timestamp_ms,
         &miner,
     )
@@ -421,8 +403,7 @@ fn transaction_versions_gate_the_payload() {
         payload: Some([0x5Au8; 32]),
         ..signed_transfer(&alice_key, [0x22u8; 32], 1, 0, 1)
     };
-    carrier.signature = vess_crypto::sign(&alice_key, DOM_TRANSFER, &carrier.unsigned_bytes())
-        .expect("transaction context is short");
+    resign(&alice_key, &mut carrier);
 
     let ts = h.timestamp();
     h.mine_block(
@@ -469,9 +450,10 @@ fn transaction_versions_gate_the_payload() {
         }
     ));
 
-    // A version the protocol does not know is refused outright.
+    // A version the protocol does not know is refused outright. One past the joint-transfer version,
+    // which is the highest defined.
     let mut future = signed_transfer(&alice_key, [0x23u8; 32], 1, 0, 2);
-    future.version = TRANSACTION_VERSION + 1;
+    future.version = TRANSACTION_VERSION_JOINT + 1;
     assert!(matches!(
         rejection(&h, future),
         ConsensusError::BadTransaction {
@@ -479,6 +461,412 @@ fn transaction_versions_gate_the_payload() {
             ..
         }
     ));
+}
+
+fn rules(
+    preimage: &[u8; 32],
+    recipient: AccountId,
+    owner: AccountId,
+    refund_height: u64,
+    max_fee: u64,
+) -> vess_core::Rules {
+    vess_core::Rules {
+        version: RULES_VERSION,
+        hash_lock: hash::hash_lock(preimage),
+        refund_height,
+        recipient_account_id: recipient,
+        owner_account_id: owner,
+        max_fee,
+    }
+}
+
+fn rules_spend(
+    rules: &vess_core::Rules,
+    preimage: Option<[u8; PREIMAGE_BYTES]>,
+    fee: u64,
+    nonce: u64,
+    balance: u64,
+) -> Transfer {
+    let recipient_account_id = if preimage.is_some() {
+        rules.recipient_account_id
+    } else {
+        rules.owner_account_id
+    };
+    Transfer {
+        version: TRANSACTION_VERSION,
+        chain_id: hash::chain_id(NETWORK_DEVNET),
+        recipient_account_id,
+        amount: balance - fee,
+        fee,
+        nonce,
+        expiry_unix: 0,
+        payload: None,
+        authority: vess_core::TransferAuthority::Rules {
+            rules: rules.clone(),
+            preimage,
+        },
+    }
+}
+
+/// The rejection a single-transaction block earns, whether it is refused while being assembled or
+/// while being validated.
+fn block_rejection(h: &Harness, payout: &AccountId, tx: Transfer) -> ConsensusError {
+    let built = build_template(
+        &h.chain,
+        &h.network,
+        &h.chain.best_id(),
+        &h.state,
+        payout,
+        h.timestamp(),
+        &[Transaction::Transfer(tx)],
+    );
+    match built {
+        Ok(mut template) => {
+            assert!(template.mine(20_000_000));
+            validate_block(&h.chain, &h.network, &h.state, &template.encode()).unwrap_err()
+        }
+        Err(error) => error,
+    }
+}
+
+fn rejected_with(reason: crate::error::TxReject) -> impl Fn(&ConsensusError) -> bool {
+    move |error| {
+        matches!(
+            error,
+            ConsensusError::BadTransaction { reason: actual, .. } if *actual == reason
+        )
+    }
+}
+
+/// An escrow is a plain account whose id is the hash of its rules: funding it is an ordinary
+/// transfer, and only the preimage can move the balance before the refund height.
+#[test]
+fn an_escrow_claim_pays_the_recipient_and_nothing_else() {
+    let mut h = Harness::new(devnet());
+    let alice_key = key(8);
+    let alice = account(&alice_key);
+    let bob = account(&key(9));
+    h.fund(&alice, 2);
+
+    let secret = [0x7Au8; 32];
+    let rules = rules(&secret, bob, alice, h.chain.best_height() + 100, 5);
+    let escrow = rules.account_id();
+    assert_ne!(escrow, alice);
+
+    let deposit = signed_transfer(&alice_key, escrow, 100, 0, 0);
+    let ts = h.timestamp();
+    h.mine_block(&alice, ts, &[Transaction::Transfer(deposit)]);
+    assert_eq!(h.state.balance(&escrow), 100);
+    assert_eq!(h.state.balance(&bob), 0);
+
+    // A wrong preimage lands nowhere.
+    let wrong = rules_spend(&rules, Some([0x7Bu8; 32]), 0, 0, 100);
+    assert!(rejected_with(TxReject::PreimageMismatch)(&block_rejection(
+        &h, &alice, wrong
+    )));
+
+    // A reveal cannot be redirected.
+    let mut elsewhere = rules_spend(&rules, Some(secret), 0, 0, 100);
+    elsewhere.recipient_account_id = [0xEEu8; 32];
+    assert!(rejected_with(TxReject::WrongDestination)(&block_rejection(
+        &h, &alice, elsewhere
+    )));
+
+    // The balance is spent whole, and the fee is capped by the rules.
+    let partial = rules_spend(&rules, Some(secret), 0, 0, 99);
+    assert!(rejected_with(TxReject::PartialSpend)(&block_rejection(
+        &h, &alice, partial
+    )));
+    let greedy = rules_spend(&rules, Some(secret), 6, 0, 100);
+    assert!(rejected_with(TxReject::FeeTooHigh)(&block_rejection(
+        &h, &alice, greedy
+    )));
+
+    // The owner cannot pull it back while the claim window is open.
+    let early_refund = rules_spend(&rules, None, 0, 0, 100);
+    assert!(rejected_with(TxReject::PreimageMismatch)(&block_rejection(
+        &h,
+        &alice,
+        early_refund
+    )));
+
+    let claim = rules_spend(&rules, Some(secret), 2, 0, 100);
+    let ts = h.timestamp();
+    h.mine_block(&alice, ts, &[Transaction::Transfer(claim)]);
+    assert_eq!(h.state.balance(&bob), 98);
+    assert_eq!(h.state.balance(&escrow), 0);
+}
+
+/// Past `refund_height` the preimage is worthless and only the owner can be paid, whoever submits.
+#[test]
+fn an_escrow_refund_opens_at_the_refund_height_and_closes_the_claim() {
+    let mut h = Harness::new(devnet());
+    let alice_key = key(10);
+    let alice = account(&alice_key);
+    let bob = account(&key(11));
+    h.fund(&alice, 2);
+
+    let secret = [0xC3u8; 32];
+    let refund_height = h.chain.best_height() + 3;
+    let rules = rules(&secret, bob, alice, refund_height, 3);
+    let escrow = rules.account_id();
+
+    let deposit = signed_transfer(&alice_key, escrow, 50, 0, 0);
+    let ts = h.timestamp();
+    h.mine_block(&alice, ts, &[Transaction::Transfer(deposit)]);
+    assert!(h.chain.best_height() < refund_height);
+
+    // Still claimable here.
+    let claim = rules_spend(&rules, Some(secret), 1, 0, 50);
+    assert_eq!(
+        build_template(
+            &h.chain,
+            &h.network,
+            &h.chain.best_id(),
+            &h.state,
+            &alice,
+            h.timestamp(),
+            &[Transaction::Transfer(claim)],
+        )
+        .map(|_| ())
+        .map_err(|_| ()),
+        Ok(())
+    );
+
+    // Move to the first refundable height.
+    while h.chain.best_height() + 1 < refund_height {
+        let ts = h.timestamp();
+        h.mine_block(&alice, ts, &[]);
+    }
+    assert_eq!(h.chain.best_height() + 1, refund_height);
+
+    // The same preimage no longer buys anything.
+    let late_claim = rules_spend(&rules, Some(secret), 0, 0, 50);
+    assert!(rejected_with(TxReject::ClaimWindowClosed)(
+        &block_rejection(&h, &alice, late_claim)
+    ));
+
+    // Nor can the refund be redirected away from the owner.
+    let mut misdirected = rules_spend(&rules, None, 0, 0, 50);
+    misdirected.recipient_account_id = bob;
+    assert!(rejected_with(TxReject::WrongDestination)(&block_rejection(
+        &h,
+        &alice,
+        misdirected
+    )));
+
+    let refund = rules_spend(&rules, None, 0, 0, 50);
+    let before = h.state.balance(&alice);
+    let ts = h.timestamp();
+    h.mine_block(&alice, ts, &[Transaction::Transfer(refund)]);
+    assert_eq!(h.state.balance(&escrow), 0);
+    assert!(h.state.balance(&alice) > before);
+}
+
+#[test]
+fn a_witness_validates_a_block_without_state() {
+    let mut h = Harness::new(devnet());
+    let alice_key = key(12);
+    let alice = account(&alice_key);
+    let bob = [0xB7u8; 32];
+    h.fund(&alice, 3);
+
+    let mut checked = 0;
+    for nonce in 0..3 {
+        let root_before = h.state.root();
+        let transfer = signed_transfer(&alice_key, bob, 1, 1, nonce);
+        let transactions = [Transaction::Transfer(transfer)];
+        let payout = alice;
+        let timestamp = h.timestamp();
+
+        let mut template = build_template(
+            &h.chain,
+            &h.network,
+            &h.chain.best_id(),
+            &h.state,
+            &payout,
+            timestamp,
+            &transactions,
+        )
+        .expect("template");
+        assert!(template.mine(20_000_000));
+        let bytes = template.encode();
+        let (header, decoded) = split_block(&bytes).unwrap();
+        let height = h.chain.best_height() + 1;
+
+        // The witness is derived from the parent state, exactly as a serving node would.
+        let witness = BlockWitness {
+            account_root: h.state.account_root(),
+            total_supply: h.state.total_supply(),
+            accounts: touched_accounts(&decoded, &header.payout_account_id)
+                .into_iter()
+                .map(|id| h.state.witness(&id))
+                .collect(),
+        };
+
+        let root_after = verify_witness(
+            &h.network,
+            &root_before,
+            &header,
+            &decoded,
+            height,
+            &witness,
+        )
+        .expect("a complete witness validates the block");
+        assert_eq!(
+            root_after, header.state_root,
+            "stateless agrees with stateful"
+        );
+
+        // Commit it for real, then check the stateful path landed on the same root.
+        let validated = validate_block(&h.chain, &h.network, &h.state, &bytes).unwrap();
+        assert_eq!(validated.state.root(), root_after);
+        h.state = validated.state;
+        h.chain.insert(validated.header).unwrap();
+        checked += 1;
+    }
+    assert_eq!(checked, 3);
+    assert_eq!(h.state.balance(&bob), 3);
+}
+
+#[test]
+fn a_witness_cannot_lie_about_the_parent_state() {
+    let mut h = Harness::new(devnet());
+    let alice_key = key(13);
+    let alice = account(&alice_key);
+    let bob = [0xB8u8; 32];
+    h.fund(&alice, 3);
+
+    let root_before = h.state.root();
+    let transfer = signed_transfer(&alice_key, bob, 1, 1, 0);
+    let transactions = [Transaction::Transfer(transfer)];
+    let timestamp = h.timestamp();
+    let mut template = build_template(
+        &h.chain,
+        &h.network,
+        &h.chain.best_id(),
+        &h.state,
+        &alice,
+        timestamp,
+        &transactions,
+    )
+    .unwrap();
+    assert!(template.mine(20_000_000));
+    let (header, decoded) = split_block(&template.encode()).unwrap();
+    let height = h.chain.best_height() + 1;
+    let touched = touched_accounts(&decoded, &header.payout_account_id);
+    let honest = BlockWitness {
+        account_root: h.state.account_root(),
+        total_supply: h.state.total_supply(),
+        accounts: touched.iter().map(|id| h.state.witness(id)).collect(),
+    };
+
+    // A richer Alice: the proof for the inflated account cannot open the real root.
+    let mut richer = honest.clone();
+    let index = touched.iter().position(|id| *id == alice).unwrap();
+    richer.accounts[index].account.as_mut().unwrap().balance = 1_000_000;
+    assert!(matches!(
+        verify_witness(&h.network, &root_before, &header, &decoded, height, &richer),
+        Err(ConsensusError::BadWitness)
+    ));
+
+    // Omitting an account leaves the partial tree short of the root.
+    let mut short = honest.clone();
+    short.accounts.pop();
+    assert!(matches!(
+        verify_witness(&h.network, &root_before, &header, &decoded, height, &short),
+        Err(ConsensusError::BadWitness)
+    ));
+
+    // Extra accounts are refused by the completeness check rather than silently ignored.
+    let mut padded = honest.clone();
+    padded.accounts.push(h.state.witness(&[0xEEu8; 32]));
+    assert!(matches!(
+        verify_witness(&h.network, &root_before, &header, &decoded, height, &padded),
+        Err(ConsensusError::BadWitness)
+    ));
+
+    // Claiming a different account root is refused, because it does not hash to the header's.
+    let mut wrong_root = honest.clone();
+    wrong_root.account_root = [1u8; 32];
+    let _ = &mut wrong_root;
+    assert!(matches!(
+        verify_witness(
+            &h.network,
+            &root_before,
+            &header,
+            &decoded,
+            height,
+            &wrong_root
+        ),
+        Err(ConsensusError::BadWitness)
+    ));
+
+    // A witness against the wrong parent state is refused, so a block cannot be replayed.
+    assert!(matches!(
+        verify_witness(&h.network, &[0u8; 32], &header, &decoded, height, &honest),
+        Err(ConsensusError::BadWitness)
+    ));
+
+    // With the honest witness everything is consistent.
+    assert!(verify_witness(&h.network, &root_before, &header, &decoded, height, &honest).is_ok());
+}
+
+/// A recipient that does not exist yet is proven by non-inclusion, so account creation works
+/// statelessly too.
+#[test]
+fn a_witness_proves_non_inclusion_for_a_new_account() {
+    let mut h = Harness::new(devnet());
+    let alice_key = key(14);
+    let alice = account(&alice_key);
+    let fresh = [0x99u8; 32];
+    h.fund(&alice, 2);
+    assert!(h.state.account(&fresh).is_none());
+
+    let root_before = h.state.root();
+    let transfer = signed_transfer(&alice_key, fresh, 5, 0, 0);
+    let transactions = [Transaction::Transfer(transfer)];
+    let timestamp = h.timestamp();
+    let mut template = build_template(
+        &h.chain,
+        &h.network,
+        &h.chain.best_id(),
+        &h.state,
+        &alice,
+        timestamp,
+        &transactions,
+    )
+    .unwrap();
+    assert!(template.mine(20_000_000));
+    let (header, decoded) = split_block(&template.encode()).unwrap();
+    let height = h.chain.best_height() + 1;
+
+    let witness = BlockWitness {
+        account_root: h.state.account_root(),
+        total_supply: h.state.total_supply(),
+        accounts: touched_accounts(&decoded, &header.payout_account_id)
+            .into_iter()
+            .map(|id| h.state.witness(&id))
+            .collect(),
+    };
+    let entry = witness
+        .accounts
+        .iter()
+        .find(|w| w.id == fresh)
+        .expect("the recipient");
+    assert!(entry.account.is_none(), "absence is what gets proven");
+    assert!(!entry.siblings.is_empty(), "and it still needs a path");
+
+    let root_after = verify_witness(
+        &h.network,
+        &root_before,
+        &header,
+        &decoded,
+        height,
+        &witness,
+    )
+    .unwrap();
+    assert_eq!(root_after, header.state_root);
 }
 
 #[test]
@@ -494,7 +882,12 @@ fn a_forged_signature_is_rejected() {
     // Sign with Alice's key, then substitute a different sender key: the id binding breaks.
     let mut tx = signed_transfer(&alice_key, bob, 1, 1, 0);
     let mallory = key(5);
-    tx.sender_public_key = vess_crypto::public_key_bytes(&mallory);
+    if let vess_core::TransferAuthority::Signature {
+        sender_public_key, ..
+    } = &mut tx.authority
+    {
+        *sender_public_key = vess_crypto::public_key_bytes(&mallory);
+    }
     let t2 = h.timestamp();
     let built = build_template(
         &h.chain,
@@ -954,16 +1347,14 @@ fn transfer_expiry_boundary_is_inclusive() {
     let block_ts = (h.timestamp() / 1_000) * 1_000 + 999;
     let mut exactly = signed_transfer(&alice_key, bob, 2, 1, 0);
     exactly.expiry_unix = block_ts / 1_000;
-    exactly.signature =
-        vess_crypto::sign(&alice_key, DOM_TRANSFER, &exactly.unsigned_bytes()).unwrap();
+    resign(&alice_key, &mut exactly);
     h.mine_block(&alice, block_ts, &[Transaction::Transfer(exactly.clone())]);
     assert_eq!(h.state.balance(&bob), 2);
 
     let block_ts = h.timestamp();
     let mut one_second_late = signed_transfer(&alice_key, bob, 10, 1, 1);
     one_second_late.expiry_unix = block_ts / 1_000 - 1;
-    one_second_late.signature =
-        vess_crypto::sign(&alice_key, DOM_TRANSFER, &one_second_late.unsigned_bytes()).unwrap();
+    resign(&alice_key, &mut one_second_late);
     let rejected = build_template(
         &h.chain,
         &h.network,
@@ -997,4 +1388,257 @@ fn reinserting_a_known_block_is_idempotent() {
     assert_eq!(h.chain.best_id(), second);
     assert_eq!(h.chain.best_work(), work);
     assert_eq!(h.chain.best_height(), 2);
+}
+
+// ------------------------------------------------------------------ futures
+
+fn joint_input(key: &vess_crypto::Key, amount: u64, nonce: u64) -> vess_core::TransferInput {
+    vess_core::TransferInput {
+        authority: vess_core::InputAuthority::Signature {
+            public_key: vess_crypto::public_key_bytes(key),
+            signature: [0u8; ML_DSA_SIG_BYTES],
+        },
+        amount,
+        nonce,
+    }
+}
+
+/// Sign every input the given keys own. Every signature covers the whole body.
+fn sign_joint(keys: &[&vess_crypto::Key], tx: &mut vess_core::JointTransfer) {
+    let body = tx.unsigned_bytes();
+    for input in tx.inputs.iter_mut() {
+        if let vess_core::InputAuthority::Signature {
+            public_key,
+            signature,
+        } = &mut input.authority
+        {
+            for key in keys {
+                if *public_key == vess_crypto::public_key_bytes(key) {
+                    *signature =
+                        vess_crypto::sign(key, vess_core::hash::DOM_JOINT_TRANSFER, &body).unwrap();
+                }
+            }
+        }
+    }
+}
+
+/// Two equal contributions into one pot, signed by both parties.
+fn joint_funding(
+    alice_key: &vess_crypto::Key,
+    alice_nonce: u64,
+    bob_key: &vess_crypto::Key,
+    bob_nonce: u64,
+    pot: AccountId,
+    amount: u64,
+) -> vess_core::JointTransfer {
+    let mut inputs = vec![
+        joint_input(alice_key, amount, alice_nonce),
+        joint_input(bob_key, amount, bob_nonce),
+    ];
+    inputs.sort_by_key(vess_core::TransferInput::account_id);
+    let mut tx = vess_core::JointTransfer {
+        version: TRANSACTION_VERSION_JOINT,
+        chain_id: hash::chain_id(NETWORK_DEVNET),
+        inputs,
+        fee: 0,
+        expiry_unix: 0,
+        outputs: vec![vess_core::Output {
+            account_id: pot,
+            amount: amount * 2,
+        }],
+    };
+    sign_joint(&[alice_key, bob_key], &mut tx);
+    tx
+}
+
+fn futures_terms(
+    start_supply: u64,
+    target_delta: u64,
+    earliest_settle_height: u64,
+    owner: AccountId,
+    recipient: AccountId,
+) -> vess_core::FuturesRules {
+    vess_core::FuturesRules {
+        version: RULES_VERSION_FUTURES,
+        start_supply,
+        target_delta,
+        earliest_settle_height,
+        recipient_account_id: recipient,
+        owner_account_id: owner,
+        max_fee: 5,
+    }
+}
+
+/// The settlement consensus would accept, built from the state the block will enter.
+fn settlement(h: &Harness, rules: &vess_core::FuturesRules, fee: u64) -> vess_core::JointTransfer {
+    let pot = rules.account_id();
+    let balance = h.state.balance(&pot);
+    let supply = h.state.total_supply();
+    let (owner, recipient) = rules.split(balance - fee, supply).unwrap();
+    let mut outputs = vec![
+        vess_core::Output {
+            account_id: rules.owner_account_id,
+            amount: owner,
+        },
+        vess_core::Output {
+            account_id: rules.recipient_account_id,
+            amount: recipient,
+        },
+    ];
+    outputs.retain(|output| output.amount > 0);
+    outputs.sort_unstable_by(|a, b| a.account_id.cmp(&b.account_id));
+    vess_core::JointTransfer {
+        version: TRANSACTION_VERSION_JOINT,
+        chain_id: hash::chain_id(NETWORK_DEVNET),
+        inputs: vec![vess_core::TransferInput {
+            authority: vess_core::InputAuthority::Futures { rules: *rules },
+            amount: balance,
+            nonce: h.state.next_nonce(&pot).unwrap_or(0),
+        }],
+        fee,
+        expiry_unix: 0,
+        outputs,
+    }
+}
+
+fn joint_block_rejection(
+    h: &Harness,
+    payout: &AccountId,
+    tx: vess_core::JointTransfer,
+) -> ConsensusError {
+    let built = build_template(
+        &h.chain,
+        &h.network,
+        &h.chain.best_id(),
+        &h.state,
+        payout,
+        h.timestamp(),
+        &[Transaction::JointTransfer(tx)],
+    );
+    match built {
+        Ok(mut template) => {
+            assert!(template.mine(20_000_000));
+            validate_block(&h.chain, &h.network, &h.state, &template.encode()).unwrap_err()
+        }
+        Err(error) => error,
+    }
+}
+
+/// Both deposits land in one block or neither does, and at maturity the pot is split by the delta.
+#[test]
+fn a_futures_pot_is_funded_atomically_then_settled_by_the_delta() {
+    let mut h = Harness::new(devnet());
+    let alice_key = key(21);
+    let alice = account(&alice_key);
+    let bob_key = key(22);
+    let bob = account(&bob_key);
+    let miner = account(&key(1));
+    h.fund(&alice, 2);
+    h.fund(&bob, 2);
+
+    let start_supply = h.state.total_supply() as u64;
+    let settle_height = h.chain.best_height() + 3;
+    // Wide enough that three blocks of emission land the split strictly inside the pot rather than
+    // at either clamp.
+    let rules = futures_terms(start_supply, 500, settle_height, alice, bob);
+    let pot = rules.account_id();
+    assert_ne!(pot, alice);
+    assert_ne!(pot, bob);
+
+    let alice_before = h.state.balance(&alice);
+    let bob_before = h.state.balance(&bob);
+    let funding = joint_funding(&alice_key, 0, &bob_key, 0, pot, 40);
+    let ts = h.timestamp();
+    h.mine_block(&miner, ts, &[Transaction::JointTransfer(funding)]);
+    assert_eq!(h.state.balance(&pot), 80);
+    assert_eq!(h.state.balance(&alice), alice_before - 40);
+    assert_eq!(h.state.balance(&bob), bob_before - 40);
+
+    while h.chain.best_height() + 1 < settle_height {
+        let ts = h.timestamp();
+        h.mine_block(&miner, ts, &[]);
+    }
+
+    // Mining issued reward after reward, so the measured delta is well past the strike.
+    let supply = h.state.total_supply();
+    assert!(supply > start_supply as u128);
+    let (expected_owner, expected_recipient) = rules.split(80, supply).unwrap();
+    assert!(
+        expected_owner > 0 && expected_recipient > 0,
+        "the split should be interior, not clamped"
+    );
+    let tx = settlement(&h, &rules, 0);
+    let ts = h.timestamp();
+    h.mine_block(&miner, ts, &[Transaction::JointTransfer(tx)]);
+
+    assert_eq!(h.state.balance(&pot), 0);
+    assert_eq!(h.state.balance(&alice), alice_before - 40 + expected_owner);
+    assert_eq!(h.state.balance(&bob), bob_before - 40 + expected_recipient);
+}
+
+/// A settlement presented before the terms open is refused, and nothing moves.
+#[test]
+fn a_settlement_before_maturity_is_rejected() {
+    let mut h = Harness::new(devnet());
+    let alice_key = key(23);
+    let alice = account(&alice_key);
+    let bob_key = key(24);
+    let bob = account(&bob_key);
+    h.fund(&alice, 2);
+    h.fund(&bob, 2);
+
+    let start_supply = h.state.total_supply() as u64;
+    let rules = futures_terms(start_supply, 50, h.chain.best_height() + 50, alice, bob);
+    let pot = rules.account_id();
+    let funding = joint_funding(&alice_key, 0, &bob_key, 0, pot, 40);
+    let ts = h.timestamp();
+    h.mine_block(&alice, ts, &[Transaction::JointTransfer(funding)]);
+
+    let tx = settlement(&h, &rules, 0);
+    let error = joint_block_rejection(&h, &alice, tx);
+    assert!(rejected_with(TxReject::SettleTooEarly)(&error), "{error}");
+    assert_eq!(h.state.balance(&pot), 80);
+}
+
+/// The split is not the submitter's to choose: a payout that differs from the measured one is
+/// refused rather than rewritten.
+#[test]
+fn a_tampered_settlement_split_is_rejected() {
+    let mut h = Harness::new(devnet());
+    let alice_key = key(25);
+    let alice = account(&alice_key);
+    let bob_key = key(26);
+    let bob = account(&bob_key);
+    h.fund(&alice, 2);
+    h.fund(&bob, 2);
+
+    let start_supply = h.state.total_supply() as u64;
+    let settle_height = h.chain.best_height() + 2;
+    let rules = futures_terms(start_supply, 50, settle_height, alice, bob);
+    let pot = rules.account_id();
+    let funding = joint_funding(&alice_key, 0, &bob_key, 0, pot, 40);
+    let ts = h.timestamp();
+    h.mine_block(&alice, ts, &[Transaction::JointTransfer(funding)]);
+    while h.chain.best_height() + 1 < settle_height {
+        let ts = h.timestamp();
+        h.mine_block(&alice, ts, &[]);
+    }
+
+    let mut tx = settlement(&h, &rules, 0);
+    // Force a split consensus would not compute, keeping the pot conserved so only the split differs.
+    let pot = h.state.balance(&rules.account_id());
+    let mut outputs = vec![
+        vess_core::Output {
+            account_id: rules.owner_account_id,
+            amount: pot / 2 + 1,
+        },
+        vess_core::Output {
+            account_id: rules.recipient_account_id,
+            amount: pot - (pot / 2 + 1),
+        },
+    ];
+    outputs.sort_unstable_by(|a, b| a.account_id.cmp(&b.account_id));
+    tx.outputs = outputs;
+    let error = joint_block_rejection(&h, &alice, tx);
+    assert!(rejected_with(TxReject::BadSettlement)(&error), "{error}");
 }

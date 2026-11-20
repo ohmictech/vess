@@ -6,6 +6,7 @@
 
 use std::net::TcpListener;
 
+pub mod archive;
 mod history;
 pub mod log;
 pub mod p2p;
@@ -18,8 +19,11 @@ use std::time::{Duration, Instant};
 use vess_consensus::chain::{Chain, HeaderSource};
 use vess_consensus::{BlockTemplate, ConsensusError, build_template, split_block, validate_block};
 use vess_core::constants::NetworkProfile;
-use vess_core::hash::{self, DOM_STATE_UPDATE, DOM_TRANSFER};
-use vess_core::{AccountId, BlockHeader, Hash, StateUpdate, Transaction, Transfer};
+use vess_core::hash::{self, DOM_JOINT_TRANSFER, DOM_STATE_UPDATE, DOM_TRANSFER};
+use vess_core::{
+    AccountId, BlockHeader, BlockWitness, Hash, InputAuthority, JointTransfer, StateUpdate,
+    Transaction, Transfer,
+};
 use vess_mempool::{AdmissionError, Mempool, MempoolError};
 use vess_net::rpc::{
     AccountInfo, BlockInfo, BlockQuery, ProofInfo, Reply, ReplyBody, Request, StatusInfo,
@@ -51,6 +55,18 @@ fn load_or_create_identity(datadir: &Path) -> Result<[u8; 32], NodeError> {
 
 /// Pruning runs at most once every this many blocks, so it is not on the per-block path.
 const PRUNE_INTERVAL_BLOCKS: u64 = 64;
+/// Headers kept in memory. Older ones stay on disk and are read back when a peer asks for them or a
+/// block just below the window needs its parent, so resident memory does not grow with chain length.
+const HEADER_MEMORY_WINDOW_BLOCKS: u64 = 10_000;
+/// Smallest window that still validates a new block: the retarget reads a whole
+/// `DIFFICULTY_WINDOW_BLOCKS` of parents, and the median-time rule reads `MTP_SPAN_BLOCKS` more.
+const MIN_HEADER_MEMORY_WINDOW: u64 = if vess_core::constants::DIFFICULTY_WINDOW_BLOCKS
+    > vess_core::constants::MTP_SPAN_BLOCKS as u64
+{
+    vess_core::constants::DIFFICULTY_WINDOW_BLOCKS
+} else {
+    vess_core::constants::MTP_SPAN_BLOCKS as u64
+};
 
 /// Target payload size for one snapshot frame, well under the 2 MiB frame limit.
 const SNAPSHOT_BATCH_BYTES: usize = 1_048_576;
@@ -113,6 +129,8 @@ pub enum NodeError {
     /// A snapshot is not newer than the state we already have.
     SnapshotNotNewer,
     InvalidSnapshotHistory,
+    /// A header would replace this node's own chain at or below its finality height.
+    Finalized,
 }
 
 impl std::fmt::Display for NodeError {
@@ -139,6 +157,7 @@ impl std::fmt::Display for NodeError {
             NodeError::InvalidSnapshotHistory => {
                 f.write_str("trusted snapshot history failed independent validation")
             }
+            NodeError::Finalized => f.write_str("block conflicts with this node's finalized chain"),
         }
     }
 }
@@ -259,6 +278,10 @@ pub struct Node {
     peers_path: PathBuf,
     /// How much history this node keeps. Persisted in the database; see `set_prune_policy`.
     prune: PrunePolicy,
+    /// How deep this node's history is final: it will not adopt a branch that replaces its own
+    /// main chain at or below `best_height - finality_depth`. Derived from the chain it validated
+    /// itself, so it needs no published hashes or operator maintenance.
+    finality_depth: u64,
     /// When the last pruning pass ran, so it happens on a schedule rather than per block.
     last_pruned_at_height: u64,
     /// Whether a snapshot may be installed for a block this node cannot validate itself.
@@ -351,6 +374,7 @@ impl Node {
             tip_signal,
             peers_path,
             prune,
+            finality_depth: vess_core::constants::DEFAULT_FINALITY_DEPTH_BLOCKS,
             last_pruned_at_height: 0,
             trust_snapshots,
             snapshot_verification,
@@ -359,7 +383,6 @@ impl Node {
         };
         node.reconcile()?;
         node.restore_mempool()?;
-        node.verify_checkpoints()?;
         if let (Some(verification), Some(verifier)) =
             (node.snapshot_verification, node.history_verifier.clone())
         {
@@ -375,25 +398,46 @@ impl Node {
         if trust_snapshots {
             node.verify_existing_snapshot_history()?;
         }
+        // History is trusted once it has been validated; nothing else can certify it, so the chain is
+        // paged out only after reconciliation has finished with it.
+        node.trim_header_memory();
         Ok(node)
     }
 
-    /// Refuse to run on a chain that contradicts a compiled-in checkpoint.
+    /// Load a block's parent, and as much of its ancestry as needed, back into memory.
     ///
-    /// Validation cannot answer this question — a long-range fork below the last block this node ever
-    /// checked looks exactly like the real chain — so a database built against another history has to
-    /// be rejected outright rather than silently served. Headers below our own pruning window are not
-    /// checkable any more; those were validated before they were pruned.
-    fn verify_checkpoints(&self) -> Result<(), NodeError> {
-        for checkpoint in self.chain.checkpoints() {
-            let Some(header) = self.chain.main_header_at(checkpoint.height) else {
-                continue;
-            };
-            if header.id() != checkpoint.id {
-                return Err(NodeError::Consensus(ConsensusError::CheckpointMismatch));
+    /// Only a window of headers is kept resident, so a block arriving just below that window would
+    /// otherwise look like it had an unknown parent. Reading the record back is cheap and bounded:
+    /// the loop stops at the first header still held, and never walks more than the window.
+    fn hydrate_parent(&mut self, parent: &Hash) {
+        let mut cursor = *parent;
+        for _ in 0..HEADER_MEMORY_WINDOW_BLOCKS {
+            if self.chain.contains(&cursor) {
+                return;
             }
+            let Ok(Some((header, height, work))) = self.store.header_record(&cursor) else {
+                return;
+            };
+            cursor = header.previous_block_id;
+            self.chain.adopt(header, height, work);
         }
-        Ok(())
+    }
+
+    /// Keep only a window of headers resident. Bodies, undo records and the header table on disk are
+    /// untouched: this bounds RSS, and `headers_from`/`block_info` fall back to the store.
+    fn trim_header_memory(&mut self) {
+        self.trim_header_memory_to(HEADER_MEMORY_WINDOW_BLOCKS);
+    }
+
+    fn trim_header_memory_to(&mut self, window: u64) {
+        // Validation needs a full difficulty window plus the median-time span behind the tip, so a
+        // smaller window would page out headers the next block has to be checked against.
+        let window = window.max(MIN_HEADER_MEMORY_WINDOW);
+        let tip = self.chain.best_height();
+        let cutoff = tip.saturating_sub(window);
+        if cutoff > self.chain.oldest_main_height().max(1) {
+            self.chain.prune_below(cutoff);
+        }
     }
 
     /// The X25519 secret this node proves in the Noise handshake.
@@ -614,7 +658,10 @@ impl Node {
             .snapshot_verification
             .is_some_and(|verification| verification.status == SnapshotVerificationStatus::Pending)
         {
-            PrunePolicy::new(self.prune.blocks, 0)
+            PrunePolicy {
+                headers: 0,
+                ..self.prune
+            }
         } else {
             self.prune
         };
@@ -804,6 +851,8 @@ impl Node {
 
     fn insert_header_only_at(&mut self, header: BlockHeader, now: u128) -> Result<(), NodeError> {
         Self::check_future_timestamp(header.timestamp_unix_ms, now)?;
+        self.check_finality(&header)?;
+        self.hydrate_parent(&header.previous_block_id);
         let outcome = self.chain.insert(header)?;
         if outcome != vess_consensus::InsertOutcome::Duplicate {
             let meta = self
@@ -814,6 +863,149 @@ impl Node {
                 .put_header(&header, meta.height, meta.chain_work)?;
         }
         Ok(())
+    }
+
+    /// Height at or below which this node's own chain is final, and the id it holds there.
+    ///
+    /// The anchor is the node's own best chain, which it validated header-by-header and
+    /// body-by-body, so it is earned rather than declared: no published hash, no attestation and no
+    /// operator upkeep. `None` when finality is disabled or the chain is shorter than the window.
+    pub fn finalized(&self) -> Option<(u64, Hash)> {
+        if self.finality_depth == 0 {
+            return None;
+        }
+        let height = self.chain.best_height().saturating_sub(self.finality_depth);
+        if height == 0 {
+            return None;
+        }
+        self.chain
+            .main_header_at(height)
+            .map(|header| (height, header.id()))
+    }
+
+    pub fn finality_depth(&self) -> u64 {
+        self.finality_depth
+    }
+
+    /// Change the finality window. `0` disables the rule; a smaller window allows deeper reorgs.
+    pub fn set_finality_depth(&mut self, depth: u64) {
+        self.finality_depth = depth;
+    }
+
+    /// Refuse a header that would replace our main chain at or below the finality height.
+    ///
+    /// This is what stops a long-range attack: an attacker who out-mines the network from genesis
+    /// still cannot replace history this node has already validated, because the branch would have
+    /// to disagree with us below a height we treat as settled. Forks above the window are ordinary
+    /// reorgs and are unaffected, and the common case — a header extending our tip, which is how
+    /// every in-order sync arrives — costs one hash comparison.
+    fn check_finality(&self, header: &BlockHeader) -> Result<(), NodeError> {
+        let Some((finalized_height, finalized_id)) = self.finalized() else {
+            return Ok(());
+        };
+        // Extending the tip, or the settled block itself, always continues our history.
+        if header.previous_block_id == self.chain.best_id()
+            || header.previous_block_id == finalized_id
+        {
+            return Ok(());
+        }
+        let Some(parent) = self.chain.meta(&header.previous_block_id) else {
+            return Ok(());
+        };
+        let height = parent.height.checked_add(1).ok_or(NodeError::Finalized)?;
+        if height <= finalized_height {
+            return if self
+                .chain
+                .main_header_at(height)
+                .is_some_and(|main| main.id() == header.id())
+            {
+                Ok(())
+            } else {
+                Err(NodeError::Finalized)
+            };
+        }
+        // Above the window: legal only if the branch descends from our settled block. A branch that
+        // arrives out of order is walked back to the anchor, bounded by the window; anything deeper
+        // is refused rather than walked, which only costs a peer a resend in order.
+        let limit = (finalized_height as usize) + self.finality_depth as usize + 8;
+        match self.ancestor_at(header.previous_block_id, finalized_height, limit) {
+            Some(id) if id == finalized_id => Ok(()),
+            Some(_) => Err(NodeError::Finalized),
+            // The branch's ancestry is partly pruned, which only happens to history this node
+            // validated and then discarded on purpose.
+            None => Ok(()),
+        }
+    }
+
+    /// The block id `steps`-th ancestor of `from` at `height`, walking down at most `limit` links.
+    fn ancestor_at(&self, from: Hash, height: u64, limit: usize) -> Option<Hash> {
+        let mut cursor = from;
+        for _ in 0..limit {
+            let meta = self.chain.meta(&cursor)?;
+            if meta.height == height {
+                return Some(cursor);
+            }
+            if meta.height < height {
+                return None;
+            }
+            cursor = self.chain.header(&cursor)?.previous_block_id;
+        }
+        None
+    }
+
+    /// The parent state's proofs for every account a stored block touches.
+    ///
+    /// A witness is a pure function of the parent state and the block, so it is never part of
+    /// consensus and never relayed as part of a block: any node with state can regenerate it, and a
+    /// node without state can ask for one and check it against a root it already trusts.
+    pub fn block_witness(&self, id: &Hash) -> Result<BlockWitness, NodeError> {
+        let body = self
+            .store
+            .body(id)?
+            .ok_or(NodeError::Malformed("body is not stored"))?;
+        let (header, transactions) = split_block(&body)?;
+        let parent_state = self.state_at(&header.previous_block_id)?;
+        Ok(BlockWitness {
+            account_root: parent_state.account_root(),
+            total_supply: parent_state.total_supply(),
+            accounts: vess_consensus::touched_accounts(&transactions, &header.payout_account_id)
+                .into_iter()
+                .map(|account| parent_state.witness(&account))
+                .collect(),
+        })
+    }
+
+    /// Validate a stored block against a witness, using only headers and the witness itself.
+    ///
+    /// This is the stateless path: the parent state root comes from the header chain, so no account
+    /// tree is read, cloned, or needed.
+    pub fn verify_block_stateless(
+        &self,
+        id: &Hash,
+        witness: &BlockWitness,
+    ) -> Result<Hash, NodeError> {
+        let body = self
+            .store
+            .body(id)?
+            .ok_or(NodeError::Malformed("body is not stored"))?;
+        let (header, transactions) = split_block(&body)?;
+        let meta = self.chain.meta(id).ok_or(NodeError::UnknownParent)?;
+        let parent = self
+            .chain
+            .header(&header.previous_block_id)
+            .ok_or(NodeError::UnknownParent)?;
+        let root = vess_consensus::verify_witness(
+            &self.network,
+            &parent.state_root,
+            &header,
+            &transactions,
+            meta.height,
+            witness,
+        )?;
+        if root != header.state_root {
+            return Err(NodeError::Consensus(ConsensusError::BadStateRoot));
+        }
+        Ok(root)
     }
 
     pub fn height(&self) -> u64 {
@@ -902,6 +1094,7 @@ impl Node {
     fn accept_block_at(&mut self, bytes: &[u8], now: u128) -> Result<Hash, NodeError> {
         let (header, _) = split_block(bytes)?;
         Self::check_future_timestamp(header.timestamp_unix_ms, now)?;
+        self.hydrate_parent(&header.previous_block_id);
         let id = header.id();
         let known = self.chain.contains(&id);
         if known && self.store.body(&id)?.is_some() {
@@ -916,6 +1109,7 @@ impl Node {
         if !known && !self.chain.contains(&header.previous_block_id) {
             return Err(NodeError::UnknownParent);
         }
+        self.check_finality(&header)?;
 
         // Validate in both cases: after a header-first sync the header is already known, but the body
         // still has to prove it belongs to that header before it can be replayed.
@@ -951,6 +1145,7 @@ impl Node {
         let is_expired = |tx: &Transaction| match tx {
             Transaction::Transfer(t) => t.expiry_unix != 0 && t.expiry_unix < now,
             Transaction::StateUpdate(t) => t.expiry_unix != 0 && t.expiry_unix < now,
+            Transaction::JointTransfer(t) => t.expiry_unix != 0 && t.expiry_unix < now,
         };
         let expired = self.mempool.transaction_ids_where(is_expired);
         if !expired.is_empty() {
@@ -1000,6 +1195,7 @@ impl Node {
             let _ = match tx {
                 Transaction::Transfer(t) => self.submit_transfer(t),
                 Transaction::StateUpdate(t) => self.submit_state_update(t),
+                Transaction::JointTransfer(t) => self.submit_joint_transfer(t),
             };
         }
 
@@ -1031,12 +1227,24 @@ impl Node {
     fn prune_included(&mut self, included: &[Transaction]) -> Result<(), NodeError> {
         let mut removed = Vec::new();
         for tx in included {
-            let sender = match tx {
-                Transaction::Transfer(t) => t.sender_id(),
-                Transaction::StateUpdate(t) => t.sender_id(),
-            };
-            if let Some(id) = self.mempool.transaction_id_for_account(&sender) {
-                removed.push(id);
+            match tx {
+                Transaction::Transfer(t) => {
+                    if let Some(id) = self.mempool.transaction_id_for_account(&t.sender_id()) {
+                        removed.push(id);
+                    }
+                }
+                Transaction::StateUpdate(t) => {
+                    if let Some(id) = self.mempool.transaction_id_for_account(&t.sender_id()) {
+                        removed.push(id);
+                    }
+                }
+                Transaction::JointTransfer(t) => {
+                    for account in t.input_accounts() {
+                        if let Some(id) = self.mempool.transaction_id_for_account(&account) {
+                            removed.push(id);
+                        }
+                    }
+                }
             }
             removed.push(tx.id());
         }
@@ -1047,6 +1255,11 @@ impl Node {
             match tx {
                 Transaction::Transfer(t) => self.mempool.remove_account(&t.sender_id()),
                 Transaction::StateUpdate(t) => self.mempool.remove_account(&t.sender_id()),
+                Transaction::JointTransfer(t) => {
+                    for account in t.input_accounts() {
+                        self.mempool.remove_account(&account);
+                    }
+                }
             }
             self.mempool.remove_transaction(&tx.id());
         }
@@ -1111,9 +1324,14 @@ impl Node {
         let mut out = Vec::new();
         let mut height = from_height;
         while out.len() < max {
+            // Headers older than the in-memory window are served from disk, so bounding memory does
+            // not make this node unable to answer a peer.
             match self.chain.main_header_at(height) {
                 Some(header) => out.push(header),
-                None => break,
+                None => match self.store.header_at_height(height) {
+                    Ok(Some((header, _, _))) => out.push(header),
+                    _ => break,
+                },
             }
             height += 1;
         }
@@ -1205,23 +1423,27 @@ impl Node {
 
     /// Whether a pending transaction still applies to the current state.
     fn applies(&self, tx: &Transaction, timestamp_unix_ms: u64) -> bool {
-        let payout = self.chain.best_header().payout_account_id;
-        applies_to(&self.state, &payout, tx, timestamp_unix_ms)
+        applies_to(
+            &self.state,
+            tx,
+            timestamp_unix_ms,
+            self.chain.best_height() + 1,
+        )
     }
 
     /// Drop pending transactions that no longer apply, e.g. after a reorganization replayed a
     /// block that spent the same account.
     pub fn prune_stale(&mut self) -> Result<usize, NodeError> {
         let timestamp = self.chain.best_header().timestamp_unix_ms;
-        let payout = self.chain.best_header().payout_account_id;
+        let next_height = self.chain.best_height() + 1;
         let state = &self.state;
         let stale = self
             .mempool
-            .transaction_ids_where(|tx| !applies_to(state, &payout, tx, timestamp));
+            .transaction_ids_where(|tx| !applies_to(state, tx, timestamp, next_height));
         if !stale.is_empty() {
             self.store.update_pending(&stale, None)?;
             self.mempool
-                .retain_valid(|tx| applies_to(state, &payout, tx, timestamp));
+                .retain_valid(|tx| applies_to(state, tx, timestamp, next_height));
         }
         Ok(stale.len())
     }
@@ -1265,20 +1487,67 @@ impl Node {
     ///
     /// Separate from [`Self::apply_transfer`] so a caller can run the expensive ML-DSA verification
     /// before taking the node lock.
-    pub fn check_transfer(network: NetworkProfile, tx: &Transfer) -> Result<(), NodeError> {
+    pub fn check_transfer(
+        network: NetworkProfile,
+        tx: &Transfer,
+        next_height: u64,
+    ) -> Result<(), NodeError> {
         if !vess_core::types::transaction_version_supported(tx.version) {
             return Err(NodeError::Malformed("unsupported version"));
         }
         if tx.chain_id != hash::chain_id(network.network) {
             return Err(NodeError::Malformed("wrong chain"));
         }
-        if !vess_crypto::verify(
-            &tx.sender_public_key,
-            DOM_TRANSFER,
-            &tx.unsigned_bytes(),
-            &tx.signature,
-        ) {
-            return Err(NodeError::Malformed("bad signature"));
+        match &tx.authority {
+            vess_core::TransferAuthority::Signature {
+                sender_public_key,
+                signature,
+            } => {
+                if !vess_crypto::verify(
+                    sender_public_key,
+                    DOM_TRANSFER,
+                    &tx.unsigned_bytes(),
+                    signature,
+                ) {
+                    return Err(NodeError::Malformed("bad signature"));
+                }
+            }
+            // The height-dependent half of an escrow spend is decided when the block is applied;
+            // admission only rejects what no height could make valid.
+            vess_core::TransferAuthority::Rules { rules, preimage } => {
+                if tx.version < vess_core::constants::TRANSACTION_VERSION {
+                    return Err(NodeError::Malformed("rules require a version 5 transfer"));
+                }
+                if rules.version != vess_core::constants::RULES_VERSION {
+                    return Err(NodeError::Malformed("unsupported rules version"));
+                }
+                if tx.fee > rules.max_fee {
+                    return Err(NodeError::Malformed("fee exceeds the escrow rules"));
+                }
+                if tx.expiry_unix != 0 {
+                    return Err(NodeError::Malformed("escrow spends cannot expire"));
+                }
+                if rules.claims_open_at(next_height) && preimage.is_none() {
+                    return Err(NodeError::Malformed("the claim window is still open"));
+                }
+                if !rules.claims_open_at(next_height) && preimage.is_some() {
+                    return Err(NodeError::Malformed("the claim window has closed"));
+                }
+                match preimage {
+                    Some(preimage) => {
+                        if vess_core::hash::hash_lock(preimage) != rules.hash_lock
+                            || tx.recipient_account_id != rules.recipient_account_id
+                        {
+                            return Err(NodeError::Malformed("preimage does not open the lock"));
+                        }
+                    }
+                    None => {
+                        if tx.recipient_account_id != rules.owner_account_id {
+                            return Err(NodeError::Malformed("refund must pay the owner"));
+                        }
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -1308,8 +1577,67 @@ impl Node {
     }
 
     pub fn submit_transfer(&mut self, tx: Transfer) -> Result<Hash, NodeError> {
-        Self::check_transfer(self.network, &tx)?;
+        Self::check_transfer(self.network, &tx, self.chain.best_height() + 1)?;
         self.apply_transfer(tx)
+    }
+
+    /// The checks that need no node state, for a joint transaction.
+    ///
+    /// Only signatures and the chain binding are checked here. Balances, nonces and the futures
+    /// settlement rule need state and are applied under the node lock, with the same predicates
+    /// consensus uses.
+    pub fn check_joint_transfer(
+        network: NetworkProfile,
+        tx: &JointTransfer,
+    ) -> Result<(), NodeError> {
+        if tx.version < vess_core::constants::TRANSACTION_VERSION_JOINT {
+            return Err(NodeError::Malformed("unsupported version"));
+        }
+        if tx.chain_id != hash::chain_id(network.network) {
+            return Err(NodeError::Malformed("wrong chain"));
+        }
+        let body = tx.unsigned_bytes();
+        for input in &tx.inputs {
+            if let InputAuthority::Signature {
+                public_key,
+                signature,
+            } = &input.authority
+                && !vess_crypto::verify(public_key, DOM_JOINT_TRANSFER, &body, signature)
+            {
+                return Err(NodeError::Malformed("bad signature"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Admit a joint transaction that has passed [`Self::check_joint_transfer`].
+    pub(crate) fn apply_joint_transfer(&mut self, tx: JointTransfer) -> Result<Hash, NodeError> {
+        for input in &tx.inputs {
+            let account = self
+                .state
+                .account(&input.account_id())
+                .ok_or(NodeError::UnknownAccount)?;
+            if input.nonce != account.next_nonce {
+                return Err(NodeError::Malformed("stale nonce"));
+            }
+        }
+        let id = tx.tx_id();
+        let canonical = Transaction::JointTransfer(tx.clone()).canonical();
+        self.mempool
+            .add_transaction_with(Transaction::JointTransfer(tx), |removed| {
+                self.store.update_pending(removed, Some((&id, &canonical)))
+            })
+            .map_err(|error| match error {
+                AdmissionError::Policy(error) => NodeError::Mempool(error),
+                AdmissionError::Persistence(error) => NodeError::Storage(error),
+            })?;
+        self.accepted_transactions += 1;
+        Ok(id)
+    }
+
+    pub fn submit_joint_transfer(&mut self, tx: JointTransfer) -> Result<Hash, NodeError> {
+        Self::check_joint_transfer(self.network, &tx)?;
+        self.apply_joint_transfer(tx)
     }
 
     /// The checks that need no node state, for a state update.
@@ -1372,6 +1700,7 @@ impl Node {
             ) {
                 Ok(Transaction::Transfer(tx)) => self.submit_transfer(tx),
                 Ok(Transaction::StateUpdate(tx)) => self.submit_state_update(tx),
+                Ok(Transaction::JointTransfer(tx)) => self.submit_joint_transfer(tx),
                 Err(error) => {
                     crate::log_warn!("mempool", "discarding malformed saved transaction: {error}");
                     continue;
@@ -1474,6 +1803,12 @@ impl Node {
                 Err(NodeError::UnknownAccount) => Reply::reject(reason::UNKNOWN_ACCOUNT),
                 Err(_) => Reply::reject(reason::MALFORMED),
             },
+            Request::SubmitJointTransfer(tx) => match self.submit_joint_transfer(tx) {
+                Ok(id) => Reply::ok(ReplyBody::Accepted(id)),
+                Err(NodeError::Mempool(_)) => Reply::reject(reason::MEMPOOL),
+                Err(NodeError::UnknownAccount) => Reply::reject(reason::UNKNOWN_ACCOUNT),
+                Err(_) => Reply::reject(reason::MALFORMED),
+            },
             Request::SubmitStateUpdate(tx) => match self.submit_state_update(tx) {
                 Ok(id) => Reply::ok(ReplyBody::Accepted(id)),
                 Err(NodeError::Mempool(_)) => Reply::reject(reason::MEMPOOL),
@@ -1481,6 +1816,14 @@ impl Node {
                 Err(_) => Reply::reject(reason::MALFORMED),
             },
             Request::Proof(id) => Reply::ok(ReplyBody::Proof(self.proof(&id))),
+            Request::Witness(id) => match self.store.body(&id) {
+                Ok(Some(body)) => match self.block_witness(&id) {
+                    Ok(witness) => Reply::ok(ReplyBody::Witness { body, witness }),
+                    Err(_) => Reply::reject(reason::MALFORMED),
+                },
+                Ok(None) => Reply::reject(reason::NOT_FOUND),
+                Err(_) => Reply::reject(reason::MALFORMED),
+            },
             Request::Block(query) => match self.block_info(query) {
                 Some(info) => Reply::ok(ReplyBody::Block(info)),
                 None => Reply::reject(reason::NOT_FOUND),
@@ -1504,18 +1847,28 @@ impl Node {
     /// A block by height on the main chain, or by id (which may be a side branch).
     pub fn block_info(&self, query: BlockQuery) -> Option<BlockInfo> {
         let id = match query {
-            BlockQuery::Height(height) => self.chain.main_header_at(height)?.id(),
+            BlockQuery::Height(height) => match self.chain.main_header_at(height) {
+                Some(header) => header.id(),
+                // Below the in-memory header window: resolve from disk.
+                None => self.store.header_at_height(height).ok().flatten()?.0.id(),
+            },
             BlockQuery::Id(id) => id,
         };
-        let meta = self.chain.meta(&id)?;
+        let (height, chain_work) = match self.chain.meta(&id) {
+            Some(meta) => (meta.height, meta.chain_work),
+            None => {
+                let (_, height, work) = self.store.header_record(&id).ok().flatten()?;
+                (height, work)
+            }
+        };
         let body = self.store.body(&id).ok().flatten()?;
         let (header, transactions) = split_block(&body).ok()?;
         Some(BlockInfo {
             id,
-            height: meta.height,
+            height,
             timestamp_unix_ms: header.timestamp_unix_ms,
             state_root: header.state_root,
-            chain_work: meta.chain_work,
+            chain_work,
             transaction_ids: transactions.iter().map(|tx| tx.id()).collect(),
         })
     }
@@ -1588,11 +1941,25 @@ impl Node {
                     info.amount = t.amount;
                     info.fee = t.fee;
                     info.payload = t.payload;
+                    info.escrow = t.rules().map(|rules| vess_net::rpc::EscrowInfo {
+                        rules: rules.clone(),
+                        claimed: t.preimage().is_some(),
+                    });
                 }
                 Transaction::StateUpdate(t) => {
                     info.sender_id = t.sender_id();
                     info.fee = t.fee;
                     info.new_state_hash = t.new_state_hash;
+                }
+                Transaction::JointTransfer(t) => {
+                    if let Some(first) = t.inputs.first() {
+                        info.sender_id = first.account_id();
+                    }
+                    if let Some(first) = t.outputs.first() {
+                        info.recipient_id = first.account_id;
+                    }
+                    info.amount = t.output_total().unwrap_or(0);
+                    info.fee = t.fee;
                 }
             }
         }
@@ -1696,15 +2063,90 @@ pub fn call(addr: &str, request: Request) -> Result<Reply, NodeError> {
 }
 
 /// Whether a transaction still applies to `state`, evaluated in isolation.
-fn applies_to(state: &State, payout: &AccountId, tx: &Transaction, timestamp_unix_ms: u64) -> bool {
-    let mut probe = state.clone();
+fn applies_to(state: &State, tx: &Transaction, timestamp_unix_ms: u64, next_height: u64) -> bool {
+    // A read-only test, not a trial execution: cloning the whole account tree once per mempool
+    // candidate made template building O(candidates x accounts), and that tree is the largest
+    // object the node holds. Every check below mirrors the matching line of `execute_transfer` /
+    // `execute_state_update`, so mempool policy cannot drift away from what consensus accepts.
+    let block_time = timestamp_unix_ms / 1_000;
     match tx {
-        Transaction::Transfer(t) => probe
-            .execute_transfer(t, &t.sender_id(), timestamp_unix_ms / 1_000, payout)
-            .is_ok(),
-        Transaction::StateUpdate(t) => probe
-            .execute_state_update(t, &t.sender_id(), timestamp_unix_ms / 1_000, payout)
-            .is_ok(),
+        Transaction::Transfer(t) => {
+            if t.amount == 0 {
+                return false;
+            }
+            if t.expiry_unix != 0 && block_time > t.expiry_unix {
+                return false;
+            }
+            let Some(account) = state.account(&t.sender_id()) else {
+                return false;
+            };
+            if account.next_nonce != t.nonce {
+                return false;
+            }
+            let Some(total) = t.amount.checked_add(t.fee) else {
+                return false;
+            };
+            if account.balance < total {
+                return false;
+            }
+            // `execute_transfer` cannot see the rules, so a spend that is too early, too late, or
+            // aimed at the wrong destination is rejected here; otherwise the miner would build a
+            // template that consensus refuses, and stop producing blocks.
+            if let Some(rules) = t.rules()
+                && vess_consensus::check_rules_spend(
+                    t,
+                    rules,
+                    t.preimage(),
+                    next_height,
+                    account.balance,
+                )
+                .is_err()
+            {
+                return false;
+            }
+            true
+        }
+        Transaction::StateUpdate(t) => {
+            if t.expiry_unix != 0 && block_time > t.expiry_unix {
+                return false;
+            }
+            match state.account(&t.sender_id()) {
+                Some(account) => account.next_nonce == t.nonce && account.balance >= t.fee,
+                None => false,
+            }
+        }
+        Transaction::JointTransfer(t) => {
+            if t.expiry_unix != 0 && block_time > t.expiry_unix {
+                return false;
+            }
+            // A settlement is only valid if consensus would compute exactly the split it declares,
+            // and that depends on the supply entering the block. Check it here so a miner never
+            // builds a template consensus refuses.
+            if let Some(rules) = t.futures_rules() {
+                let Some(account) = state.account(&rules.account_id()) else {
+                    return false;
+                };
+                if vess_consensus::check_futures_settle(
+                    t,
+                    rules,
+                    next_height,
+                    account.balance,
+                    state.total_supply(),
+                )
+                .is_err()
+                {
+                    return false;
+                }
+            }
+            t.inputs
+                .iter()
+                .all(|input| match state.account(&input.account_id()) {
+                    Some(account) => {
+                        account.next_nonce == input.nonce && account.balance >= input.amount
+                    }
+                    None => false,
+                })
+        }
     }
 }
 

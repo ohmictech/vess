@@ -49,15 +49,22 @@ const VERIFICATION_BUDGET_BURST: u32 = 256;
 /// Score at which a session is closed and the address is banned.
 const MAX_SCORE: u32 = 24;
 /// Simultaneous inbound sessions.
-const MAX_INBOUND_CONNECTIONS: usize = 32;
+///
+/// Deliberately far above `MAX_INBOUND_PER_IP`: a modest botnet can hold a handful of connections per
+/// address, so a small global cap would let it lock honest peers out of a public seed.
+const MAX_INBOUND_CONNECTIONS: usize = 512;
 /// Simultaneous inbound sessions from a single address.
 const MAX_INBOUND_PER_IP: usize = 4;
 /// Transactions selected at once for relay. Individual frames are paced and interleaved with reads.
 const MAX_ANNOUNCED_TRANSACTIONS: usize = 32;
 /// Spacing between outbound transactions, for a maximum of 160 per second.
 const TRANSACTION_ANNOUNCE_INTERVAL: Duration = Duration::from_micros(6_250);
-/// Seconds an address stays banned after a session was closed for misbehaviour.
+/// Seconds an address stays banned after a session was closed for misbehaviour. Repeated offences
+/// double this, so a peer that simply reconnects every minute stops being cheap.
 const BAN_SECONDS: u64 = 60;
+/// Ceiling for the doubling in [`BAN_SECONDS`]: an address that keeps misbehaving ends up banned for
+/// a day, which is long enough to be a deterrent and short enough to expire on its own.
+const MAX_BAN_SECONDS: u64 = 86_400;
 /// Header rounds per pull, which bounds the work a single announcement can cause.
 const MAX_PULL_ROUNDS: usize = 64;
 /// Blocks replayed per pull. A deep catch-up continues on the next resync tick instead of holding
@@ -65,6 +72,9 @@ const MAX_PULL_ROUNDS: usize = 64;
 const MAX_BLOCKS_PER_PULL: usize = 4_096;
 /// Snapshot frames accepted from one peer for one snapshot.
 const MAX_SNAPSHOT_FRAMES: usize = 4_096;
+/// Blocks one `GET_BLOCKS` reply may carry. Keeps a single request from making a peer stream an
+/// unbounded amount of data, while still amortising the round trip over many blocks.
+const MAX_BLOCKS_PER_REQUEST: usize = 64;
 /// Time a request may stay unanswered before the session is dropped.
 const REPLY_TIMEOUT_MS: u64 = 5_000;
 /// How often a session re-checks whether the peer is still ahead of us. Announcements normally
@@ -78,7 +88,9 @@ const RESYNC_INTERVAL_MS: u64 = 2_000;
 /// seconds rather than an `Instant` so the file means something across runs.
 #[derive(Default)]
 pub struct Bans {
-    entries: Mutex<Vec<(IpAddr, u64)>>,
+    /// `(address, banned until, previous offences)`. The offence count drives the backoff and is
+    /// persisted, so restarting a node does not hand an attacker a clean slate.
+    entries: Mutex<Vec<(IpAddr, u64, u32)>>,
     path: Mutex<Option<PathBuf>>,
 }
 
@@ -95,12 +107,17 @@ impl Bans {
                 let (Ok(ip), Ok(until)) = (addr.parse::<IpAddr>(), until.parse::<u64>()) else {
                     continue;
                 };
+                // Older files carry no offence count; treat an existing entry as one offence.
+                let strikes = parts
+                    .next()
+                    .and_then(|count| count.parse::<u32>().ok())
+                    .unwrap_or(1);
                 if ip.is_loopback() {
                     // Never load a loopback ban: a local cluster must not be able to lock itself out,
                     // and an old file should not be able to do it either.
                     continue;
                 }
-                entries.push((ip, until));
+                entries.push((ip, until, strikes));
             }
         }
         Bans {
@@ -109,35 +126,47 @@ impl Bans {
         }
     }
 
-    /// Ban `ip` for `seconds`. Loopback is never banned, and never written.
+    /// Ban `ip`, doubling the duration for each further offence. Loopback is never banned, and never
+    /// written.
     pub fn ban(&self, ip: IpAddr, seconds: u64, now: u64) {
         if ip.is_loopback() {
             return;
         }
-        let changed = {
+        {
             let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-            let until = now.saturating_add(seconds);
-            match entries.iter_mut().find(|(known, _)| *known == ip) {
-                Some(entry) => entry.1 = entry.1.max(until),
-                None => entries.push((ip, until)),
-            }
-            true
-        };
-        if changed {
-            self.persist();
+            let index = match entries.iter().position(|(known, ..)| *known == ip) {
+                Some(index) => index,
+                None => {
+                    entries.push((ip, 0, 0));
+                    entries.len() - 1
+                }
+            };
+            let entry = &mut entries[index];
+            entry.2 = entry.2.saturating_add(1);
+            // First offence gets the base duration; each one after that doubles.
+            let doublings = entry.2.saturating_sub(1).min(20);
+            let duration = seconds
+                .saturating_mul(1u64 << doublings)
+                .min(MAX_BAN_SECONDS);
+            entry.1 = entry.1.max(now.saturating_add(duration));
         }
+        self.persist();
     }
 
-    /// Is `ip` banned right now? Expired entries are dropped as a side effect.
+    /// Is `ip` banned right now? An entry outlives its ban by [`MAX_BAN_SECONDS`] so the offence
+    /// count is still there the next time the address turns up; only its verdict expires.
     pub fn banned(&self, ip: IpAddr, now: u64) -> bool {
         if ip.is_loopback() {
             return false;
         }
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         let before = entries.len();
-        entries.retain(|(_, until)| *until > now);
+        let remember_until = now.saturating_sub(MAX_BAN_SECONDS);
+        entries.retain(|(_, until, _)| *until > remember_until);
         let dropped = entries.len() != before;
-        let banned = entries.iter().any(|(known, _)| *known == ip);
+        let banned = entries
+            .iter()
+            .any(|(known, until, _)| *known == ip && *until > now);
         drop(entries);
         if dropped {
             self.persist();
@@ -161,7 +190,7 @@ impl Bans {
             let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
             entries
                 .iter()
-                .map(|(ip, until)| format!("{ip} {until}\n"))
+                .map(|(ip, until, strikes)| format!("{ip} {until} {strikes}\n"))
                 .collect()
         };
         let temp = path.with_extension("tmp");
@@ -530,10 +559,14 @@ fn submit(node: &Arc<Mutex<Node>>, tx: Transaction) -> bool {
     // Signature verification is the expensive part of admitting a transaction (~370 us) and needs
     // no node state. Doing it before the lock keeps one peer's traffic from serialising every other
     // session's verification, mining, and RPC on the node mutex.
-    let network = lock(node).network_profile();
+    let (network, next_height) = {
+        let guard = lock(node);
+        (guard.network_profile(), guard.chain().best_height() + 1)
+    };
     let checked = match &tx {
-        Transaction::Transfer(t) => Node::check_transfer(network, t),
+        Transaction::Transfer(t) => Node::check_transfer(network, t, next_height),
         Transaction::StateUpdate(t) => Node::check_state_update(network, t),
+        Transaction::JointTransfer(t) => Node::check_joint_transfer(network, t),
     };
     if checked.is_err() {
         return false;
@@ -542,6 +575,7 @@ fn submit(node: &Arc<Mutex<Node>>, tx: Transaction) -> bool {
     match tx {
         Transaction::Transfer(t) => guard.apply_transfer(t).is_ok(),
         Transaction::StateUpdate(t) => guard.apply_state_update(t).is_ok(),
+        Transaction::JointTransfer(t) => guard.apply_joint_transfer(t).is_ok(),
     }
 }
 
@@ -749,17 +783,17 @@ fn session(
                 let guard = lock(&node);
                 guard.height() < their_height || guard.state_height() < their_height
             };
-            if behind {
-                if let Err(why) = pull(
+            if behind
+                && let Err(why) = pull(
                     &node,
                     &mut stream,
                     their_height,
                     their_oldest_body,
                     &mut state,
-                ) {
-                    crate::log_debug!("sync", "resync pull ended: {why}");
-                    return Ok(());
-                }
+                )
+            {
+                crate::log_debug!("sync", "resync pull ended: {why}");
+                return Ok(());
             }
         }
         if !wait_for_session_input(&stream, &state)? {
@@ -1190,6 +1224,7 @@ fn announce(
         let account = match &tx {
             Transaction::Transfer(tx) => tx.sender_id(),
             Transaction::StateUpdate(tx) => tx.sender_id(),
+            Transaction::JointTransfer(tx) => *tx.input_accounts().first().unwrap_or(&[0u8; 32]),
         };
         if lock(node).mempool().transaction_id_for_account(&account) != Some(id) {
             continue;
@@ -1293,6 +1328,38 @@ fn dispatch(
                 }
                 None => reply(stream, p2p_kind::NOT_FOUND, &[])?,
             }
+            Ok(Action::None)
+        }
+        p2p_kind::GET_BLOCKS => {
+            let mut reader = Reader::new(payload);
+            let count = reader
+                .u32()
+                .map_err(|_| "malformed GET_BLOCKS".to_string())? as usize;
+            if count > MAX_BLOCKS_PER_REQUEST {
+                return Err("GET_BLOCKS asks for too many blocks".into());
+            }
+            let mut ids = Vec::with_capacity(count);
+            for _ in 0..count {
+                ids.push(
+                    reader
+                        .array::<32>()
+                        .map_err(|_| "malformed GET_BLOCKS".to_string())?,
+                );
+            }
+            let mut sent = 0u32;
+            for id in ids {
+                // Lock per body: a batch must not hold the node for the whole run of blocks.
+                let Some(bytes) = ({ lock(node).block_body(&id) }) else {
+                    continue;
+                };
+                let mut w = Writer::new();
+                let _ = w.var_bytes(&bytes);
+                reply(stream, p2p_kind::BLOCK, w.as_slice())?;
+                sent += 1;
+            }
+            let mut w = Writer::new();
+            w.u32(sent);
+            reply(stream, p2p_kind::BLOCK_END, w.as_slice())?;
             Ok(Action::None)
         }
         p2p_kind::BLOCK => {
@@ -1649,7 +1716,9 @@ fn pull_blocks(
             let guard = lock(node);
             // A reorg replays the peer's branch from where it split off our state, which may be far
             // below the tip; `next_body_height` names exactly that block.
-            let floor = guard.next_body_height().unwrap_or_else(|| guard.height() + 1);
+            let floor = guard
+                .next_body_height()
+                .unwrap_or_else(|| guard.height() + 1);
             let lookback = guard.height().saturating_sub(SYNC_LOOKBACK);
             (
                 floor.min(lookback).max(guard.chain().oldest_main_height()),
@@ -1671,29 +1740,66 @@ fn pull_blocks(
         }
 
         let mut progress = 0usize;
-        for header in headers {
-            serve_quorum_request(node, stream, state)?;
+        // Collect the ids this page needs a body for, then fetch them in batches. One request per
+        // block would cap catch-up at one round trip per block.
+        let mut wanted: Vec<Hash> = Vec::new();
+        for header in &headers {
             let id = header.id();
-            if { lock(node).chain().contains(&id) }
-                && !{ lock(node).needs_body_above(&id, floor) }
+            if { lock(node).chain().contains(&id) } && !{ lock(node).needs_body_above(&id, floor) }
             {
                 continue;
             }
-            write_frame(stream, P2P_MAGIC, p2p_kind::GET_BLOCK, &id).map_err(|e| e.to_string())?;
-            let Some(payload) = recv_until(node, stream, p2p_kind::BLOCK, state)? else {
-                return Ok(applied);
-            };
-            let mut reader = Reader::new(&payload);
-            let Ok(bytes) = reader.var_bytes(MAX_NETWORK_FRAME_BYTES) else {
-                return Ok(applied);
-            };
-            if bytes.is_empty() || lock(node).accept_block(bytes).is_err() {
-                return Ok(applied);
+            wanted.push(id);
+        }
+        for batch in wanted.chunks(MAX_BLOCKS_PER_REQUEST) {
+            serve_quorum_request(node, stream, state)?;
+            let mut w = Writer::new();
+            w.u32(batch.len() as u32);
+            for id in batch {
+                w.fixed(id);
             }
-            applied += 1;
-            progress += 1;
-            if applied >= MAX_BLOCKS_PER_PULL {
-                return Ok(applied);
+            write_frame(stream, P2P_MAGIC, p2p_kind::GET_BLOCKS, w.as_slice())
+                .map_err(|e| e.to_string())?;
+            let mut received = 0usize;
+            loop {
+                match read_frame(stream, P2P_MAGIC, MAX_NETWORK_FRAME_BYTES) {
+                    Ok((p2p_kind::BLOCK, payload)) => {
+                        if !state.note_frame() {
+                            return Err("peer exceeded the frame budget".into());
+                        }
+                        received += 1;
+                        let bytes = {
+                            let mut reader = Reader::new(&payload);
+                            match reader.var_bytes(MAX_NETWORK_FRAME_BYTES) {
+                                Ok(bytes) if !bytes.is_empty() => bytes.to_vec(),
+                                _ => return Ok(applied),
+                            }
+                        };
+                        if lock(node).accept_block(&bytes).is_err() {
+                            return Ok(applied);
+                        }
+                        applied += 1;
+                        progress += 1;
+                        if applied >= MAX_BLOCKS_PER_PULL {
+                            return Ok(applied);
+                        }
+                    }
+                    Ok((p2p_kind::BLOCK_END, _)) => break,
+                    Ok((kind, payload)) => {
+                        if !state.note_frame() {
+                            return Err("peer exceeded the frame budget".into());
+                        }
+                        if let Action::Fatal(why) = dispatch(node, stream, kind, &payload, state)? {
+                            return Err(why.into());
+                        }
+                    }
+                    Err(NetError::Timeout) => {}
+                    Err(_) => return Ok(applied),
+                }
+            }
+            if received == 0 {
+                // The peer has none of this batch; more requests would not help.
+                break;
             }
         }
         if progress == 0 || lock(node).height() >= their_height {
@@ -2216,6 +2322,41 @@ mod tests {
         assert!(vess_net::is_idle(&Error::from_raw_os_error(997)));
         assert!(!vess_net::is_idle(&Error::from_raw_os_error(10054)));
         assert!(!vess_net::is_idle(&Error::from(ErrorKind::InvalidData)));
+    }
+
+    /// A repeat offender is banned for longer, and the offence count survives a restart, so simply
+    /// reconnecting is not a way to reset the clock.
+    #[test]
+    fn repeated_offences_escalate_the_ban_and_persist() {
+        let dir = TempDir::new("ban-backoff");
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let path = dir.0.join("bans.txt");
+        let bans = Bans::load(path.clone());
+        let ip: IpAddr = "203.0.113.7".parse().unwrap();
+
+        bans.ban(ip, 60, 1_000);
+        assert!(bans.banned(ip, 1_001));
+        assert!(!bans.banned(ip, 1_061), "the first ban lasts one interval");
+
+        bans.ban(ip, 60, 2_000);
+        assert!(bans.banned(ip, 2_000 + 119), "second offence doubles it");
+        assert!(!bans.banned(ip, 2_000 + 121));
+
+        // The count is on disk, so a restart keeps escalating instead of starting over.
+        let reloaded = Bans::load(path);
+        reloaded.ban(ip, 60, 5_000);
+        assert!(
+            reloaded.banned(ip, 5_000 + 239),
+            "third offence doubles again"
+        );
+        assert!(!reloaded.banned(ip, 5_000 + 241));
+
+        // And it is capped rather than growing without bound.
+        for _ in 0..40 {
+            reloaded.ban(ip, 60, 9_000);
+        }
+        assert!(reloaded.banned(ip, 9_000 + MAX_BAN_SECONDS - 1));
+        assert!(!reloaded.banned(ip, 9_001 + MAX_BAN_SECONDS));
     }
 
     #[test]
@@ -2954,7 +3095,13 @@ mod tests {
         let second_body = lock(&source).block_body(&second).unwrap();
         let (header, mut transactions) = vess_consensus::split_block(&second_body).unwrap();
         match &mut transactions[0] {
-            Transaction::Transfer(transfer) => transfer.signature[0] ^= 1,
+            Transaction::Transfer(transfer) => {
+                if let vess_core::TransferAuthority::Signature { signature, .. } =
+                    &mut transfer.authority
+                {
+                    signature[0] ^= 1;
+                }
+            }
             _ => panic!("expected a transfer"),
         }
         let mut tampered = header.canonical().to_vec();
@@ -3061,6 +3208,33 @@ mod tests {
     /// peer's first header has a parent we never saw, and validation rejects it with "unknown
     /// previous block". Header sync must walk back to the fork point instead of giving up, or a node
     /// stays stranded on its own branch forever while the two chains keep drifting apart.
+    /// Bodies are fetched in `GET_BLOCKS` batches, so a page larger than one batch must still sync
+    /// completely and terminate: the reply is a run of `BLOCK` frames ended by `BLOCK_END`.
+    #[test]
+    fn a_page_larger_than_one_block_batch_still_syncs() {
+        let (dir_a, dir_b) = (TempDir::new("batch-a"), TempDir::new("batch-b"));
+        let a = shared(&dir_a.0);
+        let b = shared(&dir_b.0);
+        let (listener, port) = listen();
+        let serve_a = a.clone();
+        std::thread::spawn(move || serve(serve_a, listener, port));
+
+        let payout = [0x48u8; 32];
+        let blocks = MAX_BLOCKS_PER_REQUEST * 2 + 3;
+        for _ in 0..blocks {
+            mine_one(&a, &payout);
+        }
+        assert_eq!(a.lock().unwrap().height(), blocks as u64);
+
+        sync_once(&b, &format!("127.0.0.1:{port}"), 0).expect("batched sync");
+        assert_eq!(b.lock().unwrap().height(), a.lock().unwrap().height());
+        assert_eq!(
+            b.lock().unwrap().state_height(),
+            a.lock().unwrap().state_height()
+        );
+        assert_eq!(b.lock().unwrap().root(), a.lock().unwrap().root());
+    }
+
     #[test]
     fn a_deep_fork_is_adopted_by_walking_back_to_the_fork_point() {
         let (dir_a, dir_b) = (TempDir::new("deep-a"), TempDir::new("deep-b"));
@@ -3207,7 +3381,9 @@ mod tests {
                 ))
             ));
             let mut bad = wallet.build_transfer(recipient, 10, 0, 0, 0);
-            bad.signature[0] ^= 1;
+            if let vess_core::TransferAuthority::Signature { signature, .. } = &mut bad.authority {
+                signature[0] ^= 1;
+            }
             assert!(guard.submit_transfer(bad).is_err());
             let wrong_network =
                 vess_wallet::Wallet::from_seed(NetworkProfile::DEVNET.network, [0x42; 32])
@@ -3227,7 +3403,9 @@ mod tests {
                 .template(&wallet.account_id(), guard.next_timestamp_ms())
                 .unwrap();
             let mut bad = tx.clone();
-            bad.signature[0] ^= 1;
+            if let vess_core::TransferAuthority::Signature { signature, .. } = &mut bad.authority {
+                signature[0] ^= 1;
+            }
             let invalid = Transaction::Transfer(bad);
             forged.header.transaction_root = vess_core::hash::tx_root(&[invalid.id()]);
             forged.body = vess_consensus::encode_body(&[invalid]).unwrap();
@@ -3366,8 +3544,10 @@ mod tests {
         let payout = [0x43u8; 32];
         mine_one(&a, &payout);
         mine_one(&a, &payout);
+        // Headers and bodies arrive on separate round trips, so wait for the state, not just the
+        // header count, before comparing roots.
         wait_until("the announced blocks to reach B", || {
-            b.lock().unwrap().height() == 2
+            b.lock().unwrap().state_height() == 2
         });
         let b_at = {
             let guard = b.lock().unwrap();
@@ -3811,14 +3991,16 @@ mod tests {
             let tx = Transaction::Transfer(vess_core::Transfer {
                 version: 1,
                 chain_id: [0; 32],
-                sender_public_key: [key; 1952],
                 recipient_account_id: [4; 32],
                 amount: 1,
                 fee: 0,
                 nonce: 0,
                 expiry_unix: 0,
                 payload: None,
-                signature: [5; 3309],
+                authority: vess_core::TransferAuthority::Signature {
+                    sender_public_key: [key; 1952],
+                    signature: [5; 3309],
+                },
             });
             ids.push(tx.id());
             lock(&node).mempool.add_transaction(tx).unwrap();
@@ -3927,14 +4109,16 @@ mod tests {
         let tx = Transaction::Transfer(vess_core::Transfer {
             version: 1,
             chain_id: [0u8; 32],
-            sender_public_key: [1u8; 1952],
             recipient_account_id: [2u8; 32],
             amount: 1,
             fee: 0,
             nonce: 0,
             expiry_unix: 0,
             payload: None,
-            signature: [3u8; 3309],
+            authority: vess_core::TransferAuthority::Signature {
+                sender_public_key: [1u8; 1952],
+                signature: [3u8; 3309],
+            },
         });
         let transactions: Vec<Transaction> = (0..1_000).map(|_| tx.clone()).collect();
         let payload = encode_pending(&transactions);
